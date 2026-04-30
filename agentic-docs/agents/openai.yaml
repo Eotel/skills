@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agentic Docs"
+  short_description: "Bootstrap agent-readable project docs"
+  default_prompt: "Use $agentic-docs to bootstrap and maintain an agent-readable docs/ system for this project."
