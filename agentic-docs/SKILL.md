@@ -1,6 +1,6 @@
 ---
 name: agentic-docs
-description: Bootstrap, audit, and maintain repository-local documentation systems for agentic software work. Use when Codex needs to create or reorganize AGENTS.md, ARCHITECTURE.md, docs/index.md, design docs, product specs, exec plans, generated references, or documentation governance for a project that lacks agent-readable docs or needs docs/ structure updates.
+description: Bootstrap, audit, and maintain repository-local documentation systems for agentic software work. Use when Codex needs to create or reorganize AGENTS.md, ARCHITECTURE.md, docs/index.md, design docs, product specs, exec plans, generated references, DESIGN.md (Google Labs format for visual design tokens), or documentation governance for a project that lacks agent-readable docs or needs docs/ structure updates.
 ---
 
 # Agentic Docs
@@ -66,5 +66,7 @@ Tighten links, freshness, or verification instead.
 
 - `references/doc-structure.md`: placement rules, bootstrap shape, and quality bar.
 - `references/templates.md`: template catalog and generation workflow.
+- `references/design-md-format.md`: Google Labs DESIGN.md format reference for visual design tokens.
 - `scripts/bootstrap_docs.py`: copy the generic docs scaffold into a target repo.
 - `assets/templates/`: generic templates used by the script.
+- `assets/optional/`: opt-in templates not copied by the bootstrap script (currently `DESIGN.md`).
