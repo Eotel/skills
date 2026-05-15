@@ -1,0 +1,4 @@
+interface:
+  display_name: "Django"
+  short_description: "Django ORM and app best practices"
+  default_prompt: "Use $django to refactor Django ORM/query code with project-local boundaries and focused verification."
