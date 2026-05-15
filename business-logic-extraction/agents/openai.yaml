@@ -1,0 +1,4 @@
+interface:
+  display_name: "Business Logic Extraction"
+  short_description: "Extract domain decisions from adapters"
+  default_prompt: "Use $business-logic-extraction to plan and verify a business logic extraction refactor."

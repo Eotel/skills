@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repo Local Git Hooks"
+  short_description: "Detect and repair global core.hooksPath bypassing repo hooks."
+  default_prompt: "Audit this repo for global Git hook overrides and make repo-local pre-commit/pre-push hooks effective."
