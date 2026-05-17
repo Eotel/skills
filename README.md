@@ -27,3 +27,4 @@ Codex can use shared Claude skills through a symlink from
   redis, lsp, strict-types) and Python version patching.
 - **`repo-local-git-hooks`** — detect and repair global `core.hooksPath`
   overrides that bypass repository-local pre-commit or pre-push hooks.
+- **`plan-exec`** — write repo-local execution plans under `docs/exec-plans/active/`, get approval, and keep progress updated through implementation.
