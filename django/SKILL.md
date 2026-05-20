@@ -1,6 +1,6 @@
 ---
 name: django
-description: Use when working in Django projects on ORM/query placement, custom QuerySet or Manager design, extracting repeated filters/select_related/prefetch_related/orderings from views, GraphQL resolvers, API actions, services, tasks, or query modules, preserving behavior with tests, and verifying Django code with project-local lint/type/boundary checks. Trigger for Django best practices, django-stubs/mypy ORM typing, queryset-scope refactors, model-owned table scopes, read-model query boundaries, and avoiding misplaced business/query logic.
+description: Use when working in Django projects on ORM/query placement, custom QuerySet or Manager design, extracting repeated filters/select_related/prefetch_related/orderings from views, GraphQL resolvers, API actions, services, tasks, or query modules, OR extracting hidden business decisions (implicit if-branches over status/ordinal/role, view.action-keyed permission dispatch, deputy/proxy resolution) out of DRF viewsets/serializers/permissions into named predicates and policies on the owning model. Preserves observable behavior with focused tests and verifies with project-local lint/type/boundary checks. Trigger for Django best practices, django-stubs/mypy ORM typing, queryset-scope refactors, model-owned table scopes, read-model query boundaries, DRF adapter thinning, named authorization predicates, and avoiding misplaced business/query logic.
 ---
 
 # Django
@@ -36,4 +36,11 @@ from the target repository authoritative.
 - `references/orm-queryset-extraction.md`: use when extracting repeated Django
   ORM query logic into model-owned custom QuerySets or deciding what should
   stay in query/service/API layers.
+- `references/business-logic-extraction.md`: use when extracting business
+  decisions (status/ordinal/role/freezed branches, `view.action`-keyed
+  permission dispatch, deputy/proxy resolution, lifecycle transitions) out
+  of DRF viewsets, serializers, or permission classes into named predicates,
+  rosters, and transition methods on the owning model. Pairs with the generic
+  **business-logic-extraction** skill for cross-stack methodology — this
+  reference only adds the Django/DRF placement rules.
 
