@@ -28,3 +28,7 @@ Codex can use shared Claude skills through a symlink from
 - **`repo-local-git-hooks`** — detect and repair global `core.hooksPath`
   overrides that bypass repository-local pre-commit or pre-push hooks.
 - **`plan-exec`** — write repo-local execution plans under `docs/exec-plans/active/`, get approval, and keep progress updated through implementation.
+- **`markdown-lint-setup`** — bootstrap `remark` + `textlint` (with
+  `@textlint-ja/textlint-rule-preset-ai-writing`) in a Node project; always
+  excludes AI agent context dirs (`.agents`, `.claude`, `.codex`,
+  `.impeccable`, `.serena`, `.github`) from both linters.
