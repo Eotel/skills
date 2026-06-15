@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skills Catalog: APM 管理スキル一覧</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --chip:#21262d;
+    --eotel:#3fb950; --mizchi:#58a6ff; --mattpocock:#d29922;
+    --impeccable:#db61a2; --nulab:#a371f7; --astgrep:#ff7b72;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+    line-height:1.65;font-size:15px}
+  header{padding:32px 24px 18px;border-bottom:1px solid var(--border);
+    background:linear-gradient(180deg,#11161f,#0d1117)}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 20px}
+  h1{margin:0 0 6px;font-size:26px;letter-spacing:.2px}
+  .sub{color:var(--muted);font-size:14px;margin:0}
+  .meta-line{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+  .pill{background:var(--chip);border:1px solid var(--border);border-radius:999px;
+    padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  .pill b{color:var(--fg)}
+  .controls{position:sticky;top:0;z-index:5;background:rgba(13,17,23,.92);
+    backdrop-filter:blur(8px);border-bottom:1px solid var(--border);padding:12px 0}
+  .controls .wrap{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  input[type=search]{flex:1;min-width:220px;background:var(--panel);border:1px solid var(--border);
+    color:var(--fg);border-radius:8px;padding:9px 12px;font-size:14px;outline:none}
+  input[type=search]:focus{border-color:var(--accent)}
+  .filters{display:flex;gap:6px;flex-wrap:wrap}
+  .fbtn{background:var(--chip);border:1px solid var(--border);color:var(--muted);
+    border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;user-select:none}
+  .fbtn.active{color:#fff;border-color:transparent}
+  .fbtn[data-src=eotel].active{background:var(--eotel)}
+  .fbtn[data-src=mizchi].active{background:var(--mizchi)}
+  .fbtn[data-src=mattpocock].active{background:var(--mattpocock);color:#1a1205}
+  .fbtn[data-src=impeccable].active{background:var(--impeccable)}
+  .fbtn[data-src=nulab].active{background:var(--nulab)}
+  .fbtn[data-src=astgrep].active{background:var(--astgrep);color:#2a0d0a}
+  .fbtn[data-src=all].active{background:var(--accent);color:#06101f}
+  main{padding:26px 0 80px}
+  .group{margin-bottom:34px}
+  .group h2{display:flex;align-items:center;gap:10px;font-size:18px;margin:0 0 4px;
+    padding-bottom:8px;border-bottom:1px solid var(--border)}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .src-eotel .dot{background:var(--eotel)} .src-mizchi .dot{background:var(--mizchi)}
+  .src-mattpocock .dot{background:var(--mattpocock)} .src-impeccable .dot{background:var(--impeccable)}
+  .src-nulab .dot{background:var(--nulab)} .src-astgrep .dot{background:var(--astgrep)}
+  .group .repo{color:var(--muted);font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+  .group .count{margin-left:auto;color:var(--muted);font-size:12.5px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:12px;margin-top:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+    padding:14px 15px;display:flex;flex-direction:column;gap:7px;transition:border-color .15s}
+  .card:hover{border-color:var(--accent)}
+  .card .name{font-weight:650;font-size:15px;font-family:ui-monospace,Menlo,monospace}
+  .card .what{color:var(--fg);font-size:13.5px}
+  .card .when{color:var(--muted);font-size:12.5px}
+  .card .when b{color:#b9c2cc;font-weight:600}
+  .tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:2px}
+  .tag{background:var(--panel2);border:1px solid var(--border);border-radius:6px;
+    padding:1px 8px;font-size:11px;color:var(--muted)}
+  .pin{font-size:11px;color:var(--mattpocock)}
+  footer{border-top:1px solid var(--border);color:var(--muted);font-size:12.5px;
+    padding:20px 0 40px}
+  footer code{background:var(--chip);padding:1px 6px;border-radius:5px}
+  .empty{color:var(--muted);text-align:center;padding:40px;display:none}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Skills Catalog</h1>
+    <p class="sub">Eotel が APM(Agent Package Manager)で管理する Claude Code / Codex スキル一覧（自作 + サードパーティ）</p>
+    <div class="meta-line">
+      <span class="pill"><b>34</b> skills</span>
+      <span class="pill"><b>6</b> sources</span>
+      <span class="pill">manifest: <b>chezmoi-dotfiles/dot_apm/apm.yml</b></span>
+      <span class="pill">deploy: <b>~/.agents/skills/</b> → bridge → ~/.claude · ~/.codex</span>
+      <span class="pill">updated <b>2026-06-15</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="controls">
+  <div class="wrap">
+    <input id="q" type="search" placeholder="スキル名・用途で絞り込み（例: test, lint, deploy, 計画, ドキュメント）">
+    <div class="filters" id="filters">
+      <span class="fbtn active" data-src="all">すべて</span>
+      <span class="fbtn" data-src="eotel">Eotel</span>
+      <span class="fbtn" data-src="mizchi">mizchi</span>
+      <span class="fbtn" data-src="mattpocock">mattpocock</span>
+      <span class="fbtn" data-src="impeccable">impeccable</span>
+      <span class="fbtn" data-src="nulab">nulab</span>
+      <span class="fbtn" data-src="astgrep">ast-grep</span>
+    </div>
+  </div>
+</div>
+
+<main>
+  <div class="wrap" id="root"></div>
+  <div class="wrap"><div class="empty" id="empty">該当するスキルがありません</div></div>
+  <div class="wrap">
+  <footer>
+    <p><b>運用メモ</b>: 真実の source は <code>chezmoi-dotfiles/dot_apm/apm.yml</code>(<code>~/.apm/apm.yml</code> は apply で上書きされるコピー)。
+    canonical な実体は <code>~/.agents/skills/&lt;name&gt;</code> で、<code>~/.claude/skills</code> / <code>~/.codex/skills</code> へ symlink bridge。
+    install は <code>apm install --global --target agent-skills</code>。</p>
+    <p><b>更新</b>: branch 追従(mizchi / impeccable / Eotel)は <code>apm install</code> 系で bump、
+    mattpocock は SHA pin(<code>aaf2453</code>)で固定。<code>apm update --global</code> 全体実行は pin があると中断するため repo 単位 / apm.yml 編集で対応。
+    上流がディレクトリ再編した場合は apm.yml の subdir パス書き換えが必要(cloudflare-deploy は <code>alias</code> で dir 名を維持)。</p>
+  </footer>
+  </div>
+</main>
+
+<script>
+const SKILLS = [
+  // ---- Eotel/skills (自作) ----
+  {src:"eotel", repo:"Eotel/skills/agentic-docs", name:"agentic-docs", tags:["docs","governance"],
+   what:"エージェント向けのリポジトリ内ドキュメント基盤を構築・監査・保守する。",
+   when:"AGENTS.md / ARCHITECTURE.md / docs/ や design doc・PRD・exec plan・DESIGN.md(Google Labs 形式)を新規作成/再編したいとき。"},
+  {src:"eotel", repo:"Eotel/skills/apm-usage", name:"apm-usage", tags:["reference","apm","tooling"],
+   what:"APM(Agent Package Manager)のリファレンス。apm.yml 構文・install/update/outdated・lockfile・chezmoi 連携。",
+   when:"apm.yml を書く/監査する、未知の APM 挙動やエラーを調べるとき。mizchi 版を APM 0.14+ 対応に fork したもの。"},
+  {src:"eotel", repo:"Eotel/skills/business-logic-extraction", name:"business-logic-extraction", tags:["refactor","architecture"],
+   what:"肥大化した controller / resolver / service からビジネス判断を named policy・service・query helper へ抽出。",
+   when:"巨大ハンドラの分割、validation/authorization/状態遷移をエントリポイントから切り出すリファクタ時。"},
+  {src:"eotel", repo:"Eotel/skills/devenv-init", name:"devenv-init", tags:["env","nix","scaffold"],
+   what:"Eotel/devenv-templates から devenv.sh プロジェクトを scaffold(Nix ベースの再現可能な開発環境)。",
+   when:"新規 Python(Django/FastAPI/Flask)等の開発環境を direnv/treefmt/git-hooks/DB 付きで立ち上げたいとき。"},
+  {src:"eotel", repo:"Eotel/skills/django", name:"django", tags:["django","orm","refactor"],
+   what:"Django の ORM/クエリ配置、QuerySet/Manager 設計、隠れたビジネス判断の抽出、django-stubs 型付けのベストプラクティス。",
+   when:"view/resolver/service に散ったフィルタや select_related を整理、DRF アダプタを薄くしたいとき。"},
+  {src:"eotel", repo:"Eotel/skills/markdown-lint-setup", name:"markdown-lint-setup", tags:["lint","markdown","prose"],
+   what:"remark + textlint を Node プロジェクトへ導入。AI っぽい日本語(preset-ai-writing)を検出、AI エージェント dir は除外。",
+   when:"Markdown / prose lint、TOC 生成、「AI っぽい」文体の検出を一括セットアップしたいとき。"},
+  {src:"eotel", repo:"Eotel/skills/plan-exec", name:"plan-exec", tags:["planning","workflow"],
+   what:"実装計画を docs/exec-plans/ に書き出して承認 → 実行(Claude Code の plan-file 挙動を再現)。",
+   when:"サブシステム横断・API/DB 契約変更・認証/セキュリティに関わる、複数ターンに跨る作業のとき。"},
+  {src:"eotel", repo:"Eotel/skills/repo-local-git-hooks", name:"repo-local-git-hooks", tags:["git","hooks","ci"],
+   what:"グローバル core.hooksPath にローカル git hook が握り潰される問題の検出・修復。",
+   when:"nix-darwin/home-manager 環境で pre-commit/pre-push が効かず CI で lint/format が拾われるとき。"},
+
+  // ---- mizchi/skills ----
+  {src:"mizchi", repo:"mizchi/skills/tooling/ast-grep-practice", name:"ast-grep-practice", tags:["lint","ast-grep","ci"],
+   what:"ast-grep を project lint として運用するための実践ガイド(sgconfig.yml・fix/rewrite・constraints・CI)。",
+   when:"一般 linter では表現できないがast-grep なら書ける構造ルールを CI 化したいとき。"},
+  {src:"mizchi", repo:"mizchi/skills/tooling/chezmoi-management", name:"chezmoi-management", tags:["dotfiles","chezmoi","meta"],
+   what:"chezmoi dotfiles のメタスキル。source の場所・diff/apply・skill 追加・pkfire(pre-push secretlint)。",
+   when:"chezmoi source の管理/適用、dotfiles への skill 追加、APM と chezmoi の境界を扱うとき。"},
+  {src:"mizchi", repo:"mizchi/skills/cloudflare/deploy ⟶ alias: cloudflare-deploy", name:"cloudflare-deploy", tags:["cloudflare","deploy"],
+   what:"Cloudflare(Workers / Pages 等)へアプリ・インフラをデプロイする。",
+   when:"Cloudflare へホスト/公開/セットアップしたいとき。Workers AI・AI Gateway・Bindings 等の references 同梱。"},
+  {src:"mizchi", repo:"mizchi/skills/tooling/conventional-changelog", name:"conventional-changelog", tags:["release","changelog"],
+   what:"Conventional Commits と CHANGELOG 自動生成のリファレンス(release-please/changesets/git-cliff/towncrier 比較)。",
+   when:"リリースフローを統一・整備したいとき。commit 形式や semver タグの運用。"},
+  {src:"mizchi", repo:"mizchi/skills/tooling/dotenvx", name:"dotenvx", tags:["env","secrets"],
+   what:"dotenvx で .env を暗号化、多環境(production/staging/ci)管理、GitHub Actions 連携。",
+   when:".env.vault / .env.keys を扱う、環境別の暗号化シークレットを git に乗せたいとき。"},
+  {src:"mizchi", repo:"mizchi/skills/meta/empirical-prompt-tuning", name:"empirical-prompt-tuning", tags:["prompt","meta","eval"],
+   what:"エージェント向け指示(skill/コマンド/CLAUDE.md/生成プロンプト)を bias-free executor + 両面評価で反復改善するメタ手法。",
+   when:"プロンプトや skill の「empirical」評価、description/body の整合チェックを明示的に頼まれたとき。"},
+  {src:"mizchi", repo:"mizchi/skills/devops/gh-fix-ci", name:"gh-fix-ci", tags:["ci","github"],
+   what:"GitHub Actions の PR チェック失敗を gh で診断し、修正プランを立てて承認後に実装。",
+   when:"PR の CI が赤いとき(チェック名未指定でも)。外部 CI(Buildkite 等)は対象外。"},
+  {src:"mizchi", repo:"mizchi/skills/tooling/justfile", name:"justfile", tags:["task-runner"],
+   what:"just コマンドランナーの構文と GitHub Actions 連携リファレンス。",
+   when:"既存 justfile のタスク追加/改修時。新規 mizchi 系 repo は pkfire 推奨で、互換用に保持。"},
+  {src:"mizchi", repo:"mizchi/skills/testing/playwright-cli", name:"playwright-cli", tags:["testing","e2e","cli"],
+   what:"Playwright を CLI で実行(test runner / codegen / screenshot / pdf / CI sharding)。",
+   when:"ターミナルから Playwright を回したいとき。リアルタイムブラウザ操作は対象外(claude-in-chrome MCP)。"},
+  {src:"mizchi", repo:"mizchi/skills/testing/playwright-test", name:"playwright-test", tags:["testing","e2e"],
+   what:"Playwright Test(E2E)のベストプラクティス。固定 wait 回避、network trigger、DnD、shard/retry。",
+   when:"E2E テストを書く/レビューする/CI を設定するとき。"},
+  {src:"mizchi", repo:"mizchi/skills/meta/retrospective-codify", name:"retrospective-codify", tags:["meta","learning"],
+   what:"「最初に失敗した事」と「最終的に効いた事」を ast-grep ルール / skill / CLAUDE.md ルールへ codify。",
+   when:"試行錯誤の後に「今日の教訓を skill 化/lint 化して」と明示的に頼まれたとき。"},
+  {src:"mizchi", repo:"mizchi/skills/meta/tech-article-reproducibility", name:"tech-article-reproducibility", tags:["docs","review"],
+   what:"技術記事の再現性評価。初見読者をサブエージェントで模擬し、ローカル再現に不足する情報を列挙。",
+   when:"公開前のドラフトの最終チェックとして。"},
+
+  // ---- mattpocock/skills ----
+  {src:"mattpocock", repo:"mattpocock/skills/.../grill-me", name:"grill-me", tags:["planning","interview"], pin:true,
+   what:"計画/設計を、決定木の各分岐を潰すまで徹底的にインタビューで詰める。",
+   when:"設計を stress-test したい、「grill me」と言うとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../grill-with-docs", name:"grill-with-docs", tags:["planning","docs","adr"], pin:true,
+   what:"計画を既存ドメインモデルに照らして詰め、用語を磨き、CONTEXT.md / ADR を inline 更新。",
+   when:"プロジェクトの言語・文書化済み決定に対して計画を検証したいとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../tdd", name:"tdd", tags:["testing","tdd"], pin:true,
+   what:"red-green-refactor ループの TDD。",
+   when:"機能追加/バグ修正を test-first で進めたいとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../diagnose", name:"diagnose", tags:["debug","perf"], pin:true,
+   what:"難バグ/性能回帰の規律ある診断ループ(再現→最小化→仮説→計測→修正→回帰テスト)。",
+   when:"「diagnose this」「壊れている/落ちる」、性能回帰を報告されたとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../improve-codebase-architecture", name:"improve-codebase-architecture", tags:["architecture","refactor"], pin:true,
+   what:"CONTEXT.md のドメイン言語と docs/adr の決定を踏まえ、深化(deepening)機会を発見。",
+   when:"アーキ改善、リファクタ機会の発見、密結合モジュールの統合、テスト容易性向上のとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../setup-matt-pocock-skills", name:"setup-matt-pocock-skills", tags:["setup","meta"], pin:true,
+   what:"AGENTS.md/CLAUDE.md と docs/agents/ に、skill 群が使う issue tracker・triage ラベル・doc 構成を設定。",
+   when:"to-issues / to-prd / triage / diagnose / tdd 等を初めて使う前提整備として。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../to-prd", name:"to-prd", tags:["planning","issues"], pin:true,
+   what:"現在の会話文脈から PRD を生成し、issue tracker へ公開。",
+   when:"会話の流れを PRD 化したいとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../to-issues", name:"to-issues", tags:["planning","issues"], pin:true,
+   what:"計画/spec/PRD を、独立して着手できる tracer-bullet な縦スライス issue へ分解。",
+   when:"計画を実装チケットへ落とし込むとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../triage", name:"triage", tags:["issues","workflow"], pin:true,
+   what:"issue を triage ロール駆動の state machine で整理。",
+   when:"issue 作成/トリアージ、AFK エージェント向けの issue 準備、ワークフロー管理のとき。"},
+  {src:"mattpocock", repo:"mattpocock/skills/.../zoom-out", name:"zoom-out", tags:["context"], pin:true,
+   what:"俯瞰して、より高レベルの文脈・全体像を提示。",
+   when:"コードの一部に不慣れで、全体の中での位置づけを把握したいとき。"},
+
+  // ---- pbakaus/impeccable ----
+  {src:"impeccable", repo:"pbakaus/impeccable/.agents/skills/impeccable", name:"impeccable", tags:["frontend","design","ux"],
+   what:"フロントエンド UI の設計・批評・監査・洗練。視覚階層/情報設計/アクセシビリティ/タイポグラフィ/モーション/デザインシステム。",
+   when:"Web/ダッシュボード/プロダクト UI を作る/直す/磨く、デザイントークンを抽出したいとき(バックエンドのみは対象外)。"},
+
+  // ---- nulab/bee ----
+  {src:"nulab", repo:"nulab/bee/skills/using-bee", name:"using-bee", tags:["backlog","cli","pm"],
+   what:"Backlog(Nulab)プロジェクト管理を CLI 操作(issue 作成・PR 一覧・通知確認等)。",
+   when:"Backlog の各種操作を CLI から行うとき。"},
+  {src:"nulab", repo:"nulab/bee/skills/backlog-notation", name:"backlog-notation", tags:["backlog","reference"],
+   what:"Backlog 記法(Backlog notation)の構文リファレンス。見出し/リスト/表/装飾/リンク/コードブロック。",
+   when:"Backlog の課題やコメントを記法に沿って書くとき。"},
+
+  // ---- ast-grep/agent-skill ----
+  {src:"astgrep", repo:"ast-grep/agent-skill/ast-grep", name:"ast-grep", tags:["search","ast"],
+   what:"ast-grep ルールで AST(構造)ベースの検索・解析を行うガイド。",
+   when:"テキスト検索を超えた構造パターンでコードを探す/特定の言語構造を見つけたいとき。"},
+];
+
+const SRC_LABEL = {eotel:"Eotel(自作)",mizchi:"mizchi",mattpocock:"mattpocock",impeccable:"pbakaus",nulab:"nulab",astgrep:"ast-grep"};
+const SRC_ORDER = ["eotel","mizchi","mattpocock","impeccable","nulab","astgrep"];
+const root=document.getElementById("root"), empty=document.getElementById("empty");
+let activeSrc="all", query="";
+
+function render(){
+  root.innerHTML="";
+  let shown=0;
+  for(const src of SRC_ORDER){
+    if(activeSrc!=="all" && activeSrc!==src) continue;
+    let items=SKILLS.filter(s=>s.src===src);
+    if(query){
+      const q=query.toLowerCase();
+      items=items.filter(s=>(s.name+" "+s.what+" "+s.when+" "+s.tags.join(" ")+" "+s.repo).toLowerCase().includes(q));
+    }
+    if(!items.length) continue;
+    shown+=items.length;
+    const g=document.createElement("section");
+    g.className="group src-"+src;
+    g.innerHTML=`<h2><span class="dot"></span>${SRC_LABEL[src]}
+        <span class="repo">${src==="eotel"?"Eotel/skills":src==="mizchi"?"mizchi/skills":src==="mattpocock"?"mattpocock/skills (SHA pin)":src==="impeccable"?"pbakaus/impeccable":src==="nulab"?"nulab/bee":"ast-grep/agent-skill"}</span>
+        <span class="count">${items.length}</span></h2>
+      <div class="grid"></div>`;
+    const grid=g.querySelector(".grid");
+    for(const s of items){
+      const c=document.createElement("div");
+      c.className="card";
+      c.innerHTML=`<div class="name">${s.name}${s.pin?' <span class="pin" title="SHA pin で固定運用">📌 pinned</span>':''}</div>
+        <div class="what">${s.what}</div>
+        <div class="when"><b>使いどころ:</b> ${s.when}</div>
+        <div class="tags">${s.tags.map(t=>`<span class="tag">${t}</span>`).join("")}</div>`;
+      grid.appendChild(c);
+    }
+    root.appendChild(g);
+  }
+  empty.style.display = shown? "none":"block";
+}
+document.getElementById("q").addEventListener("input",e=>{query=e.target.value.trim();render();});
+document.getElementById("filters").addEventListener("click",e=>{
+  const b=e.target.closest(".fbtn"); if(!b) return;
+  document.querySelectorAll(".fbtn").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active"); activeSrc=b.dataset.src; render();
+});
+render();
+</script>
+</body>
+</html>

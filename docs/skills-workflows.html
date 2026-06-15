@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skills Workflows: 作業フローと合わせ技</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#30363d;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --chip:#21262d;
+    --setup:#8b949e; --plan:#a371f7; --spec:#58a6ff; --build:#3fb950;
+    --fix:#d29922; --shared:#db61a2;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+    line-height:1.7;font-size:15px}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 20px}
+  header{padding:30px 24px 18px;border-bottom:1px solid var(--border);
+    background:linear-gradient(180deg,#11161f,#0d1117)}
+  h1{margin:0 0 6px;font-size:25px}
+  .sub{color:var(--muted);font-size:14px;margin:0}
+  nav{margin-top:12px;display:flex;gap:14px;font-size:13.5px}
+  h2{font-size:19px;margin:34px 0 4px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{font-size:15.5px;margin:22px 0 8px}
+  p.lead{color:var(--muted);margin:6px 0 16px;font-size:14px}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:13px;
+    font-family:ui-monospace,Menlo,monospace}
+  /* pipeline */
+  .pipe{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;margin:16px 0}
+  .phase{flex:1;min-width:180px;background:var(--panel);border:1px solid var(--border);
+    border-radius:11px;padding:13px 14px;position:relative}
+  .phase .ph{font-size:11.5px;color:var(--muted);letter-spacing:.5px;text-transform:uppercase;font-weight:700}
+  .phase.p1 .ph{color:var(--plan)} .phase.p2 .ph{color:var(--spec)}
+  .phase.p3 .ph{color:var(--build)} .phase.p4 .ph{color:var(--fix)}
+  .phase .pt{font-weight:650;margin:3px 0 7px;font-size:14.5px}
+  .phase ul{margin:0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:5px}
+  .phase li{font-size:12.5px;color:var(--fg)}
+  .phase li code{font-size:11.5px}
+  .phase li span{color:var(--muted);font-size:11.5px}
+  .arrow{align-self:center;color:var(--muted);font-size:18px;padding:0 2px}
+  .sharedbar{background:var(--panel2);border:1px dashed var(--shared);border-radius:10px;
+    padding:11px 14px;margin:6px 0 4px;font-size:13px}
+  .sharedbar b{color:#f0a8cf}
+  /* principles */
+  .princ{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:11px;margin-top:8px}
+  .pc{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+  .pc .n{color:var(--accent);font-weight:700;font-size:13px}
+  .pc .t{font-weight:600;margin:2px 0 4px;font-size:13.5px}
+  .pc .d{color:var(--muted);font-size:12.5px}
+  /* planning layer */
+  .vs{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+  @media(max-width:640px){.vs{grid-template-columns:1fr}}
+  .vspanel{background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:14px 16px}
+  .vh{font-weight:650;font-size:15px;margin-bottom:9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .vh span{font-size:11.5px;color:var(--muted);font-weight:400;background:var(--panel2);
+    border:1px solid var(--border);border-radius:6px;padding:1px 7px}
+  .vspanel.local .vh{color:var(--plan)} .vspanel.remote .vh{color:var(--spec)}
+  .vspanel ul{margin:0;padding-left:17px;display:flex;flex-direction:column;gap:4px}
+  .vspanel li{font-size:13px}
+  .vspanel li b{color:#cdd6e0}
+  ul.rules{padding-left:17px;display:flex;flex-direction:column;gap:6px;margin:6px 0 0}
+  ul.rules li{font-size:13.5px} ul.rules b{color:#cdd6e0}
+  /* combos */
+  .controls{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin:14px 0 6px}
+  input[type=search]{flex:1;min-width:200px;background:var(--panel);border:1px solid var(--border);
+    color:var(--fg);border-radius:8px;padding:8px 12px;font-size:14px;outline:none}
+  input[type=search]:focus{border-color:var(--accent)}
+  .fbtn{background:var(--chip);border:1px solid var(--border);color:var(--muted);
+    border-radius:999px;padding:5px 12px;font-size:12.5px;cursor:pointer;user-select:none}
+  .fbtn.active{background:var(--accent);color:#06101f;border-color:transparent}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px;margin-top:6px}
+  .combo{background:var(--panel);border:1px solid var(--border);border-radius:11px;
+    padding:14px 15px;display:flex;flex-direction:column;gap:9px}
+  .combo:hover{border-color:var(--accent)}
+  .combo .ct{font-weight:650;font-size:15px}
+  .chain{display:flex;flex-wrap:wrap;align-items:center;gap:5px}
+  .step{background:var(--panel2);border:1px solid var(--border);border-radius:7px;
+    padding:2px 9px;font-size:12px;font-family:ui-monospace,Menlo,monospace;color:#cdd6e0}
+  .sep{color:var(--muted);font-size:13px}
+  .combo .why{color:var(--muted);font-size:12.5px}
+  .cat{align-self:flex-start;font-size:11px;color:var(--muted);background:var(--panel2);
+    border:1px solid var(--border);border-radius:6px;padding:1px 8px}
+  .empty{display:none;color:var(--muted);text-align:center;padding:36px}
+  footer{border-top:1px solid var(--border);color:var(--muted);font-size:12.5px;padding:22px 0 50px;margin-top:36px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:8px 0 0}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Skills Workflows &amp; Playbooks</h1>
+    <p class="sub">作業フロー、usecase、複数スキルの合わせ技の早見表</p>
+    <nav>
+      <a href="./skills-catalog.html">→ スキル一覧カタログ</a>
+      <a href="#pipeline">mattpocock パイプライン</a>
+      <a href="#principles">流儀</a>
+      <a href="#planning-layer">計画レイヤー</a>
+      <a href="#combos">合わせ技</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+<section id="pipeline">
+  <h2>mattpocock パイプライン</h2>
+  <p class="lead">「ドメイン文書(CONTEXT.md / ADR)を共有メモリに、spec → issue → 実装 → 診断 → アーキ改善を回す」設計。左から右へ流す。</p>
+
+  <div class="sharedbar">
+    <b>前提:</b> リポジトリごとに最初に1回 <code>/setup-matt-pocock-skills</code> を実行（自動発火OFF）。
+    issue tracker・triage ラベル・docs 配置を確定する。これを飛ばすと後続が「tracker やラベルが分からない」状態になる。
+  </div>
+
+  <div class="pipe">
+    <div class="phase p1">
+      <div class="ph">Phase 1</div><div class="pt">構想を詰める</div>
+      <ul>
+        <li><code>grill-me</code> <span>「grill me」/ 文書なしで容赦なく質問攻め</span></li>
+        <li><code>grill-with-docs</code> <span>用語・既存決定に照合、CONTEXT.md/ADR をその場で更新</span></li>
+      </ul>
+    </div>
+    <div class="arrow">→</div>
+    <div class="phase p2">
+      <div class="ph">Phase 2</div><div class="pt">作業に落とす</div>
+      <ul>
+        <li><code>/to-prd</code> <span>会話を PRD 化して tracker へ</span></li>
+        <li><code>/to-issues</code> <span>縦スライス issue に分解</span></li>
+        <li><code>/triage</code> <span>状態 machine で整理</span></li>
+      </ul>
+    </div>
+    <div class="arrow">→</div>
+    <div class="phase p3">
+      <div class="ph">Phase 3</div><div class="pt">実装する</div>
+      <ul>
+        <li><code>tdd</code> <span>red-green-refactor、縦スライス</span></li>
+        <li><code>zoom-out</code> <span>不慣れな領域を触る前に俯瞰</span></li>
+      </ul>
+    </div>
+    <div class="arrow">→</div>
+    <div class="phase p4">
+      <div class="ph">Phase 4</div><div class="pt">壊れた / 腐った時</div>
+      <ul>
+        <li><code>diagnose</code> <span>再現→仮説→修正→回帰テスト</span></li>
+        <li><code>improve-codebase-architecture</code> <span>根が構造問題なら深化 + ADR</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="sharedbar">
+    <b>共有メモリ:</b> <code>CONTEXT.md</code>（用語集）と <code>docs/adr/</code>（決定）を
+    <code>grill-with-docs</code> が育て、<code>improve-codebase-architecture</code> / <code>triage</code> / <code>to-*</code> が参照する。
+    ここが回るほど後工程の精度が上がる。
+  </div>
+</section>
+
+<section id="principles">
+  <h2>mattpocock 流の流儀</h2>
+  <div class="princ">
+    <div class="pc"><div class="t">setup を最初に必ず</div>
+      <div class="d">to-issues / triage / diagnose 等は tracker・ラベル・docs 配置を前提に動く。未設定なら <code>/setup-matt-pocock-skills</code>。</div></div>
+    <div class="pc"><div class="t">ドメイン文書が中心</div>
+      <div class="d">CONTEXT.md と ADR が共有メモリ。決定はその場で文書化し、却下理由も ADR に残して再提案を防ぐ。</div></div>
+    <div class="pc"><div class="t">縦スライス主義</div>
+      <div class="d">to-issues も tdd も薄く縦に通す(tracer bullet)。横スライス(全層先作り / 全テスト先書き)は明示的に禁止。</div></div>
+    <div class="pc"><div class="t">AFK 前提</div>
+      <div class="d">to-prd / to-issues は <code>ready-for-agent</code> を付け、人間の文脈なしでエージェントが拾える状態をゴールにする。</div></div>
+    <div class="pc"><div class="t">自動 vs 明示起動</div>
+      <div class="d"><code>setup-...</code> と <code>teach</code> は自動発火OFF(slash 起動)。<code>diagnose</code> / <code>tdd</code> / <code>zoom-out</code> は説明文の語で自動的に立ち上がる。</div></div>
+    <div class="pc"><div class="t">診断はループから</div>
+      <div class="d">diagnose はまず再現できる feedback loop を作る。3〜5 仮説をランク付けし、fix の前に回帰テストを書く。</div></div>
+  </div>
+</section>
+
+<section id="planning-layer">
+  <h2>計画レイヤーの選び方</h2>
+  <p class="lead"><code>plan-exec</code>(ローカル実行計画)と <code>to-prd</code> / <code>to-issues</code>(tracker への外部化)は相反しない。レイヤーが違うので「どこに出すか」で選ぶ。</p>
+
+  <div class="vs">
+    <div class="vspanel local">
+      <div class="vh">plan-exec <span>あなたの流儀</span></div>
+      <ul>
+        <li><b>出力先:</b> ローカル <code>docs/exec-plans/active/...md</code></li>
+        <li><b>目的:</b> このセッションで自分が今すぐ実装する計画</li>
+        <li><b>流れ:</b> 承認 → その場で実行 → 完了</li>
+        <li><b>向き:</b> tracker 不要・軽い・ソロ</li>
+      </ul>
+    </div>
+    <div class="vspanel remote">
+      <div class="vh">to-prd / to-issues <span>mattpocock</span></div>
+      <ul>
+        <li><b>出力先:</b> 共有 issue tracker（GitHub 等）</li>
+        <li><b>目的:</b> 外部化して AFK エージェント/チームが拾う</li>
+        <li><b>流れ:</b> publish → 非同期で誰かが着手</li>
+        <li><b>向き:</b> 追跡・ハンドオフ</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>決め方</h3>
+  <ul class="rules">
+    <li><b>ソロ・即実装</b> → <code>plan-exec</code> → <code>tdd</code></li>
+    <li><b>外部化 / ハンドオフ / 追跡したい</b> → (<code>grill</code> →) <code>to-prd</code> → <code>to-issues</code> → 各 issue を <code>tdd</code></li>
+    <li><b>大きい issue を拾った時</b> → その中で <code>plan-exec</code> を入れ子で使う</li>
+  </ul>
+
+  <div class="sharedbar"><b>かぶる点:</b> 「計画の分解」を両方が持つ。同じ作業で二重管理にしないため、
+    tracker に載せるなら <code>to-issues</code>、ローカルで完結するなら <code>plan-exec</code>、と最初に決め打つ。</div>
+
+  <h3>to-prd と to-issues の使い分け</h3>
+  <ul class="rules">
+    <li><b>to-prd:</b> 会話の文脈を <b>1枚の PRD（spec）</b>に。機能全体の「何を・なぜ」を固める。</li>
+    <li><b>to-issues:</b> 計画 / PRD を <b>着手可能な縦スライス issue</b> に割る。各スライスを quiz して承認後 publish。</li>
+    <li><b>チェーン:</b> <code>to-prd</code> → <code>to-issues</code>。小機能なら to-prd 単体、方針確定済みなら to-issues 直行。</li>
+  </ul>
+</section>
+
+<section id="combos">
+  <h2>合わせ技 / skill コンボ</h2>
+  <p class="lead">シナリオ別の推奨チェーン。mattpocock 系に限らず、管理中の全スキルを跨いだ実用フロー。</p>
+  <div class="controls">
+    <input id="q" type="search" placeholder="シナリオ・スキル名で絞り込み（例: refactor, CI, ドキュメント, 学習）">
+    <span class="fbtn active" data-cat="all">すべて</span>
+    <span class="fbtn" data-cat="feature">機能開発</span>
+    <span class="fbtn" data-cat="fix">バグ/CI</span>
+    <span class="fbtn" data-cat="refactor">リファクタ</span>
+    <span class="fbtn" data-cat="quality">品質/テスト</span>
+    <span class="fbtn" data-cat="setup">環境/運用</span>
+    <span class="fbtn" data-cat="meta">メタ/学習</span>
+  </div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty">該当なし</div>
+</section>
+
+<footer>
+  <p>関連: <a href="./skills-catalog.html">スキル一覧カタログ</a>（各スキルの用途と source）。
+  管理は APM(<code>chezmoi-dotfiles/dot_apm/apm.yml</code>)。更新 2026-06-15。</p>
+</footer>
+</main>
+
+<script>
+const COMBOS=[
+  {cat:"feature", title:"新機能をゼロから（mattpocock 王道）",
+   chain:["/setup-matt-pocock-skills","grill-with-docs","/to-prd","/to-issues","tdd","zoom-out（随時）"],
+   why:"構想を詰めて用語/ADR を確定 → PRD 化 → 縦スライス issue → test-first 実装。AFK エージェントが拾える状態まで持っていく。"},
+  {cat:"feature", title:"サブシステム横断の計画から実装",
+   chain:["plan-exec","grill-me","tdd"],
+   why:"plan-exec で repo-local な計画ファイルを承認ベースで作り、grill で穴を潰してから test-first 実装。API/DB 契約変更や認証まわり向け。"},
+  {cat:"fix", title:"バグ報告の処理",
+   chain:["/triage","diagnose","improve-codebase-architecture"],
+   why:"受付・状態整理 → 規律ある診断と回帰テスト → 根因が構造問題ならアーキ深化 + ADR で再発防止。"},
+  {cat:"fix", title:"CI が落ちた",
+   chain:["gh-fix-ci","diagnose"],
+   why:"gh でチェック/ログを解析して修正プラン（承認後に実装）。根が深ければ diagnose の再現ループへ。"},
+  {cat:"refactor", title:"Django のロジック整理",
+   chain:["django","business-logic-extraction","tdd"],
+   why:"ORM/クエリ配置を正し、ビジネス判断を named policy/service へ抽出、挙動はテストで固定。"},
+  {cat:"refactor", title:"構造的に手強いバグの根治",
+   chain:["diagnose","improve-codebase-architecture"],
+   why:"diagnose の post-mortem で「何が防げたか」を問い、テスト seam が無い等の構造問題ならアーキ改善へ引き継ぐ。"},
+  {cat:"quality", title:"構造 lint を育てる",
+   chain:["ast-grep","ast-grep-practice","retrospective-codify"],
+   why:"構造検索で当たりをつけ → sgconfig で lint 運用化 → ハマった教訓を ast-grep ルールに codify。"},
+  {cat:"quality", title:"E2E を整える",
+   chain:["playwright-test","playwright-cli"],
+   why:"テスト設計のベストプラクティス（固定 wait 回避等）+ CLI / CI sharding 実行。"},
+  {cat:"quality", title:"技術記事を公開前チェック",
+   chain:["tech-article-reproducibility"],
+   why:"初見読者をサブエージェントで模擬し、ローカル再現に不足する情報を洗い出す。"},
+  {cat:"setup", title:"新規プロジェクト立ち上げ",
+   chain:["devenv-init","repo-local-git-hooks","/setup-matt-pocock-skills","agentic-docs"],
+   why:"Nix 再現環境 → ローカル hook が効くか確認 → skill 前提整備 → AGENTS.md/docs 整備。"},
+  {cat:"setup", title:"ドキュメント健全化",
+   chain:["agentic-docs","markdown-lint-setup"],
+   why:"エージェント向け docs 構造を整え、remark + textlint で AI っぽい日本語まで lint。"},
+  {cat:"setup", title:"リリースフロー整備",
+   chain:["conventional-changelog"],
+   why:"Conventional Commits + CHANGELOG 自動生成の方式を統一（release-please / changesets 等の選定込み）。"},
+  {cat:"setup", title:"dotfiles / APM 管理",
+   chain:["chezmoi-management","apm-usage"],
+   why:"chezmoi source の diff/apply と APM の install/update/lockfile を正しく回す。skill の追加・更新作業そのもの。"},
+  {cat:"setup", title:"環境変数 / 秘密の管理",
+   chain:["dotenvx"],
+   why:".env 暗号化と多環境（production/staging/ci）・GitHub Actions 連携。"},
+  {cat:"setup", title:"タスクランナー整備",
+   chain:["justfile"],
+   why:"既存 justfile のタスク追加/改修。新規は pkfire 推奨だが互換用に。"},
+  {cat:"setup", title:"Backlog 運用",
+   chain:["using-bee","backlog-notation"],
+   why:"CLI で課題/PR/通知を操作、本文は Backlog 記法に沿って書く。"},
+  {cat:"meta", title:"skill / プロンプトを改善する",
+   chain:["empirical-prompt-tuning","retrospective-codify"],
+   why:"指示を実測ベースで反復改善 → 効いた知見をルール/skill に固定。"},
+  {cat:"meta", title:"何かを腰を据えて学ぶ",
+   chain:["/teach <topic>"],
+   why:"マルチセッションで lessons（HTML）を蓄積。fluency より storage strength（長期定着）重視。"},
+  {cat:"meta", title:"UI を磨く",
+   chain:["impeccable"],
+   why:"UX / 視覚階層 / アクセシビリティ / デザインシステムの監査と洗練。"},
+];
+const grid=document.getElementById("grid"), empty=document.getElementById("empty");
+let cat="all", q="";
+function render(){
+  grid.innerHTML="";
+  let items=COMBOS.filter(c=>cat==="all"||c.cat===cat);
+  if(q){const s=q.toLowerCase();
+    items=items.filter(c=>(c.title+" "+c.why+" "+c.chain.join(" ")+" "+c.cat).toLowerCase().includes(s));}
+  for(const c of items){
+    const el=document.createElement("div");el.className="combo";
+    const steps=c.chain.map((s,i)=>`<span class="step">${s}</span>`+(i<c.chain.length-1?'<span class="sep">→</span>':'')).join("");
+    el.innerHTML=`<div class="ct">${c.title}</div>
+      <div class="chain">${steps}</div>
+      <div class="why">${c.why}</div>`;
+    grid.appendChild(el);
+  }
+  empty.style.display=items.length?"none":"block";
+}
+document.getElementById("q").addEventListener("input",e=>{q=e.target.value.trim();render();});
+document.querySelectorAll(".fbtn").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".fbtn").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active");cat=b.dataset.cat;render();
+}));
+render();
+</script>
+</body>
+</html>
