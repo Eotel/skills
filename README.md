@@ -32,3 +32,23 @@ Codex can use shared Claude skills through a symlink from
   `@textlint-ja/textlint-rule-preset-ai-writing`) in a Node project; always
   excludes AI agent context dirs (`.agents`, `.claude`, `.codex`,
   `.impeccable`, `.serena`, `.github`) from both linters.
+
+### Codex orchestration bundle
+
+Three skills that share one orchestration-loop philosophy (orchestrator edits no
+code; cold author/critic split; executable rubric; critic-PASS-only gate; `/goal`
+anchor; verified memory log; smallest-blast-radius waves; sandbox/env pitfalls).
+The shared invariants live in **one** skill so the philosophy can't drift between
+the two callers. **Install all three together** — APM installs skills individually
+and does not resolve the dependency, so a caller installed without the core skill
+cannot load it.
+
+- **`codex-orchestration-core`** — the shared orchestration-loop invariants.
+  A dependency loaded (via the Skill tool) by the two skills below; not a
+  standalone task skill.
+- **`codex-orchestrator-brief`** — analyze a repo and author a written handoff
+  package (`refactor-instructions.md` + a `/goal` orchestrator prompt +
+  pre-implementation questions) for *another* model to run autonomously.
+- **`codex-tdd-orchestration`** — Claude drives codex sessions *live* in this
+  session: per topic, implementer → reviewer → fixer, topics in parallel, with
+  TDD enforcement and orchestrator-side verification.

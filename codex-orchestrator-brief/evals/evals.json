@@ -1,0 +1,60 @@
+{
+  "skill_name": "codex-orchestrator-brief",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "typer-handoff-package",
+      "prompt": "このリポジトリを深く分析して、Codex などの実装担当モデルに自律実行させるためのハンドオフ一式を作ってほしい。具体的には: (1) 証拠ベースのリファクタリング指示書 refactor-instructions.md、(2) 実装前に人間が答えるべき質問があれば questions.md、(3) /goal を使い、implementer/verifier の subsession を分けて全 wave を完遂させるオーケストレーター用プロンプト codex-goal-prompt.md。PR は検証エージェントが PASS を出したらマージしてよい方針で。あなた自身は実装しないこと。",
+      "expected_output": "refactor-instructions.md (11 sections, evidence-backed debt map with verdicts), codex-goal-prompt.md (/goal first action, independent verifier, verifier-gated merges, bounded retries, memory log, checkable rubric), and pre-implementation questions",
+      "files": [
+        "repo clone at workspace/repos/"
+      ],
+      "assertions": [
+        {
+          "name": "all-three-deliverables-exist",
+          "text": "outputs/ contains refactor-instructions.md, codex-goal-prompt.md, and questions.md (all non-empty)"
+        },
+        {
+          "name": "spec-covers-required-sections",
+          "text": "refactor-instructions.md contains all of: Objective, Project Understanding, Behaviors To Preserve, Non-Negotiables, Stop And Ask Conditions, Baseline Commands, Debt Map, Implementation Phases, Verification Requirements, Reporting Format, Out-of-scope (or unambiguous equivalents as headings)"
+        },
+        {
+          "name": "debt-items-carry-verdicts",
+          "text": "Every debt item in the Debt Map carries an explicit verdict distinguishing implement-now vs investigate-minimal vs propose-only (e.g. ✅/🔍/🛑), and at least one item is propose-only with a stated reason"
+        },
+        {
+          "name": "debt-evidence-paths-exist",
+          "text": "Every debt item cites at least one concrete file path, and at least 90% of cited paths actually exist in the typer repo clone (verify with test -e / rg)"
+        },
+        {
+          "name": "baseline-commands-are-real",
+          "text": "Each command in Baseline Commands references tooling that actually exists in the typer repo (its scripts/, pyproject.toml, or requirements files); no invented task runners (e.g. moon, just) that the repo does not have"
+        },
+        {
+          "name": "goal-first-with-verifier-termination",
+          "text": "codex-goal-prompt.md instructs invoking /goal as the first action, with the termination condition defined as rubric items judged PASS by an independent verifier (not implementer/orchestrator satisfaction)"
+        },
+        {
+          "name": "independent-verifier-context",
+          "text": "The prompt explicitly requires the verifier to run in a fresh context that has not seen the implementation conversation, forbids treating implementer self-reports as evidence, and forbids forwarding the implementer's report to the verifier"
+        },
+        {
+          "name": "verifier-pass-gates-merge",
+          "text": "The prompt states verifier PASS is the only authorization to merge a PR (no self-merge, no orchestrator discretion)"
+        },
+        {
+          "name": "rubric-lines-are-commands",
+          "text": "The rubric exists and at least 70% of its checkbox lines contain a literal executable command (backtick-quoted) plus an expected result"
+        },
+        {
+          "name": "bounded-retries-and-memory-log",
+          "text": "The prompt specifies a per-wave retry limit with escalation to a human question, and a memory log file with a distilled-rules mechanism that is passed to new implementer subsessions"
+        },
+        {
+          "name": "source-untouched",
+          "text": "git status in the repo clone shows no modified/deleted tracked source files — only added/untracked deliverable .md files"
+        }
+      ]
+    }
+  ]
+}
