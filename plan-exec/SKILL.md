@@ -44,11 +44,16 @@ A plan that wraps a one-line fix is friction, not value.
 ## Lifecycle (matches `docs/PLANS.md`)
 
 Follow `docs/PLANS.md` and start from
-`docs/exec-plans/plan-template.md`. The Codex-specific rule is approval:
+`docs/exec-plans/plan-template.md`. If either file is absent, fall back to the
+section list under [File format](#file-format) below — neither is mandatory. The Codex-specific rule is approval:
 after writing the plan file, stop and ask the user to approve before executing
 unless the user has explicitly said to proceed in auto mode.
 
 ## File format
+
+Write the plan to `docs/exec-plans/active/`, creating that directory (and any
+missing parents) if it does not exist — this is the canonical output location
+in every mode, not just an example in the approval ritual below.
 
 Use the current repo's `docs/exec-plans/plan-template.md` if it exists. If the
 repo has no template, create a compact Markdown plan with these sections:
@@ -72,7 +77,9 @@ resume without chat history.
 
 - Date: today, in the local repo timezone (Asia/Tokyo here).
 - If the session provides an explicit timezone, use that timezone for the date.
-- Slug: 2–6 kebab-case words, ASCII only, no trailing date suffixes.
+- Slug: 2–6 kebab-case words, ASCII only, no trailing date suffixes. Name the
+  user-visible capability or subsystem, not the verb (`billing-webhook-idempotency`,
+  not `add-billing-webhook`).
 - Examples:
   - `2026-04-28-managementscreens-split.md`
   - `2026-05-02-livekit-token-rotation.md`
