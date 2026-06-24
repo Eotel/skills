@@ -33,6 +33,16 @@ Codex can use shared Claude skills through a symlink from
   excludes AI agent context dirs (`.agents`, `.claude`, `.codex`,
   `.impeccable`, `.serena`, `.github`) from both linters.
 
+- **`codex-prompting`** — author or tune a prompt aimed at Codex itself,
+  accounting for its harness quirks (AGENTS.md injection, `apply_patch`, the
+  planning tool, preamble cadence) and GPT-5.x prompting principles. Ships
+  per-model reference notes (`references/models.md`) and fill-in templates
+  (task prompt, system prompt, AGENTS.md stanza, subagent TOML), and teaches
+  Codex the capabilities it ignores by default — spawning subagents and
+  resuming/forking sessions, and using **agmsg** to spawn named codex/claude-code
+  peers and send them a goal prompt. Complements the orchestration bundle below:
+  this writes *what to say to codex*; those run *the loop*.
+
 ### Codex orchestration bundle
 
 Three skills that share one orchestration-loop philosophy (orchestrator edits no

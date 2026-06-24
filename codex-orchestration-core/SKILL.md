@@ -121,3 +121,25 @@ loop, regardless of which model runs it. `brief` encodes them into a written spe
 and an orchestrator prompt for another model; `tdd-orchestration` enacts them live
 with Claude as the orchestrator. Read the caller skill next for the part that is
 unique to its mode.
+
+## Related: phrasing the codex-directed text
+
+Both callers ultimately emit prompts **aimed at Codex** — `brief` writes an
+orchestrator prompt another model runs; `tdd-orchestration` composes live
+implementer/reviewer/fixer session prompts. For *how to phrase that text well* —
+Codex's harness quirks (AGENTS.md injection, the internal planning tool, preamble
+cadence, `apply_patch`), GPT-5.x prompting principles, model/effort selection, and
+the **must-teach-explicitly** subagent/session feature (Codex won't fan out or
+resume sessions unless the prompt names the mechanism) — consult the
+**`codex-prompting`** skill and its templates. Division of labor: these invariants
+govern the *loop*; `codex-prompting` governs the *content* of the codex-directed
+prompts. Keep loop philosophy here; pull phrasing from there.
+
+On **transport** (how the codex-directed text actually reaches a codex process):
+`brief` hands a written prompt to a human/launcher; `tdd-orchestration` spawns
+sessions via `Agent(codex:codex-rescue)`. A third option is **agmsg** — spawn a
+*named* codex (or claude-code) peer and `send` it the goal prompt over a local bus,
+when you want addressable, long-lived agents you message across turns. See
+`codex-prompting`'s `references/subagents-and-sessions.md` (section C). Transport
+choice does not change these invariants — the cold-critic split and PASS-only gate
+still hold whichever way the prompt is delivered.

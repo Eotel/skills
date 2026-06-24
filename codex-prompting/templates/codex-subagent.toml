@@ -1,0 +1,27 @@
+# codex-subagent.toml — a custom Codex subagent definition.
+# Place at ~/.codex/agents/<name>.toml (personal) or .codex/agents/<name>.toml
+# (project-scoped). Then NAME this agent in your task prompt — Codex only spawns
+# it when explicitly asked. See references/subagents-and-sessions.md.
+
+name = "reviewer"                       # the handle you reference in prompts
+description = "When to use this agent"  # e.g. "Cold-reviews a diff for real risks"
+developer_instructions = """
+Core behavior for this worker. Be specific and self-contained — the worker does
+not see the parent's reasoning, only what you put here plus the task it's handed.
+e.g. "Review the given diff for correctness, security, and edge cases. Report only
+real, high-confidence issues with file:line. Do not restyle or expand scope."
+"""
+
+# --- Optional overrides ---
+model = "gpt-5.4-mini"                  # cheaper/faster for high-volume workers; see references/models.md
+model_reasoning_effort = "medium"       # low | medium | high | xhigh
+# sandbox_mode = "read-only"            # restrict what this worker can do
+# mcp_servers = ["..."]                 # MCP tools this worker may use
+# skills.config = "..."                 # skills available to this worker
+# nickname_candidates = ["rev", "critic"]
+
+# --- Global caps live in config.toml, not here ---
+# [agents]
+# max_threads = 6                # concurrent agent threads (default 6)
+# max_depth = 1                  # nesting depth (default 1 — workers don't spawn workers)
+# job_max_runtime_seconds = 1800 # per-worker timeout

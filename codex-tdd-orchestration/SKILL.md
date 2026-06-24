@@ -99,6 +99,21 @@ Reusable skeletons for implementer / reviewer / fixer prompts live in
 [references/prompts.md](references/prompts.md). Use them as starting points and
 fill in the topic-specific scope.
 
+For the codex-specific phrasing that makes those skeletons land — harness quirks
+(AGENTS.md injection, the internal planning tool, preamble cadence, `apply_patch`),
+model/effort selection, outcome-first framing, and the explicit subagent/session
+teaching Codex needs — consult the **`codex-prompting`** skill. Fold its principles
+into the implementer/reviewer/fixer prompts here: `codex-prompting` governs how to
+talk to codex; this skill governs the orchestration loop around those sessions.
+
+**Transport note.** This skill's default transport is
+`Agent(subagent_type="codex:codex-rescue")`. An alternative is **agmsg**: spawn a
+*named* peer (`/agmsg spawn codex implementer`) and `/agmsg send` it the goal
+prompt — useful when you want addressable, long-lived implementer/reviewer/fixer
+agents you can message across turns (and to mix in `claude-code` peers). The loop
+rules are unchanged: the reviewer is still a separate cold session, PASS still
+gates merge. See `codex-prompting` → `references/subagents-and-sessions.md` (C).
+
 ## Pitfalls (read this before starting)
 
 The shared sandbox/env edges are core #11; their concrete symptoms, root causes,
