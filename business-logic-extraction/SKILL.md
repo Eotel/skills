@@ -1,6 +1,6 @@
 ---
 name: business-logic-extraction
-description: Use when refactoring large controllers, request handlers, GraphQL resolvers, Action API endpoints, services, or frontend components so business decisions are extracted into named policies, services, query helpers, lifecycle helpers, hooks, or route-local models. Trigger when the user asks to extract business logic, thin adapters, split giant handlers, move validation/authorization/state transitions/side-effect orchestration out of entrypoints, or execute a multi-batch refactor plan with verification.
+description: Use when refactoring large controllers, request handlers, GraphQL resolvers, Action API endpoints, services, or frontend components so business decisions are extracted into named policies, services, query helpers, lifecycle helpers, hooks, or route-local models. Trigger when the user asks to extract business logic, thin adapters, split giant handlers, move validation/authorization/state transitions/side-effect orchestration out of entrypoints, or execute a multi-batch refactor plan with verification. Use the ast-grep skill for structural pattern search and safe codemods when locating decision branches across large handlers or many files.
 ---
 
 # Business Logic Extraction
@@ -8,6 +8,11 @@ description: Use when refactoring large controllers, request handlers, GraphQL r
 Use this skill to turn hidden business decisions into named, testable homes
 without changing observable behavior. The goal is not smaller files by itself;
 the goal is entrypoints that read like adapters.
+
+> **Finding the branches at scale:** to locate the decision points below across a
+> big handler or many files, prefer structural search over text grep — invoke the
+> **`ast-grep`** skill to match by AST shape, and to apply mechanical codemods once
+> a pattern is confirmed. Text search misses overloads, reformatting, and aliases.
 
 ## Core Rule
 

@@ -1,6 +1,6 @@
 ---
 name: django
-description: Use when working in Django projects on ORM/query placement, custom QuerySet or Manager design, extracting repeated filters/select_related/prefetch_related/orderings from views, GraphQL resolvers, API actions, services, tasks, or query modules, OR extracting hidden business decisions (implicit if-branches over status/ordinal/role, view.action-keyed permission dispatch, deputy/proxy resolution) out of DRF viewsets/serializers/permissions into named predicates and policies on the owning model. Preserves observable behavior with focused tests and verifies with project-local lint/type/boundary checks. Trigger for Django best practices, django-stubs/mypy ORM typing, queryset-scope refactors, model-owned table scopes, read-model query boundaries, DRF adapter thinning, named authorization predicates, and avoiding misplaced business/query logic.
+description: Use when working in Django projects on ORM/query placement, custom QuerySet or Manager design, extracting repeated filters/select_related/prefetch_related/orderings from views, GraphQL resolvers, API actions, services, tasks, or query modules, OR extracting hidden business decisions (implicit if-branches over status/ordinal/role, view.action-keyed permission dispatch, deputy/proxy resolution) out of DRF viewsets/serializers/permissions into named predicates and policies on the owning model. Preserves observable behavior with focused tests and verifies with project-local lint/type/boundary checks. Trigger for Django best practices, django-stubs/mypy ORM typing, queryset-scope refactors, model-owned table scopes, read-model query boundaries, DRF adapter thinning, named authorization predicates, and avoiding misplaced business/query logic. Uses ast-grep for structural search when locating repeated query patterns or decision branches across views, serializers, and permissions.
 ---
 
 # Django
@@ -8,6 +8,11 @@ description: Use when working in Django projects on ORM/query placement, custom 
 Use this skill as a compact router for Django best practices. Load the relevant
 reference file before changing code; keep project-specific architecture rules
 from the target repository authoritative.
+
+> **Locating patterns:** when finding repeated filters/`select_related` chains or
+> status/role decision branches across many views, serializers, or permissions,
+> use the **`ast-grep`** skill for AST-shape search (and codemods) rather than text
+> grep — it catches call variants, kwargs reordering, and aliased imports.
 
 ## Operating Rules
 
