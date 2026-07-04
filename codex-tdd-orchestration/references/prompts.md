@@ -35,6 +35,19 @@ If the reviewer's output isn't valid JSON, do not pass it to the fixer; re-launc
 ## 作業場所
 <worktree path>（例: `<repo>/.worktrees/<name>` — 実際の絶対 repo パスを `<repo>` に展開）。worktree の外（親リポジトリ本体や別 worktree）には絶対 cd しない。すべて worktree 内のパスで完結。
 
+## 全体の受け入れ目標
+<global acceptance objective: "done when ..." one sentence>
+
+## この agent の slice 目標
+<slice objective: "done when ..." one sentence>
+
+## ロードマップ上の位置
+<Phase/Tn name>。前提: <verified prerequisites>。次の milestone: <next gate>.
+
+## この agent が満たす受け入れチェック
+- owner: implementer / evidence: <command or file evidence> / expected: <expected result>
+- owner: orchestrator / evidence: <post-agent verification> / expected: <expected result>
+
 ## ゴール
 <concrete goal in 3-5 bullets>
 
@@ -84,6 +97,19 @@ notes: <2-3 lines>
 ## レビュー対象
 <files>
 
+## 全体の受け入れ目標
+<global acceptance objective: "done when ..." one sentence>
+
+## この reviewer の slice 目標
+<review objective: "done when ..." one sentence, usually reviewer JSON is [] or contains only actionable findings>
+
+## ロードマップ上の位置
+<Phase/Tn reviewer gate>。前提: implementer reported GREEN and orchestrator verified the expected diff shape.
+
+## この reviewer が判定する受け入れチェック
+- owner: reviewer / evidence: <diff + commands/results to inspect> / expected: actionable findings as JSON, or []
+- owner: orchestrator / evidence: <valid JSON parse> / expected: reviewer output can feed the fixer verbatim
+
 ## 参考ファイル
 <convention examples in the same repo>
 
@@ -115,6 +141,19 @@ JSON 配列:
 
 ## 作業場所
 <worktree>
+
+## 全体の受け入れ目標
+<global acceptance objective: "done when ..." one sentence>
+
+## この fixer の slice 目標
+<fix objective: "done when ..." one sentence, covering HIGH/MEDIUM reviewer findings>
+
+## ロードマップ上の位置
+<Phase/Tn fixer gate>。前提: reviewer JSON was captured verbatim. 次の milestone: orchestrator re-verification.
+
+## この fixer が満たす受け入れチェック
+- owner: fixer / evidence: <test command or code evidence> / expected: HIGH/MEDIUM findings addressed
+- owner: orchestrator / evidence: <post-fixer diff + focused tests> / expected: no unresolved required findings
 
 ## reviewer 指摘
 <<<PASTE REVIEWER JSON HERE>>>
@@ -149,3 +188,8 @@ A few things that distinguish a prompt that codex actually follows from one it i
 - **TDD steps numbered, not just labeled.** "1. RED 2. GREEN 3. Refactor" with what to do at each step. The label alone gets skipped.
 - **State the negative.** "Do not commit", "Do not cd out of worktree", "Do not skip pre-commit hooks" — these are easy to forget if only positive instructions appear.
 - **For fixer: paste reviewer JSON verbatim.** Don't summarize. The reviewer's exact wording is what the fixer matches against.
+- **Give every agent an evaluable slice objective.** Agents should receive the
+  global `done when ...` objective, their own `done when ...` slice objective,
+  the roadmap position, and the exact checklist lines they own. This keeps them
+  moving toward the same acceptance target instead of waiting for
+  micromanagement.

@@ -44,6 +44,13 @@ and its output is re-judged by a cold critic — never self-approved.
 
 ## The orchestration-loop invariants
 
+Callers cite these as `core #N (short name)` so a renumbering here is caught on
+read. Canonical short names: #1 no-code orchestrator, #2 cold critic,
+#3 executable contract, #4 PASS gate, #5 goal anchor, #6 verify-not-trust,
+#7 bounded retries, #8 memory log, #9 disjoint parallelism, #10 untouchable
+surfaces, #11 sandbox edges. Inserting or renumbering an invariant must update
+both caller skills in the same change.
+
 1. **The orchestrator edits no code.** Planning, scheduling, routing messages,
    git/worktree/branch/PR operations, and owning the memory log are orchestrator
    work. Anything that touches application source is delegated. Delegation is

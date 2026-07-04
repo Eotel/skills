@@ -23,21 +23,7 @@ Blocked by sandbox/write-scope mismatch.
 
 ### Mitigation: place worktrees inside the project at `<repo>/.worktrees/<name>`
 
-**Orchestrator creates the worktree** (codex never calls `git worktree add`), and places it **inside the project root** so codex's `apply_patch` accepts it:
-
-```bash
-# One-time per repo (idempotent — safe to re-run):
-mkdir -p .worktrees
-grep -qxF '/.worktrees/' .gitignore 2>/dev/null || echo '/.worktrees/' >> .gitignore
-
-# Per topic / orchestration:
-git fetch origin <base-branch>
-git worktree add .worktrees/<name> origin/<base-branch> -b <topic-branch>
-# Hand the absolute path of the worktree to codex.
-# `<repo>` below stands for the actual absolute repo path,
-# e.g. /Users/<you>/projects/<repo-name>/.worktrees/<name>.
-# Codex's writable_roots must contain that absolute path.
-```
+**Orchestrator creates the worktree** (codex never calls `git worktree add`), and places it **inside the project root** so codex's `apply_patch` accepts it. `scripts/worktree-setup.sh <name> <base-branch> [sibling-dep ...]`, run from the repo root, does the whole sequence — `.worktrees/` creation, idempotent `.gitignore` entry, fetch, `git worktree add`, sibling-dep symlinks — and prints the absolute worktree path. Hand that absolute path to codex; codex's writable_roots must contain it.
 
 Why `.worktrees/` and not `.claude/worktrees/`: `.claude/` is Claude Code's own settings/agents/hooks/commands directory. Dumping a full project tree underneath it confuses harness file scanning (e.g., agent discovery walks `.claude/agents/`). Keep `.worktrees/` at project root so the two concerns stay separate.
 
@@ -56,15 +42,11 @@ From a worktree at `<repo>/.worktrees/<name>/pyproject.toml`, `../my-lib` resolv
 
 **Option 1 (recommended): symlink siblings into `.worktrees/` once**
 
-```bash
-# At <repo>/, run once. The double-`../` makes the symlinks point to the
-# actual sibling repos regardless of which worktree under .worktrees/ uses them.
-for dep in <sibling-dep-1> <sibling-dep-2> ...; do
-  ln -sfn ../../$dep .worktrees/$dep
-done
-```
-
-After this, any worktree under `.worktrees/` resolves `path = "../<dep>"` to `<repo>/.worktrees/<dep>` → symlink → `<repo>/../<dep>` → the real sibling repo. `uv sync` then succeeds.
+The setup script's trailing `[sibling-dep ...]` arguments do exactly this
+(`ln -sfn ../../<dep> .worktrees/<dep>`). The double-`../` makes each symlink
+point to the actual sibling repo regardless of which worktree under
+`.worktrees/` uses it: `path = "../<dep>"` resolves to `<repo>/.worktrees/<dep>`
+→ symlink → `<repo>/../<dep>` → the real sibling repo. `uv sync` then succeeds.
 
 **Option 2: rewrite paths in `pyproject.toml`**
 
@@ -120,21 +102,11 @@ fatal: validation failed, cannot remove working tree:
 
 **Root cause**: If codex pivoted to cloning (Pitfall 1), the worktree's `.git` file now points to a freshly-created standalone gitdir rather than `<main repo>/.git/worktrees/<name>`. The main repo's worktree registration is stale.
 
-**Mitigation**: After the work is done, before cleanup, verify the pointer:
-
-```bash
-cat <repo>/.worktrees/<name>/.git
-# expected: gitdir: <repo>/.git/worktrees/<name>
-# if instead: gitdir: /tmp/<random>  → codex pivoted, use rm -rf flow
-```
-
-If the pointer is wrong:
-
-```bash
-rm -rf <repo>/.worktrees/<name> /tmp/<random-gitdir-path>
-git -C <repo> worktree prune
-git -C <repo> branch -D <topic-branch>
-```
+**Mitigation**: `scripts/worktree-teardown.sh <name> [topic-branch]` performs
+the pointer check and picks the right removal flow automatically: pointer intact
+→ `git worktree remove`; pointer rewritten (or `.git` turned into a directory by
+a clone pivot) → `rm -rf` + `git worktree prune`, with any stray gitdir it
+pointed to (e.g. under `/tmp/`) reported for manual cleanup.
 
 The commits and push still went through if the standalone clone had the right remote; the cleanup is just unusual.
 

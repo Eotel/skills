@@ -110,14 +110,11 @@ What is unique to *this* skill, beyond faithfully transcribing those invariants:
 - Pin the repo's real sandbox/env edges (core #11) into the prompt's templates so
   the running model hits them with the mitigation already in hand.
 
-When the implementation model is **Codex specifically**, consult the
-**`codex-prompting`** skill for the codex-targeted phrasing of this prompt — its
-harness quirks (AGENTS.md injection, the internal planning tool, `apply_patch`),
-model/effort selection, and especially its subagents/sessions reference: the
-orchestrator prompt names subsession spawning as a primitive, and Codex will not
-spawn a subsession unless the prompt tells it to explicitly. `codex-prompting`
-covers the prompt *content*; the loop structure stays governed by the core
-invariants above.
+When the implementation model is **Codex specifically**, pull the codex-targeted
+phrasing from the **`codex-prompting`** skill (the core skill's "Related" section
+defines the division of labor). One point is load-bearing here: the orchestrator
+prompt names subsession spawning as a primitive, and Codex will not spawn a
+subsession unless the prompt teaches it explicitly.
 
 ## Final checks before handing over
 

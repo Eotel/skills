@@ -1,29 +1,43 @@
 # Detailed workflow
 
+## Phase -1 — Acceptance planning (orchestrator only)
+
+Before any worktree setup or codex launch, turn the user's request into a finite
+roadmap. This prevents the orchestrator from micromanaging agents and gives every
+agent an acceptance-evaluable target.
+
+Produce:
+
+1. **Acceptance objective**: one `done when ...` sentence with an externally
+   checkable end-state.
+2. **Acceptance checklist**: 5-9 executable checks. Each check names owner,
+   command/evidence, and expected result.
+3. **Topic roadmap**: ordered milestones with dependencies, exit criteria, and a
+   retry cap. Use `Phase 0 baseline -> T1..Tn -> integration gate -> PR/CI/review
+   gate` unless the repo demands a narrower shape.
+4. **Per-agent contract**: for every planned implementer/reviewer/fixer, identify
+   the global objective, slice objective, checklist lines it owns, and roadmap
+   position.
+
+Do not launch Phase 0 until the roadmap is small enough to burn down and each
+milestone has a concrete exit criterion. If the roadmap keeps expanding, stop and
+re-scope instead of adding more open-ended agent work.
+
 ## Phase 0 — Base preparation (orchestrator + 1 codex)
 
 Before any parallel work, get a clean, codex-writable base.
 
 ### 0a. Orchestrator creates the worktree (do NOT delegate to codex)
 
-Place the worktree **inside the project** at `<repo>/.worktrees/<name>` so codex's sandbox accepts writes to it (see Pitfall 1 in `pitfalls.md` for why sibling-path worktrees fail). Throughout this section `<name>` is the topic identifier (e.g. `permissions-mixin`) — substitute the same value into the branch name.
+Place the worktree **inside the project** at `<repo>/.worktrees/<name>` so codex's sandbox accepts writes to it (see Pitfall 1 in `pitfalls.md` for why sibling-path worktrees fail). `<name>` is the topic identifier (e.g. `permissions-mixin`).
+
+Run [scripts/worktree-setup.sh](../scripts/worktree-setup.sh) from the repo root:
 
 ```bash
-mkdir -p .worktrees
-# Idempotent: only append the line if it's not already there.
-grep -qxF '/.worktrees/' .gitignore 2>/dev/null || echo '/.worktrees/' >> .gitignore
-
-git fetch origin <base-branch>
-git worktree add .worktrees/<name> origin/<base-branch> -b refactor/<name>
+<skill-dir>/scripts/worktree-setup.sh <name> <base-branch> [sibling-dep ...]
 ```
 
-If the project uses local sibling deps (`pyproject.toml: path = "../<dep>"`), set up symlinks once so `uv sync` / `poetry install` works inside the worktree:
-
-```bash
-for dep in <sibling-dep-1> <sibling-dep-2> ...; do
-  ln -sfn ../../$dep .worktrees/$dep
-done
-```
+It creates `.worktrees/<name>` on branch `refactor/<name>` (override with `TOPIC_BRANCH=<branch>`), keeps `/.worktrees/` in `.gitignore` idempotently, symlinks any listed sibling deps so `pyproject.toml: path = "../<dep>"` resolves inside the worktree, and prints the absolute worktree path to hand to codex.
 
 ### 0b. Codex green-base pass (1 session)
 
@@ -84,6 +98,7 @@ Don't skip these. Each one has paid for itself at least once.
 
 | Gate | When | What to check |
 |---|---|---|
+| 0 | End of Phase -1 | Acceptance objective is externally checkable; roadmap milestones have exit criteria and retry caps |
 | 1 | End of Phase 0 | Full `<test>`, `<lint>`, `<typecheck>` all green before launching Phase 1 |
 | 2 | After each codex completion | `git status` + `git diff --stat`. Does the changed-file list match what you asked for? |
 | 3 | After each fixer | Scoped tests for the topic pass |
@@ -111,17 +126,12 @@ Addresses post-review follow-up on PR #<N> (T<topic-id>).
 
 ## Worktree cleanup
 
-After push + CI green:
+After push + CI green, run [scripts/worktree-teardown.sh](../scripts/worktree-teardown.sh) from the repo root:
 
 ```bash
-# Verify worktree pointer integrity first (see Pitfalls #4)
-cat <repo>/.worktrees/<name>/.git
-# expected: gitdir: <repo>/.git/worktrees/<name>
-
-git -C <repo> worktree remove .worktrees/<name>
-git -C <repo> branch -D <topic-branch>
+<skill-dir>/scripts/worktree-teardown.sh <name> [topic-branch]
 ```
 
-If the pointer is wrong (codex pivoted to clone during work), use `rm -rf <repo>/.worktrees/<name>` and `git worktree prune` instead — see `pitfalls.md`.
+It verifies the worktree's `.git` pointer first (Pitfall 4): intact → `git worktree remove`; rewritten by a clone-pivoted codex → `rm -rf` + `git worktree prune`. Either way it deletes the topic branch.
 
 The `.worktrees/` directory itself and the sibling-dep symlinks inside it can be left in place across orchestrations — they're cheap to keep and save the symlink setup next time. `.gitignore` keeps them invisible to git.
