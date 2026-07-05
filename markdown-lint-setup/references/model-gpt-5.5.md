@@ -1,41 +1,26 @@
-# GPT-5.5 Guide
+# markdown-lint-setup — GPT-5.5
 
 > Snapshot: 2026-07. Source:
 > <https://developers.openai.com/api/docs/guides/prompt-guidance>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the execution model is GPT-5.5 (including the Codex harness).
+Direct operating instructions for GPT-5.5 (including the Codex harness)
+executing this skill. On self-load, apply them as written. When delegating,
+paste the Instructions block into the subagent prompt. They do not override
+SKILL.md's configs or steps.
 
-## Fit
+## Instructions
 
-- Responds to short, outcome-first prompts and picks an efficient path; give it
-  the destination and constraints, not a re-listed procedure.
-- Biases to action with reasonable assumptions — good for this bootstrap, but
-  pin down the exact-config and stop rules so it does not improvise.
+- Outcome contract: the four config files written, the npm scripts added, the
+  smoke test returning `0` for both linters, and pre-existing warning counts
+  summarized. Stop when it holds.
+- Copy the configs verbatim — every `dir/**` glob intact, both ignore files
+  identical, both tools installed. Do not improvise or improve the configs.
+- A non-zero smoke-test count is a config bug; fix it before reporting.
+- Warn before installing (lockfile churn); do not rewrite the user's prose
+  (`remark --output`) unless asked.
 
-## Execution Prompting
+## Caller notes
 
-- Effort: medium is a good default here; re-evaluate before escalating, since
-  5.5 reasoning is efficient on mechanical work.
-- Give an outcome contract: the four config files created, the npm scripts
-  added, and the smoke test returning `0` for both linters.
-- Exact-config fidelity over improvisation: copy the configs verbatim. The
-  `dir/**` ignore glob is load-bearing; a bare `dir/` silently fails. Do not
-  refactor or "improve" the given configs.
-- Keep `.remarkignore` and `.textlintignore` as one synced list.
-- Stop rule: after the smoke test shows two `0` counts and warnings are
-  summarized, the task is done — a non-zero count is a config bug to fix, and
-  pre-existing prose warnings are the user's content, not yours to chase.
-- Keep the both-tools default; warn before install (lockfile churn) and do not
-  run `remark --output` to rewrite prose unless asked.
-
-## Prompt Patch
-
-Add this block to model-specific agent prompts only when useful:
-
-```text
-Outcome: four config files written, npm scripts added, smoke test 0 for both
-linters. Copy the configs verbatim including every `dir/**` glob; keep both
-ignore files in sync; install both tools. Stop once the smoke test is 0 and
-warnings are summarized. A non-zero count is a config bug. Warn before install.
-```
+- Reasoning: `low`/`medium` — the work is mechanical; re-evaluate before
+  escalating.

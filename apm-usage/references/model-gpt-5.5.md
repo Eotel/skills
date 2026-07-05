@@ -1,39 +1,28 @@
-# GPT-5.5 Guide
+# apm-usage — GPT-5.5
 
 > Snapshot: 2026-07. Source:
 > <https://developers.openai.com/api/docs/guides/prompt-guidance>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the execution model is GPT-5.5 (including the Codex harness).
+Direct operating instructions for GPT-5.5 (including the Codex harness)
+executing APM tasks with this reference. On self-load, apply them as written.
+When delegating, paste the Instructions block into the subagent prompt. They
+do not override SKILL.md's command facts.
 
-## Fit
+## Instructions
 
-- Efficient on outcome-first APM tasks: state the destination and constraints,
-  then let it pick the path. Avoid legacy process-heavy step stacks.
-- Biased to action; pair that with explicit stop rules and confirmation gates so
-  it does not run irreversible steps unprompted.
+- Outcome: the requested package state is deployed and the lockfile committed
+  where it changed. Choose the path yourself, but take flags verbatim from
+  SKILL.md — never from memory.
+- After each command, check `apm deps list` / `apm targets`; stop once the
+  outcome holds.
+- Before finalizing, run one pass over correctness, grounding in actual tool
+  output, and safety of any irreversible step.
+- Get approval before `--force`, destructive git, or a global update that
+  mutates `.gitignore`.
+- Read the Gotchas section before reporting a failure; most surprises are
+  documented renames or by-design no-refresh behavior.
 
-## Execution Prompting
+## Caller notes
 
-- Give the outcome, not a step list: "package X deployed to target Y, lockfile
-  committed". Let 5.5 choose commands, but require exact flag fidelity — flags
-  come from SKILL.md, not from memory.
-- Add a stopping rule: after each command, ask whether the core request is now
-  satisfied (confirmed via `apm deps list` / `apm targets`) and stop if so.
-- Run a verification loop before finalizing: correctness, grounding against tool
-  output, and safety of any irreversible action.
-- Before reporting a failure, consult the Gotchas section; most surprises there
-  are renamed flags or by-design no-refresh behavior, not real breakage.
-- No destructive action without approval: `--force`, `.gitignore` mutation from
-  `apm deps update`, or destructive git steps need explicit sign-off first.
-
-## Prompt Patch
-
-Add this block to model-specific agent prompts only when useful:
-
-```text
-Target the outcome, not steps, but use exact flags from the reference. After
-each command check apm deps list / apm targets and stop once the outcome holds.
-Run a final correctness/grounding/safety pass. Get approval before --force,
-destructive git, or global updates that rewrite .gitignore.
-```
+- Reasoning: `low`/`medium` suffices for reference-driven command work.

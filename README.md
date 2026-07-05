@@ -15,11 +15,24 @@ Codex can use shared Claude skills through a symlink from
 ## Model-specific prompt guides
 
 The best prompt differs per execution model. Larger behavior-driving skills
-therefore keep model-neutral rules in `SKILL.md` and ship per-model tuning
-notes as `references/model-{opus-4.8,sonnet-5,fable-5,gpt-5.5}.md` — load at
-most one, only when the execution model is known. Guides tune verbosity,
-effort, tool eagerness, and prompt shape; they never override a skill's core
-rules. Small single-reading skills intentionally ship no model guides.
+therefore keep model-neutral rules in `SKILL.md` and ship per-model files as
+`references/model-{opus-4.8,sonnet-5,fable-5,gpt-5.5}.md` — load at most one,
+only when the execution model is known. Two forms exist, chosen by who reads
+the file:
+
+- **Self-execution skills** (`plan-exec`, `business-logic-extraction`,
+  `apm-usage`, `markdown-lint-setup`): the reader is the executing model, so
+  each guide is the model-optimized prompt itself — an `## Instructions`
+  block to apply directly (or paste into a subagent prompt when delegating)
+  plus `## Caller notes` for caller-side knobs (effort, sampling, token
+  limits). No self-description; description costs tokens without steering.
+- **Prompt-authoring skills** (`codex-tdd-orchestration`,
+  `codex-orchestrator-brief`): the reader composes prompts for *another*
+  model, so guides stay descriptive (Fit, tendencies) with a pasteable
+  Prompt Patch.
+
+Guides never override a skill's core rules. Small single-reading skills
+intentionally ship no model guides.
 
 ## Skills
 

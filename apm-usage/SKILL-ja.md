@@ -352,16 +352,18 @@ No extra configuration needed if `gh auth login` is done.
 ## モデル別実行ガイド
 
 上記の事実はモデル非依存（コマンドの意味はモデルで変わらない）。変わるのは
-実行モデルがこのリファレンスを「どう使うか」（正確さ、検証、推測をやめる
-タイミング）。実行モデルが判明している場合のみ、該当ガイドを**最大1つ**
-ロードする。不明ならスキップ。
+実行モデルがこのリファレンスを「どう使うか」。実行モデルが判明している場合
+のみ該当ガイドを**最大1つ**ロードし、Instructions をそのまま自分の operating
+instructions として適用する。サブエージェントに委譲する場合は、そのモデル用
+ガイドの Instructions ブロックをプロンプトに貼り付ける。不明ならスキップ。
 
 - Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
 - Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
 - Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
 - GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
 
-ガイドは本ファイルのコマンド事実、install と update の区別、lockfile
+各ガイドは注入可能な命令文と、呼び出し側ノブ(Caller notes: effort など)で
+構成される。本ファイルのコマンド事実、install と update の区別、lockfile
 ワークフローを上書き・再説明してはならない。
 
 ## 落とし穴

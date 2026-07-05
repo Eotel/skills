@@ -1,45 +1,31 @@
-# Claude Opus 4.8 Guide
+# business-logic-extraction — Claude Opus 4.8
 
 > Snapshot: 2026-07. Source:
 > <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-4-8>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the execution model is Claude Opus 4.8.
+Direct operating instructions for Claude Opus 4.8 executing this skill. On
+self-load, apply them as written. When delegating a batch, paste the
+Instructions block into the subagent prompt. They do not override SKILL.md.
 
-## Fit
+## Instructions
 
-- Strong at long-horizon extraction batches, code review, and debugging the
-  behavior-preservation questions this skill raises.
-- Opus 4.7 prompts transfer; scope discipline still needs to be stated because it
-  follows instructions literally rather than generalizing.
+- Apply the Core Rule, the Verification Ladder order, and the Review Checklist
+  to every batch, not only the first one.
+- Before claiming a batch done, run and cite the focused characterization test
+  and the touched-surface ladder rungs. Do not reason your way past the narrow
+  test to a wide check — run the narrow proof.
+- Report every behavior-preservation concern, including low-severity and
+  uncertain ones (auth weakening, contract drift, error-routing changes); do
+  not filter for importance.
+- Keep each batch minimal: no docs, abstractions, or error handling beyond the
+  extraction itself.
+- Spawn a fresh-context verifier subagent when the batch touches authorization
+  or state transitions; verify inline with the ladder otherwise.
 
-## Extraction Prompting
+## Caller notes
 
-- Opus respects effort strictly, so under-thinks moderately complex batches at
-  low/medium. Use `xhigh` for the extraction and characterization work, `high`
-  minimum when behavior preservation is subtle; reserve `low` for a single scoped
+- Effort: `xhigh` for extraction and characterization where behavior
+  preservation is subtle; `high` minimum; `low` only for a single scoped
   verify command.
-- It follows scope literally and will not silently generalize. Say the Review
-  Checklist and Core Rule apply to every batch, not just the first, or later
-  batches ship unchecked.
-- It favors reasoning over tool calls. When you need proof, name the exact
-  evidence: which characterization test and which ladder rungs must pass before it
-  claims a batch is done.
-- "Report only high-severity findings" is obeyed literally and drops recall. To
-  surface risky-but-uncertain drift (auth weakening, contract change), ask it to
-  report every concern including low-severity and uncertain ones.
-- It spawns fewer subagents by default. If you want a fresh-context verifier for
-  behavior preservation, say so explicitly; otherwise it verifies inline.
-- Keep the Verification Ladder order as written; do not let its preference for
-  reasoning skip the narrow characterization test in favor of a wide check.
-
-## Prompt Patch
-
-Add this block to model-specific agent prompts only when useful:
-
-```text
-Run at xhigh for extraction and characterization. The Core Rule, Verification
-Ladder order, and Review Checklist apply to every batch, not just the first.
-Before claiming a batch done, cite the focused test and ladder rungs you ran, and
-report every behavior-preservation concern including low-severity and uncertain.
-```
+- Thinking is off by default; enable adaptive thinking for extraction work.

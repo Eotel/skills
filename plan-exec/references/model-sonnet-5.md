@@ -1,42 +1,31 @@
-# Claude Sonnet 5 Guide
+# plan-exec — Claude Sonnet 5
 
 > Snapshot: 2026-07. Source:
 > <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-sonnet-5>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the model executing this skill is Claude Sonnet 5.
+Direct operating instructions for Claude Sonnet 5 executing this skill. On
+self-load, apply them as written. When delegating plan execution, paste the
+Instructions block into the subagent prompt. They do not override SKILL.md.
 
-## Fit
+## Instructions
 
-- Good default executor for plan-driven coding work.
-- Tool-eager and self-verifying; the plan must say what evidence closes a
-  step, or execution keeps re-checking.
+- A step is done when its listed verification commands pass: mark it in the
+  plan file and move on. Do not re-verify earlier steps or keep searching for
+  extra evidence past the listed checks.
+- Stay inside each step's file scope; route anything outside it through a plan
+  edit before touching the code.
+- Apply plan-wide rules (Progress updates, verification, scope discipline) to
+  every step, not only the step where they are written.
+- The plan file's Progress section is the durable record; do not duplicate it
+  with mechanical status messages.
+- Write the plan and reports in the tone/format the plan template specifies —
+  formatting comes from the text you were given, nothing else.
 
-## Plan Execution Prompting
+## Caller notes
 
-- Write each Plan of Work step with its exit evidence (command + expected
-  result) in the Verification section. Sonnet 5 stops cleanly when told what
-  suffices and over-verifies when not.
-- Instruction following is literal: scope every plan rule explicitly (whole
-  plan vs one step), same as for Opus 4.8.
-- Default `high` effort; reserve `xhigh` for the hardest step, not the whole
-  plan. Latency-sensitive steps get narrower objectives, not more prose.
-- Its eagerness can widen a step's blast radius mid-execution. Restate file
-  ownership per step when steps touch adjacent subsystems, and route anything
-  outside it through a plan edit first.
-- Do not rely on sampling parameters for plan prose style; Sonnet 5 rejects
-  non-default temperature — put tone and format expectations in the plan
-  template itself.
-- Progress updates are strong natively; keep the plan's Progress section as
-  the durable record and avoid duplicate mechanical status chatter.
-
-## Prompt Patch
-
-Add this block to the executing prompt only when useful:
-
-```text
-Use Claude Sonnet 5 behavior intentionally: execute each plan step within its
-stated file scope, verify with the step's listed commands, mark it done in the
-plan file when the listed evidence passes, and move on without re-verifying
-earlier steps.
-```
+- Effort: `high` default; `xhigh` only for the hardest step.
+- Non-default temperature/top_p/top_k return HTTP 400; steer style via prompt
+  text.
+- Leave `max_tokens` headroom — the tokenizer emits ~30% more tokens than
+  Sonnet 4.6 for the same text.

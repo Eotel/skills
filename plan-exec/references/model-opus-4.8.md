@@ -1,43 +1,30 @@
-# Claude Opus 4.8 Guide
+# plan-exec — Claude Opus 4.8
 
 > Snapshot: 2026-07. Source:
 > <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-4-8>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the model executing this skill is Claude Opus 4.8.
+Direct operating instructions for Claude Opus 4.8 executing this skill. On
+self-load, apply them as written. When delegating plan execution, paste the
+Instructions block into the subagent prompt. They do not override SKILL.md.
 
-## Fit
+## Instructions
 
-- Strong at long-horizon plan execution and at the review/debug steps a plan's
-  Verification section demands.
-- Literal instruction following: the plan text is what gets executed, so write
-  plan steps with explicit scope.
+- Apply every plan-wide rule to every step — update Progress at each stopping
+  point and run the step's verification commands even where the plan states
+  the rule only once.
+- Run the named verification commands and read their output before marking a
+  step done; do not infer a result from reasoning alone.
+- Keep the diff inside the plan's stated scope: no unrequested docs,
+  abstractions, or error handling.
+- When a step proves harder than planned, record it in Surprises with evidence
+  and adjust the plan file; do not silently re-plan in your head.
+- Spawn subagents only where the plan says to; otherwise work in-session.
+- The plan file's Progress section is the durable record — keep chat status
+  updates brief and non-duplicative.
 
-## Plan Execution Prompting
+## Caller notes
 
-- Opus 4.8 does not silently generalize. A rule meant for the whole plan
-  ("update Progress at every stopping point", "run lint after each step") must
-  say so — stated once inside step 1, it stays in step 1.
-- Use high effort for cross-subsystem execution; at low/medium it scopes to
-  exactly the written step and may under-think steps that turned out harder
-  than planned. When a step surprises, raise effort rather than adding text.
-- It favors reasoning over tool calls. In the Verification section, name the
-  concrete commands per step so evidence is gathered, not inferred.
-- Its native progress reporting is good — do not add forced-update
-  scaffolding; the plan's Progress section plus normal updates suffice.
-- It tends to overbuild. Keep Constraints and Non-Goals explicit ("no
-  unrequested docs, abstractions, or error handling") so the diff matches the
-  plan.
-- When the plan delegates to subagents, say explicitly when to spawn them;
-  Opus 4.8 defaults to doing the work in-session.
-
-## Prompt Patch
-
-Add this block to the executing prompt only when useful:
-
-```text
-Use Claude Opus 4.8 behavior intentionally: execute the plan steps literally
-and completely, run the named verification commands before marking a step
-done, keep the diff within the plan's stated scope, and update the plan file
-at every stopping point.
-```
+- Effort: `high`–`xhigh` for cross-subsystem execution; at low/medium Opus 4.8
+  scopes to exactly the written step and may under-think surprises.
+- Thinking is off by default; enable adaptive thinking for plan execution.

@@ -1,43 +1,36 @@
-# Claude Fable 5 Guide
+# plan-exec — Claude Fable 5
 
 > Snapshot: 2026-07. Source:
 > <https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5>.
 > Re-verify before relying on a version-specific claim.
 
-Use this only when the model executing this skill is Claude Fable 5.
+Direct operating instructions for Claude Fable 5 executing this skill. On
+self-load, apply them as written. When delegating plan execution, paste the
+Instructions block into the subagent prompt. They do not override SKILL.md.
 
-## Fit
+## Instructions
 
-- Best at the long, cross-subsystem work this skill exists for; a plan file is
-  the external memory that keeps a multi-hour run resumable.
-- Prone to wrapping routine work in ceremony — apply the "when NOT to use"
-  gate strictly before writing any plan file.
+- Apply the "when NOT to use" gate strictly; do not wrap routine work in a
+  plan file.
+- Plan only to the depth the evidence supports. Put open questions into
+  Constraints instead of expanding Plan of Work speculatively, and start
+  executing as soon as the plan is approved — do not relitigate settled
+  sections.
+- Writing the plan file ends the turn: surface it and stop for approval.
+  Autonomy instructions elsewhere do not override this pause.
+- After approval, execute without asking permission mid-plan. Anything outside
+  the approved Plan of Work becomes a new plan section or a follow-up plan
+  first — never a silent expansion, never an unrequested extra (defensive
+  branches, unasked docs).
+- Record Progress only after checking the actual tool output; a subagent's
+  status line is not evidence.
+- Write Decision Log and Surprises in full sentences a cold resume can follow,
+  not session shorthand.
+- When delegating batches, the plan file stays the single source of truth:
+  verify subagent output yourself, then update the file.
 
-## Plan Execution Prompting
+## Caller notes
 
-- Fable 5 can overplan ambiguous work. Cap the plan at what the evidence
-  supports; write open questions into Constraints instead of expanding Plan of
-  Work speculatively, and start executing once the plan is approved.
-- The approval ritual is a hard pause boundary. Autonomy instructions
-  elsewhere do not override it: write the plan, surface it, stop.
-- It may take useful-looking unrequested actions. Anything outside the
-  approved Plan of Work goes into the plan as a new section or follow-up plan
-  first — never silently folded in.
-- Audit Progress entries against actual tool output before writing them; a
-  status line from a subagent is not evidence (the skill's reviewer-pass rule
-  for extraction work applies to all delegated steps).
-- Long sessions drift toward dense shorthand. Keep the plan file readable for
-  a cold resume: full sentences in Decision Log and Surprises, not fragments.
-- Delegating batches to subagents is encouraged, but the plan file stays the
-  single source of truth — update it yourself after verifying their work.
-
-## Prompt Patch
-
-Add this block to the executing prompt only when useful:
-
-```text
-Use Claude Fable 5 behavior intentionally: plan only to the depth the evidence
-supports, stop for approval after writing the plan file, execute autonomously
-after approval, and record only tool-verified progress. Scope changes become
-new plan sections, never silent expansions.
-```
+- Effort: `high` default; `medium` is enough for small plan-worthy changes.
+- For trivial fixes, skip this skill entirely rather than downshifting the
+  model — the gate exists for that.
