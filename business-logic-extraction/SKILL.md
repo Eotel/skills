@@ -122,6 +122,21 @@ Run the narrowest proof first, then widen:
 Avoid running DB-backed pytest commands in parallel unless the repo explicitly
 supports isolated test databases per process.
 
+## Model-Specific Prompt Guides
+
+Keep the common extraction rules in this file. Load **at most one** model
+guide when the executing model is known or the user names it; otherwise skip
+this section and use the common rules only.
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+Model guides may tune batch sizing, verification eagerness, delegation, and
+reporting style. They must not override the Core Rule (extract vs keep
+inline), the Verification Ladder order, or the Review Checklist.
+
 ## Review Checklist
 
 Before finishing, confirm:

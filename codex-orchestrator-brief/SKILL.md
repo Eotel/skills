@@ -116,6 +116,24 @@ defines the division of labor). One point is load-bearing here: the orchestrator
 prompt names subsession spawning as a primitive, and Codex will not spawn a
 subsession unless the prompt teaches it explicitly.
 
+## Model-specific prompt guides
+
+Keep the common authoring rules in this file. When the **implementation model
+that will run the package** is known (the user names it, or the environment
+pins it), load **at most one** matching guide and let it tune how you phrase
+the spec and the orchestrator prompt for that runner; otherwise skip this
+section and write model-neutral prose.
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+Model guides may tune verbosity, effort hints, autonomy framing, subagent
+teaching, and prompt shape. They must not override the core invariants
+(author/critic separation, executable rubric, critic-PASS-only gate), the
+evidence requirements of Phase A/B, or the 🛑 propose-only fences.
+
 ## Final checks before handing over
 
 - Re-read both files as if you were the implementer with zero context: is any

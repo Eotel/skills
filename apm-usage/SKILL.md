@@ -371,6 +371,21 @@ No extra configuration needed if `gh auth login` is done.
 - `apm install --force` overwrites local files on collision. It does **not**
   refresh refs — use `apm update` for that.
 
+## Model-specific execution guides
+
+The facts above are model-independent — command semantics never change per
+model. What differs is how an executing model should *use* this reference
+(exactness, verification, when to stop guessing). Load **at most one** guide
+when the executing model is known; otherwise skip.
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+Guides must not restate or override the command facts, the install-vs-update
+distinction, or the lockfile workflow in this file.
+
 ## Gotchas
 
 - **`apm deps update` mutates the current working directory's `.gitignore`**:

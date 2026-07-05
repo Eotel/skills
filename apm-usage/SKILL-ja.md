@@ -349,6 +349,21 @@ No extra configuration needed if `gh auth login` is done.
 - Dependencies processed in declaration order; first wins
 - `apm install --force` はローカル上書きのみ。ref は更新しない（`apm update` を使うこと）
 
+## モデル別実行ガイド
+
+上記の事実はモデル非依存（コマンドの意味はモデルで変わらない）。変わるのは
+実行モデルがこのリファレンスを「どう使うか」（正確さ、検証、推測をやめる
+タイミング）。実行モデルが判明している場合のみ、該当ガイドを**最大1つ**
+ロードする。不明ならスキップ。
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+ガイドは本ファイルのコマンド事実、install と update の区別、lockfile
+ワークフローを上書き・再説明してはならない。
+
 ## 落とし穴
 
 - **`apm deps update` は cwd の `.gitignore` を勝手に書き換える**:

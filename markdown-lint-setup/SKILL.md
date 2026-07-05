@@ -258,6 +258,21 @@ If the user uses VS Code:
 - **`AGENTS.md` (no dot)**: this is a regular file at the repo root, *not* in `.agents/`. It is linted by default — that's intentional, since it's project documentation.
 - **`remark`'s `--output` flag rewrites files in place**: only run `pnpm remark` (without `:check`) when the working tree is clean or the user has accepted that risk. `pnpm remark:check` is always safe.
 
+## Model-specific execution guides
+
+The file contents and step order above are model-independent. What differs per
+model is execution discipline (verbatim fidelity of configs, verification
+eagerness, when to consult the gotchas). Load **at most one** guide when the
+executing model is known; otherwise skip.
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+Guides must not override the exact config contents, the `dir/**` ignore-glob
+rule, the both-tools default, or the smoke-test verification.
+
 ## What to report back to the user
 
 After running steps 1–7, summarize:

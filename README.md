@@ -12,6 +12,15 @@ apm install -g Eotel/skills/devenv-init  --target codex
 Codex can use shared Claude skills through a symlink from
 `~/.codex/skills/<name>` to `~/.claude/skills/<name>`.
 
+## Model-specific prompt guides
+
+The best prompt differs per execution model. Larger behavior-driving skills
+therefore keep model-neutral rules in `SKILL.md` and ship per-model tuning
+notes as `references/model-{opus-4.8,sonnet-5,fable-5,gpt-5.5}.md` — load at
+most one, only when the execution model is known. Guides tune verbosity,
+effort, tool eagerness, and prompt shape; they never override a skill's core
+rules. Small single-reading skills intentionally ship no model guides.
+
 ## Skills
 
 - **`agentic-docs`** — bootstrap, audit, and maintain repository-local

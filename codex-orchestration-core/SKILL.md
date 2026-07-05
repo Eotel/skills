@@ -129,6 +129,13 @@ and an orchestrator prompt for another model; `tdd-orchestration` enacts them li
 with Claude as the orchestrator. Read the caller skill next for the part that is
 unique to its mode.
 
+## Model-specific tuning lives in the callers
+
+These invariants are deliberately model-agnostic and stay that way. Per-model
+prompt tuning (verbosity, effort, tool eagerness, autonomy framing) lives in
+each caller skill's `references/model-*.md` guides — load at most one there
+when the execution model is known. Do not add model-conditional text here.
+
 ## Related: phrasing the codex-directed text
 
 Both callers ultimately emit prompts **aimed at Codex** — `brief` writes an

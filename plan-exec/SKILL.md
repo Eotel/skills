@@ -133,6 +133,22 @@ Before moving the plan to `completed/`, ask:
 
 The completed plan is the audit trail. The promoted artifacts are the institutional memory.
 
+## Model-specific prompt guides
+
+Keep the common planning rules in this file. Load **at most one** model guide
+when the executing model is known or the user names it; otherwise skip this
+section and use the common rules only.
+
+- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
+- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
+- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+
+Model guides may tune plan depth, verbosity, tool eagerness, and how execution
+progress is reported. They must not override the approval ritual, the plan
+file as source of truth, the output location, the filename convention, or the
+"when NOT to use" gate.
+
 ## Anti-patterns
 
 - Writing a plan in chat instead of in the file. The file IS the plan; chat is the conversation about it.
