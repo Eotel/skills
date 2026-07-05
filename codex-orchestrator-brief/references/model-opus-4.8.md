@@ -25,8 +25,9 @@ is Claude Opus 4.8.
 - It favors reasoning over tool calls. For each rubric line, name the tool
   evidence that must be gathered before a PASS/FAIL is recorded.
 - Subagent spawning is conservative by default. The prompt must say exactly
-  when to spawn (each implementer wave, each cold verifier) or the runner may
-  try to do the work in one session.
+  when to spawn (each implementer wave; a fresh cold verifier for every
+  verification round, including retries) or the runner may try to do the work
+  in one session.
 - Do not import forced-update or anti-laziness scaffolding; its native
   progress reporting is sufficient and the old scaffolding overtriggers.
 - For verifier roles, instruct "report every failed or uncertain line, do not
@@ -40,6 +41,7 @@ Add this block to the orchestrator prompt when the runner is Opus 4.8:
 ```text
 Use Claude Opus 4.8 behavior intentionally: apply every rule to every wave,
 gather the named tool evidence before recording rubric results, spawn an
-implementer and a cold verifier subsession per wave, and run implementation
-waves at xhigh effort.
+implementer subsession per wave and a fresh cold verifier for every
+verification round including retries, and run implementation waves at xhigh
+effort.
 ```
