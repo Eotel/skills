@@ -41,5 +41,5 @@ Add this block to the orchestrator prompt when the runner is Opus 4.8:
 Use Claude Opus 4.8 behavior intentionally: apply every rule to every wave,
 gather the named tool evidence before recording rubric results, spawn an
 implementer and a cold verifier subsession per wave, and run implementation
-waves at high effort.
+waves at xhigh effort.
 ```

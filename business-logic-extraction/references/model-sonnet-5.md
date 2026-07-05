@@ -27,7 +27,8 @@ Use this only when the execution model is Claude Sonnet 5.
   side, so it does not refactor mechanical adapter code you asked it to leave.
 - The new tokenizer emits ~30% more tokens; leave `max_tokens` headroom so batch
   reports and diffs are not truncated mid-verification.
-- Use prompt wording, not temperature/top-p/top-k (they 400), to set report tone.
+- Use prompt wording to set report tone, not temperature/top-p/top-k — the API
+  rejects non-default values for those parameters with an HTTP 400 error.
 
 ## Prompt Patch
 

@@ -122,7 +122,7 @@ Run the narrowest proof first, then widen:
 Avoid running DB-backed pytest commands in parallel unless the repo explicitly
 supports isolated test databases per process.
 
-## Model-Specific Prompt Guides
+## Model-specific prompt guides
 
 Keep the common extraction rules in this file. Load **at most one** model
 guide when the executing model is known or the user names it; otherwise skip
