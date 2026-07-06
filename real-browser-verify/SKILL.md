@@ -1,6 +1,6 @@
 ---
 name: real-browser-verify
-description: Verify a UI change or bug fix by driving the real running app through a real (authenticated) browser — dev-server lifecycle, target-screen navigation, functional operation, and evidence capture with guaranteed cleanup. Use before declaring any UI change, frontend bug fix, or deploy "done"; Playwright/E2E specs, curl, page-loads, or console-error counts are NOT acceptable substitutes for this check. Trigger phrases: 画面で確認, 実ブラウザで検証, 動作確認して, browser use で確認.
+description: 'Verify a UI change or bug fix by driving the real running app through a real (authenticated) browser — dev-server lifecycle, target-screen navigation, functional operation, and evidence capture with guaranteed cleanup. Use before declaring any UI change, frontend bug fix, or deploy "done"; Playwright/E2E specs, curl, page-loads, or console-error counts are NOT acceptable substitutes for this check. Trigger phrases: 画面で確認, 実ブラウザで検証, 動作確認して, browser use で確認.'
 ---
 
 # Real-Browser Verify
