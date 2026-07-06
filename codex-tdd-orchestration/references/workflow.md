@@ -15,10 +15,12 @@ Produce:
 3. **Topic roadmap**: ordered milestones with dependencies, exit criteria, and a
    retry cap. Use `Phase 0 baseline -> T1..Tn -> integration gate -> PR/CI/review
    gate` unless the repo demands a narrower shape.
-4. **Transport plan**: for each milestone, choose durable Codex thread, subagent,
-   or parent read-only spot check. Default to Codex threads for issue/topic
-   implementation slices; default to subagents or parent spot checks for micro
-   reviews, short follow-up checks, and narrow verification passes.
+4. **Transport plan**: for each milestone, choose a durable Codex thread or a
+   subagent. Default to Codex threads for issue/topic implementation slices;
+   default to subagents for micro cold reviews, short follow-up checks, and narrow
+   verification passes. The orchestrator's own read-only diff check is core #6
+   verification, not a review transport — it supplements the cold review, never
+   replaces it.
 5. **Per-agent contract**: for every planned Codex thread or subagent, identify
    the global objective, slice objective, checklist lines it owns, and roadmap
    position.
@@ -90,15 +92,16 @@ The prompt must include:
 - "Do not commit" — leave the working tree dirty so the orchestrator can serialize commits
 - Required final report shape (status, files_changed, test_result, notes)
 
-### Cold reviewer (subagent, parent spot check, or Codex thread)
+### Cold reviewer (subagent or Codex thread)
 
 Run a cold review after the implementer reports done and the orchestrator has
-verified the expected diff shape. Choose the smallest adequate transport:
+verified the expected diff shape (that diff check is the orchestrator's core #6
+verification — a supplement to the cold review, not the review itself). The cold
+reviewer must run in a **fresh context that never saw the author's report**, which
+rules out the orchestrator itself. Choose the smallest adequate fresh transport:
 
-- Parent read-only spot check for small diffs when the parent did not author the
-  change and can judge the diff/evidence cold enough.
-- Subagent for bounded read-only review, small follow-up checks, or narrow
-  verification passes.
+- Subagent for a bounded read-only review — the default for small diffs, follow-up
+  checks, and narrow verification passes. A fresh subagent is cold and cheap.
 - Codex thread only when the review is broad, stateful, long-running, or needs
   its own isolated worktree/history.
 
@@ -118,19 +121,34 @@ needs its own dirty worktree/history. The fixer receives the reviewer's JSON
 verbatim plus a clear "apply these, re-run tests, don't commit" instruction.
 Same TDD discipline applies for each fix.
 
-After each fix, run another cold review or parent read-only spot check before
-PASS. After required review/fix passes complete **and the orchestrator has
+After each fix, run another cold review (fresh subagent or Codex thread) before
+PASS; the orchestrator's own diff verification (core #6) does not count as that
+cold review. After required review/fix passes complete **and the orchestrator has
 verified the worktree**, move on to the topic's commit.
 
 ## Phase 2 — Integration gate + commits (sequential, orchestrator only)
 
-When all topics have cold-review PASS:
+When all topics have cold-review PASS, land them on **one integration branch** and
+verify the *combined* result. Disjoint topic branches each going green in
+isolation does **not** prove they build, test, and ship together — a single PR
+that never got integrated and re-tested can regress on cross-topic interactions
+(shared imports, lock files, generated output). This is core #9: merges are
+serialized, and the branch re-verifies after absorbing the integration base.
 
-1. Run the full project test suite, full lint, full typecheck. **Also run the CI lint command** if it differs from the local lint (Pitfall 5).
-2. Commit one topic at a time so the history reflects the orchestration shape — each commit message references the topic and review pass.
-3. Push.
-4. Verify CI on the remote and only declare done when CI is green.
-5. Remove completed worktree(s).
+1. Prepare an integration branch off the base (e.g. `integration/<run>` from
+   `origin/main`), or reuse the single topic branch when there is only one topic.
+2. For each topic **in dependency order**, absorb its work one at a time: commit
+   that topic's dirty worktree as one topic commit on its branch, then merge that
+   branch into the integration branch. After **each** merge, re-run the full
+   project test suite, full lint, and full typecheck on the integration branch —
+   **and the CI lint command** if it differs from the local lint (Pitfall 5). A
+   cross-topic interaction that "disjoint" file sets missed surfaces here, not
+   after push.
+3. Keep one commit per topic so the history stays bisectable — each commit message
+   references the topic and its review pass.
+4. Push the integration branch once the combined result is green.
+5. Verify CI on the remote and only declare done when CI is green.
+6. Remove completed worktree(s).
 
 ## Verification gates
 
@@ -142,7 +160,7 @@ Don't skip these. Each one has paid for itself at least once.
 | 1 | End of Phase 0 | Full `<test>`, `<lint>`, `<typecheck>` all green before launching Phase 1 |
 | 2 | After each delegated completion | `git status` + `git diff --stat`. Does the changed-file list match what you asked for? |
 | 3 | After each fix pass | Scoped tests for the topic pass and unresolved required findings are gone |
-| 4 | Before push (Phase 2) | Full project test + lint + typecheck **+ CI-equivalent format check** (Pitfall 5) |
+| 4 | Phase 2, after each topic is absorbed into the integration branch | Full project test + lint + typecheck **+ CI-equivalent format check** on the combined branch (Pitfall 5, core #9) |
 | 5 | After push | Wait for CI, confirm green. If red, fix and re-push before declaring done |
 
 ## Commit serialization
@@ -169,7 +187,7 @@ Addresses post-review follow-up on PR #<N> (T<topic-id>).
 After push + CI green, run [scripts/worktree-teardown.sh](../scripts/worktree-teardown.sh) from the repo root:
 
 ```bash
-<skill-dir>/scripts/worktree-teardown.sh <name> [topic-branch]
+<skill-dir>/scripts/worktree-teardown.sh <topic> [topic-branch]
 ```
 
 It verifies the worktree's `.git` pointer first (Pitfall 4): intact → `git worktree remove`; rewritten by a clone-pivoted codex → `rm -rf` + `git worktree prune`. Either way it deletes the topic branch.

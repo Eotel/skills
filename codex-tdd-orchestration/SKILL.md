@@ -9,9 +9,8 @@ description: >-
   Invocation starts with the Scope Fit Gate in the body — issue/topic-level
   implementation routes to durable Codex threads, while micro reviews, short
   follow-up checks, and narrow verification passes use the smallest independent
-  transport: subagent, parent read-only spot check, or Codex thread only when an
-  isolated worktree/history is needed. Claude itself does no coding in either
-  mode.
+  transport: a subagent, or a Codex thread only when an isolated worktree/history
+  is needed. Claude itself does no coding in either mode.
 ---
 
 # codex-tdd-orchestration
@@ -39,16 +38,20 @@ Launch durable Codex-thread orchestration only when **all** of these are true:
   topics are still worth serializing with an explicit ordering rationale.
 - Each implementation topic needs an isolated worktree or user-owned thread.
 - Each topic benefits from a cold adversarial reviewer before merge; the review
-  transport can be a Codex thread, subagent, or parent read-only spot check.
+  transport is a subagent, or a Codex thread when the review needs its own
+  isolated worktree/history. The reviewer runs in a fresh context that never saw
+  the author's report (core #2) — the orchestrator itself does not qualify.
 
-If any gate fails, do **not** run Phase 0/1/2. Report the lighter route and then
-use it:
+When **all** gates pass, the route is full orchestration: one durable Codex
+thread/worktree per issue/topic implementation slice (Phase 0/1/2 below).
 
-| Scope shape | Route |
+If **any** gate fails, do **not** run Phase 0/1/2. Report the lighter route that
+matches the scope shape and then use it:
+
+| Scope shape | Lighter route (gate did not pass) |
 |---|---|
-| Parent GitHub issue with sub-issues or clear implementation topics | One durable Codex thread/worktree per issue/topic implementation slice |
 | One GitHub issue, one coherent topic, or a diff that fits in one PR description | One Codex TDD worker, or inline TDD if delegation is unavailable |
-| Micro cold review, short follow-up check, or narrow verification pass | Subagent or parent read-only spot check; do not create a user-visible Codex thread |
+| Micro cold review, short follow-up check, or narrow verification pass | A subagent (fresh cold context); do not create a user-visible Codex thread |
 | Typo, dependency bump, formatter-only, or obvious mechanical edit | One Codex call or inline edit |
 | User also asks for PR, Oracle, Copilot review handling, or "can ship" | Treat those as post-implementation gates, not as extra orchestration topics |
 | Two topics with overlapping files | Re-scope with a user-facing proposal, otherwise serialize; do not parallelize |
@@ -98,9 +101,11 @@ Codex CLI via `Agent(subagent_type="codex:codex-rescue")` when the work needs an
 isolated worktree or user-owned thread. For a parent issue with sub-issues, the
 durable split is one Codex thread per issue/topic implementation slice. Cold
 review and follow-up fixes still gate acceptance, but their transport is sized
-to the work: parent read-only spot check, subagent, or Codex thread only when the
-review/fix needs its own isolated worktree or history. Topics run in parallel
-when file ownership is disjoint. Claude's job is to plan, delegate, **verify**
+to the work: a subagent for a bounded pass, or a Codex thread only when the
+review/fix needs its own isolated worktree or history. The cold reviewer runs in
+a fresh context; the orchestrator's own read-only diff check is verification
+(core #6), not the cold-review gate (core #2). Topics run in parallel when file
+ownership is disjoint. Claude's job is to plan, delegate, **verify**
 (core #6, verify-not-trust), commit, and handle operations codex's sandbox
 cannot. Unlike codex-orchestrator-brief, which writes a handoff package for
 another model to run later, here Claude runs the loop live in this session.
@@ -110,11 +115,15 @@ another model to run later, here Claude runs the loop live in this session.
 Durable Codex threads give three things a single Claude context cannot:
 **isolated implementation history**, **parallelism across topics**, and
 **user-visible ownership for issue/topic slices**. Review independence is still
-mandatory (core #2, cold critic), but independence is about information and role
-separation, not always about another user-visible thread. A parent spot check is
-read-only and may PASS/FAIL only because the parent did not author the diff.
-Splitting authorship from critique catches design and edge-case issues an author
-tends to defend rather than acknowledge.
+mandatory (core #2, cold critic): the reviewer runs in a fresh context that never
+saw the author's conversation or report. A subagent satisfies this cheaply without
+a user-visible thread — independence is about information separation, not about
+another user-visible thread. The orchestrator itself is **not** a valid cold
+reviewer: it watched the implementer's report, so using it as the critic
+reintroduces the author's bias through the side door (core #2, core #6). Its
+read-only diff check is core #6 verification — a supplement to, never a substitute
+for, the cold-review PASS. Splitting authorship from critique catches design and
+edge-case issues an author tends to defend rather than acknowledge.
 
 ## Core principles (this skill's application of the shared invariants)
 
@@ -123,11 +132,12 @@ tends to defend rather than acknowledge.
    source is delegated.
 2. **One issue/topic = one durable implementation thread when isolation is
    needed.** The implementer is a Codex thread for issue-level work. Reviewer and
-   fixer transport is chosen by size/risk: parent read-only spot check or
-   subagent for small bounded passes; Codex thread only when the review or fix is
-   large, stateful, or needs its own dirty worktree/history. The cold reviewer
-   must not receive the author's hidden reasoning, and every fix is re-judged
-   before PASS (core #2, cold critic; core #4, PASS gate).
+   fixer transport is chosen by size/risk: a subagent for small bounded passes;
+   a Codex thread only when the review or fix is large, stateful, or needs its own
+   dirty worktree/history. The cold reviewer runs in a fresh context and must not
+   receive the author's report or hidden reasoning — which rules out the
+   orchestrator itself as the reviewer — and every fix is re-judged before PASS
+   (core #2, cold critic; core #4, PASS gate).
 3. **TDD is enforced in the implementer prompt.** RED test first, confirm FAIL,
    then implement to GREEN, then refactor. The RED→GREEN command is this skill's
    executable acceptance contract (core #3, executable contract).
@@ -162,8 +172,10 @@ tends to defend rather than acknowledge.
 - **Phase 1** — Parallel topics: for each topic, run the durable Codex
   implementer, then cold review and fix passes using the smallest adequate
   transport; topics parallel between each other when files are disjoint
-- **Phase 2** — Integration gate + commits (sequential, orchestrator only): full
-  test/lint/typecheck + CI-equivalent checks + per-topic commit + push + CI verify
+- **Phase 2** — Integration gate + commits (sequential, orchestrator only):
+  absorb each topic onto one integration branch, re-run full
+  test/lint/typecheck + CI-equivalent checks after each (core #9) + per-topic
+  commit + push + CI verify
 
 Detailed steps, verification gates, and timing live in
 [references/workflow.md](references/workflow.md).
