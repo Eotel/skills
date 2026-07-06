@@ -121,6 +121,13 @@ When this plan dispatches subagents (e.g., a Codex worker spawned via tool, or a
 
 ## Promotion checklist (at completion)
 
+Moving a finished plan to `completed/` (and committing that move) is part of
+finishing the work, not optional bookkeeping — leaving shipped plans in
+`active/` was corrected 4+ times in a single work batch. And when a gap survey
+produces plans, capture **every** known gap as a plan while the knowledge is
+fresh (「絞るのではなく 全てのgapをわかっているうちに plan にしておくべきだ」) —
+do not select a subset and let the rest evaporate.
+
 Before moving the plan to `completed/`, ask:
 
 - Did this work change a durable convention? Update `AGENTS.md`, `CLAUDE.md`,
