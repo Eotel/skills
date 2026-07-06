@@ -1,6 +1,16 @@
 ---
 name: codex-tdd-orchestration
-description: This skill should be used when the user asks Claude to orchestrate Codex CLI sessions for implementation work — trigger phrases include "codex で並列に", "orchestrator として", "codex に任せて", "implementer/reviewer/fixer に分けて", "並列で codex を回して", "orchestrate codex", "run codex in parallel" — and on multi-topic post-review fix work where Claude would otherwise edit code itself. Invocation starts with the Scope Fit Gate in the body — a single-issue or PR-sized task routes to a lighter single-Codex/inline TDD path even when the user names this skill; full implementer→reviewer→fixer orchestration is reserved for 2+ independent fix/refactor/feature topics that benefit from TDD enforcement, adversarial review, and remediation. Claude itself does no coding in either mode.
+description: >-
+  This skill should be used when the user asks Claude to orchestrate Codex CLI
+  sessions for implementation work — trigger phrases include "codex で並列に",
+  "orchestrator として", "codex に任せて", "implementer/reviewer/fixer に分けて",
+  "並列で codex を回して", "orchestrate codex", "run codex in parallel" — and on
+  multi-topic post-review fix work where Claude would otherwise edit code itself.
+  Invocation starts with the Scope Fit Gate in the body — issue/topic-level
+  implementation routes to durable Codex threads, while micro reviews, short
+  follow-up checks, and narrow verification passes use the smallest independent
+  transport: a subagent, or a Codex thread only when an isolated worktree/history
+  is needed. Claude itself does no coding in either mode.
 ---
 
 # codex-tdd-orchestration
@@ -18,32 +28,39 @@ first decide whether full orchestration fits, then either launch it or route to 
 lighter TDD path. The gate overrides everything — including the case where the
 user named this skill by hand.
 
-Launch the full implementer → reviewer → fixer orchestration only when **all** of
-these are true:
+Launch durable Codex-thread orchestration only when **all** of these are true:
 
 - The user explicitly asks Claude to orchestrate codex and wants the main agent
   to avoid application-code edits.
-- The work decomposes into 2+ non-trivial topics, each producing code worth
-  independently reviewing before merge.
+- The work decomposes into issue/topic-level implementation slices, each
+  producing code worth independently reviewing before merge.
 - Topic file ownership is disjoint (core #9, disjoint parallelism), or the
   topics are still worth serializing with an explicit ordering rationale.
-- Each topic benefits from a cold adversarial reviewer before merge — typo
-  fixes, dependency bumps, and formatter-only diffs do not.
+- Each implementation topic needs an isolated worktree or user-owned thread.
+- Each topic benefits from a cold adversarial reviewer before merge; the review
+  transport is a subagent, or a Codex thread when the review needs its own
+  isolated worktree/history. The reviewer runs in a fresh context that never saw
+  the author's report (core #2) — the orchestrator itself does not qualify.
 
-If any gate fails, do **not** run Phase 0/1/2. Report the lighter route and then
-use it:
+When **all** gates pass, the route is full orchestration: one durable Codex
+thread/worktree per issue/topic implementation slice (Phase 0/1/2 below).
 
-| Scope shape | Route |
+If **any** gate fails, do **not** run Phase 0/1/2. Report the lighter route that
+matches the scope shape and then use it:
+
+| Scope shape | Lighter route (gate did not pass) |
 |---|---|
 | One GitHub issue, one coherent topic, or a diff that fits in one PR description | One Codex TDD worker, or inline TDD if delegation is unavailable |
+| Micro cold review, short follow-up check, or narrow verification pass | A subagent (fresh cold context); do not create a user-visible Codex thread |
 | Typo, dependency bump, formatter-only, or obvious mechanical edit | One Codex call or inline edit |
 | User also asks for PR, Oracle, Copilot review handling, or "can ship" | Treat those as post-implementation gates, not as extra orchestration topics |
 | Two topics with overlapping files | Re-scope with a user-facing proposal, otherwise serialize; do not parallelize |
 
 When the lighter route applies, preserve the valuable parts: RED → GREEN →
-REFACTOR, focused verification after each fix, PR/review handling by the main
-agent, and one broader final gate before "can ship." Avoid repeated full-suite
-runs between small review fixes unless the finding touches shared behavior.
+REFACTOR, cold review before acceptance, focused verification after each fix,
+PR/review handling by the main agent, and one broader final gate before
+"can ship." Avoid repeated full-suite runs between small review fixes unless the
+finding touches shared behavior.
 
 ## Acceptance Objective and Roadmap (full orchestration only)
 
@@ -59,9 +76,10 @@ Four artifacts, produced in Phase -1 — the full definition of each lives in
 2. **Acceptance checklist** — 5-9 executable checks, each naming owner,
    command/evidence, and expected result.
 3. **Topic roadmap** — dependency-ordered milestones, each with an exit
-   criterion and a retry cap.
-4. **Agent contracts** — every agent prompt receives the global objective, its
-   slice objective, its checklist lines, and its roadmap position.
+   criterion, transport choice, and retry cap.
+4. **Agent contracts** — every Codex thread or subagent prompt receives the
+   global objective, its slice objective, its checklist lines, and its roadmap
+   position.
 
 Progress policy: advance by clearing milestones, and verify each exit criterion
 before starting the next. Classify any new subtask (in-scope / new topic /
@@ -70,69 +88,94 @@ Default retry cap is 2 per milestone; after the cap, stop and surface the
 blocker with the evidence. Keep the roadmap visible in TaskCreate and mark items
 complete only after orchestrator verification, not after an agent status line.
 
+Intervention policy: let waiting agents work. Check roadmap milestones on a
+bounded cadence and intervene only on final status, blocked/stalled evidence,
+dirty diff mismatch, retry cap, or explicit user request. Do not send repeated
+"any update?" nudges merely because a background thread is quiet.
+
 ## What this is
 
 When the Scope Fit Gate passes, this is a workflow where Claude acts purely as an
 **orchestrator** (core #1, no-code orchestrator) and all coding is delegated to
-Codex CLI via `Agent(subagent_type="codex:codex-rescue")`. Each topic gets three
-independent codex sessions in sequence — implementer (TDD), adversarial
-reviewer, fixer — and topics run in parallel when file ownership is disjoint.
-Claude's job is to plan, delegate, **verify** (core #6, verify-not-trust),
-commit, and handle operations codex's
-sandbox cannot. Unlike codex-orchestrator-brief, which writes a handoff package
-for another model to run later, here Claude runs the loop live in this session.
+Codex CLI via `Agent(subagent_type="codex:codex-rescue")` when the work needs an
+isolated worktree or user-owned thread. For a parent issue with sub-issues, the
+durable split is one Codex thread per issue/topic implementation slice. Cold
+review and follow-up fixes still gate acceptance, but their transport is sized
+to the work: a subagent for a bounded pass, or a Codex thread only when the
+review/fix needs its own isolated worktree or history. The cold reviewer runs in
+a fresh context; the orchestrator's own read-only diff check is verification
+(core #6), not the cold-review gate (core #2). Topics run in parallel when file
+ownership is disjoint. Claude's job is to plan, delegate, **verify**
+(core #6, verify-not-trust), commit, and handle operations codex's sandbox
+cannot. Unlike codex-orchestrator-brief, which writes a handoff package for
+another model to run later, here Claude runs the loop live in this session.
 
 ## Why this shape
 
-Codex sessions give three things a single Claude context cannot: **independence
-between author and reviewer** (core #2, cold critic — the reviewer can't see the implementer's
-internal rationalizations, only the diff), **parallelism across topics**, and
-**isolation from Claude's working context**. Splitting authorship from critique
-catches design and edge-case issues an author tends to defend rather than
-acknowledge.
+Durable Codex threads give three things a single Claude context cannot:
+**isolated implementation history**, **parallelism across topics**, and
+**user-visible ownership for issue/topic slices**. Review independence is still
+mandatory (core #2, cold critic): the reviewer runs in a fresh context that never
+saw the author's conversation or report. A subagent satisfies this cheaply without
+a user-visible thread — independence is about information separation, not about
+another user-visible thread. The orchestrator itself is **not** a valid cold
+reviewer: it watched the implementer's report, so using it as the critic
+reintroduces the author's bias through the side door (core #2, core #6). Its
+read-only diff check is core #6 verification — a supplement to, never a substitute
+for, the cold-review PASS. Splitting authorship from critique catches design and
+edge-case issues an author tends to defend rather than acknowledge.
 
 ## Core principles (this skill's application of the shared invariants)
 
 1. **Claude edits no code** (core #1, no-code orchestrator). Worktree setup, git commits, push,
    `gh pr edit` are operations — those are fine. Anything that touches application
    source is delegated.
-2. **One topic = three codex sessions.** Implementer → reviewer → fixer, in
-   separate sessions, so the reviewer is genuinely cold (core #2, cold critic) and the fixer's
-   output is re-judged rather than self-approved.
+2. **One issue/topic = one durable implementation thread when isolation is
+   needed.** The implementer is a Codex thread for issue-level work. Reviewer and
+   fixer transport is chosen by size/risk: a subagent for small bounded passes;
+   a Codex thread only when the review or fix is large, stateful, or needs its own
+   dirty worktree/history. The cold reviewer runs in a fresh context and must not
+   receive the author's report or hidden reasoning — which rules out the
+   orchestrator itself as the reviewer — and every fix is re-judged before PASS
+   (core #2, cold critic; core #4, PASS gate).
 3. **TDD is enforced in the implementer prompt.** RED test first, confirm FAIL,
    then implement to GREEN, then refactor. The RED→GREEN command is this skill's
    executable acceptance contract (core #3, executable contract).
 4. **Topics are designed to be file-disjoint** (core #9, disjoint parallelism). Disjoint topics run in
-   parallel safely in the same worktree. If the user-provided topics overlap on
-   files, two moves are available, in this order of preference:
+   parallel safely as separate durable worktrees/threads. If the user-provided
+   topics overlap on files, two moves are available, in this order of preference:
    - (a) **Re-scope**: redesign the topic boundaries so each owns a different
      surface (e.g., extract a new module that two of the topics will then
      consume). **Re-scoping materially changes deliverables — surface the new
      boundaries to the user as a proposal before launching; fall back to (b) if
      the user rejects.**
    - (b) **Serialize**: if re-scoping isn't feasible, run the overlapping topics
-     one-at-a-time (still implementer → reviewer → fixer per topic), with an
-     explicit ordering rationale. Inter-topic parallelism is dropped; intra-topic
-     phasing stays.
-5. **The orchestrator verifies, doesn't trust** (core #6, verify-not-trust). After every codex
-   completion, look at `git diff --stat` against the worktree before believing the
-   codex's status line.
+     one-at-a-time (still author → cold review → fix as needed → cold PASS per
+     topic), with an explicit ordering rationale. Inter-topic parallelism is
+     dropped; intra-topic phasing stays.
+5. **The orchestrator verifies, doesn't trust** (core #6, verify-not-trust). After every
+   delegated completion, look at `git diff --stat` against the worktree before
+   believing an agent's status line.
 6. **Commits are serialized through the orchestrator** to avoid git index races
    between concurrent codex sessions.
 
 ## The 3-phase workflow
 
 - **Acceptance planning** — before Phase 0, define the acceptance objective,
-  executable checklist, topic roadmap, and per-agent contracts above.
-- **Phase 0** — Base preparation: orchestrator creates worktree at
-  `<repo>/.worktrees/<name>` via
+  executable checklist, topic roadmap, transport choices, and per-agent
+  contracts above.
+- **Phase 0** — Base preparation: orchestrator creates a worktree at
+  `<repo>/.worktrees/<topic>` for each durable implementation thread via
   [scripts/worktree-setup.sh](scripts/worktree-setup.sh) (inside the project so
-  codex's sandbox accepts writes, per core #11, sandbox edges); then 1 codex
-  session merges upstream base + confirms green
-- **Phase 1** — Parallel topics: for each topic, run implementer → reviewer →
-  fixer codex sessions; topics parallel between each other
-- **Phase 2** — Integration gate + commits (sequential, orchestrator only): full
-  test/lint/typecheck + CI-equivalent checks + per-topic commit + push + CI verify
+  codex's sandbox accepts writes, per core #11, sandbox edges); then each
+  implementation worktree confirms the upstream base is green before coding
+- **Phase 1** — Parallel topics: for each topic, run the durable Codex
+  implementer, then cold review and fix passes using the smallest adequate
+  transport; topics parallel between each other when files are disjoint
+- **Phase 2** — Integration gate + commits (sequential, orchestrator only):
+  absorb each topic onto one integration branch, re-run full
+  test/lint/typecheck + CI-equivalent checks after each (core #9) + per-topic
+  commit + push + CI verify
 
 Detailed steps, verification gates, and timing live in
 [references/workflow.md](references/workflow.md).
@@ -141,7 +184,8 @@ Detailed steps, verification gates, and timing live in
 
 Reusable skeletons for implementer / reviewer / fixer prompts live in
 [references/prompts.md](references/prompts.md). Use them as starting points and
-fill in the topic-specific scope.
+fill in the topic-specific scope. The skeletons are role contracts, not a
+mandate to create three Codex threads for every topic.
 
 **Mandatory template inserts** (from the core skill — do not restate, inject
 verbatim from `codex-orchestration-core` § "Standing dispatch preamble"):
@@ -195,9 +239,9 @@ The mitigations are cheap; the bugs are expensive.
 
 ## Task tracking
 
-This orchestration is long-running (1–3 h wallclock per topic, 8+ codex sessions
-for a 2-topic run is normal). Use **both** of the following — they serve different
-purposes:
+This orchestration can be long-running (1–3 h wallclock per topic is normal when
+implementation is substantial). Use **both** of the following — they serve
+different purposes:
 
 ### `/goal` — durable session anchor (set this FIRST)
 
@@ -247,8 +291,8 @@ Use TaskCreate at the start of orchestration to make the *structure* visible:
 - `addBlockedBy` to encode the dependency graph (T1..N blocked by Phase 0; Phase 2
   blocked by all topics)
 - Mark `in_progress` when a topic's first codex launches, `completed` only after
-  the orchestrator has **verified** the fixer's output (core #6, verify-not-trust
-  — not when the codex reports done)
+  the orchestrator has **verified** cold-review PASS and any required fixes (core
+  #6, verify-not-trust — not when the codex reports done)
 
 `/goal` answers "what is this session doing?"; TaskCreate answers "where in the
 plan are we right now?". The user sees both without having to ask.
