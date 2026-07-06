@@ -108,7 +108,17 @@ What is unique to *this* skill, beyond faithfully transcribing those invariants:
   the 🛑 items stay untouched. The prompt and the spec are two halves of one
   contract; they cannot disagree.
 - Pin the repo's real sandbox/env edges (core #11) into the prompt's templates so
-  the running model hits them with the mitigation already in hand.
+  the running model hits them with the mitigation already in hand. Transcribe the
+  core skill's "Standing dispatch preamble" (ENVIRONMENT FACTS + GUARDRAILS +
+  FINAL REPORT schema), the author upfront prohibitions, and the critic hardening
+  additions **into the package's session templates verbatim**, filled with this
+  repo's concrete values (blocked runners, ENV pins, known-flaky list). Encode the
+  dispatch mechanics as explicit orchestrator instructions: launch each session
+  with cwd at the target worktree, mandatory cwd-verify-and-STOP + write-probe
+  first commands, read-only vs `--write` as a required dispatch field, sessions
+  never commit (the orchestrator does), `git diff --stat` after every session,
+  and derive MAY-touch file lists programmatically (`git status --porcelain` +
+  prefix filter), not by hand-enumeration.
 
 When the implementation model is **Codex specifically**, pull the codex-targeted
 phrasing from the **`codex-prompting`** skill (the core skill's "Related" section

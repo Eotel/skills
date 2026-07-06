@@ -143,6 +143,17 @@ Reusable skeletons for implementer / reviewer / fixer prompts live in
 [references/prompts.md](references/prompts.md). Use them as starting points and
 fill in the topic-specific scope.
 
+**Mandatory template inserts** (from the core skill — do not restate, inject
+verbatim from `codex-orchestration-core` § "Standing dispatch preamble"):
+every implementer/fixer prompt gets the ENVIRONMENT FACTS + GUARDRAILS +
+FINAL REPORT blocks and the "Author upfront prohibitions"; every reviewer prompt
+gets the "Critic hardening" additions. Every session's first command is the
+cwd-verify-and-STOP + write-probe (core #11); no session commits (core #11 —
+the orchestrator commits in Phase 2). After every session, run
+`git -C <worktree> diff --stat` before believing its report (core #6).
+Round-1 fix prompts demand the defect *class*; a class recurring 3× escalates
+out of the loop (core #7).
+
 For the codex-specific phrasing that makes those skeletons land, and for
 transport alternatives (agmsg peers instead of `Agent` calls), see the core
 skill's "Related" section and the **`codex-prompting`** skill it points to:

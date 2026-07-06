@@ -90,6 +90,18 @@ Before handing over a Codex prompt, verify:
       (otherwise Codex won't use it).
 - [ ] **Preamble/verbosity expectation set** if the default tone is wrong for the
       context (terse automation vs. collaborative pairing).
+- [ ] **Sandbox facts and standing guardrails included** when the prompt targets
+      a sandboxed/delegated session: inject the "Standing dispatch preamble"
+      (ENVIRONMENT FACTS / GUARDRAILS / FINAL REPORT schema) and, for implementer
+      work, the author upfront prohibitions — both live canonically in
+      **codex-orchestration-core**. Without them, every session re-pays a 2–5-turn
+      environment-rediscovery tax and reviewers re-catch the same mechanical
+      defect classes.
+- [ ] **Verification method is specified, not just demanded.** "Verify your work"
+      lets Codex pick the cheapest green signal (measured: 69 false-completion
+      incidents). Name the exact commands, the artifact to paste (command output,
+      screenshot), and — for UI/bug work — real authenticated browser operation
+      of the target screen as the bar.
 
 ## Scope boundaries
 

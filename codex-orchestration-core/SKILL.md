@@ -84,9 +84,31 @@ both caller skills in the same change.
    look at the actual evidence (`git diff --stat`, the real command output, the
    produced file) before believing the agent's report. Agent reports cannot be
    fully trusted, and "forwarded to the companion" is not "done."
+   Three hard sub-rules (2026-07 retrospective, 107 delegated failures):
+   - **Empty diff + success report = hard failure.** Run `git -C <worktree> diff
+     --stat` immediately after every author/fixer session; a "done" with no diff
+     means the fix never landed (observed twice in a row on the same task) —
+     restart with the evidence re-pasted, do not proceed.
+   - **GREEN on static checks alone is rejected.** Require pasted command output;
+     for any behavioral change require a test proven to fail against pre-fix code
+     (load-bearing). Typecheck+lint GREEN has shipped HIGH-severity security and
+     data-integrity bugs.
+   - **Watchdog stalled sessions.** No tool activity for 5–10 min → kill and
+     redispatch (a wrong-cwd reviewer once stalled 19 hours). Every session's
+     mandatory FIRST command is `cd <worktree> && pwd && git log -1 --oneline`,
+     and it must STOP if the output is not the expected worktree/branch.
 
 7. **Bounded retries, then escalate.** Cap retries per unit (default 3). On
    exhaustion, escalate to a human-facing question — never an unbounded fix loop.
+   Two loop-collapse rules (the worst observed loop ran 25–30 review→fix rounds
+   over 1.5 days):
+   - **Round 1 demands the class, not the instance.** For any sanitization /
+     parity / traversal / coverage task, the author prompt says: *"Fix the general
+     defect class, not the literal example. State the general rule your fix
+     enforces; enumeration-of-examples fixes are prohibited."*
+   - **Same defect class recurring 3× across rounds = stop looping.** Escalate to
+     a structural redesign (allowlist / anchored fullmatch / different layer) or a
+     human design checkpoint. "One more finding" is not a strategy.
 
 8. **The memory log is orchestrator-owned and admits only verified facts.** Keep
    a log (e.g. `orchestration-log.md`) with a Distilled Rules section populated
@@ -120,6 +142,117 @@ both caller skills in the same change.
     pass while CI lint fails (`ruff format --check` etc.); and the sandbox does
     not inherit devenv/Nix activation, so pin env like
     `DYLD_LIBRARY_PATH=/opt/homebrew/lib` into every prompt that runs `pytest`.
+    Launch-layer rules distilled from ~45 environmental failures (42% of all
+    delegated failures — every one predictable and preventable):
+    - **Codex never commits.** A linked worktree's `.git/worktrees/<name>/`
+      metadata lives in the parent repo outside the sandbox's writable roots, so
+      `git add/commit/checkout` fails with `index.lock` EPERM *after* all the work
+      is done (10+ sessions per batch lost their final step; 1Password
+      `op-ssh-sign` hangs non-interactive commits too). Standing clause in every
+      author/fixer prompt: *"Do NOT run git add/commit/checkout — leave changes
+      uncommitted; the orchestrator commits outside the sandbox."* Drop any
+      separate-RED/GREEN-commit contract under this constraint.
+    - **Point the session cwd at the target worktree at launch.** Writable roots
+      are fixed by launch cwd, not by prompt text ("don't cd out" does not bind
+      the sandbox); `apply_patch` resolves paths from launch cwd, so a wrong cwd
+      silently lands edits in the wrong repo.
+    - **Write-probe before dispatch.** The session's first command after the
+      cwd-verify is `touch <worktree>/.codex-write-probe` — STOP on failure.
+      (All 5 parallel implementers of one wave once produced zero work because
+      the worktree was outside the writable roots.)
+    - **Read-only vs `--write` is an explicit, mandatory dispatch field** — a fix
+      task was re-sent into a read-only sandbox 3× before anyone added `--write`.
+    - **Pre-provision deps at worktree creation** (install or symlink a populated
+      sibling `node_modules`/`.venv`, run codegen); installs are network-blocked
+      in-session. If deps are absent, say so upfront: "do not attempt install;
+      verify statically and report the gap."
+
+## Standing dispatch preamble (single source of truth)
+
+Inject this block (adapted per repo) into **every** author/critic/fixer prompt.
+It eliminates the per-session rediscovery tax measured at 2–5 wasted turns per
+session across hundreds of sessions:
+
+```
+ENVIRONMENT FACTS (do not rediscover):
+- GitNexus is NOT available in this sandbox. Do not probe for it (npx gitnexus
+  hangs on blocked network). Use rg / git grep for blast-radius analysis.
+- ENV PIN: UV_CACHE_DIR, UV_TOOL_DIR, MYPY_CACHE_DIR, XDG_DATA_HOME,
+  TMPDIR=/private/tmp/<task>. Use `uv run --frozen -- <tool>`, never `uvx`.
+  `tach` needs `--offline`. <repo-specific dylib pins, e.g.
+  DYLD_LIBRARY_PATH=/opt/homebrew/lib for WeasyPrint>.
+- Blocked test runners here: <e.g. MongoMemoryServer (listen EPERM), vitest via
+  pnpm (hangs — call the binary directly)>. Accepted fallback verification:
+  <exact typecheck+lint commands>. Report blocked runs as environment
+  constraints, not code findings.
+- Known flaky baseline: <repo's known-flaky tests>. Re-run in isolation before
+  calling one a regression.
+- Emit reports/JSON as your final stdout block. Do NOT write them with
+  apply_patch (the path is outside the worktree and will be rejected).
+GUARDRAILS (non-negotiable):
+- No git add/commit/checkout/push. No --no-verify. No error-silencing
+  (.catch(()=>{}), --forceExit). No reintroducing mocks removed by prior topics.
+- Never cd outside the worktree. Never edit files outside your MAY-touch list;
+  ignore (do not fix, do not revert) other dirty files you encounter.
+- Run formatters/linters in CHECK-ONLY mode; if autofix is unavoidable, revert
+  any out-of-scope file it touched before finishing.
+FINAL REPORT: use this fixed schema, in this order, keep it short:
+status / files_changed / commands_run (with pasted tail of output) /
+blocked_by (or "none") / notes.
+```
+
+When a mid-run workaround is discovered (a new cache path, a new hang), update
+this preamble and **all fixed command blocks at once** — a workaround applied to
+only one command block was rediscovered from scratch by later sessions.
+
+### Author (implementer/fixer) upfront prohibitions
+
+Roughly half of all recurring critic catches are mechanical and belong in the
+author prompt as standing prohibitions (the critic then spends its budget on the
+reasoning-heavy half — races, idempotency, representation-bypass, runtime-type
+mismatches):
+
+```
+UPFRONT RULES (violations = automatic FAIL):
+- Touch one CRUD path → update its siblings (create AND update AND bulk) and
+  grep every producer/consumer of a changed contract.
+- New non-null / denormalized column → RunPython (or equivalent) backfill in the
+  same change.
+- Never use `x or y` where an explicit empty list / 0 / False / "" is a valid
+  value; never use truthiness to test "unset".
+- Validation must hold at the persistence layer, not only in clean()/form-layer
+  (objects.create / bulk_create must not bypass it).
+- A presence/config check is not a capability check — exercise the actual
+  runtime path (real import, real bind, real conversion).
+- Do not mock the unit under test. Assertions must be load-bearing
+  (toStrictEqual + toHaveBeenCalledTimes; a test passing for an incidental
+  reason — empty set, unconditional handler — is a defect). Prove new tests fail
+  on pre-fix code.
+- A feature you build must be wired in (imported/mounted/registered) — built-but-
+  unintegrated components are defects.
+- No secrets/tokens in logs or error strings. No URL validation via
+  startsWith/string ops. Fail closed on invalid upstream responses.
+- Every externally-influenced input gets a byte/line budget; no unbounded
+  pagination or user-supplied regex without anchoring.
+- Docs-only tasks touch zero runtime files. No blanket lint disables or
+  fmt-off regions to silence findings.
+```
+
+### Critic (reviewer/verifier) hardening
+
+Append to every critic prompt:
+
+- New files may legitimately be **untracked** in the worktree — untracked status
+  alone is not a finding.
+- Grep the **whole test suite** for tests asserting the old/removed behavior,
+  not just the diff (a stale pre-existing test slipped past both author and
+  critic).
+- Grep shared hooks/utils for residual mock fallbacks — not only changed files.
+- For fixer dispatches, frame as *"fix EXACTLY these N findings — no redesign,
+  no extra hardening"* with an explicit MAY-touch whitelist; loose "fix all P1s"
+  framing reopens design and caused scope creep.
+- Well-specified findings should include the **exact expected code** — one-shot
+  clean fixes measurably beat freeform prose descriptions.
 
 ## When these apply
 
