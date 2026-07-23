@@ -1,0 +1,99 @@
+name: LLMO Skill Security Audit
+
+on:
+  push:
+    branches:
+      - audit/llmo-skill-security-20260723
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.14"
+
+      - name: Install scanners at fixed commits
+        run: |
+          uv tool install 'git+https://github.com/NVIDIA/SkillSpector.git@8255b60823efbe0939c47721fa5b54c5a8d62873'
+          uv tool install 'git+https://github.com/cisco-ai-defense/skill-scanner.git@41fec4a9570ba1d195d12dbb0b4d140a35e63068'
+          skillspector --version || true
+          skill-scanner --version || true
+
+      - name: Fetch audit targets at fixed commits
+        run: |
+          mkdir -p audit-targets reports
+          git clone --filter=blob:none --no-checkout https://github.com/zubair-trabzada/geo-seo-claude.git audit-targets/geo-seo-claude
+          git -C audit-targets/geo-seo-claude checkout 9eec32f5f700a1e6c3cb1cb735a56ee5ec49a964
+
+          git clone --filter=blob:none --no-checkout https://github.com/199-biotechnologies/claude-skill-seo-geo-optimizer.git audit-targets/claude-skill-seo-geo-optimizer
+          git -C audit-targets/claude-skill-seo-geo-optimizer checkout d07fb889a25273d171b5633c4f11cac4ff09f8ff
+
+          git clone --filter=blob:none --no-checkout https://github.com/AgriciDaniel/claude-seo.git audit-targets/claude-seo
+          git -C audit-targets/claude-seo checkout 09d37c7b66ed3ca9c6efbdb765a805a6c76a8f01
+
+          find audit-targets -type d -name .git -prune -exec rm -rf {} +
+
+      - name: Run NVIDIA SkillSpector static scans
+        shell: bash
+        run: |
+          set +e
+          declare -A targets=(
+            [01-geo-seo-claude]="audit-targets/geo-seo-claude"
+            [02-seo-geo-optimizer]="audit-targets/claude-skill-seo-geo-optimizer"
+            [03-seo-geo]="audit-targets/claude-seo/skills/seo-geo"
+          )
+          for name in "${!targets[@]}"; do
+            target="${targets[$name]}"
+            skillspector scan "$target" --no-llm --format json --output "reports/${name}.skillspector.json" >"reports/${name}.skillspector.stdout.txt" 2>&1
+            echo $? >"reports/${name}.skillspector.exitcode.txt"
+            skillspector scan "$target" --no-llm --format markdown --output "reports/${name}.skillspector.md" >>"reports/${name}.skillspector.stdout.txt" 2>&1
+          done
+          exit 0
+
+      - name: Run Cisco Skill Scanner static and behavioral scans
+        shell: bash
+        run: |
+          set +e
+          declare -A targets=(
+            [01-geo-seo-claude]="audit-targets/geo-seo-claude"
+            [02-seo-geo-optimizer]="audit-targets/claude-skill-seo-geo-optimizer"
+            [03-seo-geo]="audit-targets/claude-seo/skills/seo-geo"
+          )
+          for name in "${!targets[@]}"; do
+            target="${targets[$name]}"
+            skill-scanner scan "$target" --lenient --use-behavioral --policy balanced --format json --output "reports/${name}.cisco.json" >"reports/${name}.cisco.stdout.txt" 2>&1
+            echo $? >"reports/${name}.cisco.exitcode.txt"
+            skill-scanner scan "$target" --lenient --use-behavioral --policy balanced --format markdown --detailed --output "reports/${name}.cisco.md" >>"reports/${name}.cisco.stdout.txt" 2>&1
+          done
+          exit 0
+
+      - name: Record provenance and file inventory
+        run: |
+          cat > reports/PROVENANCE.txt <<'EOF'
+          Audit date: 2026-07-23
+          NVIDIA/SkillSpector: 8255b60823efbe0939c47721fa5b54c5a8d62873
+          cisco-ai-defense/skill-scanner: 41fec4a9570ba1d195d12dbb0b4d140a35e63068
+          zubair-trabzada/geo-seo-claude: 9eec32f5f700a1e6c3cb1cb735a56ee5ec49a964
+          199-biotechnologies/claude-skill-seo-geo-optimizer: d07fb889a25273d171b5633c4f11cac4ff09f8ff
+          AgriciDaniel/claude-seo skill path: skills/seo-geo
+          AgriciDaniel/claude-seo: 09d37c7b66ed3ca9c6efbdb765a805a6c76a8f01
+          LLM/cloud analyzers: disabled
+          Cisco analyzers: core static + bytecode + pipeline + behavioral, balanced policy, lenient parser
+          SkillSpector analyzers: static path via --no-llm
+          EOF
+          find audit-targets -type f -printf '%p\t%s bytes\n' | sort > reports/FILE-INVENTORY.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llmo-skill-security-audit
+          path: reports/
+          if-no-files-found: error
+          retention-days: 7
