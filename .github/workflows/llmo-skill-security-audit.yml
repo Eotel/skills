@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - audit/llmo-skill-security-20260723
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -32,13 +35,10 @@ jobs:
           mkdir -p audit-targets reports
           git clone --filter=blob:none --no-checkout https://github.com/zubair-trabzada/geo-seo-claude.git audit-targets/geo-seo-claude
           git -C audit-targets/geo-seo-claude checkout 9eec32f5f700a1e6c3cb1cb735a56ee5ec49a964
-
           git clone --filter=blob:none --no-checkout https://github.com/199-biotechnologies/claude-skill-seo-geo-optimizer.git audit-targets/claude-skill-seo-geo-optimizer
           git -C audit-targets/claude-skill-seo-geo-optimizer checkout d07fb889a25273d171b5633c4f11cac4ff09f8ff
-
           git clone --filter=blob:none --no-checkout https://github.com/AgriciDaniel/claude-seo.git audit-targets/claude-seo
           git -C audit-targets/claude-seo checkout 09d37c7b66ed3ca9c6efbdb765a805a6c76a8f01
-
           find audit-targets -type d -name .git -prune -exec rm -rf {} +
 
       - name: Run NVIDIA SkillSpector static scans
