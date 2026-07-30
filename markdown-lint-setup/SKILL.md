@@ -267,9 +267,11 @@ when delegating, paste that guide's Instructions block into the subagent
 prompt. Otherwise skip.
 
 - Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
 - Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
 - Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
 - GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+- GPT-5.6 / Codex: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
 
 Each guide is written as directly injectable instructions plus caller-side
 knobs under "Caller notes". Guides must not override the exact config

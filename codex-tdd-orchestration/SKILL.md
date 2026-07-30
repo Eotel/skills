@@ -211,9 +211,11 @@ when the target execution model is known or the user names it; otherwise skip th
 section and use the common rules only.
 
 - Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
 - Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
 - Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
 - GPT-5.5: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+- GPT-5.6: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
 
 Model guides may tune verbosity, effort, tool eagerness, subagent behavior, and
 prompt shape. They must not override the Scope Fit Gate, acceptance objective,
