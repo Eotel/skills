@@ -358,9 +358,11 @@ instructions として適用する。サブエージェントに委譲する場�
 ガイドの Instructions ブロックをプロンプトに貼り付ける。不明ならスキップ。
 
 - Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
 - Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
 - Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
 - GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+- GPT-5.6 / Codex: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
 
 各ガイドは注入可能な命令文と、呼び出し側ノブ(Caller notes: effort など)で
 構成される。本ファイルのコマンド事実、install と update の区別、lockfile

@@ -1,42 +1,47 @@
 # Codex model lineup & per-model tuning
 
-> Snapshot: **2026-06**. Source: <https://developers.openai.com/codex/models>.
+> Snapshot: **2026-07**. Source: <https://developers.openai.com/codex/models>
+> (now redirects to <https://learn.chatgpt.com/docs/models>).
 > **This file goes stale fast — re-check the page (or ask the user) before pinning
-> a model id.** The Codex prompting *guide* lags the model lineup: as of this
-> snapshot the guide still references `gpt-5.1-codex-max` / `gpt-5.3-codex` while
-> the models page already lists the 5.4/5.5 generation. Trust the models page for
-> *which model exists*, and the guide for *how Codex behaves* (the harness priors
-> carry across versions).
+> a model id.** Trust the models page for *which model exists*, and the prompting
+> guide for *how Codex behaves* (the harness priors carry across versions). As of
+> this snapshot the prompt-guidance page covers the 5.6 generation directly.
 
-## Current lineup (2026-06)
+## Current lineup (2026-07)
 
 | Model id | Best for | Availability |
 |---|---|---|
-| `gpt-5.5` | Complex coding, computer use, knowledge work, research. **Default starting point for most tasks.** | CLI/SDK, app, IDE, Cloud, API |
-| `gpt-5.4` | Professional work — strong coding, reasoning, tool use, agentic workflows | All Codex platforms |
-| `gpt-5.4-mini` | Responsive coding tasks **and subagents** (cheap/fast workers) | All Codex platforms |
-| `gpt-5.3-codex-spark` | Near-instant, real-time coding iteration | Research preview (ChatGPT Pro) |
+| `gpt-5.6-sol` | Flagship — strongest capability for complex coding, computer use, research, and cybersecurity | App, web, CLI, IDE, Cloud, API |
+| `gpt-5.6-terra` | Balanced everyday work, competitive with GPT-5.5 at lower cost. **Default starting point for most tasks.** | App, web, CLI, IDE, Cloud, API |
+| `gpt-5.6-luna` | Fast and affordable; strong capability at the lowest cost — workers/subagents | App, web, CLI, IDE, Cloud, API |
+| `gpt-5.3-codex-spark` | Near-instant, real-time coding iteration (text-only) | Research preview (ChatGPT Pro) |
+
+**Previous generation** (still available, no longer the starting point):
+`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`.
 
 **Deprecated** (do not pin for new work): `gpt-5.2`, `gpt-5.3-codex`. Older still:
 `gpt-5.1-codex-max`, `gpt-5.1-codex`, `gpt-5.1-codex-mini`, `gpt-5-codex`.
 
 ## Reasoning effort
 
-- Levels: **`low` / `medium` / `high` / `xhigh`.**
-- **`medium` is the recommended all-around interactive default** — balances
-  intelligence and speed. Escalate to `high`/`xhigh` only for the hardest tasks.
-- Newer generations do *more with the same effort*: e.g. the guide notes
-  `gpt-5.1-codex-max` at `medium` beat the prior `gpt-5.1-codex` at `medium` while
-  using ~30% fewer thinking tokens. So when you move up a generation,
-  **re-evaluate downward** before assuming you still need `high`.
+- Codex levels: **`low` / `medium` (default) / `high` / `xhigh` / `max` /
+  `ultra`** — `max` is for the hardest quality-first workloads, `ultra` runs
+  subagent-based delegation. The API additionally exposes `none` for
+  latency-critical calls.
+- **`medium` is the recommended all-around interactive default.**
+- Newer generations do *more with the same effort*. When migrating a 5.5/5.4
+  prompt to 5.6, **keep its effort baseline, then test one level lower** before
+  assuming you still need `high`.
 
 ## Choosing model + effort (decision rules)
 
-- **Default:** `gpt-5.5` (or current top general model) at `medium`.
-- **Hard/ambiguous architecture or deep debugging:** top model at `high`/`xhigh`.
-- **Cheap parallel workers / subagents / high-volume mechanical edits:** a `-mini`
-  model (e.g. `gpt-5.4-mini`) — set per-agent via `model` in the agent TOML.
-- **Tight iteration loops / latency-critical:** a spark/near-instant model if
+- **Default:** `gpt-5.6-terra` at `medium`.
+- **Hard/ambiguous architecture, deep debugging, research, computer use:**
+  `gpt-5.6-sol` at `high`/`xhigh`; `max` only for quality-first work.
+- **Cheap parallel workers / subagents / high-volume mechanical edits:**
+  `gpt-5.6-luna` (or `gpt-5.4-mini`) — set per-agent via `model` in the agent
+  TOML. `ultra` effort (subagent delegation) is a design choice, not a default.
+- **Tight iteration loops / latency-critical:** `gpt-5.3-codex-spark` if
   available, accepting lower ceiling.
 - **Verbosity ≠ effort:** keep effort for difficulty, set `text.verbosity` for
   output length (see `gpt5-prompting.md`).
@@ -47,8 +52,8 @@ When a project standardizes on a model/effort, don't bury it in each task prompt
 
 - Put it in **AGENTS.md** (human + model both read it), and
 - For subagents, set `model` / `model_reasoning_effort` in the `.codex/agents/*.toml`
-  so each worker role gets the right tier (e.g. explorer on a mini model, final
-  reviewer on the top model at `high`).
+  so each worker role gets the right tier (e.g. explorer on `gpt-5.6-luna`, final
+  reviewer on `gpt-5.6-sol` at `high`).
 
 > To adjust this skill for a new model, edit **this file** (the lineup + decision
 > rules) — the templates reference "the model from `models.md`" rather than

@@ -16,7 +16,8 @@ Codex can use shared Claude skills through a symlink from
 
 The best prompt differs per execution model. Larger behavior-driving skills
 therefore keep model-neutral rules in `SKILL.md` and ship per-model files as
-`references/model-{opus-4.8,sonnet-5,fable-5,gpt-5.5}.md` — load at most one,
+`references/model-{opus-4.8,opus-5,sonnet-5,fable-5,gpt-5.5,gpt-5.6}.md` —
+load at most one,
 only when the execution model is known. Two forms exist, chosen by who reads
 the file:
 

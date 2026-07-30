@@ -45,7 +45,10 @@ Interpret `$ARGUMENTS`:
    - Codex: no such skill — refactor the diff yourself against the same criteria.
 4. **Open a PR** — dedicated worktree, explicit staging (no `git add -A`),
    conventional commit (lowercase subject). If it resolves an issue, put
-   `Closes #N` in the body. Assign to Eotel.
+   `Closes #N` in the body. Assign to Eotel. If the work was driven by an exec
+   plan and this PR ships its final step, include the plan's `git mv` to
+   `docs/exec-plans/completed/` (with `Outcomes & Retrospective` updated) in
+   this PR's diff — do not leave the finished plan in `active/`.
 5. **Watch CI** — after push, watch CI until green; if red, fix and re-push
    yourself.
    - Claude: Monitor tool (or the `ci-monitor` skill).

@@ -18,8 +18,10 @@ prompt. They do not override SKILL.md.
 - Stop after writing the plan file and wait for approval. Do not implement
   past an unapproved plan on reasonable assumptions; the approval ritual
   overrides bias-to-action defaults.
-- Done means the completion contract holds: the Verification commands pass and
-  Progress and Outcomes are updated. Do not add work beyond it.
+- Done means the completion contract holds: the Verification commands pass,
+  Progress and Outcomes are updated, and the finished plan is moved to
+  `completed/` inside the PR that ships the final step. Do not add work
+  beyond it.
 - Choose your own path within a step, but keep the step order and the plan
   template's section order; append volatile detail (Progress, Surprises)
   rather than restructuring.

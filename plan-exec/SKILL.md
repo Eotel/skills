@@ -121,9 +121,13 @@ When this plan dispatches subagents (e.g., a Codex worker spawned via tool, or a
 
 ## Promotion checklist (at completion)
 
-Moving a finished plan to `completed/` (and committing that move) is part of
-finishing the work, not optional bookkeeping — leaving shipped plans in
-`active/` was corrected 4+ times in a single work batch. And when a gap survey
+Moving a finished plan to `completed/` is part of the shipping diff, not
+follow-up bookkeeping: when the last step lands, `git mv` the plan to
+`completed/` and update `Outcomes & Retrospective` **on the same branch,
+inside the same PR** as that final change. Do not open the final PR with the
+plan still in `active/`, and do not defer the move to a "cleanup later"
+commit — deferred moves are exactly how shipped plans rot in `active/`
+(corrected 4+ times in a single work batch). And when a gap survey
 produces plans, capture **every** known gap as a plan while the knowledge is
 fresh (「絞るのではなく 全てのgapをわかっているうちに plan にしておくべきだ」) —
 do not select a subset and let the rest evaporate.
@@ -149,9 +153,11 @@ guide for the subagent's model and paste its Instructions block into the
 prompt. If the model is unknown, skip this section.
 
 - Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
+- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
 - Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
 - Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
 - GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
+- GPT-5.6 / Codex: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
 
 Each guide is written as directly injectable instructions plus caller-side
 knobs under "Caller notes" (effort, sampling, token limits). Guides must not
@@ -164,5 +170,5 @@ location, the filename convention, or the "when NOT to use" gate.
 - Treating the plan as immutable. Plans drift; that's fine, just keep them honest.
 - Wrapping a typo fix in a plan. Friction without value.
 - Folding a parallel feature into an unrelated plan to avoid creating a second file. Two unrelated plans = two files.
-- Leaving a plan in `active/` after the work shipped. Move it to `completed/` and update `Outcomes & Retrospective`.
+- Leaving a plan in `active/` after the work shipped. The final PR's diff must contain the move to `completed/` and the `Outcomes & Retrospective` update; if a shipped plan is found in `active/`, move it now.
 - Naming a plan `plan.md` or `refactor.md`. Use the dated kebab slug.
