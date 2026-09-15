@@ -1,35 +1,25 @@
-<!--
-agents-stanza.md — a block for AGENTS.md (repo root or a subdirectory). Codex
-auto-discovers and injects AGENTS.md per directory and adheres closely to it, so
-put DURABLE, repo-wide rules here instead of repeating them in every task prompt.
-Deeper-directory AGENTS.md files override shallower ones. Keep it tight — this is
-injected into every Codex turn in this tree.
--->
+<!-- Keep this file short: it is loaded for every task under its directory. -->
 
-# AGENTS.md — [project name]
+# Project rules
 
-## What this project is
-[1–3 sentences: stack, entry points, what it does.]
+## Context pointers
 
-## Conventions (conform to these)
-- [Naming / formatting / module layout rules Codex must follow]
-- [Preferred helpers/abstractions to reuse instead of reinventing]
-- [Error handling: e.g. "no broad try/catch or silent defaults"]
+- Read `[architecture doc]` when changing service or package boundaries.
+- Read `[schema doc]` when changing stored data or migrations.
+- Read `[deployment doc]` when preparing or validating a deployment.
 
-## Forbidden / be careful
-- [Files, dirs, or patterns NOT to touch or generate]
-- [Security/compliance constraints invisible in the code]
+## Invariants
 
-## Verification (required gates)
-- Build/typecheck: `[command]`
-- Lint/format: `[command]`
-- Tests: `[command]`  ← run targeted tests for changed behavior; all green before done
+- [Protected contracts, files, or security rules that apply throughout this tree.]
+- [Repository convention the code alone does not reveal.]
 
-## Model & effort (if standardized)
-- Default model: `[id from references/models.md]` at `medium` effort; escalate to
-  `high`/`xhigh` only for [hard cases].
+## Verification
 
-## Subagents (if used)
-- Predefined agents in `.codex/agents/`: `[name]` = [role], …
-- For multi-part tasks: spawn one subagent per [unit], wait for all, consolidate.
-  (Codex won't fan out unless a task prompt asks it to.)
+- Use `[canonical command or task runner]` for repository checks.
+- Run checks capable of detecting failure in the changed behavior. Broaden after
+  failures, shared-boundary changes, or release preparation.
+
+## Authority
+
+- Carry authorized, reversible local work through to completion.
+- Ask before [repository-specific destructive or external actions].

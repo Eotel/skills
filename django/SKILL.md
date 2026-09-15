@@ -1,6 +1,6 @@
 ---
 name: django
-description: Use when working in Django projects on ORM/query placement, custom QuerySet or Manager design, extracting repeated filters/select_related/prefetch_related/orderings from views, GraphQL resolvers, API actions, services, tasks, or query modules, OR extracting hidden business decisions (implicit if-branches over status/ordinal/role, view.action-keyed permission dispatch, deputy/proxy resolution) out of DRF viewsets/serializers/permissions into named predicates and policies on the owning model. Preserves observable behavior with focused tests and verifies with project-local lint/type/boundary checks. Trigger for Django best practices, django-stubs/mypy ORM typing, queryset-scope refactors, model-owned table scopes, read-model query boundaries, DRF adapter thinning, named authorization predicates, and avoiding misplaced business/query logic. Uses ast-grep for structural search when locating repeated query patterns or decision branches across views, serializers, and permissions.
+description: Refactor Django ORM/query boundaries and DRF-owned business logic. Use for QuerySet or Manager extraction, adapter thinning, and Django-specific policy placement.
 ---
 
 # Django
@@ -16,9 +16,9 @@ from the target repository authoritative.
 
 ## Operating Rules
 
-1. Orient on the project first.
-   - Read `AGENTS.md`, architecture docs, Django settings/test layout, model
-     placement rules, and nearby tests.
+1. Orient on the affected Django surface.
+   - Read applicable `AGENTS.md`, nearby tests, and the settings or architecture
+     docs that govern the change; do not load unrelated project documentation.
    - Prefer established local model/query/service patterns over generic advice.
 2. Classify the change before editing.
    - Is it table-owned ORM scope, cross-model read-model composition,
@@ -45,7 +45,6 @@ from the target repository authoritative.
   decisions (status/ordinal/role/freezed branches, `view.action`-keyed
   permission dispatch, deputy/proxy resolution, lifecycle transitions) out
   of DRF viewsets, serializers, or permission classes into named predicates,
-  rosters, and transition methods on the owning model. Pairs with the generic
-  **business-logic-extraction** skill for cross-stack methodology — this
-  reference only adds the Django/DRF placement rules.
-
+  rosters, and transition methods on the owning model. Use the generic
+  **business-logic-extraction** skill instead when Django-specific placement is
+  not the deciding concern.

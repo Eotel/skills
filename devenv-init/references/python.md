@@ -90,7 +90,7 @@ Enable when you want maximum static safety. Note that with `basedpyright` even `
 
 ## Common workflow rules
 
-Per `~/.claude/rules/python.md`: **never edit `pyproject.toml` `dependencies` directly**. Use:
+Do not edit `pyproject.toml` dependencies directly. Use:
 
 ```bash
 uv add <package>            # add a runtime dep

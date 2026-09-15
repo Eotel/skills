@@ -1,158 +1,83 @@
 ---
 name: codex-orchestrator-brief
-description: Analyze a repository and produce a complete handoff package for an implementation model (Codex, Opus, etc.) that will run autonomously — an evidence-based refactor-instructions.md spec, a short list of pre-implementation questions, and a /goal-based orchestrator prompt with implementer/verifier subsessions, waves, a checkable rubric, PR merge policy, and a cross-wave memory log. Use whenever the user wants to hand work off to codex or another model via written instructions — phrases like "codex に渡す指示書", "リファクタ指示書を作って", "orchestrator 用のプロンプト", "/goal で完遂させたい", "実装担当モデルへの handoff", "wave で実行させたい", or asks to design implementer/verifier loops. Do NOT use when the user wants Claude to drive codex sessions directly itself (that is codex-tdd-orchestration), wants the refactoring done in this session, or wants an existing prompt/system-prompt improved or optimized (that is prompt-optimizer — this skill only authors new handoff specs from repo analysis).
+description: Create a repository-backed handoff package for autonomous multi-wave implementation. Use when the deliverable is a refactor spec plus an implementer/verifier orchestration prompt.
 ---
 
 # Codex Orchestrator Brief
 
-> **Load the shared core first.** Invoke `codex-orchestration-core` via the Skill
-> tool and read its orchestration-loop invariants (numbered 1–11) before applying
-> this skill. They are the single source of truth for the loop's philosophy; this
-> skill adds only what is unique to *authoring a written handoff package*. Where a
-> step below cites "core #N", that invariant lives in the core skill, not here.
+Load `codex-orchestration-core` first. Produce a handoff package that another
+agent can execute without relying on this conversation:
 
-This skill produces the package that lets an implementation model complete a
-repo-wide refactor (or similar multi-wave task) **without the author in the loop**.
-You write; another model runs. The package has three deliverables:
+1. `refactor-instructions.md`: evidence-backed scope, constraints, phases, and
+   verification.
+2. When needed, pre-implementation questions in chat for decisions the
+   repository cannot resolve.
+3. `codex-goal-prompt.md`: the orchestration objective, worker/critic roles,
+   executable acceptance contract, retry limits, and integration boundary.
 
-1. `refactor-instructions.md` — the spec: what the project is, what must not break,
-   where the debt is, in what order to fix it.
-2. **Pre-implementation questions** — only the decisions that genuinely cannot be
-   made from the code. Delivered in chat, not in the files.
-3. `codex-goal-prompt.md` — the orchestrator prompt: a `/goal`-driven loop with
-   implementer/verifier subsessions, waves, a checkable rubric, and merge gates.
+This skill creates the package; `codex-prompting` creates or revises an individual
+prompt, while `codex-tdd-orchestration` runs a live multi-agent implementation.
 
-Both files go to the repository root unless the user says otherwise. Write the
-deliverables in the repository's primary documentation language (check AGENTS.md /
-README); keep code identifiers, commands, and file paths verbatim.
+## Gather evidence
 
-The quality bar to keep in mind throughout: the implementation model will trust
-this package completely and cannot ask you anything. Every claim it acts on must
-be true, every command must run, and everything dangerous must be fenced off
-explicitly (core #10).
+Start with applicable repository instructions and the current diff. Inspect only
+the architecture, entry points, tests, CI, generated surfaces, and deployment
+details that can affect this handoff. Do not force backend/frontend/infra lenses
+that the repository does not have.
 
-## Phase A — Evidence gathering
+Verify every load-bearing claim directly before putting it in the package:
 
-Never write the spec from priors. The spec's authority comes entirely from
-evidence, and one wrong file path or stale claim poisons the implementer's trust
-in all of it.
+- file paths and ownership boundaries;
+- behavior or contract that must remain stable;
+- debt evidence and blast radius;
+- commands used as acceptance gates;
+- generated, security-sensitive, migration, or external-state surfaces.
 
-1. Read the repo's own ground rules first: AGENTS.md / CLAUDE.md / README,
-   project rule files (`.claude/rules/`), contribution docs, and any tech-debt
-   tracker or ADR index. These define vocabulary, prohibitions, and search
-   exclusions you must honor in everything you generate.
-2. Fan out parallel Explore agents (read-only), one per lens. The standard four:
-   - **Backend/core**: structure, entry points, layering rules and violations,
-     file-size hotspots, debt signals (TODO/FIXME, swallowed errors, compat shims,
-     duplication), test coverage map, security-sensitive boundaries, async/jobs.
-   - **Frontend/clients**: structure and conventions, hotspots, dead-code tooling
-     state, test gaps per feature, contract/codegen drift risks.
-   - **Runtime/infra**: where things actually run vs. where docs say they run,
-     containers/compose, queues and long-running work, settings/secrets handling,
-     operational scripts.
-   - **Verification/docs governance**: the exact canonical commands (lint,
-     typecheck, test, boundary checks, docs lint, codegen), which are required
-     gates vs. advisory, CI workflows, generated-docs sync, stale plans/docs.
-   Adjust lenses to the repo (a CLI tool has no frontend; a monorepo may need one
-   agent per package). Tell every agent which paths to exclude.
-3. **Verify load-bearing claims yourself** before they enter the spec (core #6).
-   Subagents summarize; summaries drift. Anything that becomes a debt item, a
-   prohibition, or a rubric line gets a direct check: re-run the `wc -l`, read the
-   actual function, confirm the doc reference really is stale, confirm the file
-   really is gitignored. A claim you can't verify gets reported as a question, not
-   asserted as fact.
+An unresolved claim becomes a question or an investigation task, not an asserted
+fact.
 
-## Phase B — Write `refactor-instructions.md`
+## Write the spec
 
-Use `references/refactor-instructions-template.md` for the section-by-section
-skeleton and guidance. The non-negotiable properties:
+Read [references/refactor-instructions-template.md](references/refactor-instructions-template.md)
+for the detailed shape. Adapt it to the task rather than filling every optional
+section mechanically.
 
-- **Every debt item carries evidence** — file paths with line numbers, command
-  output, or a quoted doc sentence. An item without evidence doesn't ship.
-- **Every debt item carries a verdict**: ✅ implement now / 🔍 investigate,
-  smallest fix only / 🛑 propose only, implementation forbidden. The 🛑 set is
-  exactly core #10's untouchable surfaces; when in doubt, downgrade toward 🛑.
-- **Deletion requires proof of deadness**. If you can't prove a file/function/doc
-  is unused, it becomes a question, not a deletion task.
-- **Phases run smallest-blast-radius first** (core #9), encoded as the spec's
-  phase order: a later phase must never be a prerequisite for an earlier one.
-- Baseline commands must be the repo's canonical ones (its task runner, not raw
-  tool invocations), and you must have confirmed each one exists.
+Each implementation item needs evidence, a clear outcome, affected paths,
+constraints, and a check capable of detecting failure. Mark items that require a
+product or security decision as proposal-only. Prove deletion candidates are
+unused before authorizing removal.
 
-## Phase C — Pre-implementation questions
+Order phases by dependency and blast radius. A later phase must not be a hidden
+prerequisite for an earlier one.
 
-Collect only questions where the code cannot decide: spec/test contradictions,
-ambiguous prohibitions (does "don't do X in process" mean delegation suffices?),
-deletion candidates without proof, choices between designs that need product
-judgment. For each: state the question, the evidence both ways, which debt items
-it blocks, and the safe default the spec already encodes while unanswered. If
-everything was decidable from code, say so explicitly — an empty questions
-section is a finding, not an omission.
+## Ask only material questions
 
-## Phase D — Write the orchestrator prompt
+Ask when the code and existing documentation cannot determine a choice that
+changes scope, public behavior, security, stored data, or external state. For each
+question, give the competing evidence, blocked items, and the safe default. Do
+not turn ordinary implementation choices into approval gates.
 
-Use `references/orchestrator-prompt-template.md` for the skeleton. The prompt's
-job is to encode the core invariants into a self-contained loop another model can
-run: a pure-orchestrator main session (core #1) whose first action is `/goal`
-(core #5), with a strict author/critic split where the critic is cold (core #2),
-an executable rubric (core #3) gated only by critic PASS (core #4), waves mapped
-to the spec's phases (core #9), bounded retries (core #7), an orchestrator-owned
-memory log (core #8), and hard-stop tripwires for untouchable surfaces (core #10).
+## Write the orchestration prompt
 
-What is unique to *this* skill, beyond faithfully transcribing those invariants:
+Read [references/orchestrator-prompt-template.md](references/orchestrator-prompt-template.md).
+Name the target harness's actual delegation and messaging mechanisms only after
+confirming they exist.
 
-- The prompt is **written for another model to run**, so every primitive it names
-  (subsession spawning, message routing, PR operations) must be phrased as
-  instructions that model can follow with zero further context from you.
-- The rubric must test **exactly what the spec's phases produce** — including that
-  the 🛑 items stay untouched. The prompt and the spec are two halves of one
-  contract; they cannot disagree.
-- Pin the repo's real sandbox/env edges (core #11) into the prompt's templates so
-  the running model hits them with the mitigation already in hand. Transcribe the
-  core skill's "Standing dispatch preamble" (ENVIRONMENT FACTS + GUARDRAILS +
-  FINAL REPORT schema), the author upfront prohibitions, and the critic hardening
-  additions **into the package's session templates verbatim**, filled with this
-  repo's concrete values (blocked runners, ENV pins, known-flaky list). Encode the
-  dispatch mechanics as explicit orchestrator instructions: launch each session
-  with cwd at the target worktree, mandatory cwd-verify-and-STOP + write-probe
-  first commands, read-only vs `--write` as a required dispatch field, sessions
-  never commit (the orchestrator does), `git diff --stat` after every session,
-  and derive MAY-touch file lists programmatically (`git status --porcelain` +
-  prefix filter), not by hand-enumeration.
+The prompt must preserve:
 
-When the implementation model is **Codex specifically**, pull the codex-targeted
-phrasing from the **`codex-prompting`** skill (the core skill's "Related" section
-defines the division of labor). One point is load-bearing here: the orchestrator
-prompt names subsession spawning as a primitive, and Codex will not spawn a
-subsession unless the prompt teaches it explicitly.
+- a main orchestrator that does not implement worker-owned code;
+- explicit worker ownership and a cold independent critic;
+- an executable acceptance contract and bounded retries;
+- verification of actual diffs and command output;
+- serialized integration and protected-path checks;
+- a durable, verifiable completion condition.
 
-## Model-specific prompt guides
+Include environment facts that materially affect execution. Do not paste a
+catalog of historical failures or generic coding advice into every worker prompt.
 
-Keep the common authoring rules in this file. When the **implementation model
-that will run the package** is known (the user names it, or the environment
-pins it), load **at most one** matching guide and let it tune how you phrase
-the spec and the orchestrator prompt for that runner; otherwise skip this
-section and write model-neutral prose.
+## Completion
 
-- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
-- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
-- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
-- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
-- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
-- GPT-5.6 / Codex: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
-
-Model guides may tune verbosity, effort hints, autonomy framing, subagent
-teaching, and prompt shape. They must not override the core invariants
-(author/critic separation, executable rubric, critic-PASS-only gate), the
-evidence requirements of Phase A/B, or the 🛑 propose-only fences.
-
-## Final checks before handing over
-
-- Re-read both files as if you were the implementer with zero context: is any
-  instruction ambiguous, any referenced file nonexistent, any command unverified?
-- Confirm the two files don't contradict each other (the prompt's rubric must test
-  exactly what the spec's phases produce, including the 🛑 items staying
-  untouched).
-- Deliver in chat: the questions (Phase C), a short summary of what the analysis
-  found, and the one-line invocation the user will give the implementation model
-  (e.g. `/goal refactor-instructions.md に書かれたことを完遂しろ`).
+Re-read the spec and prompt together as a blank-slate executor. Every referenced
+file and command must exist, the acceptance contract must match the planned
+outputs, and proposal-only surfaces must remain fenced. Deliver the two files,
+the material questions, and one concise invocation for the target runner.

@@ -1,6 +1,6 @@
 ---
 name: repo-local-git-hooks
-description: Detect and repair cases where repository-local Git hooks are bypassed by a global core.hooksPath, especially on macOS machines managed by nix-darwin/home-manager that inject global gitleaks/git-hooks paths. Use when CI catches lint/format/test issues that pre-commit or pre-push should have caught, when .git/hooks exists but Git ignores it, when installing pre-commit refuses because core.hooksPath is set, or when a repo needs local pre-commit/pre-push hooks to override global hooks.
+description: Diagnose and repair repository Git hooks bypassed by a global core.hooksPath.
 ---
 
 # Repo Local Git Hooks

@@ -1,15 +1,13 @@
 ---
 name: real-browser-verify
-description: 'Verify a UI change or bug fix by driving the real running app through a real (authenticated) browser — dev-server lifecycle, target-screen navigation, functional operation, and evidence capture with guaranteed cleanup. Use before declaring any UI change, frontend bug fix, or deploy "done"; Playwright/E2E specs, curl, page-loads, or console-error counts are NOT acceptable substitutes for this check. Trigger phrases: 画面で確認, 実ブラウザで検証, 動作確認して, browser use で確認.'
+description: Verify changed UI behavior in a real authenticated browser and capture evidence. Use for frontend changes, UI bug fixes, or deployment claims.
 ---
 
 # Real-Browser Verify
 
-The bar for "verified" on UI-affecting work: **reach the actual target screen in
-a real browser, authenticated, and exercise the functional path the change
-affects.** A passing test suite, a loaded page, or a clean console is evidence of
-something else. (Measured across ~2,000 sessions: false completion was the #1
-correction, and "real browser operation" was the #1 re-typed instruction.)
+The bar for "verified" on changed UI behavior is to reach the actual target
+screen in a real browser, authenticate as the affected role, and exercise the
+functional path. A passing suite or loaded page proves a different claim.
 
 ## Procedure
 
@@ -52,11 +50,8 @@ correction, and "real browser operation" was the #1 re-typed instruction.)
    - Kill only what you started. Leave pre-existing servers running.
    - Close billed sessions/resources (avatar/realtime connections) explicitly.
 
-## Tool mapping
+## Tool boundary
 
-- Claude Code: `claude-in-chrome` MCP tools (or the project's `run` skill).
-- Codex CLI: the embedded browser / `$browser:control-in-app-browser` /
-  `$chrome:control-chrome` facilities.
-- CI contexts with no browser: say so explicitly and report the verification as
-  BLOCKED with the next-best check performed — do not silently substitute a
-  weaker check and call it verified.
+Use the real-browser capability available in the current harness. In a context
+without browser access, report this verification as blocked and state the weaker
+check separately.

@@ -1,17 +1,20 @@
 # Agent Notes
 
-## Repository Map
+## Context Pointers
 
-- Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the repository map.
-- Use [docs/index.md](docs/index.md) as the docs system of record.
-- Put large implementation plans under `docs/exec-plans/active/`.
+- Read [ARCHITECTURE.md](ARCHITECTURE.md) when changing subsystem boundaries.
+- Use [docs/index.md](docs/index.md) to find task-relevant documentation.
+- Put multi-step implementation plans under `docs/exec-plans/active/`.
 
 ## Verification
 
-- Always run relevant tests or verification steps before reporting completion.
+- Run the narrowest check that could detect a regression in the changed behavior.
+- Broaden verification for shared boundaries, refactors, release work, or failures.
 - If a check cannot run, state what was attempted and the next best check.
 
 ## Project Rules
 
 - Keep this file short. Link to detailed rules instead of duplicating them.
 - Add project-specific commands and architecture pointers here.
+- Carry out reversible, in-scope work without asking for repeated approval.
+- Ask before destructive, externally visible, or materially scope-changing work.

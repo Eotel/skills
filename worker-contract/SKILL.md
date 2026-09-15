@@ -1,14 +1,11 @@
 ---
 name: worker-contract
-description: Standard prompt contract for parallel worker agents sharing a codebase — role, file-ownership allowlist, do-not-revert-others rule, and structured findings format. Use when spawning 2+ concurrent implementation agents (Codex sessions, Claude subagents) that touch the same repository, or when the user asks for 並列worker / worker を分けて / サブエージェント最大展開.
+description: Define ownership, safety, and reporting rules for concurrent agents editing one repository. Use with two or more implementation workers.
 ---
 
 # Worker Contract
 
-The standard contract for any concurrently-running worker that edits a shared
-codebase. Retyped near-verbatim dozens of times before codification; its absence
-produced the worst incidents on record (concurrent agents deleting each other's
-files — three severity-3 corrections in one session).
+Use this contract for concurrent writers in a shared repository.
 
 ## The contract (inject into every worker prompt)
 
@@ -16,8 +13,7 @@ files — three severity-3 corrections in one session).
 You are <Worker NAME> working on <one-line role>.
 
 OWNERSHIP — you may create/edit ONLY these files:
-- <explicit path list — derive programmatically: git status --porcelain + prefix
-  filter, or the topic's planned file set. Hand-enumeration misses entries.>
+- <explicit path list derived from the planned slice and current repository state>
 
 YOU ARE NOT ALONE IN THE CODEBASE:
 - Other agents are editing other files concurrently. Files you did not author
@@ -51,6 +47,5 @@ notes: <1-3 lines>
   GREEN is a hard failure, redispatch.
 - Serialize commits/merges through the orchestrator.
 - Default one delegated session per discovered bug; share a session only when
-  the bugs' file scopes are adjacent (user-memorized nuance).
-- Prepend the standing dispatch preamble from `codex-orchestration-core` for
-  Codex sandbox sessions.
+  the file ownership and fix are adjacent.
+- Add only environment facts and guardrails relevant to the current worker.

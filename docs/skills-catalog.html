@@ -76,11 +76,11 @@
     <h1>Skills Catalog</h1>
     <p class="sub">Eotel が APM(Agent Package Manager)で管理する Claude Code / Codex スキル一覧（自作 + サードパーティ）</p>
     <div class="meta-line">
-      <span class="pill"><b>34</b> skills</span>
+      <span class="pill"><b>42</b> skills</span>
       <span class="pill"><b>6</b> sources</span>
       <span class="pill">manifest: <b>chezmoi-dotfiles/dot_apm/apm.yml</b></span>
       <span class="pill">deploy: <b>~/.agents/skills/</b> → bridge → ~/.claude · ~/.codex</span>
-      <span class="pill">updated <b>2026-06-15</b></span>
+      <span class="pill">updated <b>2026-09-15</b></span>
     </div>
   </div>
 </header>
@@ -119,29 +119,53 @@
 const SKILLS = [
   // ---- Eotel/skills (自作) ----
   {src:"eotel", repo:"Eotel/skills/agentic-docs", name:"agentic-docs", tags:["docs","governance"],
-   what:"エージェント向けのリポジトリ内ドキュメント基盤を構築・監査・保守する。",
-   when:"AGENTS.md / ARCHITECTURE.md / docs/ や design doc・PRD・exec plan・DESIGN.md(Google Labs 形式)を新規作成/再編したいとき。"},
+   what:"エージェントが参照するリポジトリ内ドキュメントを作成・再編する。",
+   when:"AGENTS.md、architecture doc、product spec、exec plan、docs governance を整えるとき。"},
   {src:"eotel", repo:"Eotel/skills/apm-usage", name:"apm-usage", tags:["reference","apm","tooling"],
-   what:"APM(Agent Package Manager)のリファレンス。apm.yml 構文・install/update/outdated・lockfile・chezmoi 連携。",
-   when:"apm.yml を書く/監査する、未知の APM 挙動やエラーを調べるとき。mizchi 版を APM 0.14+ 対応に fork したもの。"},
+   what:"APM の manifest、package、target、lockfile を現行 CLI に沿って操作する。",
+   when:"apm.yml の作成・診断、install/update、target や lockfile の問題を扱うとき。"},
   {src:"eotel", repo:"Eotel/skills/business-logic-extraction", name:"business-logic-extraction", tags:["refactor","architecture"],
-   what:"肥大化した controller / resolver / service からビジネス判断を named policy・service・query helper へ抽出。",
-   when:"巨大ハンドラの分割、validation/authorization/状態遷移をエントリポイントから切り出すリファクタ時。"},
+   what:"handler や component からビジネス判断を named domain unit へ抽出する。",
+   when:"framework 非依存の adapter thinning や business logic refactor を行うとき。"},
+  {src:"eotel", repo:"Eotel/skills/class-sweep", name:"class-sweep", tags:["bugfix","quality"],
+   what:"再発し得る defect class と sibling surface を横断確認する。",
+   when:"修正した不具合と同じ構造が別の場所にも存在し得るとき。"},
+  {src:"eotel", repo:"Eotel/skills/codex-prompting", name:"codex-prompting", tags:["codex","prompt"],
+   what:"Codex の task prompt、AGENTS.md、system prompt、custom agent 定義を作る。",
+   when:"単体の Codex 向け指示を作成・改善するとき。multi-wave handoff は別 skill。"},
+  {src:"eotel", repo:"Eotel/skills/codex-orchestration-core", name:"codex-orchestration-core", tags:["codex","orchestration"],
+   what:"Codex orchestration の安全境界と acceptance contract を共有する。",
+   when:"codex-orchestrator-brief または codex-tdd-orchestration から読み込むとき。"},
+  {src:"eotel", repo:"Eotel/skills/codex-orchestrator-brief", name:"codex-orchestrator-brief", tags:["codex","handoff"],
+   what:"repo 根拠付き refactor spec と multi-wave orchestration prompt を作る。",
+   when:"別 agent が自律実行する handoff package が成果物のとき。"},
+  {src:"eotel", repo:"Eotel/skills/codex-tdd-orchestration", name:"codex-tdd-orchestration", tags:["codex","orchestration","tdd"],
+   what:"分離 worker、TDD、cold review、integration gate で Codex 実装を進行する。",
+   when:"複数 agent または並列 Codex orchestration を明示的に依頼されたとき。"},
   {src:"eotel", repo:"Eotel/skills/devenv-init", name:"devenv-init", tags:["env","nix","scaffold"],
-   what:"Eotel/devenv-templates から devenv.sh プロジェクトを scaffold(Nix ベースの再現可能な開発環境)。",
-   when:"新規 Python(Django/FastAPI/Flask)等の開発環境を direnv/treefmt/git-hooks/DB 付きで立ち上げたいとき。"},
+   what:"Eotel/devenv-templates から再現可能な devenv.sh project を作る。",
+   when:"対応言語 stack と development service を指定して環境を初期化するとき。"},
   {src:"eotel", repo:"Eotel/skills/django", name:"django", tags:["django","orm","refactor"],
-   what:"Django の ORM/クエリ配置、QuerySet/Manager 設計、隠れたビジネス判断の抽出、django-stubs 型付けのベストプラクティス。",
-   when:"view/resolver/service に散ったフィルタや select_related を整理、DRF アダプタを薄くしたいとき。"},
+   what:"Django の ORM/query boundary と DRF 所有の business logic を整理する。",
+   when:"QuerySet/Manager 抽出、DRF adapter thinning、Django 固有 policy 配置を扱うとき。"},
   {src:"eotel", repo:"Eotel/skills/markdown-lint-setup", name:"markdown-lint-setup", tags:["lint","markdown","prose"],
-   what:"remark + textlint を Node プロジェクトへ導入。AI っぽい日本語(preset-ai-writing)を検出、AI エージェント dir は除外。",
-   when:"Markdown / prose lint、TOC 生成、「AI っぽい」文体の検出を一括セットアップしたいとき。"},
+   what:"remark と textlint で Markdown 構造と日本語 prose lint を設定する。",
+   when:"JavaScript/TypeScript repo に指定された Markdown lint を導入するとき。"},
   {src:"eotel", repo:"Eotel/skills/plan-exec", name:"plan-exec", tags:["planning","workflow"],
-   what:"実装計画を docs/exec-plans/ に書き出して承認 → 実行(Claude Code の plan-file 挙動を再現)。",
-   when:"サブシステム横断・API/DB 契約変更・認証/セキュリティに関わる、複数ターンに跨る作業のとき。"},
+   what:"repo-local な実装計画を作成し、進捗と判断を保ちながら実行する。",
+   when:"サブシステム横断、高リスク、または複数ターンの作業を行うとき。"},
+  {src:"eotel", repo:"Eotel/skills/real-browser-verify", name:"real-browser-verify", tags:["browser","verification"],
+   what:"認証済みの実ブラウザで変更された UI の機能経路を操作して証拠を残す。",
+   when:"frontend change、UI bugfix、deployment claim を検証するとき。"},
   {src:"eotel", repo:"Eotel/skills/repo-local-git-hooks", name:"repo-local-git-hooks", tags:["git","hooks","ci"],
-   what:"グローバル core.hooksPath にローカル git hook が握り潰される問題の検出・修復。",
-   when:"nix-darwin/home-manager 環境で pre-commit/pre-push が効かず CI で lint/format が拾われるとき。"},
+   what:"global core.hooksPath により repo hook が迂回される問題を診断・修復する。",
+   when:"repository の pre-commit/pre-push が実行されないとき。"},
+  {src:"eotel", repo:"Eotel/skills/ship", name:"ship", tags:["pr","ci","review"],
+   what:"変更を実装、検証、PR、CI、review resolution まで進める。",
+   when:"変更を end-to-end で ship するよう明示されたとき。"},
+  {src:"eotel", repo:"Eotel/skills/worker-contract", name:"worker-contract", tags:["agents","safety"],
+   what:"同じ repository を編集する並列 worker の ownership と報告契約を定める。",
+   when:"2つ以上の implementation worker を同時に動かすとき。"},
 
   // ---- mizchi/skills ----
   {src:"mizchi", repo:"mizchi/skills/tooling/ast-grep-practice", name:"ast-grep-practice", tags:["lint","ast-grep","ci"],

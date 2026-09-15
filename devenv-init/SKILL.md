@@ -1,20 +1,12 @@
 ---
 name: devenv-init
-description: Scaffold a per-language devenv.sh project from Eotel/devenv-templates. Use when the user wants to set up a new Python (optionally with Django, FastAPI, or Flask), or future Node/Go/Rust development environment with reproducible Nix-based tooling. Wraps `nix flake init -t github:Eotel/devenv-templates` and patches feature toggles (direnv, delta, treefmt, git-hooks, postgres, mysql, redis, lsp, strict-types) plus Python version and project name in a single command.
+description: Initialize a reproducible devenv.sh project from Eotel/devenv-templates. Use for supported language stacks and development-service options.
 license: MIT
 ---
 
 # devenv-init
 
 Scaffold a reproducible per-language development environment in the current directory using [Eotel/devenv-templates](https://github.com/Eotel/devenv-templates).
-
-## When to invoke
-
-User says any of:
-- "set up a python/django/fastapi/flask devenv"
-- "scaffold a devenv for python here"
-- "make a new project with devenv"
-- "/devenv-init …"
 
 ## Prerequisites
 
@@ -26,7 +18,7 @@ User says any of:
 
 | Option | Values | Default | Notes |
 |---|---|---|---|
-| `--lang` | `python` | (required) | Other languages added incrementally. |
+| `--lang` | `python` | (required) | Only Python is currently supported. |
 | `--framework` | `django` / `fastapi` / `flask` | (none) | Pairs with `--lang python`. |
 | `--python` | `3.10` / `3.11` / `3.12` / `3.13` | `3.12` | Patches `languages.python.version`, `requires-python`, `target-version`, `pythonVersion`. |
 | `--name` | string | dirname | Patches `pyproject.toml` `name` and `packages = ["src/<name>"]`. |
@@ -58,10 +50,10 @@ The actual implementation lives at `scripts/scaffold.sh`. Invoke it directly wit
 
 - `references/options-matrix.md` — option × template combinations with notes.
 - `references/python.md` — Python-specific details (db, framework, strict types).
-- `references/nodejs.md`, `references/golang.md`, `references/rust.md` — placeholders for future templates.
 
 ## Project-level rules to honor
 
-- Always run `nix flake check` (or `nix-instantiate --parse`) after every Nix file edit.
+- After editing Nix, run `nix flake check` or at least
+  `nix-instantiate --parse` on the changed file.
 - `git-hooks.hooks` is the modern devenv pre-commit (not the deprecated `pre-commit.hooks`).
 - After scaffolding, use `uv add` to install Python deps; do not edit `pyproject.toml` `dependencies` directly.

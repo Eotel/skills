@@ -1,70 +1,69 @@
-# apm.yml manifest schema
+# `apm.yml` Reference
 
-## Top-level fields
+Use this as a shape guide, then verify version-sensitive fields with the
+installed APM CLI. `apm init`, `apm install --help`, and `apm lock` are the
+authorities for the installed release.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | Yes | Package identifier |
-| `version` | string | Yes | Semver (e.g. `1.0.0`) |
-| `description` | string | No | Brief description |
-| `author` | string | No | Author or organization |
-| `license` | string | No | SPDX identifier |
-| `target` | enum | No | `vscode` / `claude` / `codex` / `all` (auto-detected if omitted) |
-| `type` | enum | No | `instructions` / `skill` / `hybrid` / `prompts` |
-| `scripts` | map | No | Named commands via `apm run <name>` |
-| `dependencies` | object | No | `apm` and `mcp` dependency lists |
-| `devDependencies` | object | No | Dev-only deps (excluded from `apm pack`) |
-
-## Dependency string forms
-
-```
-owner/repo                           # GitHub shorthand
-owner/repo#v1.0.0                    # pinned tag
-owner/repo#main                      # branch ref
-owner/repo/path/to/skill             # subdirectory
-gitlab.com/org/repo                  # non-GitHub host
-./packages/my-skill                  # local path
-```
-
-## Dependency object form
+## Minimal manifest
 
 ```yaml
-- git: https://gitlab.com/org/repo.git
-  path: skills/my-skill              # subdirectory within repo
-  ref: v2.0                          # branch, tag, or commit SHA
-  alias: my-skill                    # local name override
+name: my-project
+version: 1.0.0
+targets:
+  - agent-skills
+dependencies:
+  apm:
+    - owner/repo#<tag-or-sha>
+  mcp: []
+scripts: {}
 ```
 
-## MCP dependency forms
+Declare `targets` when installation should not depend on directory-marker
+auto-detection. Target names and expansion rules change; obtain the accepted
+values from `apm install --help`.
+
+## APM dependencies
+
+Common forms:
 
 ```yaml
-mcp:
-  # Registry reference
-  - io.github.github/github-mcp-server
-
-  # With overlays
-  - name: io.github.github/github-mcp-server
-    transport: stdio
-    tools: ["repos", "issues"]
-    env:
-      GITHUB_TOKEN: "${MY_TOKEN}"
-
-  # Self-defined (private)
-  - name: internal-server
-    registry: false
-    transport: http
-    url: "${SERVER_URL}"
+dependencies:
+  apm:
+    - owner/repo
+    - owner/repo#v1.0.0
+    - owner/repo#abc1234
+    - owner/repo/path/to/package
+    - git: https://gitlab.com/org/repo.git
+      path: skills/my-skill
+      ref: v2.0.0
+    - ./packages/local-package
 ```
 
-## Canonical normalization
+Prefer a tag or commit when reproducibility matters. Local-path packages are
+for development and are not portable to user-scope installs.
 
-APM normalizes all dependency references:
+## MCP dependencies
 
-| Input | Stored as |
-|-------|-----------|
-| `https://github.com/owner/repo.git` | `owner/repo` |
-| `git@github.com:owner/repo.git` | `owner/repo` |
-| `github.com/owner/repo` | `owner/repo` |
-| `https://gitlab.com/org/repo.git` | `gitlab.com/org/repo` |
+Registry and self-defined MCP entries have version-sensitive fields. Add them
+with `apm install --mcp ...` where possible so APM writes the supported shape.
+Inspect the result before committing it; do not copy a remembered schema into a
+manifest.
 
-Duplicate detection works across all input forms.
+## Scripts
+
+`scripts` is a name-to-command map executed with `apm run <name>`:
+
+```yaml
+scripts:
+  verify: "apm audit --ci"
+```
+
+Keep secrets out of the manifest and generated lockfile. Use environment
+references supported by the installed APM release.
+
+## Lockfile contract
+
+- Regenerate `apm.lock.yaml` with `apm lock`, `apm install`, or `apm update`.
+- Commit project lockfiles unless repository policy says otherwise.
+- Use `apm install --frozen` in CI when manifest/lockfile drift must fail.
+- Inspect lockfile diffs after updates; do not edit resolved refs by hand.

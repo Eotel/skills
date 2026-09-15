@@ -1,6 +1,6 @@
 ---
 name: agentic-docs
-description: Bootstrap, audit, and maintain repository-local documentation systems for agentic software work. Use when Codex needs to create or reorganize AGENTS.md, ARCHITECTURE.md, docs/index.md, design docs, product specs, exec plans, generated references, DESIGN.md (Google Labs format for visual design tokens), or documentation governance for a project that lacks agent-readable docs or needs docs/ structure updates.
+description: Create or reorganize repository documentation for agentic work. Use for AGENTS.md, architecture docs, product specs, exec plans, or documentation governance.
 ---
 
 # Agentic Docs
@@ -41,8 +41,9 @@ Tighten links, freshness, or verification instead.
 ## Workflow
 
 1. Inspect the project before writing.
-   - Read existing `AGENTS.md`, `CLAUDE.md`, `README.md`, `ARCHITECTURE.md`,
-     `docs/`, package scripts, test configs, and lint configs.
+   - Start with applicable `AGENTS.md`, `CLAUDE.md`, `README.md`, and docs
+     indexes. Read architecture, plans, scripts, and lint/test configs only when
+     the current documentation mode needs them.
    - Use `rg` to find existing mentions of docs, plans, architecture, ADRs,
      generated schemas, and product specs.
    - Identify the real subsystems and checks. Do not invent categories that do

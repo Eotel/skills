@@ -151,8 +151,9 @@ Run in this order; stop widening once a stage fails:
 2. `uv run pytest src/<app>/tests/<existing endpoint tests>` — the legacy
    tests that exercise the refactored adapter path; status codes and error
    message strings must match.
-3. `uv run pytest` — full suite to catch ripple effects in signals,
-   migrations, and GraphQL surfaces.
+3. Broaden to `uv run pytest` when the extraction crosses shared model,
+   signal, migration, or GraphQL boundaries, or when narrower checks expose
+   unexpected coupling.
 4. `uv run ruff check <touched>` and `uv run ruff format --check <touched>`.
 5. `mypy` / `ty` only on touched modules when the project runs them in CI.
    Pre-existing django-stubs FK-narrowing warnings on unrelated lines are
@@ -195,5 +196,6 @@ A realistic batch of extractions for a DRF viewset that had duplicated
 - Add a `test_<app>_policies.py` file with: 6 pure tests for slot
   predicates, 14 DB tests for chain operations and roster/policy
   predicates.
-- Verify with focused tests → legacy endpoint tests → full suite → ruff.
+- Verify with focused tests → legacy endpoint tests → broader suite when the
+  shared-boundary risk warrants it → ruff.
   Confirm status codes and error message strings are byte-identical.

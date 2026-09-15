@@ -1,6 +1,6 @@
 ---
 name: business-logic-extraction
-description: Use when refactoring large controllers, request handlers, GraphQL resolvers, Action API endpoints, services, or frontend components so business decisions are extracted into named policies, services, query helpers, lifecycle helpers, hooks, or route-local models. Trigger when the user asks to extract business logic, thin adapters, split giant handlers, move validation/authorization/state transitions/side-effect orchestration out of entrypoints, or execute a multi-batch refactor plan with verification. Use the ast-grep skill for structural pattern search and safe codemods when locating decision branches across large handlers or many files.
+description: Extract business decisions from handlers or components into named, testable domain units. Use for framework-neutral adapter-thinning and business-logic refactors.
 ---
 
 # Business Logic Extraction
@@ -36,8 +36,9 @@ Keep inline when the code is mechanical adaptation:
 
 ## Workflow
 
-1. Orient on the repo's architecture first.
-   - Read `AGENTS.md`, architecture docs, boundary docs, package scripts, and nearby tests.
+1. Orient on the affected architecture.
+   - Read applicable `AGENTS.md`, nearby tests, and only the boundary documents
+     that govern the change.
    - Identify dependency boundaries before moving code.
    - Prefer local patterns over inventing a new layer.
 2. Inventory candidates.
@@ -92,21 +93,6 @@ Frontend:
   that style; otherwise rely on existing component/e2e coverage and record the
   test-runner gap.
 
-## Plan And Goal Shape
-
-For non-trivial extractions, create or update an execution plan that includes:
-
-- purpose and observable non-goals
-- architecture constraints
-- inventory/scoring criteria
-- batch plan with rollback/idempotence notes
-- verification commands grouped by backend, frontend, architecture, and hygiene
-- progress, surprises, decisions, outcomes, and follow-up opportunities
-
-Keep the active goal concrete: "execute this plan and verify implementation
-before reporting completion." Mark it complete only after code, docs, and
-verification are done.
-
 ## Verification Ladder
 
 Run the narrowest proof first, then widen:
@@ -121,26 +107,6 @@ Run the narrowest proof first, then widen:
 
 Avoid running DB-backed pytest commands in parallel unless the repo explicitly
 supports isolated test databases per process.
-
-## Model-specific prompt guides
-
-Keep the common extraction rules in this file. When the executing model is
-known, load **at most one** matching guide and apply its Instructions as your
-operating instructions; when delegating a batch to a subagent, pick the guide
-for the subagent's model and paste its Instructions block into the prompt. If
-the model is unknown, skip this section.
-
-- Claude Opus 4.8: [references/model-opus-4.8.md](references/model-opus-4.8.md)
-- Claude Opus 5: [references/model-opus-5.md](references/model-opus-5.md)
-- Claude Sonnet 5: [references/model-sonnet-5.md](references/model-sonnet-5.md)
-- Claude Fable 5: [references/model-fable-5.md](references/model-fable-5.md)
-- GPT-5.5 / Codex: [references/model-gpt-5.5.md](references/model-gpt-5.5.md)
-- GPT-5.6 / Codex: [references/model-gpt-5.6.md](references/model-gpt-5.6.md)
-
-Each guide is written as directly injectable instructions plus caller-side
-knobs under "Caller notes" (effort, sampling, token limits). Guides must not
-override the Core Rule (extract vs keep inline), the Verification Ladder
-order, or the Review Checklist.
 
 ## Review Checklist
 

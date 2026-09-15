@@ -184,7 +184,7 @@
       <ul>
         <li><b>出力先:</b> ローカル <code>docs/exec-plans/active/...md</code></li>
         <li><b>目的:</b> このセッションで自分が今すぐ実装する計画</li>
-        <li><b>流れ:</b> 承認 → その場で実行 → 完了</li>
+        <li><b>流れ:</b> 計画を記録 → 依頼済みの範囲を実行 → 完了</li>
         <li><b>向き:</b> tracker 不要・軽い・ソロ</li>
       </ul>
     </div>
@@ -236,7 +236,7 @@
 
 <footer>
   <p>関連: <a href="./skills-catalog.html">スキル一覧カタログ</a>（各スキルの用途と source）。
-  管理は APM(<code>chezmoi-dotfiles/dot_apm/apm.yml</code>)。更新 2026-06-15。</p>
+  管理は APM(<code>chezmoi-dotfiles/dot_apm/apm.yml</code>)。更新 2026-09-15。</p>
 </footer>
 </main>
 
@@ -247,7 +247,7 @@ const COMBOS=[
    why:"構想を詰めて用語/ADR を確定 → PRD 化 → 縦スライス issue → test-first 実装。AFK エージェントが拾える状態まで持っていく。"},
   {cat:"feature", title:"サブシステム横断の計画から実装",
    chain:["plan-exec","grill-me","tdd"],
-   why:"plan-exec で repo-local な計画ファイルを承認ベースで作り、grill で穴を潰してから test-first 実装。API/DB 契約変更や認証まわり向け。"},
+   why:"plan-exec で repo-local な計画と完了条件を固定し、必要なら grill で穴を潰してから実装。API/DB 契約変更や認証まわり向け。"},
   {cat:"fix", title:"バグ報告の処理",
    chain:["/triage","diagnose","improve-codebase-architecture"],
    why:"受付・状態整理 → 規律ある診断と回帰テスト → 根因が構造問題ならアーキ深化 + ADR で再発防止。"},

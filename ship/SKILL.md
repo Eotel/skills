@@ -1,65 +1,43 @@
 ---
 name: ship
-description: Standard end-to-end shipping pipeline for a change — implement (TDD) → verify the fix in the real environment → simplify → open a PR → watch CI to green → handle every review comment, then declare done only when re-shipping is a no-op. Use when the user runs /ship or asks to ship / 出荷 / 仕上げて出す a change end-to-end. Runs in both Claude Code and Codex; each step names the skill to use where one exists and gives an agent-neutral fallback where it does not.
+description: Ship a change end to end through implementation, verification, PR, CI, and review resolution. Use when the user explicitly asks to ship.
 ---
 
-# ship
+# Ship
 
-Run the standard shipping pipeline below. Before starting, set the whole pipeline
-— termination condition: further work is a no-op and the change can ship — as a
-**session-scoped completion gate**:
-
-- **Claude Code**: set a verifiable end-state with `/goal` and let the Stop hook
-  gate completion; watch CI with the Monitor tool.
-- **Codex**: use the goal mechanism if available; otherwise track all 7 steps as
-  an explicit TODO/checklist and do not stop until every step is done; watch CI
-  with `gh run watch` / `gh pr checks`.
-
-## Arguments
-
-Interpret `$ARGUMENTS`:
-
-- Contains `codex` → delegate implementation to Codex via the
-  **codex-tdd-orchestration** skill and stay in the orchestrator/verifier role.
-  (If the driver is already Codex, implement using that skill's
-  implementer → reviewer → fixer split.)
-- Contains `oracle` → after opening the PR, review it with the **oracle** skill
-  and fix findings until none remain.
-- Anything else → treat as the implementation target (issue URL / plan file /
-  feature description).
+Carry the requested change to a review-ready, CI-green pull request. Use the
+harness's durable progress mechanism for long work, but do not add a goal or
+approval gate when the request is already authorized and can complete in one
+turn.
 
 ## Pipeline
 
-1. **Implement** — use the **tdd** skill: red → green → refactor, vertical
-   slices. If a plan is given (`docs/exec-plans/active/*.md`), follow it to
-   completion.
-2. **Verify in the real environment** — do not stop at green tests. Re-confirm
-   yourself that the originally-reported symptom / requested behavior actually
-   holds in the real environment (real DB / real browser / real run). For UI,
-   diff a screenshot of the whole target area against the mock. Use the
-   **real-browser-verify** skill where it applies.
-3. **Simplify (max)** — review the diff and apply reuse / simplification /
-   efficiency cleanups. **Never cut scope (what is built)**; surface any cut
-   candidate as an issue instead.
-   - Claude: run the `simplify` skill at max.
-   - Codex: no such skill — refactor the diff yourself against the same criteria.
-4. **Open a PR** — dedicated worktree, explicit staging (no `git add -A`),
-   conventional commit (lowercase subject). If it resolves an issue, put
-   `Closes #N` in the body. Assign to Eotel. If the work was driven by an exec
-   plan and this PR ships its final step, include the plan's `git mv` to
-   `docs/exec-plans/completed/` (with `Outcomes & Retrospective` updated) in
-   this PR's diff — do not leave the finished plan in `active/`.
-5. **Watch CI** — after push, watch CI until green; if red, fix and re-push
-   yourself.
-   - Claude: Monitor tool (or the `ci-monitor` skill).
-   - Codex: poll `gh run watch` / `gh pr checks` without blocking sleeps.
-6. **Handle review** — collect every review comment (oracle / Copilot / human)
-   and triage each claim against the source in one pass (valid → fix, invalid →
-   rebut with evidence). Do not dribble fixes across rounds.
-   - Claude: use the `fix-review` skill / flow.
-   - Codex: fetch all comments with `gh pr view <N> --comments` and
-     `gh api repos/<owner>/<repo>/pulls/<N>/comments`, then address every one.
-7. **Declare done** — only after confirming from ground truth that further work
-   is a no-op: the **original symptom is gone**, CI is green, and zero review
-   comments are unaddressed. Green tests / green CI alone are not the completion
-   condition.
+1. **Implement.** Follow an approved exec plan when present. Use TDD when the
+   requested behavior or defect benefits from a regression test; do not create a
+   test that only mirrors a low-impact mechanical edit.
+2. **Verify.** Run focused checks capable of detecting the requested failure.
+   Broaden for integration, shared-boundary refactors, or repository release
+   policy. Use `real-browser-verify` for changed UI behavior.
+3. **Review the diff.** Remove accidental complexity, scope drift, dead code, and
+   duplicated rules without cutting requested behavior.
+4. **Prepare the change.** Update completed exec-plan state, stage explicit paths,
+   create conventional commits from this agent's changes, and preserve unrelated
+   worktree state.
+5. **Open the PR.** Push, assign Eotel, include `Closes #N` for resolved issues,
+   and describe the verification evidence.
+6. **Clear remote gates.** Monitor required checks to green. Diagnose and fix
+   failures caused by the change, then rerun the affected local check before
+   pushing again.
+7. **Resolve review.** Collect all current review comments, address valid findings,
+   and respond with evidence when a finding does not apply. Recheck comments and
+   CI after updates.
+
+## Completion boundary
+
+Shipping is complete when the requested outcome holds in the relevant
+environment, required CI is green, and no required review comment remains
+unresolved. Report blocked real-environment or production verification
+separately; do not substitute a mock or weaker check.
+
+Opening a PR is authorized by the ship request. Merge, close, production writes,
+and destructive cleanup still require explicit user authorization.

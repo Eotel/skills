@@ -1,195 +1,78 @@
-# Detailed workflow
+# Live Orchestration Workflow
 
-## Phase -1 — Acceptance planning (orchestrator only)
+Use this procedure only after the root skill's scope gate selects full
+orchestration.
 
-Before any worktree setup or codex launch, turn the user's request into a finite
-roadmap. This prevents the orchestrator from micromanaging agents and gives every
-agent an acceptance-evaluable target.
+## Acceptance planning
 
-Produce:
+Create four artifacts before dispatch:
 
-1. **Acceptance objective**: one `done when ...` sentence with an externally
-   checkable end-state.
-2. **Acceptance checklist**: 5-9 executable checks. Each check names owner,
-   command/evidence, and expected result.
-3. **Topic roadmap**: ordered milestones with dependencies, exit criteria, and a
-   retry cap. Use `Phase 0 baseline -> T1..Tn -> integration gate -> PR/CI/review
-   gate` unless the repo demands a narrower shape.
-4. **Transport plan**: for each milestone, choose a durable Codex thread or a
-   subagent. Default to Codex threads for issue/topic implementation slices;
-   default to subagents for micro cold reviews, short follow-up checks, and narrow
-   verification passes. The orchestrator's own read-only diff check is core #6
-   verification, not a review transport — it supplements the cold review, never
-   replaces it.
-5. **Per-agent contract**: for every planned Codex thread or subagent, identify
-   the global objective, slice objective, checklist lines it owns, and roadmap
-   position.
+1. A global `done when ...` outcome.
+2. An acceptance checklist whose items name an owner, evidence, and expected
+   result.
+3. A dependency-ordered topic map with file ownership and retry caps.
+4. A short contract for each worker and critic.
 
-Do not launch Phase 0 until the roadmap is small enough to burn down and each
-milestone has a concrete exit criterion. If the roadmap keeps expanding, stop and
-re-scope instead of adding more open-ended agent work.
+Keep these in the harness's durable plan/task surface. Update progress only after
+inspecting evidence.
 
-After launch, do not micromanage waiting agents. Poll on a bounded cadence tied
-to roadmap milestones, then intervene only on final status, blocked/stalled
-evidence, dirty diff mismatch, retry cap, or explicit user request. Do not send
-repeated nudges just because a background thread is quiet.
+## Environment readiness
 
-## Phase 0 — Base preparation (orchestrator + codex baseline)
+For each isolated worktree or checkout:
 
-Before any parallel work, get clean, codex-writable bases for the durable
-implementation threads.
+- resolve the exact base, branch, and working directory;
+- confirm the worker's sandbox can write there;
+- provision dependencies required by offline or network-restricted workers;
+- record relevant baseline failures;
+- reserve git commits, integration, push, and PR operations for the main agent
+  when worker sandboxes cannot perform them reliably.
 
-### 0a. Orchestrator creates the worktree(s) (do NOT delegate to codex)
+Do not create an isolated worktree for a bounded read-only pass that can use the
+current checkout safely.
 
-Place each durable implementation worktree **inside the project** at
-`<repo>/.worktrees/<topic>` so codex's sandbox accepts writes to it (see Pitfall
-1 in `pitfalls.md` for why sibling-path worktrees fail). `<topic>` is the
-issue/topic identifier (e.g. `permissions-mixin`).
+## Topic loop
 
-Run [scripts/worktree-setup.sh](../scripts/worktree-setup.sh) from the repo root
-for each durable implementation topic:
+### Implement
 
-```bash
-<skill-dir>/scripts/worktree-setup.sh <topic> <base-branch> [sibling-dep ...]
-```
+Give the owner the global outcome, slice outcome, owned files, exclusions,
+environment facts, and checks. Use `worker-contract` for concurrent writers.
 
-It creates `.worktrees/<topic>` on branch `refactor/<topic>` (override with
-`TOPIC_BRANCH=<branch>`), keeps `/.worktrees/` in `.gitignore` idempotently,
-symlinks any listed sibling deps so `pyproject.toml: path = "../<dep>"` resolves
-inside the worktree, and prints the absolute worktree path to hand to codex.
+For changed behavior, establish a regression check that fails before the fix and
+passes afterward. For a behavior-neutral refactor, use a structural or contract
+check that detects the intended transformation.
 
-### 0b. Codex green-base pass
+### Review
 
-Run the green-base pass **inside each implementation worktree** before that
-thread starts coding:
+Inspect the worker's actual diff before dispatching a critic. A success report
+with no intended diff or with unowned paths is a failed handoff.
 
-- Merge the upstream base branch (e.g. `origin/main`) into the topic branch
-- Resolve conflicts
-- Run the project test/lint/typecheck commands and confirm green
-- Push (orchestrator handles push if codex's network is restricted — Pitfall 2)
+Give a fresh, read-only critic only the spec, diff, repository conventions, and
+acceptance checks. Require actionable findings with evidence or an empty result.
 
-Do not start Phase 1 for a topic until its base is green. If the base is
-unstable, you waste codex turns chasing pre-existing failures.
+### Fix and recheck
 
-## Phase 1 — Parallel topics
+Send findings verbatim to the topic owner or a bounded fixer. Run focused checks
+after the fix and use a fresh critic for the next acceptance judgment. Stop at
+the retry cap; recurring defect classes require a structural change or user
+decision.
 
-For each issue/topic implementation slice, use a durable Codex thread/worktree
-for the implementer when the work needs isolation or user-owned history. **Topics
-can run in parallel between each other** when file ownership is disjoint. Within
-one topic, the gates remain serial: implementer → cold review → fix if needed →
-cold PASS.
+## Integration
 
-### Implementer codex (background)
+Integrate one topic at a time in dependency order. Before accepting each topic:
 
-Launch with `Agent(subagent_type="codex:codex-rescue", run_in_background=true)`.
+- its required checks pass;
+- its latest critic has no blocking finding;
+- its diff is limited to owned and expected files;
+- it has absorbed prior integrated changes when necessary;
+- the checks capable of detecting cross-topic drift pass.
 
-The prompt must include:
+Run the full repository or release gate once on the integrated result when the
+blast radius or repository policy requires it. Do not repeat broad suites between
+small fixes without a new reason.
 
-- Worktree path and a clear "do not cd out of this directory" instruction
-- Concrete file list the topic should touch
-- TDD steps written out explicitly: write RED test → confirm FAIL → implement → confirm GREEN → refactor
-- Scope guard: list what's **out of scope** for this topic (other topics' files)
-- "Do not commit" — leave the working tree dirty so the orchestrator can serialize commits
-- Required final report shape (status, files_changed, test_result, notes)
+## Finish
 
-### Cold reviewer (subagent or Codex thread)
-
-Run a cold review after the implementer reports done and the orchestrator has
-verified the expected diff shape (that diff check is the orchestrator's core #6
-verification — a supplement to the cold review, not the review itself). The cold
-reviewer must run in a **fresh context that never saw the author's report**, which
-rules out the orchestrator itself. Choose the smallest adequate fresh transport:
-
-- Subagent for a bounded read-only review — the default for small diffs, follow-up
-  checks, and narrow verification passes. A fresh subagent is cold and cheap.
-- Codex thread only when the review is broad, stateful, long-running, or needs
-  its own isolated worktree/history.
-
-Regardless of transport, the prompt/check must include:
-
-- Path to look at + reference files (existing convention examples to compare against)
-- A set of review observations to look for (API design, edge cases, test coverage, convention drift, etc.)
-- "Code is read-only" — the reviewer must not edit
-- Output as a JSON array of `{file, line, severity, issue, suggestion}` so the orchestrator can pipe it directly into the fixer prompt
-
-### Fixer (smallest adequate author transport)
-
-If review finds required fixes, route them to the smallest adequate author
-transport: the implementation Codex thread for local follow-up, a fixer subagent
-for a short bounded patch, or a separate Codex thread when the fix is broad or
-needs its own dirty worktree/history. The fixer receives the reviewer's JSON
-verbatim plus a clear "apply these, re-run tests, don't commit" instruction.
-Same TDD discipline applies for each fix.
-
-After each fix, run another cold review (fresh subagent or Codex thread) before
-PASS; the orchestrator's own diff verification (core #6) does not count as that
-cold review. After required review/fix passes complete **and the orchestrator has
-verified the worktree**, move on to the topic's commit.
-
-## Phase 2 — Integration gate + commits (sequential, orchestrator only)
-
-When all topics have cold-review PASS, land them on **one integration branch** and
-verify the *combined* result. Disjoint topic branches each going green in
-isolation does **not** prove they build, test, and ship together — a single PR
-that never got integrated and re-tested can regress on cross-topic interactions
-(shared imports, lock files, generated output). This is core #9: merges are
-serialized, and the branch re-verifies after absorbing the integration base.
-
-1. Prepare an integration branch off the base (e.g. `integration/<run>` from
-   `origin/main`), or reuse the single topic branch when there is only one topic.
-2. For each topic **in dependency order**, absorb its work one at a time: commit
-   that topic's dirty worktree as one topic commit on its branch, then merge that
-   branch into the integration branch. After **each** merge, re-run the full
-   project test suite, full lint, and full typecheck on the integration branch —
-   **and the CI lint command** if it differs from the local lint (Pitfall 5). A
-   cross-topic interaction that "disjoint" file sets missed surfaces here, not
-   after push.
-3. Keep one commit per topic so the history stays bisectable — each commit message
-   references the topic and its review pass.
-4. Push the integration branch once the combined result is green.
-5. Verify CI on the remote and only declare done when CI is green.
-6. Remove completed worktree(s).
-
-## Verification gates
-
-Don't skip these. Each one has paid for itself at least once.
-
-| Gate | When | What to check |
-|---|---|---|
-| 0 | End of Phase -1 | Acceptance objective is externally checkable; roadmap milestones have exit criteria and retry caps |
-| 1 | End of Phase 0 | Full `<test>`, `<lint>`, `<typecheck>` all green before launching Phase 1 |
-| 2 | After each delegated completion | `git status` + `git diff --stat`. Does the changed-file list match what you asked for? |
-| 3 | After each fix pass | Scoped tests for the topic pass and unresolved required findings are gone |
-| 4 | Phase 2, after each topic is absorbed into the integration branch | Full project test + lint + typecheck **+ CI-equivalent format check** on the combined branch (Pitfall 5, core #9) |
-| 5 | After push | Wait for CI, confirm green. If red, fix and re-push before declaring done |
-
-## Commit serialization
-
-Concurrent author transports in the same worktree can race on `.git/index.lock`. To prevent this:
-
-- **Each author transport is instructed to NOT commit.** They leave the worktree dirty.
-- **Orchestrator commits per topic** after cold-review PASS, one at a time.
-- This also produces a clean per-topic history: one commit per topic, easy to bisect or revert.
-
-Commit message convention (adapt to project):
-
-```
-<type>(<scope>): <one-line summary>
-
-- <change 1>
-- <change 2>
-
-Addresses post-review follow-up on PR #<N> (T<topic-id>).
-```
-
-## Worktree cleanup
-
-After push + CI green, run [scripts/worktree-teardown.sh](../scripts/worktree-teardown.sh) from the repo root:
-
-```bash
-<skill-dir>/scripts/worktree-teardown.sh <topic> [topic-branch]
-```
-
-It verifies the worktree's `.git` pointer first (Pitfall 4): intact → `git worktree remove`; rewritten by a clone-pivoted codex → `rm -rf` + `git worktree prune`. Either way it deletes the topic branch.
-
-The `.worktrees/` directory itself and the sibling-dep symlinks inside it can be left in place across orchestrations — they're cheap to keep and save the symlink setup next time. `.gitignore` keeps them invisible to git.
+Report the integrated evidence, critic decisions, retries, and blocked/out-of-scope
+work. Push or open a PR when requested. Wait for remote checks when shipping is
+in scope. Merge, close, production writes, and destructive cleanup require the
+user's authority.

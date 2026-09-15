@@ -1,87 +1,68 @@
 # Eotel Skills
 
-Reusable agent skills packaged for APM.
+Reusable agent skills packaged for APM. Each skill keeps selection metadata in a
+short description, shared workflow decisions in `SKILL.md`, and conditional
+detail in references or scripts.
 
 ## Install
 
+Check `apm install --help` for the installed APM release. A typical shared install
+is:
+
 ```bash
-apm install -g Eotel/skills/agentic-docs --target claude
-apm install -g Eotel/skills/devenv-init  --target codex
+apm install -g Eotel/skills/agentic-docs --target agent-skills
 ```
 
-Codex can use shared Claude skills through a symlink from
-`~/.codex/skills/<name>` to `~/.claude/skills/<name>`.
+Install only the skill directories needed by the target workflow. The Codex
+orchestration callers also require `codex-orchestration-core`.
 
-## Model-specific prompt guides
+## Authoring policy
 
-The best prompt differs per execution model. Larger behavior-driving skills
-therefore keep model-neutral rules in `SKILL.md` and ship per-model files as
-`references/model-{opus-4.8,opus-5,sonnet-5,fable-5,gpt-5.5,gpt-5.6}.md` —
-load at most one,
-only when the execution model is known. Two forms exist, chosen by who reads
-the file:
-
-- **Self-execution skills** (`plan-exec`, `business-logic-extraction`,
-  `apm-usage`, `markdown-lint-setup`): the reader is the executing model, so
-  each guide is the model-optimized prompt itself — an `## Instructions`
-  block to apply directly (or paste into a subagent prompt when delegating)
-  plus `## Caller notes` for caller-side knobs (effort, sampling, token
-  limits). No self-description; description costs tokens without steering.
-- **Prompt-authoring skills** (`codex-tdd-orchestration`,
-  `codex-orchestrator-brief`): the reader composes prompts for *another*
-  model, so guides stay descriptive (Fit, tendencies) with a pasteable
-  Prompt Patch.
-
-Guides never override a skill's core rules. Small single-reading skills
-intentionally ship no model guides.
+- Descriptions state the capability and discriminating trigger in one or two
+  sentences.
+- Root skill files contain only shared decisions, invariants, and routing needed
+  when the skill is active.
+- Detailed procedures, templates, schemas, and environment-specific guidance are
+  loaded conditionally from `references/` or executed from `scripts/`.
+- Model IDs, effort levels, CLI flags, and SDK details are checked against current
+  primary documentation instead of copied into every skill.
+- Safety and permission boundaries stay explicit. Ordinary reversible work does
+  not gain extra approval gates merely because a skill is active.
 
 ## Skills
 
-- **`agentic-docs`** — bootstrap, audit, and maintain repository-local
-  documentation systems for agentic software work.
-- **`business-logic-extraction`** — plan, execute, and verify refactors that
-  move hidden business decisions out of adapters into named services, policies,
-  query helpers, lifecycle helpers, hooks, or route-local models.
-- **`django`** — apply Django ORM/query placement guidance, including
-  model-owned QuerySet extraction and focused verification.
-- **`devenv-init`** — scaffold a per-language devenv.sh project from
-  [Eotel/devenv-templates](https://github.com/Eotel/devenv-templates) with
-  toggleable features (direnv, delta, treefmt, git-hooks, postgres, mysql,
-  redis, lsp, strict-types) and Python version patching.
-- **`repo-local-git-hooks`** — detect and repair global `core.hooksPath`
-  overrides that bypass repository-local pre-commit or pre-push hooks.
-- **`plan-exec`** — write repo-local execution plans under `docs/exec-plans/active/`, get approval, and keep progress updated through implementation.
-- **`markdown-lint-setup`** — bootstrap `remark` + `textlint` (with
-  `@textlint-ja/textlint-rule-preset-ai-writing`) in a Node project; always
-  excludes AI agent context dirs (`.agents`, `.claude`, `.codex`,
-  `.impeccable`, `.serena`, `.github`) from both linters.
+- `agentic-docs`: create or reorganize agent-readable repository documentation.
+- `apm-usage`: operate APM manifests, packages, targets, and lockfiles.
+- `business-logic-extraction`: move framework-neutral business decisions into
+  named domain units.
+- `class-sweep`: find sibling occurrences of a plausibly repeated defect class.
+- `devenv-init`: scaffold supported devenv.sh project environments.
+- `django`: refactor Django ORM/query boundaries and DRF-owned policies.
+- `markdown-lint-setup`: configure remark and textlint for repository Markdown.
+- `plan-exec`: create and execute durable repo-local implementation plans.
+- `real-browser-verify`: verify changed UI behavior in an authenticated browser.
+- `repo-local-git-hooks`: repair repository hooks bypassed by global Git config.
+- `ship`: carry a change through implementation, PR, CI, and review resolution.
 
-- **`codex-prompting`** — author or tune a prompt aimed at Codex itself,
-  accounting for its harness quirks (AGENTS.md injection, `apply_patch`, the
-  planning tool, preamble cadence) and GPT-5.x prompting principles. Ships
-  per-model reference notes (`references/models.md`) and fill-in templates
-  (task prompt, system prompt, AGENTS.md stanza, subagent TOML), and teaches
-  Codex the capabilities it ignores by default — spawning subagents and
-  resuming/forking sessions, and using **agmsg** to spawn named codex/claude-code
-  peers and send them a goal prompt. Complements the orchestration bundle below:
-  this writes *what to say to codex*; those run *the loop*.
+### Codex prompts and orchestration
 
-### Codex orchestration bundle
+- `codex-prompting`: write a task prompt, system/developer prompt, `AGENTS.md`
+  instruction, or custom-agent definition.
+- `codex-orchestration-core`: shared safety and acceptance contracts for the two
+  orchestration workflows below.
+- `codex-orchestrator-brief`: create a repository-backed implementation spec and
+  multi-wave handoff prompt for another agent to run.
+- `codex-tdd-orchestration`: run live multi-agent Codex implementation with
+  isolated ownership, TDD, cold review, and integration gates.
+- `worker-contract`: define file ownership and reporting for concurrent writers.
 
-Three skills that share one orchestration-loop philosophy (orchestrator edits no
-code; cold author/critic split; executable rubric; critic-PASS-only gate; `/goal`
-anchor; verified memory log; smallest-blast-radius waves; sandbox/env pitfalls).
-The shared invariants live in **one** skill so the philosophy can't drift between
-the two callers. **Install all three together** — APM installs skills individually
-and does not resolve the dependency, so a caller installed without the core skill
-cannot load it.
+## Validation
 
-- **`codex-orchestration-core`** — the shared orchestration-loop invariants.
-  A dependency loaded (via the Skill tool) by the two skills below; not a
-  standalone task skill.
-- **`codex-orchestrator-brief`** — analyze a repo and author a written handoff
-  package (`refactor-instructions.md` + a `/goal` orchestrator prompt +
-  pre-implementation questions) for *another* model to run autonomously.
-- **`codex-tdd-orchestration`** — Claude drives codex sessions *live* in this
-  session: per topic, implementer → reviewer → fixer, topics in parallel, with
-  TDD enforcement and orchestrator-side verification.
+Validate each skill with OpenAI's `skill-creator` validator:
+
+```bash
+uv run --with pyyaml python /path/to/skill-creator/scripts/quick_validate.py ./skill-name
+```
+
+Also run the skill's own script tests and meaningful behavioral checks when it
+contains executable helpers.
