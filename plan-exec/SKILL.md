@@ -32,8 +32,8 @@ Use the repository timezone and include:
 - Blockers And Human Tasks
 - Verification: acceptance criteria, not results
 
-Keep the plan under 150 lines. Make it detailed enough to resume without chat
-history, but do not restate facts the repository makes cheap to inspect.
+Keep the plan to at most 150 lines. Make it detailed enough to resume without
+chat history, but do not restate facts the repository makes cheap to inspect.
 
 ## Authorization boundary
 
@@ -51,7 +51,7 @@ scope expansion that the request did not authorize.
 - Before stopping, plan the next agent's first step in `Now And Next`, and
   list what blocks completion or needs a person in `Blockers And Human Tasks`.
 - Put unrelated follow-up work in a separate plan rather than expanding this one.
-- Verify each milestone with evidence capable of detecting failure in that step.
+- Verify each step with evidence capable of detecting failure in that step.
 
 When concurrent agents are explicitly requested, the plan remains the shared
 source of truth. Give each worker a disjoint ownership slice and update the plan
@@ -59,11 +59,8 @@ only after checking its artifacts.
 
 ## Complete the lifecycle
 
-Delete the plan in the same change as the completed work. Put the delivered
-result, remaining work, and actual verification in the PR description; git
-history keeps the plan's last version for reviewers.
-
-Before deleting, promote only durable knowledge:
+The work is complete when every step in `Remaining Work` is done and verified.
+Before deleting the plan, promote only durable knowledge:
 
 - a repository-wide convention belongs in agent or architecture documentation;
 - a hard-to-reverse decision with real alternatives belongs in an ADR;
@@ -72,3 +69,15 @@ Before deleting, promote only durable knowledge:
 - a real follow-up belongs in a new active plan.
 
 Do not create follow-up plans merely to preserve speculative ideas.
+
+Then delete the plan in the change that completes the work, and record the
+delivered result, remaining follow-ups, and actual verification where the change
+is reviewed:
+
+- with a PR, in the PR description. From then on the PR, its review threads,
+  and its checks are the resume point; fix CI or review findings there instead
+  of restoring the plan;
+- without a PR, in the body of the commit that deletes the plan.
+
+Git history keeps the last committed version of the plan. A plan that was
+never committed leaves only that result record.

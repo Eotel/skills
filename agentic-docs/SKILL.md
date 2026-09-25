@@ -69,6 +69,7 @@ Tighten links, freshness, or verification instead.
 - `references/templates.md`: template catalog and generation workflow.
 - `references/design-md-format.md`: Google Labs DESIGN.md format reference for visual design tokens.
 - `scripts/bootstrap_docs.py`: copy the generic docs scaffold into a target repo.
-- `scripts/check_plans.py`: check that exec plans hold only current and next work.
+- `scripts/check_plans.py`: fail on kept completed plans, history headings, or
+  active plans over 150 lines.
 - `assets/templates/`: generic templates used by the script.
 - `assets/optional/`: opt-in templates not copied by the bootstrap script (currently `DESIGN.md`).

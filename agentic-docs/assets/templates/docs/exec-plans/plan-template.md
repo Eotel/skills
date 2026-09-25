@@ -3,9 +3,10 @@
 Owner: NAME
 Created: YYYY-MM-DD
 
-<!-- Keep this plan under 150 lines. Write only current state and remaining
-work: delete finished steps instead of checking them off. Results go in the PR;
-the plan is deleted in the change that completes it. -->
+<!-- Keep this plan to at most 150 lines. Write only current state and
+remaining work: delete finished steps instead of checking them off. The plan is
+deleted in the change that completes it; results go in the PR description, or
+in that commit's body when there is no PR. -->
 
 ## Goal
 

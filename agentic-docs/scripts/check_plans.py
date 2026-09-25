@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that exec plans hold only current and next work."""
+"""Fail on kept completed plans, history headings, or oversized active plans."""
 
 from __future__ import annotations
 
@@ -9,9 +9,26 @@ from pathlib import Path
 
 DEFAULT_MAX_LINES = 150
 HISTORY_HEADING = re.compile(
-    r"^#{2,6}\s+(?P<title>(?:progress|outcomes|surprises|decision log)\b.*?)\s*$",
-    re.IGNORECASE | re.MULTILINE,
+    r" {0,3}#{2,6}[ \t]+(?P<title>(?:(?:progress|outcomes|surprises|decision log)\b"
+    r"|進捗|作業ログ|決定ログ|振り返り).*?)[ \t#]*",
+    re.IGNORECASE,
 )
+FENCE = re.compile(r" {0,3}(?P<marker>`{3,}|~{3,})")
+
+
+def history_headings(text: str) -> list[str]:
+    titles = []
+    fence = None
+    for line in text.splitlines():
+        match = FENCE.match(line)
+        if fence is None and match:
+            fence = match["marker"]
+        elif fence is not None:
+            if line.strip().startswith(fence[0] * len(fence)):
+                fence = None
+        elif heading := HISTORY_HEADING.fullmatch(line):
+            titles.append(heading["title"])
+    return titles
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,9 +58,9 @@ def main() -> int:
     for path in sorted((plans_root / "active").rglob("*.md")):
         text = path.read_text(encoding="utf-8")
         problems.extend(
-            f"{path.relative_to(plans_root)}: history heading '{match['title']}'; "
+            f"{path.relative_to(plans_root)}: history heading '{title}'; "
             "keep only current state and next steps"
-            for match in HISTORY_HEADING.finditer(text)
+            for title in history_headings(text)
         )
         line_count = len(text.splitlines())
         if line_count > args.max_lines:
