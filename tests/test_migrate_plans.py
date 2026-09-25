@@ -111,6 +111,15 @@ class MigratePlansTest(unittest.TestCase):
         self.assertIn(f"{ACTIVE}: feature", section)
         self.assertNotIn("unrelated", section)
 
+    def test_reports_repository_without_commits(self) -> None:
+        git(self.root, "add", "-A")
+
+        result = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{ACTIVE} (last commit none)", result.stdout)
+        self.assertIn("base HEAD does not resolve", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

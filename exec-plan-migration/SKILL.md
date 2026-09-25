@@ -31,13 +31,17 @@ leave them alone.
    rules, `AGENTS.md`/`CLAUDE.md`, the plan template, `PLANS.md`, audit scripts,
    CI jobs, pre-commit hooks, and lint config that expect `completed/`. Replace
    the rules with the `plan-exec` lifecycle and remove the checks, including
-   their tests. Keep checks that still hold, such as filename format.
+   their tests. Keep checks that still hold, such as filename format. When the
+   repository routes CI, hooks, and task runners through one audit script,
+   rewrite that script's checks instead of removing the wiring.
 2. **Resolve references to completed plans.** Read only the referenced completed
    plans; a reference is the signal that something still depends on them. Move
    any knowledge still needed into its durable home (ADR, design doc, test, or
    the referring comment itself), then repoint or remove the reference. Never
    leave a path to a deleted plan. Unreferenced completed plans go to git
-   history unread.
+   history unread. A reference to a plan that lives in another repository,
+   common in forks and sibling repositories, becomes a permalink pinned to a
+   commit of that repository; `blob/main` links break once it migrates too.
 3. **Triage active plans.** Classify each one from evidence in code, git log,
    and issue or PR state, not from its checkboxes:
    - done: promote durable knowledge, then delete;

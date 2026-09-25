@@ -64,8 +64,20 @@ def find_references(
     ]
 
 
+def resolves(root: Path, ref: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def last_commit_date(root: Path, path: str) -> str:
-    return git(root, "log", "-1", "--format=%cs", "--", path).strip() or "uncommitted"
+    if not resolves(root, "HEAD"):
+        return "none"
+    return git(root, "log", "-1", "--format=%cs", "--", path).strip() or "none"
 
 
 def branches_touching_plans(root: Path, base: str) -> dict[str, list[str]]:
@@ -110,8 +122,11 @@ def main() -> int:
             print(f"- {hit}")
 
     print("\n## Unmerged branches touching plans")
-    for path, refs in sorted(branches_touching_plans(root, args.base).items()):
-        print(f"{path}: {', '.join(refs)}")
+    if resolves(root, args.base):
+        for path, refs in sorted(branches_touching_plans(root, args.base).items()):
+            print(f"{path}: {', '.join(refs)}")
+    else:
+        print(f"Skipped: base {args.base} does not resolve to a commit.")
 
     if args.apply and references:
         print("\nRefusing --apply: rewrite the references above first.")
