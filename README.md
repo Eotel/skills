@@ -40,6 +40,9 @@ orchestration callers also require `codex-orchestration-core`.
 - `django`: refactor Django ORM/query boundaries and DRF-owned policies.
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
 - `plan-exec`: create and execute durable repo-local implementation plans.
+- `exec-plan-migration` (temporary): move a repository from the legacy
+  `completed/` plan archive to forward-only plans. Requires `plan-exec` and
+  `agentic-docs`. Remove it once the remaining repositories have migrated.
 - `real-browser-verify`: verify changed UI behavior in an authenticated browser.
 - `repo-local-git-hooks`: repair repository hooks bypassed by global Git config.
 - `ship`: carry a change through implementation, PR, CI, and review resolution.
