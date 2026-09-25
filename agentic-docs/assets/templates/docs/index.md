@@ -27,4 +27,5 @@ User-facing behavior and product requirements live under
 
 - `generated/` stores snapshots derived from source contracts. Source files stay authoritative.
 - `references/` stores external framework or vendor reference caches.
-- `exec-plans/` stores active and completed implementation plans.
+- `exec-plans/` stores active implementation plans. Completed plans are deleted;
+  their results live in PR descriptions.
