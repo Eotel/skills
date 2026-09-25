@@ -19,8 +19,8 @@ Place knowledge by durability.
 |---|---|
 | Stable architecture boundary | `docs/design-docs/` |
 | User-facing behavior | `docs/product-specs/` |
-| Multi-step work state | `docs/exec-plans/active/` |
-| Completed implementation history | `docs/exec-plans/completed/` |
+| Current and next multi-step work | `docs/exec-plans/active/` |
+| Completed work results | PR description and git history |
 | Generated contract snapshot | `docs/generated/` |
 | External framework reference | `docs/references/` |
 | Broad unresolved debt | `docs/exec-plans/tech-debt-tracker.md` |
@@ -45,7 +45,6 @@ docs/
     index.md
   exec-plans/
     active/
-    completed/
     plan-template.md
     tech-debt-tracker.md
   generated/
@@ -73,7 +72,8 @@ When adding a durable rule, identify how it is enforced:
 - type checks for data shape and module boundary assumptions
 - lint or ast-grep rules for architecture and import constraints
 - textlint or markdownlint for prose conventions
-- scripts for repeatable repository maintenance
+- scripts for repeatable repository maintenance, such as
+  `scripts/check_plans.py` for exec plan shape
 
 If enforcement is not practical, say that the rule remains a judgment call.
 
@@ -84,6 +84,6 @@ A good agentic docs system is small, linked, and falsifiable.
 - Small: entry points are maps, not manuals.
 - Linked: every durable doc is reachable from an index.
 - Falsifiable: important rules identify their verification path.
-- Resumable: active plans preserve progress, surprises, decisions, and
-  verification results.
+- Resumable: active plans state the current facts, remaining work, and the
+  next agent's first step, without a history of finished work.
 - Local: agents do not need private chat history or external memory to proceed.

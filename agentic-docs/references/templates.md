@@ -33,6 +33,15 @@ preserve local conventions.
 - `assets/templates/docs/generated/README.md`
 - `assets/templates/docs/references/README.md`
 
+## Plan Check
+
+`scripts/check_plans.py --root /path/to/repo` fails when `docs/exec-plans/`
+keeps completed plans, an active plan exceeds 150 lines, or an active plan has
+history headings outside code fences, such as `Progress`, `Decision Log`, or
+`進捗`. It checks shape only; whether the text is forward-looking stays a
+judgment call. Vendor it into the target
+repository when CI or a stop hook should enforce plan shape.
+
 ## Optional Templates
 
 Templates under `assets/optional/` are not part of the default scaffold and

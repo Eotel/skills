@@ -4,7 +4,8 @@
 
 - Read [ARCHITECTURE.md](ARCHITECTURE.md) when changing subsystem boundaries.
 - Use [docs/index.md](docs/index.md) to find task-relevant documentation.
-- Put multi-step implementation plans under `docs/exec-plans/active/`.
+- Put multi-step implementation plans under `docs/exec-plans/active/`. Plans
+  hold only current state and next steps; delete a plan when its work lands.
 
 ## Verification
 

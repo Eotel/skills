@@ -20,9 +20,10 @@ turn.
    policy. Use `real-browser-verify` for changed UI behavior.
 3. **Review the diff.** Remove accidental complexity, scope drift, dead code, and
    duplicated rules without cutting requested behavior.
-4. **Prepare the change.** Update completed exec-plan state, stage explicit paths,
-   create conventional commits from this agent's changes, and preserve unrelated
-   worktree state.
+4. **Prepare the change.** Delete the completed exec plan after promoting
+   durable decisions, put its verification results in the PR description, stage
+   explicit paths, create conventional commits from this agent's changes, and
+   preserve unrelated worktree state. From here on, the PR is the resume point.
 5. **Open the PR.** Push, assign Eotel, include `Closes #N` for resolved issues,
    and describe the verification evidence.
 6. **Clear remote gates.** Monitor required checks to green. Diagnose and fix
