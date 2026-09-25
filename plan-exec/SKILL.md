@@ -45,6 +45,8 @@ scope expansion that the request did not authorize.
 
 ## Execute and maintain
 
+- When resuming a plan in the legacy shape (history sections or a `completed/`
+  archive), rewrite it into the current shape before continuing.
 - Delete finished steps instead of checking them off. Do not keep `Progress`,
   `Outcomes`, `Surprises`, or dated decision logs.
 - Rewrite `Context` when evidence changes a fact; do not append what happened.
