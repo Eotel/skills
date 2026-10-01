@@ -23,7 +23,9 @@ the shared safety and acceptance behavior.
    can independently inspect or run. Replace subjective gates such as "cleaner"
    with observable behavior, commands, or diff constraints. Confirm the premises
    the spec relies on (reachability, today's public contract) before dispatch; a
-   spec never widens a public contract the request did not name.
+   spec never widens a public contract the request did not name. Each acceptance
+   sentence traces to the request: one that is stricter becomes a finding nobody
+   asked for.
 
 4. **PASS gate.** Integrate a unit only after its required checks pass and the
    critic has no blocking finding. CI or other remote gates remain additional
@@ -44,7 +46,10 @@ the shared safety and acceptance behavior.
    triggers redesign or a user decision instead of an unbounded loop. For
    analysis code, the class-level fix is the authoritative analysis (the
    language's or database's own) rather than a longer hand-written list, and a
-   heuristic check never trades missed cases for false positives.
+   heuristic check never trades missed cases for false positives. For a
+   universal requirement ("never raises", "always redacts"), it is one boundary
+   that enforces the property by construction, named in the spec, not another
+   handled case.
 
 8. **Verified memory.** Record only facts established by artifacts or commands.
    Feed relevant lessons to later workers without forwarding author reasoning to
