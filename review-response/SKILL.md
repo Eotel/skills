@@ -19,7 +19,8 @@ description: Handle code reviews that came back on many PRs at once (items retur
   people can also change.
 - Progress lives in one local status file from the start of the run: a JSON list
   of units rendered to Markdown with `scripts/render_status.py`, one row per unit
-  with its state, next step, and links. The orchestrator updates it at every
+  with its state, next step, links, and the tracker item of each PR it names
+  (whose turn it is, open or done). The orchestrator updates it at every
   milestone so the user can see what is running, what is waiting, and what was
   left out of scope.
 - `scripts/`: tracker listing and updates, PR and CI watchers, and the status
@@ -50,4 +51,5 @@ description: Handle code reviews that came back on many PRs at once (items retur
   `references/triage.md`), and out-of-scope items are listed with a reason.
 - Every commit that landed during the run has finished its checks, and any red
   result has an owner.
-- The status file lists each unit with links to its PRs and issues.
+- The status file lists each unit with links to its PRs, issues, and tracker
+  items.

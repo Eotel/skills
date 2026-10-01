@@ -14,7 +14,7 @@ import urllib.request
 
 
 FIELDS = (
-    "name,completed,assignee.gid,assignee.name,modified_at,created_at,"
+    "name,completed,assignee.gid,assignee.name,modified_at,created_at,permalink_url,"
     "custom_fields.gid,custom_fields.text_value,custom_fields.display_value"
 )
 
@@ -62,6 +62,7 @@ def task_record(task, url_field):
         "url": field.get("text_value") or field.get("display_value"),
         "modified_at": task.get("modified_at"),
         "created_at": task.get("created_at"),
+        "permalink_url": task.get("permalink_url"),
     }
 
 
@@ -123,6 +124,7 @@ def main(argv=None):
     returned.add_argument("--assignee", required=True, help="Asana user ID")
     find = commands.add_parser("find", help="find tasks by exact URL custom field, including completed tasks")
     find.add_argument("url")
+    commands.add_parser("index", help="list open and completed project tasks with task links")
     create = commands.add_parser("create", help="create a task with the caller's full title")
     create.add_argument("url")
     create.add_argument("title")
@@ -138,20 +140,22 @@ def main(argv=None):
         url_field = getattr(args, "url_field", os.environ.get("ASANA_URL_FIELD"))
         if not url_field:
             raise ValueError("Missing URL field; pass --url-field or set ASANA_URL_FIELD")
-        if args.command in ("returned", "find", "create") and not project:
+        if args.command in ("returned", "find", "index", "create") and not project:
             raise ValueError("Missing project; pass --project or set ASANA_PROJECT")
         client = Asana(pat)
 
         def emit(task):
             print(json.dumps(task_record(task, url_field), ensure_ascii=False))
 
-        if args.command in ("returned", "find"):
+        if args.command in ("returned", "find", "index"):
             for task in client.project_tasks(project, incomplete=args.command == "returned"):
                 record = task_record(task, url_field)
                 if args.command == "returned":
                     matches = not record["completed"] and record["assignee_gid"] == args.assignee
-                else:
+                elif args.command == "find":
                     matches = (record["url"] or "").rstrip("/") == args.url.rstrip("/")
+                else:
+                    matches = True
                 if matches:
                     emit(task)
         elif args.command == "create":

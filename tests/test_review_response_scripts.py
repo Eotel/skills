@@ -134,6 +134,251 @@ class RenderStatusTests(unittest.TestCase):
         data["units"][0].update(repo="", target="api#12", what="#201")
         self.assertIn(" | #201 | ", renderer.render_status(data))
 
+    def render_with_tracker(self, data, tasks):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "status.json"
+            tracker = Path(temporary) / "tracker.jsonl"
+            source.write_text(json.dumps(data), encoding="utf-8")
+            tracker.write_text("".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8")
+            return subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), str(source), "--tracker", str(tracker)], capture_output=True, text=True)
+
+    def test_tracker_recognizes_markdown_destinations_with_titles_and_angles(self):
+        tasks = [{"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False}]
+        for target in (
+            '[pull](https://github.com/acme/api/pull/12 "Review")',
+            "[pull](https://github.com/acme/api/pull/12 'Review')",
+            "[pull](https://github.com/acme/api/pull/12 (Review))",
+            "[pull](<https://github.com/acme/api/pull/12>)",
+            '[pull](<https://github.com/acme/api/pull/12> "Review")',
+        ):
+            with self.subTest(target=target):
+                data = self.data()
+                data["units"][0]["target"] = target
+                result = self.render_with_tracker(data, tasks)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                row = result.stdout.splitlines()[4]
+                self.assertIn(" | " + target + " | ", row)
+                self.assertTrue(row.endswith(" | acme/api#12 Alex · open |"), row)
+
+    def test_tracker_reads_asana_jsonl_with_unicode_line_separators(self):
+        for separator in ("\u2028", "\u2029", "\u0085"):
+            with self.subTest(separator=repr(separator)), tempfile.TemporaryDirectory() as temporary:
+                task = {
+                    "gid": "task-id", "name": "Review" + separator + "#12", "completed": False,
+                    "assignee": {"gid": "user-id", "name": "Alex"},
+                    "custom_fields": [{"gid": "url-field", "text_value": "https://github.com/acme/api/pull/12"}],
+                }
+                response = io.StringIO(json.dumps({"data": [task], "next_page": None}))
+                output = io.StringIO()
+                with patch.dict(os.environ, {"ASANA_PAT": "test-token", "ASANA_PROJECT": "project-id", "ASANA_URL_FIELD": "url-field"}, clear=True), patch.object(asana.urllib.request, "urlopen", return_value=response), redirect_stdout(output):
+                    self.assertEqual(asana.main(["index"]), 0)
+                self.assertIn(separator, output.getvalue())
+                self.assertEqual(output.getvalue().count("\n"), 1)
+                source = Path(temporary) / "status.json"
+                tracker = Path(temporary) / "tracker.jsonl"
+                source.write_text(json.dumps(self.data()), encoding="utf-8")
+                tracker.write_text(output.getvalue(), encoding="utf-8")
+                result = subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), str(source), "--tracker", str(tracker)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
+
+    def test_tracker_lists_duplicate_url_tasks_in_file_order(self):
+        data = self.data()
+        data["units"][0].update(target="PR#12 PR#13 PR#12", next="PR#12")
+        result = self.render_with_tracker(data, [
+            {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False,
+             "permalink_url": "https://example.invalid/tasks/first"},
+            {"url": "https://github.com/acme/api/pull/13", "assignee": "Casey", "completed": False},
+            {"url": "https://github.com/acme/api/pull/12", "assignee": "Blair", "completed": True,
+             "permalink_url": "https://example.invalid/tasks/second"},
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = (
+            "[acme/api#12](https://example.invalid/tasks/first) Alex · open<br>"
+            "[acme/api#12](https://example.invalid/tasks/second) Blair · done<br>"
+            "acme/api#13 Casey · open"
+        )
+        self.assertTrue(result.stdout.splitlines()[4].endswith(" | " + expected + " |"), result.stdout)
+
+    def test_tracker_matches_task_urls_with_trailing_slashes(self):
+        for suffix in ("/", "///"):
+            with self.subTest(suffix=suffix):
+                result = self.render_with_tracker(self.data(), [
+                    {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False},
+                    {"url": "https://github.com/acme/api/pull/12" + suffix, "assignee": "Blair", "completed": True},
+                ])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = "acme/api#12 Alex · open<br>acme/api#12 Blair · done"
+                self.assertTrue(result.stdout.splitlines()[4].endswith(" | " + expected + " |"), result.stdout)
+
+    def test_tracker_skips_blank_jsonl_lines(self):
+        task = {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False}
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "status.json"
+                tracker = Path(temporary) / "tracker.jsonl"
+                source.write_text(json.dumps(self.data()), encoding="utf-8")
+                tracker.write_bytes((newline + " \t" + newline + json.dumps(task) + newline + newline).encode("utf-8"))
+                result = subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), str(source), "--tracker", str(tracker)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
+
+    def test_tracker_ignores_records_without_url(self):
+        result = self.render_with_tracker(self.data(), [
+            {"name": "Review #12", "assignee": "Ignored", "completed": False},
+            {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False},
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
+        self.assertNotIn("Ignored", result.stdout)
+        self.assertTrue(all(line.endswith(" | — |") for line in result.stdout.splitlines()[5:7]), result.stdout)
+
+    def test_tracker_skips_url_less_records_before_validating_other_fields(self):
+        ignored_records = [
+            {"name": "ignored"},
+            {"url": None, "completed": "done", "assignee": 12, "permalink_url": 12},
+            {"url": "", "completed": "done", "assignee": 12, "permalink_url": 12},
+        ]
+        for ignored in ignored_records:
+            with self.subTest(record=ignored):
+                result = self.render_with_tracker(self.data(), [
+                    ignored,
+                    {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False},
+                ])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
+                self.assertNotIn("ignored", result.stdout)
+
+    def test_help_names_tracker_option(self):
+        result = subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), "--help"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--tracker FILE", result.stdout)
+        self.assertIn("Tracker column", result.stdout)
+
+    def test_cli_tracker_column_lists_open_and_done_tasks(self):
+        result = self.render_with_tracker(self.data(), [
+            {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False,
+             "permalink_url": "https://app.asana.com/0/1200000000000001/1200000000000002"},
+            {"url": "https://github.com/acme/api/pull/13", "assignee": "Blair", "completed": True,
+             "permalink_url": "https://app.asana.com/0/1200000000000001/1200000000000003"},
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[2], "| ID | Repo | Target | What | State | Next | Tracker |")
+        self.assertEqual(lines[3], "| --- | --- | --- | --- | --- | --- | --- |")
+        self.assertTrue(lines[4].endswith(" | [acme/api#12](https://app.asana.com/0/1200000000000001/1200000000000002) Alex · open |"), lines[4])
+        self.assertTrue(lines[5].endswith(" | [acme/api#13](https://app.asana.com/0/1200000000000001/1200000000000003) Blair · done |"), lines[5])
+        self.assertTrue(lines[6].endswith(" | — |"), lines[6])
+
+    def test_tracker_resolves_references_in_first_seen_order_with_cell_context(self):
+        data = self.data()
+        data["units"][0].update(
+            id="PR#97", state="pending PR#98",
+            target="PR#12 ui#15 api-tools#16 acme/worker#17/#18 #19",
+            what="[issue](https://github.com/acme/docs/issues/20) [pull](https://github.com/acme/ui/pull/21) api#12 #201 `PR#90` ``ui#91`` https://github.com/acme/api/pull/92 unknown-api#93 word#94 [external](https://example.invalid/acme/api/pull/95) [PR#96](https://example.invalid/elsewhere)",
+            next="ui#15 PR#12 #22",
+        )
+        data["units"][2].update(repo="", target="ui#30/#31 #32", what="#33", next="PR#34")
+        data["out_of_scope"] = ["api#99"]
+        tasks = [
+            {"url": f"https://github.com/{repo}/pull/{number}", "assignee": "Reviewer", "completed": False,
+             "permalink_url": f"https://app.asana.com/0/1200000000000001/12000000000000{number:02}"}
+            for repo, number in [
+                ("acme/api", 12), ("acme/ui", 15), ("acme/api-tools", 16), ("acme/worker", 17),
+                ("acme/worker", 18), ("acme/api", 19), ("acme/docs", 20), ("acme/ui", 21),
+                ("acme/api", 22), ("acme/ui", 30), ("acme/ui", 31), ("acme/ui", 32),
+                ("acme/ui", 33), ("acme/api", 34), ("acme/api", 90), ("acme/ui", 91),
+                ("acme/api", 92), ("acme/api", 93), ("acme/api", 94), ("acme/api", 95),
+                ("acme/api", 96), ("acme/api", 97), ("acme/api", 98), ("acme/api", 99),
+            ]
+        ]
+        tasks.append({"url": "https://github.com/acme/api/issues/201", "assignee": "Issue owner", "completed": False,
+                      "permalink_url": "https://app.asana.com/0/1200000000000001/1200000000000201"})
+        tasks.reverse()  # Output order comes from references, not the tracker file.
+        result = self.render_with_tracker(data, tasks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = "<br>".join([
+            "[acme/api#12](https://app.asana.com/0/1200000000000001/1200000000000012) Reviewer · open",
+            "[acme/ui#15](https://app.asana.com/0/1200000000000001/1200000000000015) Reviewer · open",
+            "[acme/api-tools#16](https://app.asana.com/0/1200000000000001/1200000000000016) Reviewer · open",
+            "[acme/worker#17](https://app.asana.com/0/1200000000000001/1200000000000017) Reviewer · open",
+            "[acme/worker#18](https://app.asana.com/0/1200000000000001/1200000000000018) Reviewer · open",
+            "[acme/api#19](https://app.asana.com/0/1200000000000001/1200000000000019) Reviewer · open",
+            "[acme/docs#20](https://app.asana.com/0/1200000000000001/1200000000000020) Reviewer · open",
+            "[acme/ui#21](https://app.asana.com/0/1200000000000001/1200000000000021) Reviewer · open",
+            "[acme/api#22](https://app.asana.com/0/1200000000000001/1200000000000022) Reviewer · open",
+        ])
+        third = "<br>".join([
+            "[acme/ui#30](https://app.asana.com/0/1200000000000001/1200000000000030) Reviewer · open",
+            "[acme/ui#31](https://app.asana.com/0/1200000000000001/1200000000000031) Reviewer · open",
+            "[acme/ui#32](https://app.asana.com/0/1200000000000001/1200000000000032) Reviewer · open",
+        ])
+        lines = result.stdout.splitlines()
+        self.assertTrue(lines[4].endswith(" | " + first + " |"), lines[4])
+        self.assertTrue(lines[5].endswith(" | — |"), lines[5])
+        self.assertTrue(lines[6].endswith(" | " + third + " |"), lines[6])
+
+    def test_tracker_falls_back_for_missing_metadata_and_escapes_cell_text(self):
+        data = self.data()
+        data["units"][0]["target"] = "PR#12 PR#13 PR#14 PR#15"
+        result = self.render_with_tracker(data, [
+            {"url": "https://github.com/acme/api/pull/12", "assignee": None, "completed": False, "permalink_url": None},
+            {"url": "https://github.com/acme/api/pull/13", "completed": True},
+            {"url": "https://github.com/acme/api/pull/14", "assignee": "Al|ex\r\nReviewer\nTeam", "completed": False,
+             "permalink_url": "https://example.invalid/task|14"},
+            {"url": "https://github.com/acme/api/pull/15", "assignee": "", "completed": False, "permalink_url": ""},
+            {"url": None, "assignee": None, "completed": False, "permalink_url": None},
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = "<br>".join([
+            "acme/api#12 unassigned · open",
+            "acme/api#13 unassigned · done",
+            r"[acme/api#14](https://example.invalid/task\|14) Al\|ex<br>Reviewer<br>Team · open",
+            "acme/api#15 unassigned · open",
+        ])
+        self.assertTrue(result.stdout.splitlines()[4].endswith(" | " + expected + " |"), result.stdout)
+        empty = self.render_with_tracker(data, [])
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertIn("| Next | Tracker |", empty.stdout)
+        self.assertTrue(all(line.endswith(" | — |") for line in empty.stdout.splitlines()[4:7]))
+
+    def test_cli_tracker_input_errors_write_nothing(self):
+        valid = {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False,
+                 "permalink_url": "https://example.invalid/task/12"}
+        malformed = [
+            ("invalid-json", b'{"url":'), ("invalid-encoding", b"\xff"),
+            ("non-record", b"null\n"), ("array", b"[]\n"),
+            ("missing-completed", json.dumps({"url": valid["url"]}).encode()),
+        ]
+        for field, value in (("url", 12), ("assignee", {"name": "Alex"}), ("permalink_url", 12), ("completed", "done")):
+            record = dict(valid, **{field: value})
+            malformed.append(("invalid-" + field, json.dumps(record).encode()))
+        for name, content in [("missing", None), ("directory", None)] + malformed:
+            for destination in ("stdout", "new-file", "existing-file"):
+                with self.subTest(input=name, destination=destination), tempfile.TemporaryDirectory() as temporary:
+                    source = Path(temporary) / "status.json"
+                    tracker = Path(temporary) / "tracker.jsonl"
+                    output = Path(temporary) / "status.md"
+                    source.write_text(json.dumps(self.data()), encoding="utf-8")
+                    if name == "directory":
+                        tracker.mkdir()
+                    elif content is not None:
+                        tracker.write_bytes(json.dumps(valid).encode() + b"\n" + content)
+                    original = b"existing markdown\n"
+                    if destination == "existing-file":
+                        output.write_bytes(original)
+                    args = [sys.executable, str(SCRIPTS / "render_status.py"), str(source), "--tracker", str(tracker)]
+                    if destination != "stdout":
+                        args.extend(["--output", str(output)])
+                    result = subprocess.run(args, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertTrue(result.stderr.startswith("render_status: "), result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    if destination == "existing-file":
+                        self.assertEqual(output.read_bytes(), original)
+                    else:
+                        self.assertFalse(output.exists())
+
     def test_cli_renders_read_only_input(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "status.json"
@@ -373,6 +618,48 @@ class WatchPrsTests(unittest.TestCase):
 
 
 class WatchChecksTests(unittest.TestCase):
+    def test_classify_commit_missing_non_actions_metadata_does_not_block(self):
+        runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
+        for count in (0, None, "missing"):
+            for app in ({"slug": "some-app"}, {}, None, "missing"):
+                with self.subTest(count=count, app=app):
+                    suite = {"status": "queued"}
+                    if count != "missing":
+                        suite["latest_check_runs_count"] = count
+                    if app != "missing":
+                        suite["app"] = app
+                    self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, [suite]), (True, []))
+
+    def test_help_explains_suite_pending_rule(self):
+        result = subprocess.run([sys.executable, str(SCRIPTS / "watch_checks.py"), "--help"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = " ".join(result.stdout.split())
+        self.assertIn("Non-completed suites block only with check runs or a GitHub Actions slug.", help_text)
+        self.assertIn("Missing counts mean zero; missing app metadata means non-Actions.", help_text)
+
+    def test_classify_commit_ignores_empty_other_app_suites(self):
+        runs = [{"name": name, "status": "completed", "conclusion": "success"} for name in ("unit", "lint", "smoke")]
+        suites = [{"status": "queued", "conclusion": None, "latest_check_runs_count": 0, "app": {"slug": "some-app"}}]
+        suites.extend({"status": "completed", "conclusion": "success", "latest_check_runs_count": 1, "app": {"slug": "github-actions"}} for _ in runs)
+        self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (True, []))
+
+    def test_classify_commit_empty_actions_suite_is_pending(self):
+        runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
+        for count in (0, None, "missing"):
+            with self.subTest(count=count):
+                suite = {"status": "queued", "app": {"slug": "github-actions"}}
+                if count != "missing":
+                    suite["latest_check_runs_count"] = count
+                self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, [suite]), (False, []))
+
+    def test_classify_commit_rerequested_suite_with_runs_is_pending(self):
+        runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
+        for app in ({"slug": "some-app"}, None):
+            for status in ("queued", "in_progress"):
+                with self.subTest(app=app, status=status):
+                    suites = [{"status": status, "latest_check_runs_count": 1, "app": app}]
+                    self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (False, []))
+
     def poll_commit(self, runs, status_pages, suite_pages=None):
         output = io.StringIO()
         errors = io.StringIO()
@@ -395,12 +682,12 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         return code, output.getvalue(), api.call_args_list, sleep
 
-    def test_incomplete_check_suites_keep_completed_runs_pending(self):
+    def test_incomplete_check_suites_with_runs_keep_completed_runs_pending(self):
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         statuses = [{"state": "success", "statuses": [{"context": "legacy", "state": "success"}]}]
         for state in ("queued", "in_progress"):
             with self.subTest(state=state):
-                suites = [{"check_suites": [{"status": "completed"}]}, {"check_suites": [{"status": state}]}]
+                suites = [{"check_suites": [{"status": "completed"}]}, {"check_suites": [{"status": state, "latest_check_runs_count": 1}]}]
                 code, output, _, sleep = self.poll_commit(runs, statuses, suites)
                 self.assertEqual(code, 130)
                 self.assertEqual(output, "")
@@ -519,6 +806,11 @@ class WatchChecksTests(unittest.TestCase):
 
 
 class AsanaTasksTests(unittest.TestCase):
+    def test_help_names_index_subcommand(self):
+        result = subprocess.run([sys.executable, str(SCRIPTS / "asana_tasks.py"), "--help"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^\s+index\s+list open and completed project tasks")
+
     def test_missing_pat_cli_exits_without_echoing_secrets(self):
         environment = dict(os.environ)
         environment.pop("ASANA_PAT", None)
@@ -583,6 +875,42 @@ class AsanaTasksTests(unittest.TestCase):
         rows = self.run_mocked(["find", "https://github.com/acme/api/pull/12/"], client)
         client.project_tasks.assert_called_once_with("project-id", incomplete=False)
         self.assertEqual([row["gid"] for row in rows], ["task-id"])
+
+    def test_index_lists_all_project_tasks_with_links_and_global_options(self):
+        first = self.task(gid="1200000000000002")
+        first["permalink_url"] = "https://app.asana.com/0/1200000000000001/1200000000000002"
+        second = self.task(gid="1200000000000003", completed=True)
+        second["assignee"] = None
+        second["permalink_url"] = "https://app.asana.com/0/1200000000000001/1200000000000003"
+        for before in (True, False):
+            with self.subTest(options_before_command=before), tempfile.TemporaryDirectory() as temporary:
+                env_file = Path(temporary) / "test.env"
+                env_file.write_text("ASANA_PAT=test-token\n", encoding="utf-8")
+                options = ["--project", "1200000000000001", "--url-field", "url-field", "--env-file", str(env_file)]
+                args = options + ["index"] if before else ["index"] + options
+                pages = [
+                    {"data": [first], "next_page": {"offset": "next-page"}},
+                    {"data": [second], "next_page": None},
+                ]
+                output = io.StringIO()
+                with patch.dict(os.environ, {}, clear=True), patch.object(asana.urllib.request, "urlopen", side_effect=[io.StringIO(json.dumps(page)) for page in pages]) as request, redirect_stdout(output):
+                    self.assertEqual(asana.main(args), 0)
+                rows = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(rows, [
+                    {"gid": "1200000000000002", "name": "Review #12", "completed": False,
+                     "assignee": "reviewer", "assignee_gid": "user-id", "url": "https://github.com/acme/api/pull/12",
+                     "modified_at": None, "created_at": None, "permalink_url": first["permalink_url"]},
+                    {"gid": "1200000000000003", "name": "Review #12", "completed": True,
+                     "assignee": None, "assignee_gid": None, "url": "https://github.com/acme/api/pull/12",
+                     "modified_at": None, "created_at": None, "permalink_url": second["permalink_url"]},
+                ])
+                urls = [call.args[0].full_url for call in request.call_args_list]
+                for url in urls:
+                    self.assertIn("/projects/1200000000000001/tasks?", url)
+                    params = asana.urllib.parse.parse_qs(asana.urllib.parse.urlsplit(url).query)
+                    self.assertEqual(params["completed_since"], ["1970-01-01T00:00:00Z"])
+                    self.assertIn("permalink_url", params["opt_fields"][0].split(","))
+                self.assertIn("offset=next-page", urls[1])
 
     def test_create_keeps_full_title_and_accepts_options_after_subcommand(self):
         client = Mock()
