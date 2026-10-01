@@ -1,6 +1,6 @@
 ---
 name: real-browser-verify
-description: Verify changed UI behavior in a real authenticated browser and capture evidence. Use for frontend changes, UI bug fixes, or deployment claims.
+description: Verify changed UI behavior in a real authenticated browser and capture evidence. Use before claiming that a frontend change, UI bug fix, or deployment works.
 ---
 
 # Real-Browser Verify

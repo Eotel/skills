@@ -1,6 +1,6 @@
 ---
 name: class-sweep
-description: Sweep for recurrence after fixing a plausibly reusable defect pattern, including sibling views and regression coverage.
+description: Sweep sibling code and views for recurrences of a defect and add regression coverage. Use after fixing a bug whose construct, shared component, or parallel surface could repeat elsewhere.
 ---
 
 # Class Sweep

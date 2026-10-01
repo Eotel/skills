@@ -1,6 +1,6 @@
 ---
 name: markdown-lint-setup
-description: Set up remark and textlint for Markdown structure and Japanese prose linting in a JavaScript or TypeScript repository.
+description: Set up remark and textlint for Markdown structure and Japanese prose linting in a JavaScript or TypeScript repository. Use when adding or changing a repository's Markdown lint configuration.
 ---
 
 # Markdown Lint Setup

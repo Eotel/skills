@@ -1,6 +1,6 @@
 ---
 name: devenv-init
-description: Initialize a reproducible devenv.sh project from Eotel/devenv-templates. Use for supported language stacks and development-service options.
+description: Initialize a reproducible devenv.sh project from Eotel/devenv-templates. Use when setting up devenv for a supported language stack or adding its development services.
 license: MIT
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: agentic-docs
-description: Create or reorganize repository documentation for agentic work. Use for AGENTS.md, architecture docs, product specs, exec plans, or documentation governance.
+description: Create or reorganize repository documentation for agentic work. Use when writing or restructuring AGENTS.md, architecture docs, product specs, exec plans, or documentation governance.
 ---
 
 # Agentic Docs
