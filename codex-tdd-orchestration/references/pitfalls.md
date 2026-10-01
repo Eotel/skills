@@ -43,9 +43,35 @@ agent. Repair or delete worktree metadata only with explicit authority.
 Symptom: local lint/test is green but CI uses another command, version, generated
 check, or environment.
 
-Mitigation: inspect CI before dispatch and include the relevant command in the
-acceptance contract. When a remote-only failure appears, add an equivalent local
-gate if the repository can run it reliably.
+Mitigation: inspect CI and the repository's commit/push hooks before dispatch and
+include the relevant commands in the acceptance contract. When a remote-only
+failure appears, add an equivalent local gate if the repository can run it
+reliably.
+
+## New worktrees lack local-only files
+
+Symptom: hooks or tests fail only in freshly created worktrees, typically at the
+import of a native library or on a missing local configuration file.
+
+Mitigation: create every worktree through the same routine
+(`scripts/worktree-setup.sh`) and let it copy the repository's local-only files;
+run a smoke command in the new worktree before dispatching a worker to it.
+
+## Monitors that never fire
+
+Symptom: a completion or CI monitor stays silent although the work has finished.
+
+Mitigation: write monitors in a language without implicit word-splitting (for
+example Python), emit every terminal state rather than only success, and let each
+monitor fire once on an already-finished item before relying on it.
+
+## Parallel suites saturate the host
+
+Symptom: load spikes, hook timeouts, and very slow workers when several workers
+and push hooks run full suites at once.
+
+Mitigation: stagger worker launches and pushes by host load; the push-time full
+suite is usually the longest step.
 
 ## Environment pins
 

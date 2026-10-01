@@ -27,7 +27,9 @@ Evidence:
 
 Complete the slice through implementation and repair. For changed behavior,
 prove the regression check fails before the fix and passes afterward. Leave git
-integration and external operations to the orchestrator.
+integration and external operations to the orchestrator. Check the slice's
+premise in the code first; if the slice would change a public contract the
+request does not name, stop and report instead.
 
 Return:
 status / files_changed / evidence with output / blocked_by / notes
@@ -45,9 +47,9 @@ Judge only:
 - diff: <command or artifact>
 - acceptance checks: <exact checks>
 
-Inspect correctness, scope, protected surfaces, integration, and whether the
-checks would catch the reported behavior. Do not use the author's report and do
-not edit files.
+Inspect the spec's premises, correctness, scope, protected surfaces,
+integration, and whether the checks would catch the reported behavior. Do not
+use the author's report and do not edit files.
 
 Return a JSON array of actionable findings:
 [{"file":"...","line":null,"severity":"HIGH|MEDIUM|LOW","issue":"...","evidence":"..."}]
