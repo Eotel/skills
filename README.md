@@ -45,6 +45,8 @@ orchestration callers also require `codex-orchestration-core`.
   `agentic-docs`. Remove it once the remaining repositories have migrated.
 - `real-browser-verify`: verify changed UI behavior in an authenticated browser.
 - `repo-local-git-hooks`: repair repository hooks bypassed by global Git config.
+- `review-response`: handle reviews that came back on many PRs and drive each PR
+  to its end state. Uses `codex-orchestration-core` for implementation work.
 - `ship`: carry a change through implementation, PR, CI, and review resolution.
 
 ### Codex prompts and orchestration

@@ -1,6 +1,6 @@
 ---
 name: codex-orchestration-core
-description: Shared safety and acceptance contracts for codex-orchestrator-brief and codex-tdd-orchestration. Use only when either workflow loads it.
+description: Shared safety and acceptance contracts for codex-orchestrator-brief, codex-tdd-orchestration, and review-response. Use only when one of those workflows loads it.
 ---
 
 # Codex Orchestration Core
@@ -21,7 +21,9 @@ the shared safety and acceptance behavior.
 
 3. **Executable contract.** State each required outcome with evidence a critic
    can independently inspect or run. Replace subjective gates such as "cleaner"
-   with observable behavior, commands, or diff constraints.
+   with observable behavior, commands, or diff constraints. Confirm the premises
+   the spec relies on (reachability, today's public contract) before dispatch; a
+   spec never widens a public contract the request did not name.
 
 4. **PASS gate.** Integrate a unit only after its required checks pass and the
    critic has no blocking finding. CI or other remote gates remain additional
@@ -33,10 +35,16 @@ the shared safety and acceptance behavior.
 
 6. **Verify reports.** Inspect the actual diff, files, and command output after a
    worker finishes. An empty or out-of-scope diff contradicts a success report.
+   Read a verdict only from that job's own result artifact after its process
+   exits, and take a gate's result from the command's own exit status and a
+   non-zero executed count, never from a pipeline's last stage.
 
 7. **Bounded retries.** Give each unit a retry cap. On the first recurrence, fix
    the defect class rather than another literal example; repeated recurrence
-   triggers redesign or a user decision instead of an unbounded loop.
+   triggers redesign or a user decision instead of an unbounded loop. For
+   analysis code, the class-level fix is the authoritative analysis (the
+   language's or database's own) rather than a longer hand-written list, and a
+   heuristic check never trades missed cases for false positives.
 
 8. **Verified memory.** Record only facts established by artifacts or commands.
    Feed relevant lessons to later workers without forwarding author reasoning to
@@ -54,6 +62,9 @@ the shared safety and acceptance behavior.
 11. **Environment contract.** Resolve the exact worktree, branch, write access,
     available dependencies, sandbox, and network limits before dispatch. Supply
     known facts to workers; do not make each one rediscover the environment.
+    Derive the acceptance gate set from the repository's own hooks and CI, and
+    create every worktree through one routine that also brings local-only files,
+    smoke-tested before dispatch.
 
 ## Worker prompt contract
 
@@ -73,8 +84,9 @@ them relevant. Do not paste a catalog of every failure seen in unrelated work.
 ## Critic contract
 
 The critic is read-only unless it has been explicitly assigned a separate fix
-phase. It checks the acceptance contract, searches for sibling cases suggested by
-the diff, and reports only actionable findings with file locations and evidence.
+phase. It checks the acceptance contract and the premises the spec relies on,
+searches for sibling cases suggested by the diff, and reports only actionable
+findings with file locations and evidence.
 A later fixer receives those findings verbatim; a fresh critic judges the result.
 
 ## Completion

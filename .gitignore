@@ -1,6 +1,7 @@
 .DS_Store
 *.log
 tmp/
+__pycache__/
 
 # Claude Code local overrides
 .claude/settings.local.json
