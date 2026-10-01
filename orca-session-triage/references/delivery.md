@@ -15,3 +15,8 @@
   It landed when `result.send.prompt.stages` contains `turn_started`. A busy
   Codex shows the input queued until its next tool call; report that instead of
   resending.
+- A pending AskUserQuestion in Claude Code is a selector ("Enter to select ·
+  ↑/↓ to navigate"), not a prompt. Move the cursor with
+  `orca terminal send --terminal <handle> --text $'\e[B' --json` (↓; `\e[A` is
+  ↑), read the screen to confirm the highlighted option, then send a bare
+  `--enter`. The transcript then records the chosen answer.
