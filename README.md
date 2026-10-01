@@ -16,18 +16,10 @@ apm install -g Eotel/skills/agentic-docs --target agent-skills
 Install only the skill directories needed by the target workflow. The Codex
 orchestration callers also require `codex-orchestration-core`.
 
-## Authoring policy
+## Authoring
 
-- Descriptions state the capability and discriminating trigger in one or two
-  sentences.
-- Root skill files contain only shared decisions, invariants, and routing needed
-  when the skill is active.
-- Detailed procedures, templates, schemas, and environment-specific guidance are
-  loaded conditionally from `references/` or executed from `scripts/`.
-- Model IDs, effort levels, CLI flags, and SDK details are checked against current
-  primary documentation instead of copied into every skill.
-- Safety and permission boundaries stay explicit. Ordinary reversible work does
-  not gain extra approval gates merely because a skill is active.
+Authoring rules, script and test conventions, and validation commands live in
+[`AGENTS.md`](AGENTS.md).
 
 ## Skills
 
@@ -60,14 +52,3 @@ orchestration callers also require `codex-orchestration-core`.
 - `codex-tdd-orchestration`: run live multi-agent Codex implementation with
   isolated ownership, TDD, cold review, and integration gates.
 - `worker-contract`: define file ownership and reporting for concurrent writers.
-
-## Validation
-
-Validate each skill with OpenAI's `skill-creator` validator:
-
-```bash
-uv run --with pyyaml python /path/to/skill-creator/scripts/quick_validate.py ./skill-name
-```
-
-Also run the skill's own script tests and meaningful behavioral checks when it
-contains executable helpers.
