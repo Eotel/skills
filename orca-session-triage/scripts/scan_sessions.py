@@ -122,7 +122,7 @@ def message_text(payload):
 
 def summarize_rollout(path):
     """Return (cwd, summary) for one Codex rollout file."""
-    cwd, asks, outputs, last_user, last_assistant = None, {}, set(), None, None
+    cwd, asks, outputs, last_user, last_assistant, last_role = None, {}, set(), None, None, None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
@@ -140,9 +140,11 @@ def summarize_rollout(path):
         elif kind == "message" and payload.get("role") == "user":
             value = message_text(payload)
             if value and not value.lstrip().startswith(("<", "# AGENTS.md instructions")):
-                last_user = (row.get("timestamp"), value)
+                last_user, last_role = (row.get("timestamp"), value), "user"
         elif kind == "message" and payload.get("role") == "assistant":
-            last_assistant = message_text(payload) or last_assistant
+            value = message_text(payload)
+            if value:
+                last_assistant, last_role = value, "assistant"
     pending = []
     for call_id, ask in asks.items():
         if call_id in outputs:
@@ -153,13 +155,15 @@ def summarize_rollout(path):
         "rollout": str(path),
         "last_user": last_user[1] if last_user else None,
         "last_assistant": last_assistant,
+        "last_role": last_role,
         "pending_requests": pending,
     }
 
 
 def asks_user(final_text):
+    """True when one of the last three lines is a question; agents often add a reason after it."""
     lines = [line.strip() for line in (final_text or "").splitlines() if line.strip()]
-    return bool(lines) and lines[-1].endswith(("?", "？"))
+    return any(line.endswith(("?", "？")) for line in lines[-3:])
 
 
 def waiting_reasons(row, decision_marker):
@@ -171,6 +175,9 @@ def waiting_reasons(row, decision_marker):
         reasons.append("final message asks")
     if any(not r["answered_in_chat_later"] for s in row["codex"] for r in s["pending_requests"]):
         reasons.append("Codex request pending")
+    latest = row["codex"][-1] if row["codex"] else {}
+    if latest.get("last_role") == "assistant" and asks_user(latest.get("last_assistant")):
+        reasons.append("Codex final message asks")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
         reasons.append("decision marker in comment")
     return reasons
