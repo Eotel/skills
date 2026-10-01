@@ -13,3 +13,6 @@ act on.
   merge it and after what, so nobody merges the older head.
 - Merge at the verified head (for GitHub, `--match-head-commit`), then watch the
   landed head's checks to completion. Do the same for merges made by others.
+- After a PR lands, read what else landed in the files it touched since its base.
+  A merge that applies cleanly can still leave two statements that contradict each
+  other, and checks do not see it.

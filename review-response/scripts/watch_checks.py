@@ -19,8 +19,15 @@ def classify_checks(runs):
 
 
 def classify_commit(runs, combined, suites):
-    """Wait for all check suites, check runs and commit status contexts to finish."""
-    if any(suite.get("status", "").lower() != "completed" for suite in suites):
+    """Non-completed suites block only with check runs or a GitHub Actions slug.
+    Missing counts mean zero; missing app metadata means non-Actions.
+    """
+    if any(
+        suite.get("status", "").lower() != "completed"
+        and ((suite.get("latest_check_runs_count") or 0) > 0
+             or (suite.get("app") or {}).get("slug") == "github-actions")
+        for suite in suites
+    ):
         return False, []
     statuses = combined["statuses"]
     if not runs and not statuses:
@@ -86,7 +93,11 @@ def positive_interval(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="Non-completed suites block only with check runs or a GitHub Actions slug. "
+               "Missing counts mean zero; missing app metadata means non-Actions.",
+    )
     parser.add_argument("commits", nargs="+", type=commit_spec, help="commit specs, for example acme/api@abcdef123")
     parser.add_argument("--interval", type=positive_interval, default=60, help="poll interval in seconds (default: 60)")
     args = parser.parse_args(argv)
