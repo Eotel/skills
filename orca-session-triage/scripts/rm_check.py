@@ -70,7 +70,9 @@ def check(worktree, main, base, compose_projects, pr=None):
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    if git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
+    if base is None:
+        blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
+    elif git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
         if not pr:
             blockers.append("HEAD %s is not in %s" % (head[:8], base))
         elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
@@ -88,9 +90,15 @@ def main_checkout(worktree):
     return None
 
 
+BASE_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
+
+
 def default_base(worktree):
-    ref = git(worktree, "rev-parse", "--abbrev-ref", "origin/HEAD").stdout.strip()
-    return ref or "origin/main"
+    """The first existing remote default branch, or None when the repository has none."""
+    for ref in BASE_CANDIDATES:
+        if git(worktree, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
+            return ref
+    return None
 
 
 def pull_request(worktree, number):

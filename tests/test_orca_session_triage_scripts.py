@@ -177,6 +177,7 @@ class CodexRolloutTests(unittest.TestCase):
         self.assertEqual(result["/w/app/three"][0]["pending_requests"], [])
         self.assertEqual(result["/w/app/two"][0]["last_user"], "#123 を直して")
         [session] = result["/w/app/one"]
+        self.assertEqual(session["last_role"], "assistant")
         self.assertEqual(session["last_user"], "ssh app@host")
         self.assertEqual(session["last_assistant"], "Deploying now.")
         self.assertEqual(session["pending_requests"], [{
@@ -229,6 +230,21 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/b"], ("waiting", ["final message asks"]))
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
         self.assertNotIn("/w/main", result)
+
+    def test_a_codex_final_message_that_asks_is_waiting(self):
+        codex = {"/w/q": [{"rollout": "r", "last_user": "ship it", "last_role": "assistant",
+                           "last_assistant": "PR #1 is green.\nPR #1 をマージしてよいですか？\n"
+                                             "AGENTS.md で確認が必要と定めているため、ここで確認しています。",
+                           "pending_requests": []}],
+                 "/w/r": [{"rollout": "r", "last_user": "マージしてよいですか？", "last_role": "user",
+                           "last_assistant": "Shall I merge?", "pending_requests": []}]}
+        result = self.classes(
+            [worktree("/w/q", "done", agent="codex", pr={"number": 1, "state": "merged"}),
+             worktree("/w/r", "working", agent="codex")],
+            [terminal("/w/q", "codex"), terminal("/w/r", "codex")], codex)
+
+        self.assertEqual(result["/w/q"], ("waiting", ["Codex final message asks"]))
+        self.assertEqual(result["/w/r"], ("working", []))
 
     def test_codex_requests_unstarted_agents_and_merged_work(self):
         pending = {"asked_at": "t", "questions": [], "answered_in_chat_later": False}
@@ -421,6 +437,17 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((clean_code, clean["ok"], clean["main"]), (0, True, str(self.main.resolve())))
         self.assertEqual((dirty_code, dirty["blockers"]), (1, ["1 uncommitted changes"]))
+
+    def test_command_without_a_base_ref_says_so(self):
+        (self.wt / "app.txt").write_text("v2\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.getvalue())["blockers"],
+                         ["1 uncommitted changes",
+                          "no base ref found (origin/HEAD, origin/main, origin/master); pass --base"])
 
     def test_command_rejects_a_path_that_is_not_a_git_worktree(self):
         plain = Path(self.tmp.name) / "plain"
