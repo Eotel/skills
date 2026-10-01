@@ -1,6 +1,6 @@
 ---
 name: django
-description: Refactor Django ORM/query boundaries and DRF-owned business logic. Use for QuerySet or Manager extraction, adapter thinning, and Django-specific policy placement.
+description: Refactor Django ORM/query boundaries and DRF-owned business logic. Use when extracting QuerySet or Manager methods, thinning views or serializers, or deciding where Django-specific policy lives.
 ---
 
 # Django

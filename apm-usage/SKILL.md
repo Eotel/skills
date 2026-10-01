@@ -1,6 +1,6 @@
 ---
 name: apm-usage
-description: Use APM to author or debug apm.yml, install or update agent packages, inspect targets, and resolve lockfile behavior.
+description: Operate APM manifests, packages, targets, and lockfiles. Use when editing apm.yml, installing or updating agent packages, or debugging why a package did or did not deploy.
 ---
 
 # APM Usage
