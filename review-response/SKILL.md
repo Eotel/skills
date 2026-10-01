@@ -17,6 +17,11 @@ description: Handle code reviews that came back on many PRs at once (items retur
   before dispatching any work.
 - `references/shared-prs.md`: pushing to or merging a PR that other sessions or
   people can also change.
+- Progress lives in one local status file from the start of the run: a JSON list
+  of units rendered to Markdown with `scripts/render_status.py`, one row per unit
+  with its state, next step, and links. The orchestrator updates it at every
+  milestone so the user can see what is running, what is waiting, and what was
+  left out of scope.
 - `scripts/`: tracker listing and updates, PR and CI watchers, and the status
   table renderer. Each script documents its options with `--help`; tracker IDs
   and repository aliases come from the caller's configuration, not from this
