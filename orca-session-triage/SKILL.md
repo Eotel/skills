@@ -1,6 +1,6 @@
 ---
 name: orca-session-triage
-description: Use when the user asks which Orca sessions are finished, stuck, or waiting on them, wants their pending questions answered in one pass, or wants finished worktrees closed. Not for driving a single session.
+description: Sweep Orca agent sessions, relay batched answers, and close finished worktrees. Use when the user asks which Orca sessions are finished, stuck, or waiting on them, wants their pending questions answered in one pass, or wants finished worktrees closed.
 ---
 
 # Orca Session Triage
