@@ -13,7 +13,8 @@ capabilities guidance for the `db` part).
   verbatim and link the original. Images they use can be fetched with the
   Artifact tool's `read` (`paths`) and republished as the new page's `files`.
 - A cleanup section: one close/keep row per `finished` or `unstarted` worktree,
-  with what `rm_check.py` found and anything the row's choice also removes.
+  with what `rm_check.py` found and anything the row's choice also removes, and
+  one row per kept worktree with `closable` tabs, naming each tab.
 - Answers: declare `db` with an owner-only root rule, write one document
   (`answers/latest`) on submit, and also offer "copy as text" for pasting into
   the chat. Read the document back with `ArtifactData get`, or take the pasted
