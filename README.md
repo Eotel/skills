@@ -31,9 +31,9 @@ Authoring rules, script and test conventions, and validation commands live in
 - `devenv-init`: scaffold supported devenv.sh project environments.
 - `django`: refactor Django ORM/query boundaries and DRF-owned policies.
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
-- `orca-session-triage`: sweep Orca agent sessions for finished worktrees, waiting
-  questions, and agents that never got a task; batch the answers and close the
-  finished tabs and worktrees.
+- `orca-session-triage`: sweep Orca agent sessions for finished or stalled
+  worktrees, waiting questions, and agents that never got a task; batch the
+  answers and next steps and close the finished tabs and worktrees.
 - `plan-exec`: create and execute durable repo-local implementation plans.
 - `exec-plan-migration` (temporary): move a repository from the legacy
   `completed/` plan archive to forward-only plans. Requires `plan-exec` and

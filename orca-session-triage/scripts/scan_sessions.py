@@ -191,7 +191,11 @@ def waiting_reasons(row, decision_marker):
 
 
 def classify(row, decision_marker):
-    """Return (class, reasons): waiting > unstarted > working > finished > idle."""
+    """Return (class, reasons): waiting > unstarted > working > finished > stalled.
+
+    A stalled worktree has nothing running and nothing asked, yet is still open: it
+    waits on the user's next step (merge, review request, close, next task).
+    """
     reasons = waiting_reasons(row, decision_marker)
     if reasons:
         return "waiting", reasons
@@ -204,7 +208,9 @@ def classify(row, decision_marker):
         return "working", []
     if (row["linked_pr"] or {}).get("state") == "merged":
         return "finished", ["PR merged"]
-    return "idle", []
+    if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
+        return "finished", ["board status completed"]
+    return "stalled", []
 
 
 def shell_is_idle(term, now, idle_minutes):
@@ -217,7 +223,7 @@ def shell_is_idle(term, now, idle_minutes):
 
 def closable_terminals(row_class, terms, now, idle_minutes):
     """Handles to close in a kept worktree: idle shells, plus agents once nothing is pending."""
-    agents_done = row_class in ("finished", "idle")
+    agents_done = row_class in ("finished", "stalled")
     return [t["handle"] for t in terms if t.get("handle")
             and (agents_done if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
 
@@ -238,6 +244,7 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         row = {
             "path": w["path"], "repo": w.get("repo"), "branch": w.get("branch"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
+            "status": w.get("workspaceStatus"),
             "agents": [{"type": a.get("agentType"), "state": a.get("state")} for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
                           for t in terms],
@@ -246,8 +253,94 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         }
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["closable"] = closable_terminals(row["class"], terms, now, shell_idle_minutes)
+        row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
+                                  for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
     return rows
+
+
+def github_slug(remote_url):
+    """owner/repo of a github.com remote; None for any other host."""
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", remote_url or "")
+    return match.group(1) if match else None
+
+
+def git_state(path):
+    """Branch, uncommitted paths, commits not pushed to the upstream, and the GitHub repo.
+
+    None outside a git checkout; `unpushed` is None without an upstream.
+    """
+    def run(*args):
+        return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
+
+    try:
+        status = run("status", "--porcelain")
+        if status.returncode != 0:
+            return None
+        ahead = run("rev-list", "--count", "@{u}..HEAD")
+        branch = run("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or None
+        head = run("rev-parse", "HEAD").stdout.strip() or None
+        origin = run("remote", "get-url", "origin").stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return {
+        "branch": branch, "head": head,
+        "dirty": len(status.stdout.splitlines()),
+        "unpushed": int(ahead.stdout) if ahead.returncode == 0 else None,
+        "github": github_slug(origin),
+    }
+
+
+def summarize_pr(data):
+    """Reduce `gh pr view --json` output to what decides a stalled worktree's next step."""
+    checks = {}
+    for check in data.get("statusCheckRollup") or []:
+        key = (check.get("conclusion") or check.get("state") or check.get("status") or "UNKNOWN").upper()
+        checks[key] = checks.get(key, 0) + 1
+    return {
+        "number": data.get("number"), "url": data.get("url"), "state": data.get("state"),
+        "head": data.get("headRefName"), "head_oid": data.get("headRefOid"),
+        "review": data.get("reviewDecision") or None,
+        "requested": [r.get("login") or r.get("name") for r in data.get("reviewRequests") or []],
+        # GitHub reports a deleted account's review with a null author, shown as "ghost".
+        "reviews": [((r.get("author") or {}).get("login") or "ghost") + ":" + r.get("state", "")
+                    for r in data.get("latestReviews") or []],
+        "merge_state": data.get("mergeStateStatus"), "checks": checks,
+    }
+
+
+PR_FIELDS = ("number,url,state,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
+             "mergeStateStatus,statusCheckRollup")
+
+
+def gh_pr(slug, ref):
+    """Summary of a GitHub PR by number or head branch, or None when gh finds none or fails."""
+    try:
+        out = subprocess.run(["gh", "pr", "view", str(ref), "-R", slug, "--json", PR_FIELDS],
+                             capture_output=True, text=True, timeout=30)
+        return summarize_pr(json.loads(out.stdout)) if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+
+def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
+    """Return rows where each stalled row also carries its git and PR state.
+
+    `pr.head_matches` is False when the PR found (a branch name can be reused)
+    does not point at the checkout's HEAD.
+    """
+    result = []
+    for row in rows:
+        if row["class"] != "stalled":
+            result.append(row)
+            continue
+        git = git_lookup(row["path"])
+        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("branch")
+        pr = pr_lookup(git["github"], ref) if git and git.get("github") and ref else None
+        if pr is not None:
+            pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head")}
+        result.append({**row, "git": git, "pr": pr})
+    return result
 
 
 def read_codex(session_roots, since=None):
@@ -293,7 +386,7 @@ def main(argv=None):
     parser.add_argument("--codex-sessions", action="append",
                         help="Codex session root or glob; repeatable (default: Orca codex accounts and ~/.codex/sessions)")
     parser.add_argument("--since-hours", type=float, default=24,
-                        help="skip Codex rollouts not modified within this many hours; an older idle "
+                        help="skip Codex rollouts not modified within this many hours; an older quiet "
                              "Codex then reads as unstarted (default: 24)")
     parser.add_argument("--decision-marker", default="要判断",
                         help="worktree comment prefix that marks a pending human decision (default: 要判断)")
@@ -306,8 +399,9 @@ def main(argv=None):
     terminals = orca_result(args.orca, ["terminal", "list"], "terminals", args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
-    rows = build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects), codex,
-                           args.decision_marker, shell_idle_minutes=args.shell_idle_minutes)
+    rows = add_next_step_facts(build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects),
+                                               codex, args.decision_marker,
+                                               shell_idle_minutes=args.shell_idle_minutes))
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0

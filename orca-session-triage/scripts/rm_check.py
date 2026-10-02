@@ -37,14 +37,25 @@ def same_tree(left, right):
     return all(same_tree(left / n, right / n) for n in names)
 
 
+def holds_nothing(path):
+    """An empty file, or a directory whose files are all empty."""
+    if path.is_symlink():
+        return False
+    if path.is_file():
+        return path.stat().st_size == 0
+    return path.is_dir() and all(holds_nothing(child) for child in path.iterdir())
+
+
 def ignored_for_review(worktree, main):
-    """Ignored paths that are neither caches nor identical copies of the main checkout."""
+    """Ignored paths that hold something and are neither caches nor copies of the main checkout."""
     review = []
     for line in git(worktree, "status", "--porcelain", "--ignored").stdout.splitlines():
         if not line.startswith("!! ") or is_cache(line[3:]):
             continue
         rel = line[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
+        if holds_nothing(source):
+            continue
         if not copy.exists():
             review.append(rel + " (not in main checkout)")
         elif not same_tree(source, copy):
