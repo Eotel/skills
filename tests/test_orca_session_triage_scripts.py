@@ -28,6 +28,7 @@ def load_script(name):
 
 scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
+precheck = load_script("precheck")
 
 
 def write_jsonl(path, rows):
@@ -907,6 +908,102 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out.getvalue())["blockers"], ["not a git worktree"])
+
+
+class PrecheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ps = Path(self.tmp.name) / "ps.json"
+
+    def run_precheck(self, worktrees, workspace="/w/triage"):
+        self.ps.write_text(json.dumps({"result": {"worktrees": worktrees}}))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = precheck.main(["--ps-json", str(self.ps), "--workspace", workspace])
+        return code, out.getvalue()
+
+    def test_skips_while_an_agent_in_the_workspace_works_is_blocked_or_waits(self):
+        for state in ("working", "blocked", "waiting"):
+            with self.subTest(state=state):
+                code, out = self.run_precheck([worktree("/w/triage", state)])
+
+                self.assertEqual(code, 1)
+                self.assertIn(f"skip: an agent in /w/triage is {state}", out)
+
+    def test_runs_when_the_workspace_agents_are_done_whatever_other_worktrees_do(self):
+        code, out = self.run_precheck([worktree("/w/triage", "done"), worktree("/w/lane", "waiting")])
+
+        self.assertEqual(code, 0)
+        self.assertIn("run: no agent in /w/triage works or waits", out)
+
+    def test_matches_the_workspace_through_a_symlink(self):
+        real = Path(self.tmp.name) / "real"
+        real.mkdir()
+        link = Path(self.tmp.name) / "link"
+        link.symlink_to(real)
+
+        code, out = self.run_precheck([worktree(str(link), "waiting")], workspace=str(real))
+
+        self.assertEqual(code, 1)
+
+    def test_requires_the_workspace_since_orca_runs_a_precheck_in_the_main_checkout(self):
+        self.ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/triage", "waiting")]}}))
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            precheck.main(["--ps-json", str(self.ps)])
+
+        self.assertEqual(exit.exception.code, 2)
+
+    def test_skips_when_orca_does_not_know_the_workspace(self):
+        code, out = self.run_precheck([worktree("/w/lane", "done")])
+
+        self.assertEqual(code, 2)
+        self.assertIn("/w/triage is not an Orca worktree", out)
+
+    def test_skip_reason_carries_what_orca_said_on_stderr(self):
+        refusing = Path(self.tmp.name) / "refusing-orca"
+        refusing.write_text("#!/bin/sh\necho 'runtime not reachable' >&2\nexit 3\n")
+        refusing.chmod(0o755)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = precheck.main(["--orca", str(refusing), "--workspace", "/w/triage"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("skip: could not read Orca worktrees: runtime not reachable", out.getvalue())
+
+    def test_says_when_orca_cut_its_list_before_the_workspace(self):
+        self.ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/lane", "done")], "truncated": True}}))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = precheck.main(["--ps-json", str(self.ps), "--workspace", "/w/triage"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("skip: /w/triage is not among the 1 worktrees Orca listed before cutting the list short",
+                      out.getvalue())
+
+    def test_skips_with_the_reason_when_orca_answers_in_another_shape(self):
+        for answer in ({"result": {"worktrees": None}}, {"result": {"worktrees": [{"agents": []}]}}, ["x"]):
+            with self.subTest(answer=answer):
+                self.ps.write_text(json.dumps(answer))
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = precheck.main(["--ps-json", str(self.ps), "--workspace", "/w/triage"])
+
+                self.assertEqual(code, 2)
+                self.assertIn("skip: could not read Orca worktrees", out.getvalue())
+
+    def test_skips_with_the_reason_when_the_orca_cli_fails(self):
+        garbled = Path(self.tmp.name) / "garbled-orca"
+        garbled.write_text("#!/bin/sh\necho not json\n")
+        garbled.chmod(0o755)
+        for orca in (str(Path(self.tmp.name) / "missing-orca"), "false", str(garbled)):
+            with self.subTest(orca=orca):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = precheck.main(["--orca", orca, "--workspace", "/w/triage"])
+
+                self.assertEqual(code, 2)
+                self.assertIn("skip: could not read Orca worktrees", out.getvalue())
 
 
 if __name__ == "__main__":

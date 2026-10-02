@@ -1,6 +1,6 @@
 ---
 name: orca-session-triage
-description: Sweep Orca agent sessions, relay batched answers and next steps, and close finished tabs and worktrees. Use when the user asks which Orca sessions are finished, stalled, or waiting on them, wants their pending questions answered in one pass, or wants finished sessions, tabs, or worktrees closed.
+description: Sweep Orca agent sessions, relay batched answers and next steps, and close finished tabs and worktrees. Use when the user asks which Orca sessions are finished, stalled, or waiting on them, wants their pending questions answered in one pass, wants finished sessions, tabs, or worktrees closed, or wants the sweep scheduled.
 ---
 
 # Orca Session Triage
@@ -29,6 +29,8 @@ user approves.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees and tabs.
+- `references/hourly.md`: a run started as `/orca-session-triage hourly`, or
+  setting up the Orca automation that starts it.
 
 ## Done
 
