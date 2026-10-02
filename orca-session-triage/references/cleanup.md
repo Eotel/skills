@@ -36,7 +36,9 @@ A worktree's `closable` list names the tabs it can lose while the checkout stays
 shells whose last line is a bare prompt (`❯`) with no output for
 `--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
 worktree is `finished` or `stalled`, its agent sessions. A helper agent in a
-`working` or `waiting` worktree stays: its lead may send it the next round.
+`working` or `waiting` worktree stays: its lead may send it the next round. An
+`unsure` worktree keeps its agents until you have read the final message and
+classed it.
 
 1. `orca terminal close --terminal <handle> --json` per approved handle. It stops
    that pane's process (`ptyKilled: true`) and removes a single-pane tab; `--tab`

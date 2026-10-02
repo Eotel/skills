@@ -333,7 +333,7 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/j", "done", pr={"number": 1, "state": "merged"}),
              worktree("/w/s", "done", pr={"number": 2, "state": "merged"})],
             [terminal("/w/j", "claude", "term_j"), terminal("/w/s", "claude", "term_s")],
-            judge={asks: 0.79, done: 0.1}.get)
+            judge={asks: 0.79, done: 0.29}.get)
 
         self.assertEqual(result["/w/j"], ("waiting", ["final message asks (Jev 0.79)"]))
         self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
