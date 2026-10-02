@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -196,9 +197,14 @@ def worktree(path, state=None, agent="claude", comment="", pr=None, main=False):
     }
 
 
-def terminal(path, agent, handle="term_1"):
+def terminal(path, agent, handle="term_1", title="t", preview="", quiet_minutes=0, orphaned=False):
     return {"worktreeId": "repo::" + path, "handle": handle, "agentIdentity": agent,
-            "title": "t", "connected": True}
+            "title": title, "connected": not orphaned, "orphaned": orphaned, "preview": preview,
+            "lastOutputAt": (NOW - quiet_minutes * 60) * 1000}
+
+
+NOW = 1_800_000_000
+PROMPT = "app on main via python\n❯"
 
 
 class ClassifyTests(unittest.TestCase):
@@ -212,9 +218,56 @@ class ClassifyTests(unittest.TestCase):
     def claude_says(self, path, *rows):
         write_jsonl(scan.claude_project_dir(self.projects, path) / "s.jsonl", list(rows))
 
+    def inventory(self, worktrees, terminals, codex=None):
+        return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=NOW)
+
     def classes(self, worktrees, terminals, codex=None):
-        rows = scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断")
-        return {r["path"]: (r["class"], r["reasons"]) for r in rows}
+        return {r["path"]: (r["class"], r["reasons"]) for r in self.inventory(worktrees, terminals, codex)}
+
+    def closable(self, worktrees, terminals, codex=None):
+        return {r["path"]: r["closable"] for r in self.inventory(worktrees, terminals, codex)}
+
+    def test_a_finished_setup_shell_is_closable_while_the_agent_works(self):
+        result = self.closable(
+            [worktree("/w/a", "working")],
+            [terminal("/w/a", "claude", "term_agent"),
+             terminal("/w/a", None, "term_setup", title="Setup", preview=PROMPT, quiet_minutes=90)])
+
+        self.assertEqual(result["/w/a"], ["term_setup"])
+
+    def test_an_idle_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
+        self.claude_says("/w/b", user("go"), assistant(text("PR #2 is open for review.")))
+        result = self.closable(
+            [worktree("/w/b", "done", pr={"number": 2, "state": "open"})],
+            [terminal("/w/b", "claude", "term_lead"), terminal("/w/b", "codex", "term_helper"),
+             terminal("/w/b", None, "term_server", preview="ready on http://localhost:3000",
+                      quiet_minutes=90),
+             terminal("/w/b", None, "term_clone", preview="Receiving objects:  42%", quiet_minutes=90),
+             terminal("/w/b", None, "term_psql", preview="psql (16.4)\ntaihei=#", quiet_minutes=90),
+             terminal("/w/b", None, "term_node", preview="Welcome to Node.js\n>", quiet_minutes=90),
+             terminal("/w/b", None, "term_typed", preview=PROMPT, quiet_minutes=5),
+             {**terminal("/w/b", None, "term_unknown", preview=PROMPT), "lastOutputAt": None},
+             {key: value for key, value in terminal("/w/b", None, preview=PROMPT, quiet_minutes=90).items()
+              if key != "handle"}],
+            {"/w/b": [{"rollout": "r", "last_user": "implement", "last_role": "assistant",
+                       "last_assistant": "Implemented.", "pending_requests": []}]})
+
+        self.assertEqual(result["/w/b"], ["term_lead", "term_helper"])
+
+    def test_an_agent_orca_reports_waiting_is_never_closable(self):
+        self.claude_says("/w/p", user("go"), assistant(text("Running the migration now.")))
+        result = self.inventory([worktree("/w/p", "waiting")], [terminal("/w/p", "claude", "term_blocked")])
+
+        self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
+                         [("waiting", ["Orca agent waiting"], [])])
+
+    def test_orphaned_terminal_records_are_ignored(self):
+        result = self.inventory(
+            [worktree("/w/c", None)],
+            [terminal("/w/c", "codex", "term_gone", orphaned=True)])
+
+        self.assertEqual([(r["class"], r["terminals"], r["closable"]) for r in result],
+                         [("idle", [], [])])
 
     def test_waiting_comes_from_transcripts_and_the_decision_marker(self):
         self.claude_says("/w/a", user("go"), assistant(
@@ -301,6 +354,26 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         rows = {r["path"]: r["class"] for r in json.loads(out.getvalue())}
         self.assertEqual(rows, {"/w/new": "working", "/w/old": "unstarted"})
+
+
+    def test_shell_idle_minutes_sets_when_a_quiet_shell_becomes_closable(self):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/s", None)]}}))
+        shell = {**terminal("/w/s", None, "term_shell", preview=PROMPT),
+                 "lastOutputAt": (time.time() - 10 * 60) * 1000}
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [shell]}}))
+
+        def closable(*extra):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                scan.main(["--ps-json", str(ps), "--terminals-json", str(terms),
+                           "--claude-projects", str(self.dir / "claude"),
+                           "--codex-sessions", str(self.dir / "none"), *extra])
+            return json.loads(out.getvalue())[0]["closable"]
+
+        self.assertEqual(closable(), [])
+        self.assertEqual(closable("--shell-idle-minutes", "5"), ["term_shell"])
 
 
 def git(cwd, *args):

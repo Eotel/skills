@@ -19,6 +19,11 @@ DEFAULT_CODEX_SESSIONS = [
 
 CLAUDE_DIR_LIMIT = 200
 
+# A line holding only one of these is a shell waiting for input (starship and
+# similar prompts put the glyph on its own line). Prompts that carry text, such
+# as `taihei=#` or `42%`, may belong to a running program, so they never count.
+BARE_PROMPTS = ("❯", "$", "%")
+
 
 def claude_project_dir(projects_root, worktree_path):
     """Claude Code stores a cwd's transcripts under the path with non-alphanumerics as '-'.
@@ -178,6 +183,8 @@ def waiting_reasons(row, decision_marker):
     latest = row["codex"][-1] if row["codex"] else {}
     if latest.get("last_role") == "assistant" and asks_user(latest.get("last_assistant")):
         reasons.append("Codex final message asks")
+    if any(a["state"] == "waiting" for a in row["agents"]):
+        reasons.append("Orca agent waiting")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
         reasons.append("decision marker in comment")
     return reasons
@@ -200,25 +207,45 @@ def classify(row, decision_marker):
     return "idle", []
 
 
-def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker):
+def shell_is_idle(term, now, idle_minutes):
+    """A shell whose screen ends at a bare prompt and that printed nothing for idle_minutes."""
+    lines = [line.strip() for line in (term.get("preview") or "").splitlines() if line.strip()]
+    last_output = term.get("lastOutputAt")
+    quiet = last_output is not None and now - last_output / 1000 >= idle_minutes * 60
+    return bool(lines) and lines[-1] in BARE_PROMPTS and quiet
+
+
+def closable_terminals(row_class, terms, now, idle_minutes):
+    """Handles to close in a kept worktree: idle shells, plus agents once nothing is pending."""
+    agents_done = row_class in ("finished", "idle")
+    return [t["handle"] for t in terms if t.get("handle")
+            and (agents_done if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
+
+
+def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
+                    now=None, shell_idle_minutes=30):
     """Join Orca worktrees with their terminals and transcripts and classify each one."""
+    now = time.time() if now is None else now
     by_worktree = {}
     for term in terminals:
-        by_worktree.setdefault(term.get("worktreeId"), []).append(term)
+        if not term.get("orphaned"):
+            by_worktree.setdefault(term.get("worktreeId"), []).append(term)
     rows = []
     for w in worktrees:
         if w.get("isMainWorktree"):
             continue
+        terms = by_worktree.get(w.get("worktreeId"), [])
         row = {
             "path": w["path"], "repo": w.get("repo"), "branch": w.get("branch"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
             "agents": [{"type": a.get("agentType"), "state": a.get("state")} for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
-                          for t in by_worktree.get(w.get("worktreeId"), [])],
+                          for t in terms],
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
         row["class"], row["reasons"] = classify(row, decision_marker)
+        row["closable"] = closable_terminals(row["class"], terms, now, shell_idle_minutes)
         rows.append(row)
     return rows
 
@@ -270,6 +297,9 @@ def main(argv=None):
                              "Codex then reads as unstarted (default: 24)")
     parser.add_argument("--decision-marker", default="要判断",
                         help="worktree comment prefix that marks a pending human decision (default: 要判断)")
+    parser.add_argument("--shell-idle-minutes", type=float, default=30,
+                        help="a shell at its prompt counts as closable after this long without output "
+                             "(default: 30)")
     args = parser.parse_args(argv)
 
     worktrees = orca_result(args.orca, ["worktree", "ps"], "worktrees", args.ps_json)
@@ -277,7 +307,7 @@ def main(argv=None):
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
     rows = build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects), codex,
-                           args.decision_marker)
+                           args.decision_marker, shell_idle_minutes=args.shell_idle_minutes)
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0

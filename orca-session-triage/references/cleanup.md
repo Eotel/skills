@@ -25,3 +25,19 @@ Run these per approved worktree, in order.
 A merged remote branch the user approved deleting: check
 `gh api repos/<owner>/<repo>/compare/<default>...<branch>` reports `ahead_by: 0`,
 then `gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`.
+
+## Closing tabs in a kept worktree
+
+A worktree's `closable` list names the tabs it can lose while the checkout stays:
+shells whose last line is a bare prompt (`❯`) with no output for
+`--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
+worktree is `finished` or `idle`, its agent sessions. A helper agent in a
+`working` or `waiting` worktree stays: its lead may send it the next round.
+
+1. `orca terminal close --terminal <handle> --json` per approved handle. It stops
+   that pane's process (`ptyKilled: true`) and removes a single-pane tab; `--tab`
+   would also close any pane split beside it.
+2. Confirm the handles are gone from `orca terminal list --json`.
+
+Closing drops Orca's resume record, not the transcript: `claude --resume
+<session-id>` or `codex resume <session-id>` in the worktree reopens the session.
