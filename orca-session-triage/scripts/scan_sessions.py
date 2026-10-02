@@ -165,10 +165,16 @@ def summarize_rollout(path):
     }
 
 
+QUESTION_ENDINGS = ("?", "？", "か。", "か")
+
+
 def asks_user(final_text):
-    """True when one of the last three lines is a question; agents often add a reason after it."""
+    """True when one of the last three lines is a question; agents often add a reason after it.
+
+    A Japanese question ends in か (しましょうか。) as often as in a question mark.
+    """
     lines = [line.strip() for line in (final_text or "").splitlines() if line.strip()]
-    return any(line.endswith(("?", "？")) for line in lines[-3:])
+    return any(line.endswith(QUESTION_ENDINGS) for line in lines[-3:])
 
 
 def waiting_reasons(row, decision_marker):
