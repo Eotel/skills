@@ -30,7 +30,14 @@ def busy_states(page, workspace):
     row = next((w for w in page["worktrees"] if os.path.realpath(w["path"]) == here), None)
     if row is None:
         return None
-    return [a["state"] for a in row.get("agents") or [] if a.get("state") in BUSY_STATES]
+    return [busy_label(a) for a in row.get("agents") or [] if a.get("state") in BUSY_STATES]
+
+
+def busy_label(agent):
+    """Orca keeps an agent working while its background shell, monitor, or helper runs after its turn."""
+    main = agent.get("mainAgent")
+    turn_over = agent["state"] == "working" and isinstance(main, dict) and main.get("state") == "done"
+    return "working (a background job after its turn)" if turn_over else agent["state"]
 
 
 def main(argv=None):

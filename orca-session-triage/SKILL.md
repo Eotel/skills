@@ -21,8 +21,12 @@ user approves.
   `confidence`. Only `done` can finish; the other two keep the row `stalled`
   with a reason. When `asks` is 0.3 to 0.7, `confidence` is below 0.6, or Jev
   gave no usable answer, the row is `unsure`: read its final message and class
-  it yourself. A decision marker outlives its answer, so also read each
-  `waiting` and `stalled` row's latest message yourself.
+  it yourself. Orca also reports an agent as working while its background
+  shell, monitor, or helper runs after its turn. Jev reads that row too: a
+  question makes it `waiting` or `unsure`; otherwise it stays `working` with
+  that reason, and never finishes while the job runs. A decision marker
+  outlives its answer, so also read each `waiting` and `stalled` row's latest
+  message yourself.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
 - `references/delivery.md`: batching questions and sending answers.
