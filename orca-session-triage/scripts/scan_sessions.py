@@ -86,7 +86,8 @@ def user_text(entry):
 
 
 def is_real_user_message(entry):
-    if entry.get("type") != "user" or entry.get("isMeta"):
+    """A message the user typed; meta entries and compaction summaries are Claude Code's own."""
+    if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isCompactSummary"):
         return False
     value = user_text(entry)
     return bool(value) and not value.lstrip().startswith("<")
