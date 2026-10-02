@@ -1,7 +1,8 @@
 """Offline behavior tests for the orca-session-triage command line tools."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import http.client
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import urllib.error
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -218,11 +220,13 @@ class ClassifyTests(unittest.TestCase):
     def claude_says(self, path, *rows):
         write_jsonl(scan.claude_project_dir(self.projects, path) / "s.jsonl", list(rows))
 
-    def inventory(self, worktrees, terminals, codex=None):
-        return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=NOW)
+    def inventory(self, worktrees, terminals, codex=None, judge=None):
+        return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=NOW,
+                                    judge=judge or (lambda message: 0.0))
 
-    def classes(self, worktrees, terminals, codex=None):
-        return {r["path"]: (r["class"], r["reasons"]) for r in self.inventory(worktrees, terminals, codex)}
+    def classes(self, worktrees, terminals, codex=None, judge=None):
+        rows = self.inventory(worktrees, terminals, codex, judge)
+        return {r["path"]: (r["class"], r["reasons"]) for r in rows}
 
     def closable(self, worktrees, terminals, codex=None):
         return {r["path"]: r["closable"] for r in self.inventory(worktrees, terminals, codex)}
@@ -312,38 +316,71 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/a", "working"), worktree("/w/b", "done"),
              worktree("/w/c", "working", comment="要判断: which base?"),
              worktree("/w/main", main=True)],
-            [terminal("/w/a", "claude"), terminal("/w/b", "claude"), terminal("/w/c", "claude")])
+            [terminal("/w/a", "claude"), terminal("/w/b", "claude"), terminal("/w/c", "claude")],
+            judge={"PR is up.\nShall I merge it?": 0.9}.get)
 
         self.assertEqual(result["/w/a"], ("waiting", ["AskUserQuestion pending"]))
-        self.assertEqual(result["/w/b"], ("waiting", ["final message asks"]))
+        self.assertEqual(result["/w/b"], ("waiting", ["final message asks (Jev 0.90)"]))
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
         self.assertNotIn("/w/main", result)
 
-    def test_a_japanese_question_that_ends_in_ka_is_waiting(self):
-        self.claude_says("/w/j", user("go"), assistant(text(
-            "EPM は merge 済みです。\nPR が出たら、diff の読み直しとテストの再実行でレビューしましょうか。")))
-        self.claude_says("/w/s", user("go"), assistant(text("確認しました。\n残りはありません。")))
+    def test_a_final_message_jev_judges_as_waiting_on_the_user_is_waiting(self):
+        asks = "devel の通しは終わりました。\n調べるか issue にするかは、ご判断ください。"
+        done = "確認しました。\n残りはありません。"
+        self.claude_says("/w/j", user("go"), assistant(text(asks)))
+        self.claude_says("/w/s", user("go"), assistant(text(done)))
         result = self.classes(
             [worktree("/w/j", "done", pr={"number": 1, "state": "merged"}),
              worktree("/w/s", "done", pr={"number": 2, "state": "merged"})],
-            [terminal("/w/j", "claude", "term_j"), terminal("/w/s", "claude", "term_s")])
+            [terminal("/w/j", "claude", "term_j"), terminal("/w/s", "claude", "term_s")],
+            judge={asks: 0.79, done: 0.29}.get)
 
-        self.assertEqual(result["/w/j"], ("waiting", ["final message asks"]))
+        self.assertEqual(result["/w/j"], ("waiting", ["final message asks (Jev 0.79)"]))
         self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
 
+    def test_a_final_message_jev_is_unsure_about_is_read_before_anything_closes(self):
+        maybe = "PR は merge しました。\n残っている判断: 表記をどちらにそろえるかは別に決める必要があります。"
+        leaning = "Once the other agent reports, I'll decide how to handle these."
+        self.claude_says("/w/x", user("go"), assistant(text(maybe)))
+        self.claude_says("/w/y", user("go"), assistant(text(leaning)))
+        result = self.inventory(
+            [worktree("/w/x", "done", pr={"number": 1, "state": "merged"}), worktree("/w/y", "done")],
+            [terminal("/w/x", "claude", "term_x"), terminal("/w/y", "claude", "term_y")],
+            judge={maybe: 0.3, leaning: 0.69}.get)
+
+        self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
+            ("unsure", ["Jev unsure (0.30): read the final message"], []),
+            ("unsure", ["Jev unsure (0.69): read the final message"], [])])
+
+    def test_an_unjudged_final_message_is_read_before_anything_closes(self):
+        self.claude_says("/w/u", user("go"), assistant(text("Merged.")))
+        self.claude_says("/w/v", user("go"), assistant(text("Running the suite.")))
+        judged = []
+
+        def unavailable(message):
+            judged.append(message)
+            return None
+
+        result = self.inventory(
+            [worktree("/w/u", "done", pr={"number": 1, "state": "merged"}), worktree("/w/v", "working")],
+            [terminal("/w/u", "claude", "term_u"), terminal("/w/v", "claude", "term_v")], judge=unavailable)
+
+        self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
+            ("unsure", ["Jev could not judge: read the final message"], []), ("working", [], [])])
+        self.assertEqual(judged, ["Merged."])
+
     def test_a_codex_final_message_that_asks_is_waiting(self):
+        asks = "PR #1 is green.\nPR #1 をマージしてよいですか？\nAGENTS.md で確認が必要と定めているため、ここで確認しています。"
         codex = {"/w/q": [{"rollout": "r", "last_user": "ship it", "last_role": "assistant",
-                           "last_assistant": "PR #1 is green.\nPR #1 をマージしてよいですか？\n"
-                                             "AGENTS.md で確認が必要と定めているため、ここで確認しています。",
-                           "pending_requests": []}],
+                           "last_assistant": asks, "pending_requests": []}],
                  "/w/r": [{"rollout": "r", "last_user": "マージしてよいですか？", "last_role": "user",
                            "last_assistant": "Shall I merge?", "pending_requests": []}]}
         result = self.classes(
             [worktree("/w/q", "done", agent="codex", pr={"number": 1, "state": "merged"}),
              worktree("/w/r", "working", agent="codex")],
-            [terminal("/w/q", "codex"), terminal("/w/r", "codex")], codex)
+            [terminal("/w/q", "codex"), terminal("/w/r", "codex")], codex, judge={asks: 0.8}.get)
 
-        self.assertEqual(result["/w/q"], ("waiting", ["Codex final message asks"]))
+        self.assertEqual(result["/w/q"], ("waiting", ["Codex final message asks (Jev 0.80)"]))
         self.assertEqual(result["/w/r"], ("working", []))
 
     def test_codex_requests_unstarted_agents_and_merged_work(self):
@@ -368,6 +405,53 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/f"], ("unstarted", ["codex terminal without a recent transcript"]))
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
         self.assertEqual(result["/w/h"], ("stalled", []))
+
+
+def jev_answer(probability):
+    return io.BytesIO(json.dumps({"model": "jev-1.13.0", "answers": {
+        "asks_user": {"type": "noul", "noul": probability}}}).encode())
+
+
+class CutShort(io.BytesIO):
+    """A response whose connection closes mid-body."""
+
+    def read(self, *args):
+        raise http.client.IncompleteRead(b"{")
+
+
+class JevTests(unittest.TestCase):
+    def test_asks_jev_whether_the_tail_of_a_message_waits_on_the_user(self):
+        sent = []
+
+        def opener(request, timeout):
+            sent.append((request.full_url, request.get_header("Authorization"), json.loads(request.data)))
+            return jev_answer(0.86)
+
+        judge = scan.jev_judge("key-1", opener=opener)
+
+        self.assertEqual(judge("経緯。" * 3000 + "\nやるかどうか指示をください。"), 0.86)
+        url, authorization, body = sent[0]
+        self.assertEqual((url, authorization, body["model"]),
+                         ("https://api.typesafe.ai/v1/systemone", "Bearer key-1", "jev-latest"))
+        self.assertEqual(body["questions"]["asks_user"]["type"], "noul")
+        self.assertTrue(body["state"].endswith("やるかどうか指示をください。"))
+        self.assertEqual(len(body["state"]), scan.JEV_MAX_CHARS)
+
+    def test_a_failed_jev_call_judges_nothing_and_says_why(self):
+        failures = [urllib.error.HTTPError("u", 401, "Unauthorized", None, None),
+                    TimeoutError("timed out"), urllib.error.URLError("offline"),
+                    io.BytesIO(b"not json"), io.BytesIO(b'{"answers": {}}'), jev_answer(float("nan")),
+                    jev_answer(1.5), jev_answer("nan"), CutShort()]
+        for failure in failures:
+            def opener(request, timeout, failure=failure):
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertIsNone(scan.jev_judge("key-1", opener=opener)("m"))
+            self.assertIn("Jev could not judge", err.getvalue())
 
 
 class NextStepFactTests(unittest.TestCase):
@@ -424,10 +508,10 @@ class NextStepFactTests(unittest.TestCase):
         self.assertIsNone(scan.github_slug("https://git.disroot.org/usvdh/collect.git"))
 
 
-    def test_only_stalled_rows_get_git_and_pr_facts(self):
+    def test_only_stalled_and_unsure_rows_get_git_and_pr_facts(self):
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
                 {"path": "/w/branch", "class": "stalled", "linked_pr": None},
-                {"path": "/w/forgejo", "class": "stalled", "linked_pr": None},
+                {"path": "/w/forgejo", "class": "unsure", "linked_pr": None},
                 {"path": "/w/busy", "class": "working", "linked_pr": {"number": 9, "state": "open"}}]
         gits = {"/w/linked": {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"},
                 "/w/branch": {"branch": "fix-b", "head": "bbb", "dirty": 2, "unpushed": 1, "github": "acme/app"},
@@ -452,6 +536,11 @@ class ScanCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
+        # A host's real Jev key must never reach a test run.
+        for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}),
+                         patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key"))):
+            hermetic.start()
+            self.addCleanup(hermetic.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -499,6 +588,54 @@ class ScanCommandTests(unittest.TestCase):
 
         self.assertEqual(closable(), [])
         self.assertEqual(closable("--shell-idle-minutes", "5"), ["term_shell"])
+
+    def scan_merged_worktree(self, *extra):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [
+            worktree("/w/m", "done", pr={"number": 1, "state": "merged"})]}}))
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [terminal("/w/m", "claude")]}}))
+        claude = self.dir / "claude"
+        write_jsonl(scan.claude_project_dir(claude, "/w/m") / "s.jsonl",
+                    [user("go"), assistant(text("Merged. Shall I delete the branch?"))])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--claude-projects", str(claude),
+                       "--codex-sessions", str(self.dir / "none"), *extra])
+        row = json.loads(out.getvalue())[0]
+        return (row["class"], row["reasons"], row["asks"]), err.getvalue()
+
+    def test_without_a_jev_key_idle_final_messages_come_back_unjudged(self):
+        result, err = self.scan_merged_worktree()
+
+        self.assertEqual(result, ("unsure", ["Jev could not judge: read the final message"], {"claude": None}))
+        self.assertIn("TYPESAFE_API_KEY", err)
+
+    def test_judges_with_the_key_file(self):
+        key = self.dir / "api_key"
+        key.write_text("key-2\n")
+        sent = []
+
+        def urlopen(request, timeout):
+            sent.append(request.get_header("Authorization"))
+            return jev_answer(0.7)
+
+        with patch.object(scan.urllib.request, "urlopen", urlopen):
+            result, _ = self.scan_merged_worktree("--jev-key-file", str(key))
+
+        self.assertEqual(result, ("waiting", ["final message asks (Jev 0.70)"], {"claude": 0.7}))
+        self.assertEqual(sent, ["Bearer key-2"])
+
+    def test_the_environment_key_wins_over_the_key_file(self):
+        key = self.dir / "api_key"
+        key.write_text("from-file\n")
+        garbled = self.dir / "garbled"
+        garbled.write_bytes(b"\xff\xfe")
+
+        self.assertEqual(scan.jev_key({"TYPESAFE_API_KEY": "from-env"}, key), "from-env")
+        self.assertEqual(scan.jev_key({}, key), "from-file")
+        self.assertIsNone(scan.jev_key({}, self.dir / "missing"))
+        self.assertIsNone(scan.jev_key({}, garbled))
 
 
 def git(cwd, *args):
