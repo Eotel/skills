@@ -188,10 +188,10 @@ class CodexRolloutTests(unittest.TestCase):
         }])
 
 
-def worktree(path, state=None, agent="claude", comment="", pr=None, main=False):
+def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress"):
     return {
         "worktreeId": "repo::" + path, "path": path, "repo": "app", "branch": "refs/heads/x",
-        "workspaceStatus": "in-progress", "comment": comment, "linkedPR": pr,
+        "workspaceStatus": status, "comment": comment, "linkedPR": pr,
         "isMainWorktree": main,
         "agents": [{"agentType": agent, "state": state}] if state else [],
     }
@@ -235,7 +235,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/a"], ["term_setup"])
 
-    def test_an_idle_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
+    def test_a_stalled_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
         self.claude_says("/w/b", user("go"), assistant(text("PR #2 is open for review.")))
         result = self.closable(
             [worktree("/w/b", "done", pr={"number": 2, "state": "open"})],
@@ -261,13 +261,48 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("waiting", ["Orca agent waiting"], [])])
 
+    def test_finished_work_with_only_closable_tabs_has_no_meaningful_tab(self):
+        self.claude_says("/w/m", user("go"), assistant(text("Merged.")))
+        self.claude_says("/w/n", user("go"), assistant(text("Done; board set to completed.")))
+        rows = self.inventory(
+            [worktree("/w/m", "done", pr={"number": 1, "state": "merged"}),
+             worktree("/w/n", "done", status="completed")],
+            [terminal("/w/m", "claude", "term_m"),
+             terminal("/w/m", None, "term_setup", title="Setup", preview=PROMPT, quiet_minutes=90),
+             terminal("/w/n", "claude", "term_n"),
+             terminal("/w/n", None, "term_dev", preview="ready on http://localhost:5173", quiet_minutes=90)])
+
+        self.assertEqual([(r["class"], r["reasons"], r["meaningful_tabs"]) for r in rows], [
+            ("finished", ["PR merged"], []),
+            ("finished", ["board status completed"], ["term_dev"])])
+
+    def test_a_completed_board_never_hides_an_open_pr_or_a_working_agent(self):
+        self.claude_says("/w/o", user("go"), assistant(text("PR #3 is open.")))
+        self.claude_says("/w/k", user("go"), assistant(text("Working on it.")))
+        rows = self.inventory(
+            [worktree("/w/o", "done", status="completed", pr={"number": 3, "state": "open"}),
+             worktree("/w/k", "working", status="completed")],
+            [terminal("/w/o", "claude", "term_o"), terminal("/w/k", "claude", "term_k")])
+
+        self.assertEqual([r["class"] for r in rows], ["stalled", "working"])
+
+    def test_a_tab_without_a_handle_still_counts_as_meaningful(self):
+        self.claude_says("/w/h", user("go"), assistant(text("Merged.")))
+        rows = self.inventory(
+            [worktree("/w/h", "done", pr={"number": 1, "state": "merged"})],
+            [terminal("/w/h", "claude", "term_h"),
+             {key: value for key, value in terminal("/w/h", None, title="dev server").items()
+              if key != "handle"}])
+
+        self.assertEqual(rows[0]["meaningful_tabs"], ["(no handle) dev server"])
+
     def test_orphaned_terminal_records_are_ignored(self):
         result = self.inventory(
             [worktree("/w/c", None)],
             [terminal("/w/c", "codex", "term_gone", orphaned=True)])
 
         self.assertEqual([(r["class"], r["terminals"], r["closable"]) for r in result],
-                         [("idle", [], [])])
+                         [("stalled", [], [])])
 
     def test_waiting_comes_from_transcripts_and_the_decision_marker(self):
         self.claude_says("/w/a", user("go"), assistant(
@@ -320,7 +355,85 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/e"], ("working", []))
         self.assertEqual(result["/w/f"], ("unstarted", ["codex terminal without a recent transcript"]))
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
-        self.assertEqual(result["/w/h"], ("idle", []))
+        self.assertEqual(result["/w/h"], ("stalled", []))
+
+
+class NextStepFactTests(unittest.TestCase):
+    def test_summarizes_review_merge_and_check_state_of_a_pr(self):
+        data = {"number": 11263, "state": "OPEN", "reviewDecision": "APPROVED",
+                "reviewRequests": [{"login": "k-mizokami"}, {"name": "backend"}],
+                "latestReviews": [{"author": {"login": "hdknr"}, "state": "APPROVED"},
+                                  {"author": None, "state": "COMMENTED"}],
+                "mergeStateStatus": "CLEAN", "headRefName": "fix-a", "headRefOid": "abc123",
+                "url": "https://github.com/acme/app/pull/11263",
+                "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"},
+                                      {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                                      {"status": "IN_PROGRESS", "conclusion": ""},
+                                      {"state": "FAILURE"}]}
+
+        self.assertEqual(scan.summarize_pr(data), {
+            "number": 11263, "url": "https://github.com/acme/app/pull/11263", "state": "OPEN",
+            "head": "fix-a", "head_oid": "abc123", "review": "APPROVED",
+            "requested": ["k-mizokami", "backend"], "reviews": ["hdknr:APPROVED", "ghost:COMMENTED"],
+            "merge_state": "CLEAN", "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
+
+    def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
+        with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
+            self.assertIsNone(scan.gh_pr("acme/app", 7))
+        with patch.object(scan.subprocess, "run", side_effect=scan.subprocess.TimeoutExpired("gh", 30)):
+            self.assertIsNone(scan.gh_pr("acme/app", 7))
+        failed = scan.subprocess.CompletedProcess([], 1, stdout="", stderr="no pull requests found")
+        with patch.object(scan.subprocess, "run", return_value=failed):
+            self.assertIsNone(scan.gh_pr("acme/app", "fix-a"))
+
+
+    def test_reads_uncommitted_and_unpushed_work_and_the_github_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, work = Path(tmp) / "origin.git", Path(tmp) / "work"
+            git(tmp, "init", "-q", "--bare", "-b", "main", str(origin))
+            git(tmp, "clone", "-q", str(origin), str(work))
+            git(work, "config", "user.email", "t@example.com")
+            git(work, "config", "user.name", "t")
+            for name in ("a.txt", "b.txt"):
+                (work / name).write_text(name)
+                git(work, "add", name)
+                git(work, "commit", "-q", "-m", name)
+                if name == "a.txt":
+                    git(work, "push", "-q", "-u", "origin", "main")
+            (work / "notes.txt").write_text("draft")
+            git(work, "remote", "set-url", "origin", "git@github.com:acme/app.git")
+
+            self.assertEqual(scan.git_state(str(work)),
+                             {"branch": "main", "head": git(work, "rev-parse", "HEAD"),
+                              "dirty": 1, "unpushed": 1, "github": "acme/app"})
+            self.assertIsNone(scan.git_state(str(Path(tmp) / "missing")))
+
+        self.assertEqual(scan.github_slug("https://github.com/spin-dd/taihei-report.git"), "spin-dd/taihei-report")
+        self.assertIsNone(scan.github_slug("https://git.disroot.org/usvdh/collect.git"))
+
+
+    def test_only_stalled_rows_get_git_and_pr_facts(self):
+        rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
+                {"path": "/w/branch", "class": "stalled", "linked_pr": None},
+                {"path": "/w/forgejo", "class": "stalled", "linked_pr": None},
+                {"path": "/w/busy", "class": "working", "linked_pr": {"number": 9, "state": "open"}}]
+        gits = {"/w/linked": {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"},
+                "/w/branch": {"branch": "fix-b", "head": "bbb", "dirty": 2, "unpushed": 1, "github": "acme/app"},
+                "/w/forgejo": {"branch": "fix-c", "head": "ccc", "dirty": 0, "unpushed": 0, "github": None}}
+        asked = []
+
+        def pr_lookup(slug, ref):
+            asked.append((slug, ref))
+            return {"number": ref, "head_oid": "aaa"}
+
+        result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
+
+        self.assertEqual(asked, [("acme/app", 7), ("acme/app", "fix-b")])
+        self.assertEqual([(r.get("git"), r.get("pr")) for r in result], [
+            (gits["/w/linked"], {"number": 7, "head_oid": "aaa", "head_matches": True}),
+            (gits["/w/branch"], {"number": "fix-b", "head_oid": "aaa", "head_matches": False}),
+            (gits["/w/forgejo"], None), (None, None)])
+        self.assertNotIn("git", rows[0])
 
 
 class ScanCommandTests(unittest.TestCase):
@@ -428,6 +541,15 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(blocked["blockers"], ["HEAD %s is not in main" % head[:8]])
         self.assertTrue(squashed["ok"])
         self.assertEqual(reopened["blockers"], ["HEAD %s is not in main and PR #7 is OPEN" % head[:8]])
+
+    def test_an_ignored_path_that_holds_nothing_needs_no_review(self):
+        (self.main / "uploads").write_text("rows from the main checkout\n")
+        (self.wt / "uploads").write_text("")
+        (self.wt / "node_modules").mkdir()
+        (self.wt / ".env").mkdir()
+        (self.wt / ".env" / "empty").write_text("")
+
+        self.assertEqual(self.check()["review"], [])
 
     def test_ignored_files_need_review_unless_cache_or_same_as_main(self):
         (self.main / ".env").write_text("A=1\n")

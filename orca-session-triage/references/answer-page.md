@@ -12,6 +12,9 @@ capabilities guidance for the `db` part).
 - Grill pages a session already published: copy their questions and options
   verbatim and link the original. Images they use can be fetched with the
   Artifact tool's `read` (`paths`) and republished as the new page's `files`.
+- A next-step section: one row per `stalled` worktree with its PR, review,
+  and checks, the proposed step first, and what it waits on when nothing is
+  the user's to decide.
 - A cleanup section: one close/keep row per `finished` or `unstarted` worktree,
   with what `rm_check.py` found and anything the row's choice also removes, and
   one row per kept worktree with `closable` tabs, naming each tab.

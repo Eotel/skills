@@ -1,6 +1,10 @@
-# Closing approved worktrees
+# Closing worktrees
 
-Run these per approved worktree, in order.
+A `finished` worktree whose `meaningful_tabs` is empty is done and left behind:
+remove it without asking when `rm_check.py` reports `ok` with no `containers`,
+and report it afterwards. Every other worktree waits for the user's choice.
+
+Run these per worktree, in order.
 
 1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the PR may
    have been squash-merged: a MERGED PR whose head equals HEAD counts as merged.
@@ -31,7 +35,7 @@ then `gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`.
 A worktree's `closable` list names the tabs it can lose while the checkout stays:
 shells whose last line is a bare prompt (`❯`) with no output for
 `--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
-worktree is `finished` or `idle`, its agent sessions. A helper agent in a
+worktree is `finished` or `stalled`, its agent sessions. A helper agent in a
 `working` or `waiting` worktree stays: its lead may send it the next round.
 
 1. `orca terminal close --terminal <handle> --json` per approved handle. It stops

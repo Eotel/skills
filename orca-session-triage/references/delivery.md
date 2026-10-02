@@ -5,8 +5,8 @@
   `answered_in_chat_later` was usually answered by a later user message: confirm
   before listing it. Put a recommended option first.
 - Offer `finished` and `unstarted` worktrees in the same pass as close/keep
-  choices, and each kept worktree's `closable` tabs as one close/keep choice per
-  worktree. An `unstarted` agent's task reuses its repository's established
+  choices, each `stalled` row's next step (`next-step.md`), and each kept
+  worktree's `closable` tabs as one close/keep choice per worktree. An `unstarted` agent's task reuses its repository's established
   request form, found in that repository's earlier transcripts (for example
   `$ship <issue URL>`).
 - Questions go stale within minutes. Right before sending, re-read each target
