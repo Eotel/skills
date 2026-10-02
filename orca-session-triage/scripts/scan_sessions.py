@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import http.client
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 
 DEFAULT_CODEX_SESSIONS = [
     "~/Library/Application Support/orca/codex-accounts/*/home/sessions",
@@ -165,30 +167,73 @@ def summarize_rollout(path):
     }
 
 
-QUESTION_ENDINGS = ("?", "？", "か。", "か")
+# Jev (TypeSafe) answers a yes/no question about a text with a probability.
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_QUESTION = ("Does this message end by waiting for the user's answer, decision, or instruction "
+                "before the agent can continue?")
+JEV_MAX_CHARS = 4000  # the ask sits at the end; earlier context rarely changes the answer
+JEV_TIMEOUT = 15
+JEV_KEY_FILE = "~/.config/typesafe/api_key"
+ASKS_THRESHOLD = 0.5
+# Finished work is removed without asking, so it must be clearly settled: Jev
+# scores of 0.3-0.5 were mostly open decisions left for someone else.
+SETTLED_BELOW = 0.3
 
 
-def asks_user(final_text):
-    """True when one of the last three lines is a question; agents often add a reason after it.
+def jev_key(env, key_file):
+    """TYPESAFE_API_KEY from the environment, else the key file's content, else None."""
+    if env.get("TYPESAFE_API_KEY"):
+        return env["TYPESAFE_API_KEY"]
+    try:
+        return Path(key_file).expanduser().read_text().strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
 
-    A Japanese question ends in か (しましょうか。) as often as in a question mark.
-    """
-    lines = [line.strip() for line in (final_text or "").splitlines() if line.strip()]
-    return any(line.endswith(QUESTION_ENDINGS) for line in lines[-3:])
+
+def jev_judge(api_key, opener=None):
+    """A judge returning the probability that a message waits on the user, or None on failure."""
+    def judge(message):
+        body = {"state": message[-JEV_MAX_CHARS:], "model": "jev-latest",
+                "questions": {"asks_user": {"type": "noul", "instructions": JEV_QUESTION}}}
+        request = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
+            "Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
+        try:
+            with (opener or urllib.request.urlopen)(request, timeout=JEV_TIMEOUT) as response:
+                probability = float(json.load(response)["answers"]["asks_user"]["noul"])
+            if not 0 <= probability <= 1:  # also false for NaN
+                raise ValueError(f"noul out of range: {probability}")
+            return probability
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
+            print(f"Jev could not judge a final message: {error!r}", file=sys.stderr)
+            return None
+    return judge
 
 
-def waiting_reasons(row, decision_marker):
+def is_working(row):
+    return any(a["state"] == "working" for a in row["agents"])
+
+
+def final_messages(row):
+    """The last thing each agent said, by source; Codex only when it spoke after the user."""
+    messages = {"claude": (row["claude"] or {}).get("final_text")}
+    latest = row["codex"][-1] if row["codex"] else {}
+    if latest.get("last_role") == "assistant":
+        messages["codex"] = latest.get("last_assistant")
+    return {source: message for source, message in messages.items() if message}
+
+
+def waiting_reasons(row, decision_marker, threshold=ASKS_THRESHOLD):
     reasons = []
     claude = row["claude"] or {}
+    asks = row.get("asks") or {}
     if claude.get("pending_questions"):
         reasons.append("AskUserQuestion pending")
-    elif asks_user(claude.get("final_text")):
-        reasons.append("final message asks")
+    elif asks.get("claude") is not None and asks["claude"] >= threshold:
+        reasons.append(f"final message asks (Jev {asks['claude']:.2f})")
     if any(not r["answered_in_chat_later"] for s in row["codex"] for r in s["pending_requests"]):
         reasons.append("Codex request pending")
-    latest = row["codex"][-1] if row["codex"] else {}
-    if latest.get("last_role") == "assistant" and asks_user(latest.get("last_assistant")):
-        reasons.append("Codex final message asks")
+    if asks.get("codex") is not None and asks["codex"] >= threshold:
+        reasons.append(f"Codex final message asks (Jev {asks['codex']:.2f})")
     if any(a["state"] == "waiting" for a in row["agents"]):
         reasons.append("Orca agent waiting")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
@@ -196,13 +241,15 @@ def waiting_reasons(row, decision_marker):
     return reasons
 
 
-def classify(row, decision_marker):
+def classify(row, decision_marker, threshold=ASKS_THRESHOLD):
     """Return (class, reasons): waiting > unstarted > working > finished > stalled.
 
-    A stalled worktree has nothing running and nothing asked, yet is still open: it
-    waits on the user's next step (merge, review request, close, next task).
+    A final message Jev could not judge also makes an idle worktree waiting, so it
+    is read before anything closes. A stalled worktree has nothing running and
+    nothing asked, yet is still open: it waits on the user's next step (merge,
+    review request, close, next task).
     """
-    reasons = waiting_reasons(row, decision_marker)
+    reasons = waiting_reasons(row, decision_marker, threshold)
     if reasons:
         return "waiting", reasons
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
@@ -210,8 +257,14 @@ def classify(row, decision_marker):
                      and not has_transcript[t["agent"]]})
     if silent:
         return "unstarted", [agent + " terminal without a recent transcript" for agent in silent]
-    if any(a["state"] == "working" for a in row["agents"]):
+    if is_working(row):
         return "working", []
+    asks = row.get("asks") or {}
+    if None in asks.values():
+        return "waiting", ["final message not judged"]
+    unsettled = [f"final message may ask (Jev {p:.2f})" for p in asks.values() if p >= SETTLED_BELOW]
+    if unsettled:
+        return "stalled", unsettled
     if (row["linked_pr"] or {}).get("state") == "merged":
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
@@ -235,8 +288,12 @@ def closable_terminals(row_class, terms, now, idle_minutes):
 
 
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
-                    now=None, shell_idle_minutes=30):
-    """Join Orca worktrees with their terminals and transcripts and classify each one."""
+                    now=None, shell_idle_minutes=30, judge=lambda message: None,
+                    asks_threshold=ASKS_THRESHOLD):
+    """Join Orca worktrees with their terminals and transcripts and classify each one.
+
+    `judge(message)` returns the probability that a final message waits on the user.
+    """
     now = time.time() if now is None else now
     by_worktree = {}
     for term in terminals:
@@ -257,7 +314,9 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
-        row["class"], row["reasons"] = classify(row, decision_marker)
+        row["asks"] = {} if is_working(row) else {source: judge(message)
+                                                  for source, message in final_messages(row).items()}
+        row["class"], row["reasons"] = classify(row, decision_marker, asks_threshold)
         row["closable"] = closable_terminals(row["class"], terms, now, shell_idle_minutes)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
@@ -399,15 +458,27 @@ def main(argv=None):
     parser.add_argument("--shell-idle-minutes", type=float, default=30,
                         help="a shell at its prompt counts as closable after this long without output "
                              "(default: 30)")
+    parser.add_argument("--jev-key-file", default=JEV_KEY_FILE,
+                        help="Jev (TypeSafe) API key file, read when TYPESAFE_API_KEY is unset "
+                             "(default: %(default)s)")
+    parser.add_argument("--asks-threshold", type=float, default=ASKS_THRESHOLD,
+                        help="Jev probability from which a final message counts as asking the user "
+                             "(default: %(default)s)")
     args = parser.parse_args(argv)
 
     worktrees = orca_result(args.orca, ["worktree", "ps"], "worktrees", args.ps_json)
     terminals = orca_result(args.orca, ["terminal", "list"], "terminals", args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
+    key = jev_key(os.environ, args.jev_key_file)
+    if key is None:
+        print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
+              "idle final messages are not judged, so read them", file=sys.stderr)
+    judge = jev_judge(key) if key else (lambda message: None)
     rows = add_next_step_facts(build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects),
                                                codex, args.decision_marker,
-                                               shell_idle_minutes=args.shell_idle_minutes))
+                                               shell_idle_minutes=args.shell_idle_minutes, judge=judge,
+                                               asks_threshold=args.asks_threshold))
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
