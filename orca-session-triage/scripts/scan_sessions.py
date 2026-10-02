@@ -245,6 +245,20 @@ def is_working(row):
     return any(a["state"] == "working" for a in row["agents"])
 
 
+def main_state(agent):
+    main = agent.get("mainAgent")
+    return main.get("state") if isinstance(main, dict) else None
+
+
+def turn_runs(row):
+    """An agent is in its own turn, not only holding a background shell, monitor, or helper.
+
+    Orca keeps `state` at working while such a job runs after the turn ended;
+    `mainAgent.state` then says done.
+    """
+    return any(a["state"] == "working" and a.get("turn") != "done" for a in row["agents"])
+
+
 def latest_message(row):
     """(source, text) of the newest final message, Claude's when the times tie or are missing.
 
@@ -277,6 +291,7 @@ def unsure_reason(jev):
     return None
 
 
+BACKGROUND_REASON = "a background job runs after the agent's turn"
 STATE_REASONS = {
     "in_progress": "final message says work continues, yet no agent runs",
     "blocked_on_others": "final message waits on someone else",
@@ -312,7 +327,9 @@ def classify(row, decision_marker):
     it yourself before anything closes. Only work Jev calls done can finish; a
     stalled worktree has nothing running and nothing asked, yet is still open,
     and its reason says what Jev read (work continues, waits on someone else,
-    or done but not merged).
+    or done but not merged). A worktree Orca calls working only for a background
+    job is read too: a question makes it waiting or unsure, and it never
+    finishes while the job runs.
     """
     reasons = waiting_reasons(row, decision_marker)
     if reasons:
@@ -322,9 +339,13 @@ def classify(row, decision_marker):
                      and not has_transcript[t["agent"]]})
     if silent:
         return "unstarted", [agent + " terminal without a recent transcript" for agent in silent]
-    if is_working(row):
-        return "working", []
     jev = row.get("jev")
+    if turn_runs(row):
+        return "working", []
+    if is_working(row):
+        if jev and (jev["asks"] is None or jev["asks"] >= SETTLED_BELOW):
+            return "unsure", [unsure_reason(jev)]
+        return "working", [BACKGROUND_REASON]
     if jev and unsure_reason(jev):
         return "unsure", [unsure_reason(jev)]
     state = f"{STATE_REASONS[jev['status']]} (Jev {jev['confidence']:.2f})" if jev else None
@@ -382,13 +403,14 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "path": w["path"], "repo": w.get("repo"), "branch": w.get("branch"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
             "status": w.get("workspaceStatus"),
-            "agents": [{"type": a.get("agentType"), "state": a.get("state")} for a in w.get("agents") or []],
+            "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a)}
+                       for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
                           for t in terms],
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
-        latest = None if is_working(row) else latest_message(row)
+        latest = None if turn_runs(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes)

@@ -207,13 +207,22 @@ class CodexRolloutTests(unittest.TestCase):
         }])
 
 
-def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress"):
+def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress",
+             turn=None):
+    """`turn` is the main agent's own state; Orca's `state` stays working while a background job runs."""
     return {
         "worktreeId": "repo::" + path, "path": path, "repo": "app", "branch": "refs/heads/x",
         "workspaceStatus": status, "comment": comment, "linkedPR": pr,
         "isMainWorktree": main,
-        "agents": [{"agentType": agent, "state": state}] if state else [],
+        "agents": [{"agentType": agent, "state": state, **({"mainAgent": {"state": turn}} if turn else {})}]
+        if state else [],
     }
+
+
+def with_agents(row, *agents):
+    """The worktree row holding these Orca agents, each (type, state, main agent's state or None)."""
+    return {**row, "agents": [{"agentType": kind, "state": state, **({"mainAgent": {"state": turn}} if turn else {})}
+                              for kind, state, turn in agents]}
 
 
 def terminal(path, agent, handle="term_1", title="t", preview="", quiet_minutes=0, orphaned=False):
@@ -465,6 +474,73 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
             ("unsure", ["Jev could not judge: read the final message"], []), ("working", [], [])])
         self.assertEqual(judged, ["Merged."])
+
+    def test_a_question_is_found_while_only_a_background_job_keeps_the_agent_working(self):
+        asks = "PR #220 を出しました。merge には許可が必要です。進めてよいですか。"
+        self.claude_says("/w/bg", user("go"), assistant(text(asks)))
+
+        result = self.classes([worktree("/w/bg", "working", turn="done")], [terminal("/w/bg", "claude")],
+                              judge=judging({asks: verdict(0.9, "blocked_on_others")}))
+
+        self.assertEqual(result["/w/bg"], ("waiting", ["final message asks (Jev 0.90)"]))
+
+    def test_a_background_job_keeps_the_worktree_working_whatever_the_final_message_says(self):
+        self.claude_says("/w/watch", user("go"), assistant(text("Merged. Watching the 12:00 import on stage.")))
+
+        result = self.inventory(
+            [worktree("/w/watch", "working", turn="done", pr={"number": 1, "state": "merged"}, status="completed")],
+            [terminal("/w/watch", "claude", "term_w")])
+
+        self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
+                         [("working", ["a background job runs after the agent's turn"], [])])
+
+    def test_an_unsure_question_behind_a_background_job_is_read(self):
+        maybe = "PR は出しました。表記をどちらにそろえるかは別に決める必要があります。"
+        self.claude_says("/w/m", user("go"), assistant(text(maybe)))
+        self.claude_says("/w/n", user("go"), assistant(text("Watching CI.")))
+
+        result = self.classes(
+            [worktree("/w/m", "working", turn="done"), worktree("/w/n", "working", turn="done")],
+            [terminal("/w/m", "claude", "term_m"), terminal("/w/n", "claude", "term_n")],
+            judge=judging({maybe: verdict(0.5, "in_progress"), "Watching CI.": verdict(0.1, "in_progress", 0.4)}))
+
+        self.assertEqual(result["/w/m"], ("unsure", ["Jev unsure whether it asks (0.50): read the final message"]))
+        self.assertEqual(result["/w/n"], ("working", ["a background job runs after the agent's turn"]))
+
+    def test_agents_sharing_a_worktree_are_read_together(self):
+        asks = "merge してよいですか。"
+        for path in ("/w/turn", "/w/wait", "/w/pair"):
+            self.claude_says(path, user("go"), assistant(text(asks)))
+        judged = []
+
+        def judge(message):
+            judged.append(message)
+            return verdict(0.1, "in_progress")
+
+        result = {r["path"]: (r["class"], r["reasons"], r["closable"]) for r in self.inventory(
+            [with_agents(worktree("/w/turn"), ("claude", "working", "done"), ("claude", "working", "working")),
+             with_agents(worktree("/w/wait"), ("claude", "working", "done"), ("claude", "waiting", None)),
+             with_agents(worktree("/w/pair", pr={"number": 1, "state": "merged"}),
+                         ("claude", "done", "done"), ("codex", "working", "done"))],
+            [terminal("/w/turn", "claude", "term_t"), terminal("/w/wait", "claude", "term_w"),
+             terminal("/w/pair", "claude", "term_p")], judge=judge)}
+
+        self.assertEqual(result["/w/turn"], ("working", [], []))
+        self.assertEqual(result["/w/wait"], ("waiting", ["Orca agent waiting"], []))
+        self.assertEqual(result["/w/pair"], ("working", ["a background job runs after the agent's turn"], []))
+        self.assertEqual(judged, [asks, asks])
+
+    def test_an_agent_without_a_readable_main_state_counts_as_in_its_turn(self):
+        self.claude_says("/w/odd", user("go"), assistant(text("merge してよいですか。")))
+        odd = worktree("/w/odd", "working")
+        for main_agent in (None, {"state": None}, "done", ["done"], True):
+            with self.subTest(main_agent=main_agent):
+                row = {**odd, "agents": [{**odd["agents"][0], "mainAgent": main_agent}]}
+
+                result = self.classes([row], [terminal("/w/odd", "claude")],
+                                      judge=judging({"merge してよいですか。": verdict(0.9)}))
+
+                self.assertEqual(result["/w/odd"], ("working", []))
 
     def test_a_codex_final_message_that_asks_is_waiting(self):
         asks = "PR #1 is green.\nPR #1 をマージしてよいですか？\nAGENTS.md で確認が必要と定めているため、ここで確認しています。"
@@ -930,6 +1006,12 @@ class PrecheckTests(unittest.TestCase):
 
                 self.assertEqual(code, 1)
                 self.assertIn(f"skip: an agent in /w/triage is {state}", out)
+
+    def test_skip_reason_names_a_background_job_left_after_the_agents_turn(self):
+        code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+
+        self.assertEqual(code, 1)
+        self.assertIn("skip: an agent in /w/triage is working (a background job after its turn)", out)
 
     def test_runs_when_the_workspace_agents_are_done_whatever_other_worktrees_do(self):
         code, out = self.run_precheck([worktree("/w/triage", "done"), worktree("/w/lane", "waiting")])
