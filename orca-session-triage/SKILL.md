@@ -14,12 +14,14 @@ user approves.
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus
   Claude and Codex transcripts, lists the tabs it could close (`closable`), and
   gives each `stalled` and `unsure` row its `git` and `pr` state. Jev
-  (TypeSafe) judges whether each idle agent's final message waits on the user
-  (`asks`, a probability; key from `TYPESAFE_API_KEY` or
-  `~/.config/typesafe/api_key`): 0.7 or more is `waiting`, below 0.3 is not
-  asking. Between those, or with no usable answer, the row is `unsure`: read
-  its final message and class it yourself as `waiting`, `stalled`, or
-  `finished`. A decision marker outlives its answer, so also read each
+  (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
+  reads each idle worktree's newest final message and returns `jev`: `asks`,
+  the probability that it waits on the user (0.7 or more is `waiting`), and
+  `status` (`in_progress`, `blocked_on_others`, or `done`) with its
+  `confidence`. Only `done` can finish; the other two keep the row `stalled`
+  with a reason. When `asks` is 0.3 to 0.7, `confidence` is below 0.6, or Jev
+  gave no usable answer, the row is `unsure`: read its final message and class
+  it yourself. A decision marker outlives its answer, so also read each
   `waiting` and `stalled` row's latest message yourself.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
@@ -39,8 +41,9 @@ and each approved tab is gone from `orca terminal list`.
 ## Boundary
 
 - Scanning, reading transcripts, and `rm_check.py` are read-only: run them
-  without asking. The scan sends each idle agent's final message (its last
-  4,000 characters) to TypeSafe's API; without a key it sends nothing.
+  without asking. The scan sends each idle worktree's newest final message
+  (its last 4,000 characters) to TypeSafe's API; without a key it sends
+  nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
   choice per item. The exception is a finished worktree with no meaningful tab

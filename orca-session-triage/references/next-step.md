@@ -8,6 +8,9 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 
 | State | Next step |
 |---|---|
+| Reason "final message says work continues, yet no agent runs" | read its screen: a helper, background job, or CI still running means it is working, so leave it; otherwise the lane continues or says where it stopped |
+| Reason "final message waits on someone else" | blocker: name who it waits on, no question |
+| Reason "final message says done" | the work is done but not merged or closed: the rows below pick the step |
 | `git` is null | the checkout is missing or unreadable: look at the path first |
 | `pr.head_matches` is false | the PR found is not this checkout's HEAD (a reused branch name): confirm the PR before using its state |
 | `git.dirty` or `git.unpushed` above 0 | the lane commits and pushes, or discards |

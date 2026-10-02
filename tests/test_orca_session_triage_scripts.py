@@ -69,13 +69,14 @@ class ClaudeTranscriptTests(unittest.TestCase):
             {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}},
             user([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
             assistant(text("working on it")),
-            assistant(text("Done. Shall I merge it?")),
+            {**assistant(text("Done. Shall I merge it?")), "timestamp": "2026-10-01T01:08:00Z"},
         ])
 
         result = scan.read_claude(self.projects, self.worktree)
 
         self.assertEqual(result["last_user"], "second request")
         self.assertEqual(result["final_text"], "Done. Shall I merge it?")
+        self.assertEqual(result["final_at"], "2026-10-01T01:08:00Z")
         self.assertEqual(result["pending_questions"], [])
 
     def test_lists_ask_user_question_without_a_result(self):
@@ -183,6 +184,7 @@ class CodexRolloutTests(unittest.TestCase):
         self.assertEqual(session["last_role"], "assistant")
         self.assertEqual(session["last_user"], "ssh app@host")
         self.assertEqual(session["last_assistant"], "Deploying now.")
+        self.assertEqual(session["last_assistant_at"], "2026-10-01T01:08:00Z")
         self.assertEqual(session["pending_requests"], [{
             "asked_at": "2026-10-01T01:06:00Z",
             "questions": [{"title": "SSH host?"}],
@@ -209,6 +211,15 @@ NOW = 1_800_000_000
 PROMPT = "app on main via python\n❯"
 
 
+def verdict(asks=0.0, status="done", confidence=0.9):
+    return {"asks": asks, "status": status, "confidence": confidence}
+
+
+def judging(table):
+    """A judge reading Jev's verdict from table, sure the work is done otherwise."""
+    return lambda message: table.get(message, verdict())
+
+
 class ClassifyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -222,7 +233,7 @@ class ClassifyTests(unittest.TestCase):
 
     def inventory(self, worktrees, terminals, codex=None, judge=None):
         return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=NOW,
-                                    judge=judge or (lambda message: 0.0))
+                                    judge=judge or judging({}))
 
     def classes(self, worktrees, terminals, codex=None, judge=None):
         rows = self.inventory(worktrees, terminals, codex, judge)
@@ -317,7 +328,7 @@ class ClassifyTests(unittest.TestCase):
              worktree("/w/c", "working", comment="要判断: which base?"),
              worktree("/w/main", main=True)],
             [terminal("/w/a", "claude"), terminal("/w/b", "claude"), terminal("/w/c", "claude")],
-            judge={"PR is up.\nShall I merge it?": 0.9}.get)
+            judge=judging({"PR is up.\nShall I merge it?": verdict(0.9)}))
 
         self.assertEqual(result["/w/a"], ("waiting", ["AskUserQuestion pending"]))
         self.assertEqual(result["/w/b"], ("waiting", ["final message asks (Jev 0.90)"]))
@@ -333,7 +344,7 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/j", "done", pr={"number": 1, "state": "merged"}),
              worktree("/w/s", "done", pr={"number": 2, "state": "merged"})],
             [terminal("/w/j", "claude", "term_j"), terminal("/w/s", "claude", "term_s")],
-            judge={asks: 0.79, done: 0.29}.get)
+            judge=judging({asks: verdict(0.79), done: verdict(0.29)}))
 
         self.assertEqual(result["/w/j"], ("waiting", ["final message asks (Jev 0.79)"]))
         self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
@@ -341,16 +352,87 @@ class ClassifyTests(unittest.TestCase):
     def test_a_final_message_jev_is_unsure_about_is_read_before_anything_closes(self):
         maybe = "PR は merge しました。\n残っている判断: 表記をどちらにそろえるかは別に決める必要があります。"
         leaning = "Once the other agent reports, I'll decide how to handle these."
-        self.claude_says("/w/x", user("go"), assistant(text(maybe)))
-        self.claude_says("/w/y", user("go"), assistant(text(leaning)))
+        terse = "commit・push はしていません。"
+        for path, message in (("/w/x", maybe), ("/w/y", leaning), ("/w/z", terse)):
+            self.claude_says(path, user("go"), assistant(text(message)))
         result = self.inventory(
-            [worktree("/w/x", "done", pr={"number": 1, "state": "merged"}), worktree("/w/y", "done")],
-            [terminal("/w/x", "claude", "term_x"), terminal("/w/y", "claude", "term_y")],
-            judge={maybe: 0.3, leaning: 0.69}.get)
+            [worktree("/w/x", "done", pr={"number": 1, "state": "merged"}), worktree("/w/y", "done"),
+             worktree("/w/z", "done", pr={"number": 2, "state": "merged"})],
+            [terminal("/w/x", "claude", "term_x"), terminal("/w/y", "claude", "term_y"),
+             terminal("/w/z", "claude", "term_z")],
+            judge=judging({maybe: verdict(0.3), leaning: verdict(0.69, "in_progress"),
+                           terse: verdict(0.1, "done", 0.59)}))
 
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
-            ("unsure", ["Jev unsure (0.30): read the final message"], []),
-            ("unsure", ["Jev unsure (0.69): read the final message"], [])])
+            ("unsure", ["Jev unsure whether it asks (0.30): read the final message"], []),
+            ("unsure", ["Jev unsure whether it asks (0.69): read the final message"], []),
+            ("unsure", ["Jev unsure of the state (done 0.59): read the final message"], [])])
+
+    def test_the_state_jev_reads_decides_what_an_idle_worktree_needs(self):
+        says = {"/w/p": ("Codex に修正を渡しました。終わったら確かめます。", "in_progress", "open"),
+                "/w/m": ("merge しました。#850 に取りかかります。", "in_progress", "merged"),
+                "/w/r": ("レビューは hdknr に依頼しました。", "blocked_on_others", "open"),
+                "/w/d": ("実装とテストが終わりました。", "done", "open"),
+                "/w/f": ("merge して、残りはありません。", "done", "merged")}
+        for path, (message, _, _) in says.items():
+            self.claude_says(path, user("go"), assistant(text(message)))
+        result = self.classes(
+            [worktree(path, "done", pr={"number": 1, "state": pr}) for path, (_, _, pr) in says.items()],
+            [terminal(path, "claude", "term_" + path[-1]) for path in says],
+            judge=judging({message: verdict(0.05, status, 0.93) for message, status, _ in says.values()}))
+
+        self.assertEqual(result, {
+            "/w/p": ("stalled", ["final message says work continues, yet no agent runs (Jev 0.93)"]),
+            "/w/m": ("stalled", ["final message says work continues, yet no agent runs (Jev 0.93)"]),
+            "/w/r": ("stalled", ["final message waits on someone else (Jev 0.93)"]),
+            "/w/d": ("stalled", ["final message says done (Jev 0.93)"]),
+            "/w/f": ("finished", ["PR merged"])})
+
+    def test_an_agent_whose_message_says_work_continues_keeps_its_tab(self):
+        waiting_on_job = "push（pre-push の full pytest）の完了を待っています。"
+        waiting_on_review = "レビューは hdknr に依頼しました。"
+        self.claude_says("/w/j", user("go"), assistant(text(waiting_on_job)))
+        self.claude_says("/w/r", user("go"), assistant(text(waiting_on_review)))
+        rows = self.inventory([worktree("/w/j", "done", pr={"number": 1, "state": "open"}),
+                               worktree("/w/r", "done", pr={"number": 2, "state": "open"})],
+                              [terminal("/w/j", "claude", "term_j"), terminal("/w/r", "claude", "term_r")],
+                              judge=judging({waiting_on_job: verdict(0.0, "in_progress", 0.96),
+                                             waiting_on_review: verdict(0.0, "blocked_on_others", 0.96)}))
+
+        self.assertEqual([(r["class"], r["closable"], r["meaningful_tabs"]) for r in rows],
+                         [("stalled", [], ["term_j"]), ("stalled", ["term_r"], [])])
+
+    def test_only_the_latest_final_message_is_judged(self):
+        lead = "Codex の修正を確かめました。テストは通っています。"
+        helper = "commit・push はしていません。"
+        self.claude_says("/w/l", user("go"), {**assistant(text(lead)), "timestamp": "2026-10-01T02:00:00Z"})
+        self.claude_says("/w/h", user("go"), {**assistant(text("Codex に渡しました。")),
+                                              "timestamp": "2026-10-01T01:00:00Z"})
+        codex = {path: [{"rollout": "r", "last_user": "fix", "last_role": "assistant", "last_assistant": helper,
+                         "last_assistant_at": "2026-10-01T01:30:00Z", "pending_requests": []}]
+                 for path in ("/w/l", "/w/h")}
+        judged = []
+
+        def judge(message):
+            judged.append(message)
+            return verdict(0.1, "blocked_on_others")
+
+        rows = self.inventory([worktree("/w/l", "done"), worktree("/w/h", "done")],
+                              [terminal("/w/l", "claude"), terminal("/w/h", "claude")], codex, judge)
+
+        self.assertEqual(judged, [lead, helper])
+        self.assertEqual([r["jev"] for r in rows], [
+            {"source": "claude", **verdict(0.1, "blocked_on_others")},
+            {"source": "codex", **verdict(0.1, "blocked_on_others")}])
+
+    def test_claude_speaks_for_the_worktree_when_either_time_is_missing(self):
+        self.claude_says("/w/t", user("go"), assistant(text("Done.")))
+        codex = {"/w/t": [{"rollout": "r", "last_user": "fix", "last_role": "assistant", "last_assistant": "ok",
+                           "last_assistant_at": "2026-10-01T01:30:00Z", "pending_requests": []}]}
+
+        rows = self.inventory([worktree("/w/t", "done")], [terminal("/w/t", "claude")], codex)
+
+        self.assertEqual(rows[0]["jev"]["source"], "claude")
 
     def test_an_unjudged_final_message_is_read_before_anything_closes(self):
         self.claude_says("/w/u", user("go"), assistant(text("Merged.")))
@@ -378,7 +460,7 @@ class ClassifyTests(unittest.TestCase):
         result = self.classes(
             [worktree("/w/q", "done", agent="codex", pr={"number": 1, "state": "merged"}),
              worktree("/w/r", "working", agent="codex")],
-            [terminal("/w/q", "codex"), terminal("/w/r", "codex")], codex, judge={asks: 0.8}.get)
+            [terminal("/w/q", "codex"), terminal("/w/r", "codex")], codex, judge=judging({asks: verdict(0.8)}))
 
         self.assertEqual(result["/w/q"], ("waiting", ["Codex final message asks (Jev 0.80)"]))
         self.assertEqual(result["/w/r"], ("working", []))
@@ -398,18 +480,20 @@ class ClassifyTests(unittest.TestCase):
              worktree("/w/h", "done", pr={"number": 2, "state": "open"})],
             [terminal("/w/d", "codex"), terminal("/w/e", "codex"), terminal("/w/f", "codex"),
              terminal("/w/g", "claude"), terminal("/w/h", "claude")],
-            codex)
+            codex, judging({"PR is open for review.": verdict(0.1, "blocked_on_others")}))
 
         self.assertEqual(result["/w/d"], ("waiting", ["Codex request pending"]))
         self.assertEqual(result["/w/e"], ("working", []))
         self.assertEqual(result["/w/f"], ("unstarted", ["codex terminal without a recent transcript"]))
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
-        self.assertEqual(result["/w/h"], ("stalled", []))
+        self.assertEqual(result["/w/h"], ("stalled", ["final message waits on someone else (Jev 0.90)"]))
 
 
-def jev_answer(probability):
+def jev_answer(asks, status="done", confidence=0.9):
     return io.BytesIO(json.dumps({"model": "jev-1.13.0", "answers": {
-        "asks_user": {"type": "noul", "noul": probability}}}).encode())
+        "asks_user": {"type": "noul", "noul": asks},
+        "status": {"type": "choice", "choice": status, "confidence": confidence,
+                   "probabilities": {status: confidence}}}}).encode())
 
 
 class CutShort(io.BytesIO):
@@ -420,20 +504,24 @@ class CutShort(io.BytesIO):
 
 
 class JevTests(unittest.TestCase):
-    def test_asks_jev_whether_the_tail_of_a_message_waits_on_the_user(self):
+    def test_asks_jev_whether_the_tail_of_a_message_waits_on_the_user_and_how_the_work_stands(self):
         sent = []
 
         def opener(request, timeout):
             sent.append((request.full_url, request.get_header("Authorization"), json.loads(request.data)))
-            return jev_answer(0.86)
+            return jev_answer(0.86, "blocked_on_others", 0.62)
 
         judge = scan.jev_judge("key-1", opener=opener)
 
-        self.assertEqual(judge("経緯。" * 3000 + "\nやるかどうか指示をください。"), 0.86)
+        self.assertEqual(judge("経緯。" * 3000 + "\nやるかどうか指示をください。"),
+                         {"asks": 0.86, "status": "blocked_on_others", "confidence": 0.62})
         url, authorization, body = sent[0]
         self.assertEqual((url, authorization, body["model"]),
                          ("https://api.typesafe.ai/v1/systemone", "Bearer key-1", "jev-latest"))
         self.assertEqual(body["questions"]["asks_user"]["type"], "noul")
+        self.assertEqual(body["questions"]["status"]["type"], "choice")
+        self.assertEqual(sorted(body["questions"]["status"]["criteria"]),
+                         ["blocked_on_others", "done", "in_progress"])
         self.assertTrue(body["state"].endswith("やるかどうか指示をください。"))
         self.assertEqual(len(body["state"]), scan.JEV_MAX_CHARS)
 
@@ -441,7 +529,8 @@ class JevTests(unittest.TestCase):
         failures = [urllib.error.HTTPError("u", 401, "Unauthorized", None, None),
                     TimeoutError("timed out"), urllib.error.URLError("offline"),
                     io.BytesIO(b"not json"), io.BytesIO(b'{"answers": {}}'), jev_answer(float("nan")),
-                    jev_answer(1.5), jev_answer("nan"), CutShort()]
+                    jev_answer(1.5), jev_answer("nan"), CutShort(), jev_answer(0.1, "asks_user"),
+                    jev_answer(0.1, "done", float("nan")), jev_answer(0.1, "done", 1.2)]
         for failure in failures:
             def opener(request, timeout, failure=failure):
                 if isinstance(failure, Exception):
@@ -603,12 +692,13 @@ class ScanCommandTests(unittest.TestCase):
             scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--claude-projects", str(claude),
                        "--codex-sessions", str(self.dir / "none"), *extra])
         row = json.loads(out.getvalue())[0]
-        return (row["class"], row["reasons"], row["asks"]), err.getvalue()
+        return (row["class"], row["reasons"], row["jev"]), err.getvalue()
 
     def test_without_a_jev_key_idle_final_messages_come_back_unjudged(self):
         result, err = self.scan_merged_worktree()
 
-        self.assertEqual(result, ("unsure", ["Jev could not judge: read the final message"], {"claude": None}))
+        self.assertEqual(result, ("unsure", ["Jev could not judge: read the final message"],
+                                  {"source": "claude", "asks": None, "status": None, "confidence": None}))
         self.assertIn("TYPESAFE_API_KEY", err)
 
     def test_judges_with_the_key_file(self):
@@ -623,7 +713,8 @@ class ScanCommandTests(unittest.TestCase):
         with patch.object(scan.urllib.request, "urlopen", urlopen):
             result, _ = self.scan_merged_worktree("--jev-key-file", str(key))
 
-        self.assertEqual(result, ("waiting", ["final message asks (Jev 0.70)"], {"claude": 0.7}))
+        self.assertEqual(result, ("waiting", ["final message asks (Jev 0.70)"],
+                                  {"source": "claude", **verdict(0.7)}))
         self.assertEqual(sent, ["Bearer key-2"])
 
     def test_the_environment_key_wins_over_the_key_file(self):
