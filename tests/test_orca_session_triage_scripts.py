@@ -319,6 +319,18 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
         self.assertNotIn("/w/main", result)
 
+    def test_a_japanese_question_that_ends_in_ka_is_waiting(self):
+        self.claude_says("/w/j", user("go"), assistant(text(
+            "EPM は merge 済みです。\nPR が出たら、diff の読み直しとテストの再実行でレビューしましょうか。")))
+        self.claude_says("/w/s", user("go"), assistant(text("確認しました。\n残りはありません。")))
+        result = self.classes(
+            [worktree("/w/j", "done", pr={"number": 1, "state": "merged"}),
+             worktree("/w/s", "done", pr={"number": 2, "state": "merged"})],
+            [terminal("/w/j", "claude", "term_j"), terminal("/w/s", "claude", "term_s")])
+
+        self.assertEqual(result["/w/j"], ("waiting", ["final message asks"]))
+        self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
+
     def test_a_codex_final_message_that_asks_is_waiting(self):
         codex = {"/w/q": [{"rollout": "r", "last_user": "ship it", "last_role": "assistant",
                            "last_assistant": "PR #1 is green.\nPR #1 をマージしてよいですか？\n"
