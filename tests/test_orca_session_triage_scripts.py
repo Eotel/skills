@@ -79,6 +79,20 @@ class ClaudeTranscriptTests(unittest.TestCase):
         self.assertEqual(result["final_at"], "2026-10-01T01:08:00Z")
         self.assertEqual(result["pending_questions"], [])
 
+    def test_a_compaction_summary_is_not_the_users_last_word(self):
+        self.transcript([
+            user("sync the partner master"),
+            assistant(text("devel is filled; stage waits for the 12:00 import.")),
+            {"type": "system", "subtype": "compact_boundary"},
+            {"type": "user", "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+             "message": {"role": "user", "content": "This session is being continued from a previous conversation."}},
+        ])
+
+        result = scan.read_claude(self.projects, self.worktree)
+
+        self.assertEqual((result["last_user"], result["final_text"]),
+                         ("sync the partner master", "devel is filled; stage waits for the 12:00 import."))
+
     def test_lists_ask_user_question_without_a_result(self):
         answered = {"questions": [{"question": "Which base?", "options": []}]}
         pending = {"questions": [{"question": "Merge now?", "options": [{"label": "Yes"}]}]}
