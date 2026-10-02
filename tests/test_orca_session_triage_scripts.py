@@ -338,13 +338,19 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/j"], ("waiting", ["final message asks (Jev 0.79)"]))
         self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
 
-    def test_merged_work_whose_final_message_may_still_ask_stays_open(self):
+    def test_a_final_message_jev_is_unsure_about_is_read_before_anything_closes(self):
         maybe = "PR は merge しました。\n残っている判断: 表記をどちらにそろえるかは別に決める必要があります。"
+        leaning = "Once the other agent reports, I'll decide how to handle these."
         self.claude_says("/w/x", user("go"), assistant(text(maybe)))
-        result = self.classes([worktree("/w/x", "done", pr={"number": 1, "state": "merged"})],
-                              [terminal("/w/x", "claude", "term_x")], judge={maybe: 0.48}.get)
+        self.claude_says("/w/y", user("go"), assistant(text(leaning)))
+        result = self.inventory(
+            [worktree("/w/x", "done", pr={"number": 1, "state": "merged"}), worktree("/w/y", "done")],
+            [terminal("/w/x", "claude", "term_x"), terminal("/w/y", "claude", "term_y")],
+            judge={maybe: 0.3, leaning: 0.69}.get)
 
-        self.assertEqual(result["/w/x"], ("stalled", ["final message may ask (Jev 0.48)"]))
+        self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
+            ("unsure", ["Jev unsure (0.30): read the final message"], []),
+            ("unsure", ["Jev unsure (0.69): read the final message"], [])])
 
     def test_an_unjudged_final_message_is_read_before_anything_closes(self):
         self.claude_says("/w/u", user("go"), assistant(text("Merged.")))
@@ -360,11 +366,8 @@ class ClassifyTests(unittest.TestCase):
             [terminal("/w/u", "claude", "term_u"), terminal("/w/v", "claude", "term_v")], judge=unavailable)
 
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result], [
-            ("waiting", ["final message not judged"], []), ("working", [], [])])
+            ("unsure", ["Jev could not judge: read the final message"], []), ("working", [], [])])
         self.assertEqual(judged, ["Merged."])
-        zero = scan.build_inventory([worktree("/w/u", "done")], [terminal("/w/u", "claude")], self.projects,
-                                    {}, "要判断", now=NOW, judge=unavailable, asks_threshold=0)
-        self.assertEqual(zero[0]["reasons"], ["final message not judged"])
 
     def test_a_codex_final_message_that_asks_is_waiting(self):
         asks = "PR #1 is green.\nPR #1 をマージしてよいですか？\nAGENTS.md で確認が必要と定めているため、ここで確認しています。"
@@ -505,10 +508,10 @@ class NextStepFactTests(unittest.TestCase):
         self.assertIsNone(scan.github_slug("https://git.disroot.org/usvdh/collect.git"))
 
 
-    def test_only_stalled_rows_get_git_and_pr_facts(self):
+    def test_only_stalled_and_unsure_rows_get_git_and_pr_facts(self):
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
                 {"path": "/w/branch", "class": "stalled", "linked_pr": None},
-                {"path": "/w/forgejo", "class": "stalled", "linked_pr": None},
+                {"path": "/w/forgejo", "class": "unsure", "linked_pr": None},
                 {"path": "/w/busy", "class": "working", "linked_pr": {"number": 9, "state": "open"}}]
         gits = {"/w/linked": {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"},
                 "/w/branch": {"branch": "fix-b", "head": "bbb", "dirty": 2, "unpushed": 1, "github": "acme/app"},
@@ -605,25 +608,23 @@ class ScanCommandTests(unittest.TestCase):
     def test_without_a_jev_key_idle_final_messages_come_back_unjudged(self):
         result, err = self.scan_merged_worktree()
 
-        self.assertEqual(result, ("waiting", ["final message not judged"], {"claude": None}))
+        self.assertEqual(result, ("unsure", ["Jev could not judge: read the final message"], {"claude": None}))
         self.assertIn("TYPESAFE_API_KEY", err)
 
-    def test_judges_with_the_key_file_against_the_threshold(self):
+    def test_judges_with_the_key_file(self):
         key = self.dir / "api_key"
         key.write_text("key-2\n")
         sent = []
 
         def urlopen(request, timeout):
             sent.append(request.get_header("Authorization"))
-            return jev_answer(0.6)
+            return jev_answer(0.7)
 
         with patch.object(scan.urllib.request, "urlopen", urlopen):
-            strict, _ = self.scan_merged_worktree("--jev-key-file", str(key), "--asks-threshold", "0.7")
-            default, _ = self.scan_merged_worktree("--jev-key-file", str(key))
+            result, _ = self.scan_merged_worktree("--jev-key-file", str(key))
 
-        self.assertEqual(strict, ("stalled", ["final message may ask (Jev 0.60)"], {"claude": 0.6}))
-        self.assertEqual(default, ("waiting", ["final message asks (Jev 0.60)"], {"claude": 0.6}))
-        self.assertEqual(sent, ["Bearer key-2", "Bearer key-2"])
+        self.assertEqual(result, ("waiting", ["final message asks (Jev 0.70)"], {"claude": 0.7}))
+        self.assertEqual(sent, ["Bearer key-2"])
 
     def test_the_environment_key_wins_over_the_key_file(self):
         key = self.dir / "api_key"

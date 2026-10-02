@@ -174,9 +174,9 @@ JEV_QUESTION = ("Does this message end by waiting for the user's answer, decisio
 JEV_MAX_CHARS = 4000  # the ask sits at the end; earlier context rarely changes the answer
 JEV_TIMEOUT = 15
 JEV_KEY_FILE = "~/.config/typesafe/api_key"
-ASKS_THRESHOLD = 0.5
-# Finished work is removed without asking, so it must be clearly settled: Jev
-# scores of 0.3-0.5 were mostly open decisions left for someone else.
+# Jev is sure from these bounds on; a score between them, or no score, is
+# unsure and the final message is read before the row is classed.
+ASKS_FROM = 0.7
 SETTLED_BELOW = 0.3
 
 
@@ -222,17 +222,29 @@ def final_messages(row):
     return {source: message for source, message in messages.items() if message}
 
 
-def waiting_reasons(row, decision_marker, threshold=ASKS_THRESHOLD):
+def is_sure_ask(probability):
+    return probability is not None and probability >= ASKS_FROM
+
+
+def unsure_reason(probability):
+    if probability is None:
+        return "Jev could not judge: read the final message"
+    if SETTLED_BELOW <= probability < ASKS_FROM:
+        return f"Jev unsure ({probability:.2f}): read the final message"
+    return None
+
+
+def waiting_reasons(row, decision_marker):
     reasons = []
     claude = row["claude"] or {}
     asks = row.get("asks") or {}
     if claude.get("pending_questions"):
         reasons.append("AskUserQuestion pending")
-    elif asks.get("claude") is not None and asks["claude"] >= threshold:
+    elif is_sure_ask(asks.get("claude")):
         reasons.append(f"final message asks (Jev {asks['claude']:.2f})")
     if any(not r["answered_in_chat_later"] for s in row["codex"] for r in s["pending_requests"]):
         reasons.append("Codex request pending")
-    if asks.get("codex") is not None and asks["codex"] >= threshold:
+    if is_sure_ask(asks.get("codex")):
         reasons.append(f"Codex final message asks (Jev {asks['codex']:.2f})")
     if any(a["state"] == "waiting" for a in row["agents"]):
         reasons.append("Orca agent waiting")
@@ -241,15 +253,15 @@ def waiting_reasons(row, decision_marker, threshold=ASKS_THRESHOLD):
     return reasons
 
 
-def classify(row, decision_marker, threshold=ASKS_THRESHOLD):
-    """Return (class, reasons): waiting > unstarted > working > finished > stalled.
+def classify(row, decision_marker):
+    """Return (class, reasons): waiting > unstarted > working > unsure > finished > stalled.
 
-    A final message Jev could not judge also makes an idle worktree waiting, so it
-    is read before anything closes. A stalled worktree has nothing running and
-    nothing asked, yet is still open: it waits on the user's next step (merge,
-    review request, close, next task).
+    An unsure worktree has a final message Jev could not judge or was unsure
+    about: read it and decide whether it asks before anything closes. A stalled
+    worktree has nothing running and nothing asked, yet is still open: it waits
+    on the user's next step (merge, review request, close, next task).
     """
-    reasons = waiting_reasons(row, decision_marker, threshold)
+    reasons = waiting_reasons(row, decision_marker)
     if reasons:
         return "waiting", reasons
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
@@ -259,12 +271,9 @@ def classify(row, decision_marker, threshold=ASKS_THRESHOLD):
         return "unstarted", [agent + " terminal without a recent transcript" for agent in silent]
     if is_working(row):
         return "working", []
-    asks = row.get("asks") or {}
-    if None in asks.values():
-        return "waiting", ["final message not judged"]
-    unsettled = [f"final message may ask (Jev {p:.2f})" for p in asks.values() if p >= SETTLED_BELOW]
-    if unsettled:
-        return "stalled", unsettled
+    unsure = [reason for reason in map(unsure_reason, (row.get("asks") or {}).values()) if reason]
+    if unsure:
+        return "unsure", unsure
     if (row["linked_pr"] or {}).get("state") == "merged":
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
@@ -288,8 +297,7 @@ def closable_terminals(row_class, terms, now, idle_minutes):
 
 
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
-                    now=None, shell_idle_minutes=30, judge=lambda message: None,
-                    asks_threshold=ASKS_THRESHOLD):
+                    now=None, shell_idle_minutes=30, judge=lambda message: None):
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns the probability that a final message waits on the user.
@@ -316,7 +324,7 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         }
         row["asks"] = {} if is_working(row) else {source: judge(message)
                                                   for source, message in final_messages(row).items()}
-        row["class"], row["reasons"] = classify(row, decision_marker, asks_threshold)
+        row["class"], row["reasons"] = classify(row, decision_marker)
         row["closable"] = closable_terminals(row["class"], terms, now, shell_idle_minutes)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
@@ -389,14 +397,14 @@ def gh_pr(slug, ref):
 
 
 def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
-    """Return rows where each stalled row also carries its git and PR state.
+    """Return rows where each stalled or unsure row also carries its git and PR state.
 
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD.
     """
     result = []
     for row in rows:
-        if row["class"] != "stalled":
+        if row["class"] not in ("stalled", "unsure"):
             result.append(row)
             continue
         git = git_lookup(row["path"])
@@ -461,9 +469,6 @@ def main(argv=None):
     parser.add_argument("--jev-key-file", default=JEV_KEY_FILE,
                         help="Jev (TypeSafe) API key file, read when TYPESAFE_API_KEY is unset "
                              "(default: %(default)s)")
-    parser.add_argument("--asks-threshold", type=float, default=ASKS_THRESHOLD,
-                        help="Jev probability from which a final message counts as asking the user "
-                             "(default: %(default)s)")
     args = parser.parse_args(argv)
 
     worktrees = orca_result(args.orca, ["worktree", "ps"], "worktrees", args.ps_json)
@@ -473,12 +478,11 @@ def main(argv=None):
     key = jev_key(os.environ, args.jev_key_file)
     if key is None:
         print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
-              "idle final messages are not judged, so read them", file=sys.stderr)
+              "idle final messages come back unsure, so read them", file=sys.stderr)
     judge = jev_judge(key) if key else (lambda message: None)
     rows = add_next_step_facts(build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects),
                                                codex, args.decision_marker,
-                                               shell_idle_minutes=args.shell_idle_minutes, judge=judge,
-                                               asks_threshold=args.asks_threshold))
+                                               shell_idle_minutes=args.shell_idle_minutes, judge=judge))
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
