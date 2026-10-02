@@ -100,7 +100,7 @@ def read_claude(projects_root, worktree_path):
     path = max(candidates, key=lambda p: p.stat().st_mtime)
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
-    texts, asked, answered = [], {}, set()
+    texts, final_at, asked, answered = [], None, {}, set()
     for entry in rows[last + 1:]:
         content = message_of(entry).get("content")
         if not isinstance(content, list):
@@ -111,6 +111,7 @@ def read_claude(projects_root, worktree_path):
             kind = block.get("type")
             if entry.get("type") == "assistant" and kind == "text" and block["text"].strip():
                 texts.append(block["text"])
+                final_at = entry.get("timestamp")
             elif kind == "tool_use" and block.get("name") == "AskUserQuestion":
                 asked[block.get("id")] = block.get("input")
             elif kind == "tool_result":
@@ -119,6 +120,7 @@ def read_claude(projects_root, worktree_path):
         "transcript": str(path),
         "last_user": user_text(rows[last]) if last >= 0 else None,
         "final_text": texts[-1] if texts else None,
+        "final_at": final_at,
         "pending_questions": [q for i, q in asked.items() if i not in answered],
     }
 
@@ -129,7 +131,8 @@ def message_text(payload):
 
 def summarize_rollout(path):
     """Return (cwd, summary) for one Codex rollout file."""
-    cwd, asks, outputs, last_user, last_assistant, last_role = None, {}, set(), None, None, None
+    cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
+    last_assistant = last_assistant_at = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
@@ -151,7 +154,7 @@ def summarize_rollout(path):
         elif kind == "message" and payload.get("role") == "assistant":
             value = message_text(payload)
             if value:
-                last_assistant, last_role = value, "assistant"
+                last_assistant, last_assistant_at, last_role = value, row.get("timestamp"), "assistant"
     pending = []
     for call_id, ask in asks.items():
         if call_id in outputs:
@@ -162,15 +165,29 @@ def summarize_rollout(path):
         "rollout": str(path),
         "last_user": last_user[1] if last_user else None,
         "last_assistant": last_assistant,
+        "last_assistant_at": last_assistant_at,
         "last_role": last_role,
         "pending_requests": pending,
     }
 
 
-# Jev (TypeSafe) answers a yes/no question about a text with a probability.
+# Jev (TypeSafe) answers typed questions about a text: a yes/no probability
+# (noul) and a pick among named options with a confidence (choice).
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-JEV_QUESTION = ("Does this message end by waiting for the user's answer, decision, or instruction "
-                "before the agent can continue?")
+JEV_QUESTIONS = {
+    # Asked apart from the state: as one more option, "waits for your
+    # instruction" read as in_progress.
+    "asks_user": {"type": "noul", "instructions": (
+        "Does this message end by waiting for the user's answer, decision, or instruction "
+        "before the agent can continue?")},
+    "status": {"type": "choice",
+               "instructions": "What is the state of the agent's work, judging from its last message?",
+               "criteria": {
+                   "in_progress": "still working, or waiting on its own helper, background job, or CI",
+                   "blocked_on_others": "its part is done and it waits on someone else, such as a "
+                                        "reviewer, a coordinator, or another team",
+                   "done": "the work is finished and nothing is left"}},
+}
 JEV_MAX_CHARS = 4000  # the ask sits at the end; earlier context rarely changes the answer
 JEV_TIMEOUT = 15
 JEV_KEY_FILE = "~/.config/typesafe/api_key"
@@ -178,6 +195,8 @@ JEV_KEY_FILE = "~/.config/typesafe/api_key"
 # unsure and the final message is read before the row is classed.
 ASKS_FROM = 0.7
 SETTLED_BELOW = 0.3
+STATE_SURE_FROM = 0.6  # a status confidence below this is unsure
+NO_VERDICT = {"asks": None, "status": None, "confidence": None}
 
 
 def jev_key(env, key_file):
@@ -190,19 +209,31 @@ def jev_key(env, key_file):
         return None
 
 
+def probability(value):
+    value = float(value)
+    if not 0 <= value <= 1:  # also false for NaN
+        raise ValueError(f"probability out of range: {value}")
+    return value
+
+
 def jev_judge(api_key, opener=None):
-    """A judge returning the probability that a message waits on the user, or None on failure."""
+    """A judge returning Jev's verdict on a message, or None on failure.
+
+    The verdict holds `asks` (probability that it waits on the user), `status`
+    (in_progress, blocked_on_others, or done), and that status's `confidence`.
+    """
     def judge(message):
-        body = {"state": message[-JEV_MAX_CHARS:], "model": "jev-latest",
-                "questions": {"asks_user": {"type": "noul", "instructions": JEV_QUESTION}}}
+        body = {"state": message[-JEV_MAX_CHARS:], "model": "jev-latest", "questions": JEV_QUESTIONS}
         request = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
             "Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
         try:
             with (opener or urllib.request.urlopen)(request, timeout=JEV_TIMEOUT) as response:
-                probability = float(json.load(response)["answers"]["asks_user"]["noul"])
-            if not 0 <= probability <= 1:  # also false for NaN
-                raise ValueError(f"noul out of range: {probability}")
-            return probability
+                answers = json.load(response)["answers"]
+            status = answers["status"]["choice"]
+            if status not in JEV_QUESTIONS["status"]["criteria"]:
+                raise ValueError(f"unknown status: {status!r}")
+            return {"asks": probability(answers["asks_user"]["noul"]), "status": status,
+                    "confidence": probability(answers["status"]["confidence"])}
         except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
             print(f"Jev could not judge a final message: {error!r}", file=sys.stderr)
             return None
@@ -213,39 +244,58 @@ def is_working(row):
     return any(a["state"] == "working" for a in row["agents"])
 
 
-def final_messages(row):
-    """The last thing each agent said, by source; Codex only when it spoke after the user."""
-    messages = {"claude": (row["claude"] or {}).get("final_text")}
+def latest_message(row):
+    """(source, text) of the newest final message, Claude's when the times tie or are missing.
+
+    A helper's report to its lead comes before the lead's own last word, so only
+    the newest one says how the worktree stands. Codex counts only when it spoke
+    after the user.
+    """
+    claude = row["claude"] or {}
     latest = row["codex"][-1] if row["codex"] else {}
-    if latest.get("last_role") == "assistant":
-        messages["codex"] = latest.get("last_assistant")
-    return {source: message for source, message in messages.items() if message}
+    codex_spoke = latest.get("last_role") == "assistant" and latest.get("last_assistant")
+    if not claude.get("final_text"):
+        return ("codex", latest["last_assistant"]) if codex_spoke else None
+    claude_at, codex_at = claude.get("final_at"), latest.get("last_assistant_at")
+    if codex_spoke and claude_at and codex_at and codex_at > claude_at:
+        return "codex", latest["last_assistant"]
+    return "claude", claude["final_text"]
 
 
-def is_sure_ask(probability):
-    return probability is not None and probability >= ASKS_FROM
+def is_sure_ask(asks):
+    return asks is not None and asks >= ASKS_FROM
 
 
-def unsure_reason(probability):
-    if probability is None:
+def unsure_reason(jev):
+    if jev["asks"] is None:
         return "Jev could not judge: read the final message"
-    if SETTLED_BELOW <= probability < ASKS_FROM:
-        return f"Jev unsure ({probability:.2f}): read the final message"
+    if SETTLED_BELOW <= jev["asks"] < ASKS_FROM:
+        return f"Jev unsure whether it asks ({jev['asks']:.2f}): read the final message"
+    if jev["confidence"] < STATE_SURE_FROM:
+        return f"Jev unsure of the state ({jev['status']} {jev['confidence']:.2f}): read the final message"
     return None
+
+
+STATE_REASONS = {
+    "in_progress": "final message says work continues, yet no agent runs",
+    "blocked_on_others": "final message waits on someone else",
+    "done": "final message says done",
+}
 
 
 def waiting_reasons(row, decision_marker):
     reasons = []
     claude = row["claude"] or {}
-    asks = row.get("asks") or {}
+    jev = row.get("jev") or {}
+    asks = jev.get("asks")
     if claude.get("pending_questions"):
         reasons.append("AskUserQuestion pending")
-    elif is_sure_ask(asks.get("claude")):
-        reasons.append(f"final message asks (Jev {asks['claude']:.2f})")
+    elif is_sure_ask(asks) and jev["source"] == "claude":
+        reasons.append(f"final message asks (Jev {asks:.2f})")
     if any(not r["answered_in_chat_later"] for s in row["codex"] for r in s["pending_requests"]):
         reasons.append("Codex request pending")
-    if is_sure_ask(asks.get("codex")):
-        reasons.append(f"Codex final message asks (Jev {asks['codex']:.2f})")
+    if is_sure_ask(asks) and jev["source"] == "codex":
+        reasons.append(f"Codex final message asks (Jev {asks:.2f})")
     if any(a["state"] == "waiting" for a in row["agents"]):
         reasons.append("Orca agent waiting")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
@@ -256,10 +306,12 @@ def waiting_reasons(row, decision_marker):
 def classify(row, decision_marker):
     """Return (class, reasons): waiting > unstarted > working > unsure > finished > stalled.
 
-    An unsure worktree has a final message Jev could not judge or was unsure
-    about: read it and decide whether it asks before anything closes. A stalled
-    worktree has nothing running and nothing asked, yet is still open: it waits
-    on the user's next step (merge, review request, close, next task).
+    Jev reads the newest final message of an idle worktree. When it is unsure,
+    or gave no usable answer, the worktree is unsure: read the message and class
+    it yourself before anything closes. Only work Jev calls done can finish; a
+    stalled worktree has nothing running and nothing asked, yet is still open,
+    and its reason says what Jev read (work continues, waits on someone else,
+    or done but not merged).
     """
     reasons = waiting_reasons(row, decision_marker)
     if reasons:
@@ -271,14 +323,17 @@ def classify(row, decision_marker):
         return "unstarted", [agent + " terminal without a recent transcript" for agent in silent]
     if is_working(row):
         return "working", []
-    unsure = [reason for reason in map(unsure_reason, (row.get("asks") or {}).values()) if reason]
-    if unsure:
-        return "unsure", unsure
+    jev = row.get("jev")
+    if jev and unsure_reason(jev):
+        return "unsure", [unsure_reason(jev)]
+    state = f"{STATE_REASONS[jev['status']]} (Jev {jev['confidence']:.2f})" if jev else None
+    if jev and jev["status"] != "done":
+        return "stalled", [state]
     if (row["linked_pr"] or {}).get("state") == "merged":
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
-    return "stalled", []
+    return "stalled", [state] if state else []
 
 
 def shell_is_idle(term, now, idle_minutes):
@@ -289,18 +344,28 @@ def shell_is_idle(term, now, idle_minutes):
     return bool(lines) and lines[-1] in BARE_PROMPTS and quiet
 
 
-def closable_terminals(row_class, terms, now, idle_minutes):
+def agents_done(row):
+    """Nothing is pending on the agents: closing their tabs loses no work.
+
+    An agent whose last message says work continues may be waiting on a
+    background job that its tab still holds.
+    """
+    still_working = (row.get("jev") or {}).get("status") == "in_progress"
+    return row["class"] in ("finished", "stalled") and not still_working
+
+
+def closable_terminals(agents_closable, terms, now, idle_minutes):
     """Handles to close in a kept worktree: idle shells, plus agents once nothing is pending."""
-    agents_done = row_class in ("finished", "stalled")
     return [t["handle"] for t in terms if t.get("handle")
-            and (agents_done if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
+            and (agents_closable if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
 
 
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
                     now=None, shell_idle_minutes=30, judge=lambda message: None):
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
-    `judge(message)` returns the probability that a final message waits on the user.
+    `judge(message)` returns Jev's verdict on the newest final message, a dict of
+    `asks`, `status`, and `confidence` (see jev_judge), or None when it failed.
     """
     now = time.time() if now is None else now
     by_worktree = {}
@@ -322,10 +387,10 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
-        row["asks"] = {} if is_working(row) else {source: judge(message)
-                                                  for source, message in final_messages(row).items()}
+        latest = None if is_working(row) else latest_message(row)
+        row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
-        row["closable"] = closable_terminals(row["class"], terms, now, shell_idle_minutes)
+        row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
