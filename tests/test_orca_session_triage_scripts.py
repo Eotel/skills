@@ -235,6 +235,18 @@ NOW = 1_800_000_000
 PROMPT = "app on main via python\n❯"
 
 
+def done_agent(kind, pane, said="", asked="", minutes_ago=0, interrupted=False):
+    """An agent Orca shows as a done card: its turn ended `minutes_ago` in the pane `tab:leaf`."""
+    return {"agentType": kind, "state": "done", "paneKey": pane, "interrupted": interrupted,
+            "stateStartedAt": (NOW - minutes_ago * 60) * 1000,
+            "lastAssistantMessage": said, "prompt": asked}
+
+
+def in_pane(term, pane):
+    tab, leaf = pane.split(":")
+    return {**term, "tabId": tab, "leafId": leaf}
+
+
 def verdict(asks=0.0, status="done", confidence=0.9):
     return {"asks": asks, "status": status, "confidence": confidence}
 
@@ -342,6 +354,58 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([(r["class"], r["terminals"], r["closable"]) for r in result],
                          [("stalled", [], [])])
+
+    def test_each_agent_orca_marks_done_is_a_done_card_with_the_tab_that_closes_it(self):
+        rows = self.inventory(
+            [{**worktree("/w/d"), "agents": [
+                done_agent("codex", "tab1:leaf1", said="PR #5 is open for review.", asked="fix #4",
+                           minutes_ago=120),
+                {"agentType": "claude", "state": "working", "paneKey": "tab2:leaf2"}]}],
+            [in_pane(terminal("/w/d", "codex", "term_codex"), "tab1:leaf1"),
+             in_pane(terminal("/w/d", "claude", "term_claude"), "tab2:leaf2")])
+
+        self.assertEqual(rows[0]["done_cards"], [
+            {"agent": "codex", "handle": "term_codex", "done_at": "2027-01-15T06:00:00Z",
+             "interrupted": False, "prompt": "fix #4", "last_message": "PR #5 is open for review."}])
+
+    def test_a_done_card_whose_tab_sleeps_has_no_handle(self):
+        rows = self.inventory(
+            [{**worktree("/w/s"), "agents": [done_agent("claude", "tab9:leaf9", interrupted=True)]}], [])
+
+        self.assertEqual([(c["agent"], c["handle"], c["interrupted"]) for c in rows[0]["done_cards"]],
+                         [("claude", None, True)])
+
+    def test_a_reopened_tab_closes_its_card_when_it_is_the_only_tab_of_that_agent(self):
+        reopened = {"tabId": "pty:new", "leafId": "pty:new"}
+        rows = self.inventory(
+            [{**worktree("/w/r"), "agents": [done_agent("claude", "tab1:leaf1"),
+                                             done_agent("codex", "tab2:leaf2")],
+              "unread": True}],
+            [{**terminal("/w/r", "claude", "term_reopened"), **reopened},
+             {**terminal("/w/r", "codex", "term_one"), **reopened},
+             {**terminal("/w/r", "codex", "term_other"), **reopened}])
+
+        self.assertEqual([(c["agent"], c["handle"]) for c in rows[0]["done_cards"]],
+                         [("claude", "term_reopened"), ("codex", None)])
+        self.assertTrue(rows[0]["unread"])
+
+    def test_a_main_checkout_is_read_only_while_it_hosts_an_agent(self):
+        rows = self.inventory(
+            [{**worktree("/repo/hosting", main=True), "agents": [done_agent("codex", "tab1:leaf1")]},
+             worktree("/repo/shell-only", main=True), worktree("/w/t", "working")],
+            [in_pane(terminal("/repo/hosting", "codex", "term_main"), "tab1:leaf1"),
+             terminal("/repo/shell-only", None, "term_shell"), terminal("/w/t", "claude", "term_t")])
+
+        self.assertEqual([(r["path"], r["main"], [c["handle"] for c in r["done_cards"]]) for r in rows],
+                         [("/repo/hosting", True, ["term_main"]), ("/w/t", False, [])])
+
+    def test_a_tab_orca_detached_but_still_runs_is_read(self):
+        detached = {**terminal("/w/u", "claude", "term_detached"), "orphaned": True, "connected": True,
+                    "tabId": "pty:u", "leafId": "pty:u"}
+        rows = self.inventory([{**worktree("/w/u"), "agents": [done_agent("claude", "tab1:leaf1")]}], [detached])
+
+        self.assertEqual(([t["handle"] for t in rows[0]["terminals"]], rows[0]["done_cards"][0]["handle"]),
+                         (["term_detached"], "term_detached"))
 
     def test_waiting_comes_from_transcripts_and_the_decision_marker(self):
         self.claude_says("/w/a", user("go"), assistant(
@@ -850,6 +914,12 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["blockers"], [])
+
+    def test_the_main_checkout_is_never_removable(self):
+        result = rmcheck.check(self.main, self.main, base="main", compose_projects=[])
+
+        self.assertEqual((result["ok"], result["blockers"]),
+                         (False, ["this is the repository's main checkout: close its tabs and keep it"]))
 
     def test_uncommitted_changes_block_removal(self):
         (self.wt / "app.txt").write_text("v2\n")

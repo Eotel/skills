@@ -33,7 +33,8 @@ Authoring rules, script and test conventions, and validation commands live in
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
 - `orca-session-triage`: sweep Orca agent sessions for finished or stalled
   worktrees, waiting questions, and agents that never got a task; batch the
-  answers and next steps and close the finished tabs and worktrees.
+  answers and next steps, clear the done cards, and close the finished tabs
+  and worktrees.
 - `plan-exec`: create and execute durable repo-local implementation plans.
 - `exec-plan-migration` (temporary): move a repository from the legacy
   `completed/` plan archive to forward-only plans. Requires `plan-exec` and

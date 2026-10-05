@@ -4,10 +4,15 @@
   titles and options come from the rollout. A request marked
   `answered_in_chat_later` was usually answered by a later user message: confirm
   before listing it. Put a recommended option first.
+- Read each row's `done_cards` with its final message. What is left for the
+  user (a decision, an approval, a login or check only they can do, a request
+  they cut short) is a question in this pass, quoting what is left. A card with
+  nothing left for them closes without a question (`cleanup.md`).
 - Offer `finished` and `unstarted` worktrees in the same pass as close/keep
   choices, each `stalled` row's next step (`next-step.md`), and each kept
-  worktree's `closable` tabs as one close/keep choice per worktree. An `unstarted` agent's task reuses its repository's established
-  request form, found in that repository's earlier transcripts (for example
+  worktree's `closable` shells as one close/keep choice per worktree. An
+  `unstarted` agent's task reuses its repository's established request form,
+  found in that repository's earlier transcripts (for example
   `$ship <issue URL>`).
 - Questions go stale within minutes. Right before sending, re-read each target
   session's latest message and composer and drop answers that no longer apply.

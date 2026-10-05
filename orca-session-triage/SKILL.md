@@ -1,13 +1,13 @@
 ---
 name: orca-session-triage
-description: Sweep Orca agent sessions, relay batched answers and next steps, and close finished tabs and worktrees. Use when the user asks which Orca sessions are finished, stalled, or waiting on them, wants their pending questions answered in one pass, wants finished sessions, tabs, or worktrees closed, or wants the sweep scheduled.
+description: Sweep Orca agent sessions, relay batched answers and next steps, clear the board's done cards, and close finished tabs and worktrees. Use when the user asks which Orca sessions are finished, stalled, or waiting on them, wants their pending questions answered in one pass, wants done cards, finished sessions, tabs, or worktrees closed, or wants the sweep scheduled.
 ---
 
 # Orca Session Triage
 
 Find Orca worktrees whose agents finished, stalled, wait on a human, or never
-got a task; relay the user's answers and next steps in one batch; close what the
-user approves.
+got a task; relay the user's answers and next steps in one batch; clear the
+board's done cards; close what the user approves.
 
 ## Where
 
@@ -26,13 +26,18 @@ user approves.
   question makes it `waiting` or `unsure`; otherwise it stays `working` with
   that reason, and never finishes while the job runs. A decision marker
   outlives its answer, so also read each `waiting` and `stalled` row's latest
-  message yourself.
+  message yourself. Each row lists its `done_cards`, one per agent Orca shows
+  as done: the `handle` that closes its tab (null while the tab sleeps),
+  whether the user `interrupted` it, the `prompt` it last got, and Orca's copy
+  of its last message. The board keeps a card in Done until its tab closes.
+  `unread` says the user has not opened the worktree since it last spoke. A
+  repository's main checkout is a row (`main`) while it hosts an agent.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
 - `references/delivery.md`: batching questions and sending answers.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
-- `references/cleanup.md`: closing worktrees and tabs.
+- `references/cleanup.md`: closing worktrees, tabs, and done cards.
 - `references/hourly.md`: a run started as `/orca-session-triage hourly`, or
   setting up the Orca automation that starts it.
 
@@ -40,7 +45,8 @@ user approves.
 
 Every agent worktree has a class you checked and none is left `unsure`, the
 user saw every live question and every `stalled` row's proposed next step, each
-sent answer or step reached `turn_started` or is reported as queued, each
+sent answer or step reached `turn_started` or is reported as queued, every done
+card is closed, asked about, or reported with the reason it stays, each
 approved or left-behind worktree is gone from `orca worktree ps` and from disk,
 and each approved tab is gone from `orca terminal list`.
 
@@ -52,6 +58,7 @@ and each approved tab is gone from `orca terminal list`.
   nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
-  choice per item. The exception is a finished worktree with no meaningful tab
-  that `rm_check.py` clears: remove it, then report it.
+  choice per item. Two exceptions act first and report after: a finished
+  worktree with no meaningful tab that `rm_check.py` clears is removed, and a
+  done card that leaves the user nothing to do has its tab closed.
 - Relay answers verbatim; the session answers the user's follow-up questions.

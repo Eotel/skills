@@ -2,6 +2,7 @@
 """Inventory Orca agent sessions from Orca state and agent transcripts."""
 
 import argparse
+from datetime import datetime, timezone
 import glob
 import http.client
 import json
@@ -382,31 +383,73 @@ def closable_terminals(agents_closable, terms, now, idle_minutes):
             and (agents_closable if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
 
 
+def iso_time(epoch_ms):
+    if epoch_ms is None:
+        return None
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def done_cards(agents, terms):
+    """One card per agent Orca shows as done, with the live tab that closes it.
+
+    A tab Orca reopened carries a new pane id, so a card whose pane is gone
+    takes the worktree's only unclaimed tab of its agent. `handle` is None
+    while the tab sleeps, or when several tabs could be its own.
+    `last_message` is what Orca kept of the agent's last word and can be empty;
+    the row's transcripts hold the rest.
+    """
+    by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terms}
+    panes = {a.get("paneKey") for a in agents}
+    unclaimed = {}
+    for t in terms:
+        if t.get("handle") and f"{t.get('tabId')}:{t.get('leafId')}" not in panes:
+            unclaimed.setdefault(t.get("agentIdentity"), []).append(t["handle"])
+
+    def handle_of(agent):
+        own = by_pane.get(agent.get("paneKey"))
+        spare = unclaimed.get(agent.get("agentType"), [])
+        alone = sum(1 for a in agents if a.get("agentType") == agent.get("agentType")
+                    and by_pane.get(a.get("paneKey")) is None) == 1
+        return own or (spare[0] if len(spare) == 1 and alone else None)
+
+    return [{
+        "agent": a.get("agentType"), "handle": handle_of(a),
+        "done_at": iso_time(a.get("stateStartedAt")), "interrupted": bool(a.get("interrupted")),
+        "prompt": a.get("prompt") or "", "last_message": a.get("lastAssistantMessage") or "",
+    } for a in agents if a.get("state") == "done"]
+
+
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
                     now=None, shell_idle_minutes=30, judge=lambda message: None):
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
     `asks`, `status`, and `confidence` (see jev_judge), or None when it failed.
+    A repository's main checkout is read only while it hosts an agent (`main`).
     """
     now = time.time() if now is None else now
     by_worktree = {}
     for term in terminals:
-        if not term.get("orphaned"):
+        # Orphaned and disconnected is the stale record of a closed tab; a tab
+        # Orca detached from the window stays connected and still runs.
+        if term.get("connected") or not term.get("orphaned"):
             by_worktree.setdefault(term.get("worktreeId"), []).append(term)
     rows = []
     for w in worktrees:
-        if w.get("isMainWorktree"):
+        main = bool(w.get("isMainWorktree"))
+        if main and not w.get("agents"):
             continue
         terms = by_worktree.get(w.get("worktreeId"), [])
         row = {
-            "path": w["path"], "repo": w.get("repo"), "branch": w.get("branch"),
+            "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
             "status": w.get("workspaceStatus"),
+            "unread": bool(w.get("unread")),
             "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a)}
                        for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
                           for t in terms],
+            "done_cards": done_cards(w.get("agents") or [], terms),
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
