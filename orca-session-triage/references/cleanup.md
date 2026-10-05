@@ -2,7 +2,9 @@
 
 A `finished` worktree whose `meaningful_tabs` is empty is done and left behind:
 remove it without asking when `rm_check.py` reports `ok` with no `containers`,
-and report it afterwards. Every other worktree waits for the user's choice.
+and report it afterwards. Every other worktree waits for the user's choice. A
+row with `main: true` is a repository's own checkout: its tabs close and the
+checkout stays (`rm_check.py` blocks its removal).
 
 Run these per worktree, in order.
 
@@ -39,7 +41,8 @@ worktree is `finished` or `stalled`, its agent sessions, unless the final
 message says work continues: a background job may still run in that tab. A
 helper agent in a `working` or `waiting` worktree stays: its lead may send it
 the next round. An `unsure` worktree keeps its agents until you have read the
-final message and classed it.
+final message and classed it. Shells close on the user's choice; agent sessions
+follow "Clearing done cards".
 
 1. `orca terminal close --terminal <handle> --json` per approved handle. It stops
    that pane's process (`ptyKilled: true`) and removes a single-pane tab; `--tab`
@@ -48,3 +51,33 @@ final message and classed it.
 
 Closing drops Orca's resume record, not the transcript: `claude --resume
 <session-id>` or `codex resume <session-id>` in the worktree reopens the session.
+
+## Clearing done cards
+
+A row's `done_cards` are the agents whose turn ended; the board keeps each one
+in Done until its tab closes. Read the card's final message (the row's
+transcript; the card's `last_message` when none was read; its screen when both
+are empty), then:
+
+- Something is left for the user: it is a question (`delivery.md`). An
+  `interrupted` card is a request they cut short: ask whether its `prompt`
+  still stands. The card closes once the answer is delivered and the lane ends
+  its turn with nothing more for them.
+- The last message is itself what they asked for (an explanation, a report)
+  and the row is `unread`: report it as ready to read and keep the card.
+- Nothing is left for the user (finished, or waiting only on a reviewer, a
+  release, a deploy, or another lane): write what remains and who it waits on
+  with `orca worktree set --worktree path:<path> --comment "<text>" --json`,
+  close the tab with `orca terminal close --terminal <handle> --json`, then
+  report it. The worktree, its files, and the transcript stay; when the review
+  or deploy arrives, a later sweep reopens the session there (`claude --resume
+  <session-id>` or `codex resume <session-id>`) or carries the step itself.
+- A lead whose helper still works, and a session with the user's draft in its
+  composer, stay: report each with that reason.
+
+A null `handle` is a sleeping tab. `orca terminal close --worktree path:<path>
+--all --json` retires every tab of that worktree, shells included: use it when
+the worktree's live tabs are all in `closable`, and otherwise report the card
+as asleep. A card whose worktree is removed goes with it; what it left for the
+user is still a question. Confirm each closed card is gone from its worktree's
+`agents` in `orca worktree ps --json`.

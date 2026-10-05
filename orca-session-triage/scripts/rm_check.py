@@ -77,6 +77,8 @@ def compose_in(worktree, compose_projects):
 def check(worktree, main, base, compose_projects, pr=None):
     """Return {"ok", "blockers", "review", "containers"} for removing `worktree`."""
     blockers = []
+    if Path(worktree).resolve() == Path(main).resolve():
+        blockers.append("this is the repository's main checkout: close its tabs and keep it")
     changes = [line for line in git(worktree, "status", "--porcelain").stdout.splitlines() if line]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
