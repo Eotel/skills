@@ -27,12 +27,18 @@ Blocked by sandbox/write-scope mismatch.
 
 ```bash
 # One-time per repo (idempotent — safe to re-run):
-mkdir -p .worktrees
+mkdir -p -- .worktrees
+worktrees_real=$(python3 -c 'import os,sys; p=os.path.realpath(sys.argv[1]); r=os.path.realpath(sys.argv[2]); sys.exit(0 if p.startswith(r + os.sep) and os.path.isdir(p) and not os.path.islink(sys.argv[1]) else 1)' .worktrees . && realpath .worktrees) || { echo ".worktrees must be a real directory inside the repo" >&2; exit 1; }
 grep -qxF '/.worktrees/' .gitignore 2>/dev/null || echo '/.worktrees/' >> .gitignore
 
-# Per topic / orchestration:
-git fetch origin <base-branch>
-git worktree add .worktrees/<name> origin/<base-branch> -b <topic-branch>
+# Per topic / orchestration; never paste raw prompt values into these variables.
+name="permissions-mixin"
+base_branch="main"
+case "$name" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid topic slug" >&2; exit 1;; esac
+case "$base_branch" in (*[!A-Za-z0-9._/-]*|""|/*|*..*|*//*|*/*/*) echo "invalid base branch" >&2; exit 1;; esac
+topic_branch="refactor/$name"
+git fetch origin "$base_branch"
+git worktree add -- "$worktrees_real/$name" "origin/$base_branch" -b "$topic_branch"
 # Hand the absolute path of the worktree to codex.
 # `<repo>` below stands for the actual absolute repo path,
 # e.g. /Users/<you>/projects/<repo-name>/.worktrees/<name>.
@@ -59,8 +65,9 @@ From a worktree at `<repo>/.worktrees/<name>/pyproject.toml`, `../my-lib` resolv
 ```bash
 # At <repo>/, run once. The double-`../` makes the symlinks point to the
 # actual sibling repos regardless of which worktree under .worktrees/ uses them.
-for dep in <sibling-dep-1> <sibling-dep-2> ...; do
-  ln -sfn ../../$dep .worktrees/$dep
+for dep in sibling-dep-1 sibling-dep-2; do
+  case "$dep" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid sibling dependency: $dep" >&2; exit 1;; esac
+  ln -sfn -- "../../$dep" ".worktrees/$dep"
 done
 ```
 
@@ -123,17 +130,26 @@ fatal: validation failed, cannot remove working tree:
 **Mitigation**: After the work is done, before cleanup, verify the pointer:
 
 ```bash
-cat <repo>/.worktrees/<name>/.git
-# expected: gitdir: <repo>/.git/worktrees/<name>
+repo=/absolute/path/to/repo
+name="permissions-mixin"
+case "$name" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid topic slug" >&2; exit 1;; esac
+cat -- "$repo/.worktrees/$name/.git"
+# expected: gitdir: $repo/.git/worktrees/$name
 # if instead: gitdir: /tmp/<random>  → codex pivoted, use rm -rf flow
 ```
 
 If the pointer is wrong:
 
 ```bash
-rm -rf <repo>/.worktrees/<name> /tmp/<random-gitdir-path>
-git -C <repo> worktree prune
-git -C <repo> branch -D <topic-branch>
+repo=/absolute/path/to/repo
+name="permissions-mixin"
+topic_branch="refactor/$name"
+case "$name" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid topic slug" >&2; exit 1;; esac
+worktree_path=$(realpath -m -- "$repo/.worktrees/$name")
+repo_real=$(realpath -- "$repo")
+case "$worktree_path" in ("$repo_real"/.worktrees/*) rm -rf -- "$worktree_path";; (*) echo "refusing to remove path outside repo worktrees" >&2; exit 1;; esac
+git -C "$repo" worktree prune
+git -C "$repo" branch -D -- "$topic_branch"
 ```
 
 The commits and push still went through if the standalone clone had the right remote; the cleanup is just unusual.

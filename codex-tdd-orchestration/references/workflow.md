@@ -6,22 +6,31 @@ Before any parallel work, get a clean, codex-writable base.
 
 ### 0a. Orchestrator creates the worktree (do NOT delegate to codex)
 
-Place the worktree **inside the project** at `<repo>/.worktrees/<name>` so codex's sandbox accepts writes to it (see Pitfall 1 in `pitfalls.md` for why sibling-path worktrees fail). Throughout this section `<name>` is the topic identifier (e.g. `permissions-mixin`) — substitute the same value into the branch name.
+Place the worktree **inside the project** at `<repo>/.worktrees/<slug>` so codex's sandbox accepts writes to it (see Pitfall 1 in `pitfalls.md` for why sibling-path worktrees fail). Do **not** paste prompt, issue, branch, repository, or dependency names directly into shell commands. First derive a strict slug and validate every shell operand that came from a prompt or repository file.
 
 ```bash
-mkdir -p .worktrees
+# Fill these in, then validate them before use.
+name="permissions-mixin"
+base_branch="main"
+case "$name" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid topic slug" >&2; exit 1;; esac
+case "$base_branch" in (*[!A-Za-z0-9._/-]*|""|/*|*..*|*//*|*/*/*) echo "invalid base branch" >&2; exit 1;; esac
+topic_branch="refactor/$name"
+
+mkdir -p -- .worktrees
+worktrees_real=$(python3 -c 'import os,sys; p=os.path.realpath(sys.argv[1]); r=os.path.realpath(sys.argv[2]); sys.exit(0 if p.startswith(r + os.sep) and os.path.isdir(p) and not os.path.islink(sys.argv[1]) else 1)' .worktrees . && realpath .worktrees) || { echo ".worktrees must be a real directory inside the repo" >&2; exit 1; }
 # Idempotent: only append the line if it's not already there.
 grep -qxF '/.worktrees/' .gitignore 2>/dev/null || echo '/.worktrees/' >> .gitignore
 
-git fetch origin <base-branch>
-git worktree add .worktrees/<name> origin/<base-branch> -b refactor/<name>
+git fetch origin "$base_branch"
+git worktree add -- "$worktrees_real/$name" "origin/$base_branch" -b "$topic_branch"
 ```
 
 If the project uses local sibling deps (`pyproject.toml: path = "../<dep>"`), set up symlinks once so `uv sync` / `poetry install` works inside the worktree:
 
 ```bash
-for dep in <sibling-dep-1> <sibling-dep-2> ...; do
-  ln -sfn ../../$dep .worktrees/$dep
+for dep in sibling-dep-1 sibling-dep-2; do
+  case "$dep" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid sibling dependency: $dep" >&2; exit 1;; esac
+  ln -sfn -- "../../$dep" ".worktrees/$dep"
 done
 ```
 
@@ -114,14 +123,18 @@ Addresses post-review follow-up on PR #<N> (T<topic-id>).
 After push + CI green:
 
 ```bash
+repo=/absolute/path/to/repo
+name="permissions-mixin"
+topic_branch="refactor/$name"
+case "$name" in (*[!A-Za-z0-9._-]*|""|.|..) echo "invalid topic slug" >&2; exit 1;; esac
 # Verify worktree pointer integrity first (see Pitfalls #4)
-cat <repo>/.worktrees/<name>/.git
-# expected: gitdir: <repo>/.git/worktrees/<name>
+cat -- "$repo/.worktrees/$name/.git"
+# expected: gitdir: $repo/.git/worktrees/$name
 
-git -C <repo> worktree remove .worktrees/<name>
-git -C <repo> branch -D <topic-branch>
+git -C "$repo" worktree remove -- ".worktrees/$name"
+git -C "$repo" branch -D -- "$topic_branch"
 ```
 
-If the pointer is wrong (codex pivoted to clone during work), use `rm -rf <repo>/.worktrees/<name>` and `git worktree prune` instead — see `pitfalls.md`.
+If the pointer is wrong (codex pivoted to clone during work), remove only validated paths under `<repo>/.worktrees/<slug>` and then run `git worktree prune` — see `pitfalls.md`.
 
 The `.worktrees/` directory itself and the sibling-dep symlinks inside it can be left in place across orchestrations — they're cheap to keep and save the symlink setup next time. `.gitignore` keeps them invisible to git.
