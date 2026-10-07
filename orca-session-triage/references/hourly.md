@@ -9,7 +9,9 @@ triage workspace. Run the triage as usual; this page covers what differs.
   「要判断: …」. The open question holds the session, and later runs skip until
   the user answers, so each question is asked once.
 - A row the user chose to leave in an earlier run of this session stays left
-  until its newest final message changes.
+  until its newest final message changes. Only those: every other row's
+  verdict is acted on in every run, changed or not, so a finished or stalled
+  row is offered again until it is closed.
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.

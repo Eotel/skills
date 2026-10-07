@@ -37,7 +37,11 @@ under `tests/`.
 - `python3 -m unittest discover -s tests`
 - `uv run --with pyyaml python <skill-creator>/scripts/quick_validate.py ./<skill>`
   with the `skill-creator` copy bundled with Codex (and Claude Code's, when
-  installed).
+  installed). It accepts only the Agent Skills keys, so it reports the Claude
+  Code keys listed in `tests/test_skill_frontmatter.py` (`context`, `model`,
+  `hooks`, and the rest) as unexpected: that report is expected for a skill
+  that uses them, and every other error is not. Codex ignores those keys and
+  still loads the skill; the test fails on any key neither reads.
 
 ## Adding a skill
 

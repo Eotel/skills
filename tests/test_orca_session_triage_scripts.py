@@ -29,6 +29,7 @@ def load_script(name):
 scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
 precheck = load_script("precheck")
+stopcheck = load_script("stop_check")
 
 
 def write_jsonl(path, rows):
@@ -858,14 +859,89 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/continues"][0], "stalled")
         self.assertEqual(result["/w/other-head"][0], "stalled")
 
-    def test_only_stalled_and_unsure_rows_get_git_and_pr_facts(self):
+    def test_a_merged_pr_finishes_a_row_no_agent_ran_in(self):
+        # Orca's PR link is often missing or stale; the lookup by branch sees the merge.
+        def row(path, reasons, jev=None, link=None):
+            return {"path": path, "class": "stalled", "linked_pr": link, "reasons": reasons, "jev": jev,
+                    "claude": None, "codex": []}
+
+        rows = [row("/w/no-session", ["no agent session in this worktree"]),
+                row("/w/done", ["final message says done (Jev 1.00)"],
+                    jev={"source": "claude", "asks": 0.0, "status": "done", "confidence": 1.0},
+                    link={"number": 7, "state": "open"}),
+                row("/w/continues", ["final message says work continues (Jev 0.90)"],
+                    jev={"source": "claude", "asks": 0.1, "status": "in_progress", "confidence": 0.9}),
+                row("/w/no-session-other-head", ["no agent session in this worktree"]),
+                row("/w/no-session-open", ["no agent session in this worktree"])]
+        heads = {"/w/no-session-other-head": "zzz"}
+        states = {"/w/no-session-open": "OPEN"}
+        current = {}
+
+        def git_lookup(path):
+            current["path"] = path
+            return {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
+
+        def pr_lookup(slug, ref):
+            path = current["path"]
+            return {"number": 7, "state": states.get(path, "MERGED"), "merged_at": "2026-10-06T07:35:27Z",
+                    "head_oid": heads.get(path, "aaa")}
+
+        result = {r["path"]: (r["class"], r["reasons"])
+                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+
+        self.assertEqual(result["/w/no-session"], ("finished", ["PR merged"]))
+        # Jev's "done" is a fast read: a merged row it judged waits for the careful one.
+        self.assertEqual(result["/w/done"][0], "stalled")
+        self.assertEqual(result["/w/continues"][0], "stalled")
+        self.assertEqual(result["/w/no-session-other-head"][0], "stalled")
+        self.assertEqual(result["/w/no-session-open"][0], "stalled")
+
+    def test_the_review_queue_holds_every_row_a_reader_must_class(self):
+        # Jev reads fast and shallow: every row it judged from a final message gets
+        # one careful read, and the verdict is kept until that message changes.
+        def row(path, cls, pr=None, jev=True, final_at="t1", **extra):
+            return {"path": path, "repo": "app", "class": cls, "reasons": ["r"], "comment": "c",
+                    "jev": {"asks": 0.5} if jev else None, "pr": pr, "git": {"dirty": 0},
+                    "claude": {"last_user": "u", "final_text": "f", "final_at": final_at, "transcript": "/x.jsonl"},
+                    "codex": [{"last_assistant": "old", "last_assistant_at": "t0"},
+                              {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"}],
+                    "terminals": [{"handle": "term_1"}], **extra}
+
+        rows = [row("/w/unsure", "unsure"),
+                row("/w/merged-but-continues", "stalled", pr={"state": "MERGED", "number": 3}),
+                row("/w/blocked-by-jev", "stalled", pr={"state": "OPEN", "number": 4}),
+                row("/w/asks-by-jev", "waiting"),
+                row("/w/no-message", "stalled", jev=False),
+                row("/w/finished", "finished", pr={"state": "MERGED", "number": 5}),
+                row("/w/working", "working"),
+                row("/w/read-before", "stalled", final_at="t1"),
+                row("/w/changed-since", "stalled", final_at="t2")]
+        verdicts = {"/w/read-before": {"read": scan.read_key(row("/w/read-before", "stalled")), "class": "blocked"},
+                    "/w/changed-since": {"read": scan.read_key(row("/w/changed-since", "stalled")),
+                                         "class": "finished"}}
+
+        queue = scan.review_queue(rows, verdicts)
+
+        self.assertEqual([e["path"] for e in queue], ["/w/unsure", "/w/merged-but-continues", "/w/blocked-by-jev",
+                                                       "/w/asks-by-jev", "/w/changed-since"])
+        self.assertEqual(queue[0], {
+            "path": "/w/unsure", "repo": "app", "class": "unsure", "reasons": ["r"], "comment": "c",
+            "jev": {"asks": 0.5}, "pr": None, "git": {"dirty": 0},
+            "claude": {"last_user": "u", "final_text": "f", "final_at": "t1", "transcript": "/x.jsonl"},
+            "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
+            "final_at": "t1", "read": scan.read_key(rows[0])})
+
+    def test_rows_a_reader_classes_get_git_and_pr_facts(self):
+        # A waiting row is read too: its decision marker may be answered by a merge.
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
                 {"path": "/w/branch", "class": "stalled", "linked_pr": None},
                 {"path": "/w/forgejo", "class": "unsure", "linked_pr": None},
+                {"path": "/w/asks", "class": "waiting", "linked_pr": {"number": 8, "state": "open"}},
                 {"path": "/w/busy", "class": "working", "linked_pr": {"number": 9, "state": "open"}}]
         gits = {"/w/linked": {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"},
                 "/w/branch": {"branch": "fix-b", "head": "bbb", "dirty": 2, "unpushed": 1, "github": "acme/app"},
-                "/w/forgejo": {"branch": "fix-c", "head": "ccc", "dirty": 0, "unpushed": 0, "github": None}}
+                "/w/forgejo": {"branch": "fix-c", "head": "ccc", "dirty": 0, "unpushed": 0, "github": None},
+                "/w/asks": {"branch": "fix-d", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}}
         asked = []
 
         def pr_lookup(slug, ref):
@@ -874,11 +950,12 @@ class NextStepFactTests(unittest.TestCase):
 
         result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
 
-        self.assertEqual(asked, [("acme/app", 7), ("acme/app", "fix-b")])
+        self.assertEqual(asked, [("acme/app", 7), ("acme/app", "fix-b"), ("acme/app", 8)])
         self.assertEqual([(r.get("git"), r.get("pr")) for r in result], [
             (gits["/w/linked"], {"number": 7, "head_oid": "aaa", "head_matches": True}),
             (gits["/w/branch"], {"number": "fix-b", "head_oid": "aaa", "head_matches": False}),
-            (gits["/w/forgejo"], None), (None, None)])
+            (gits["/w/forgejo"], None),
+            (gits["/w/asks"], {"number": 8, "head_oid": "aaa", "head_matches": True}), (None, None)])
         self.assertNotIn("git", rows[0])
 
 
@@ -886,9 +963,10 @@ class ScanCommandTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
-        # A host's real Jev key must never reach a test run.
+        # A host's real Jev key and verdict store must never reach a test run.
         for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}),
-                         patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key"))):
+                         patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
+                         patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json"))):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
@@ -919,6 +997,27 @@ class ScanCommandTests(unittest.TestCase):
         rows = {r["path"]: r["class"] for r in json.loads(out.getvalue())}
         self.assertEqual(rows, {"/w/new": "working", "/w/old": "unstarted"})
 
+
+    def test_writes_the_review_queue_when_asked(self):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/idle", "done")]}}))
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [terminal("/w/idle", "claude")]}}))
+        claude = self.dir / "claude"
+        write_jsonl(scan.claude_project_dir(claude, "/w/idle") / "s.jsonl",
+                    [user("go"), assistant(text("PR を出しました。"))])
+        queue = self.dir / "triage" / "review-queue.json"
+
+        env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_API_KEY"}
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), patch.dict(os.environ, env, clear=True):
+            scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--claude-projects", str(claude),
+                       "--codex-sessions", str(self.dir / "none"), "--jev-key-file", str(self.dir / "no-key"),
+                       "--review-out", str(queue)])
+
+        written = json.loads(queue.read_text())
+        self.assertEqual([r["path"] for r in written["rows"]], ["/w/idle"])
+        self.assertEqual(written["rows"][0]["claude"]["final_text"], "PR を出しました。")
+        self.assertTrue(written["generated_at"])
 
     def test_reads_the_orchestration_mailbox_from_json_files(self):
         ps = self.dir / "ps.json"
@@ -1311,6 +1410,147 @@ class PrecheckTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn("skip: could not read Orca worktrees", out.getvalue())
 
+
+class StopCheckTests(unittest.TestCase):
+    """The Stop hook keeps a triage turn open while its review queue is not classed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.dir = self.root / "s1"
+        self.dir.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def queue(self, *paths, at="2026-10-07T10:00:00+00:00"):
+        (self.dir / "review-queue.json").write_text(json.dumps(
+            {"generated_at": at, "rows": [{"path": p} for p in paths]}))
+
+    def result(self, *paths, at="2026-10-07T10:00:00+00:00"):
+        (self.dir / "review-result.json").write_text(json.dumps(
+            {"queue_generated_at": at, "rows": [{"path": p, "class": "blocked"} for p in paths]}))
+
+    def check(self, active=False):
+        return stopcheck.decide({"session_id": "s1", "stop_hook_active": active}, self.root)
+
+    def test_lets_the_turn_end_without_a_queue_or_with_an_empty_one(self):
+        self.assertIsNone(self.check())
+        self.queue()
+        self.assertIsNone(self.check())
+
+    def test_blocks_while_queued_rows_are_not_classed(self):
+        self.queue("/w/a", "/w/b")
+        blocked = self.check()
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("/w/a", blocked["reason"])
+        self.assertIn("orca-row-classify", blocked["reason"])
+
+        self.result("/w/a")
+        self.assertIn("/w/b", self.check()["reason"])
+        self.assertNotIn("/w/a", self.check()["reason"])
+
+    def test_a_result_for_an_older_queue_does_not_count(self):
+        self.result("/w/a", at="2026-10-07T09:00:00+00:00")
+        self.queue("/w/a")
+        self.assertEqual(self.check()["decision"], "block")
+
+    def test_lets_the_turn_end_once_every_row_is_classed(self):
+        self.queue("/w/a", "/w/b")
+        self.result("/w/a", "/w/b")
+        self.assertIsNone(self.check())
+
+    def test_blocks_once_then_lets_a_repeated_stop_through(self):
+        self.queue("/w/a")
+        self.assertEqual(self.check()["decision"], "block")
+        self.assertIsNone(self.check(active=True))
+
+    def test_a_verdict_without_a_known_class_does_not_count(self):
+        self.queue("/w/a")
+        (self.dir / "review-result.json").write_text(json.dumps(
+            {"queue_generated_at": "2026-10-07T10:00:00+00:00", "rows": [{"path": "/w/a", "class": "maybe"}]}))
+        self.assertEqual(self.check()["decision"], "block")
+
+    def test_a_damaged_queue_or_result_lets_the_turn_end(self):
+        (self.dir / "review-queue.json").write_text(json.dumps({"generated_at": "g", "rows": [{"nopath": 1}]}))
+        self.assertIsNone(self.check())
+        (self.dir / "review-queue.json").write_text("[]")
+        self.assertIsNone(self.check())
+
+
+
+class VerdictStoreTests(unittest.TestCase):
+    """A careful read is kept only while what it read still holds."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = self.root / "verdicts.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def row(path, final_at="t1", pr=None, dirty=0, cls="stalled", codex_at=None):
+        return {"path": path, "class": cls, "jev": {"asks": 0.1}, "pr": pr, "git": {"dirty": dirty},
+                "claude": {"final_at": final_at} if final_at else None,
+                "codex": [{"last_assistant_at": codex_at}] if codex_at else []}
+
+    def test_a_verdict_lapses_when_the_pr_or_the_tree_changed_or_nothing_was_read(self):
+        open_pr = {"state": "OPEN", "number": 7, "head_oid": "a"}
+        read = self.row("/w/a", pr=open_pr)
+        verdicts = {"/w/a": {"read": scan.read_key(read), "class": "blocked"},
+                    "/w/none": {"read": scan.read_key(self.row("/w/none", final_at=None)), "class": "blocked"}}
+
+        self.assertEqual(scan.review_queue([read], verdicts), [])
+        for changed in (self.row("/w/a", pr={**open_pr, "state": "MERGED"}),
+                        self.row("/w/a", pr={**open_pr, "head_oid": "b"}),
+                        self.row("/w/a", pr=open_pr, dirty=2),
+                        self.row("/w/a", pr=open_pr, final_at="t2")):
+            self.assertEqual([e["path"] for e in scan.review_queue([changed], verdicts)], ["/w/a"])
+        self.assertEqual([e["path"] for e in scan.review_queue([self.row("/w/none", final_at=None)], verdicts)],
+                         ["/w/none"])
+        self.assertNotIn("verdict", scan.with_verdicts([self.row("/w/none", final_at=None)], verdicts)[0])
+        self.assertNotIn("verdict", scan.with_verdicts([{**read, "class": "working"}], verdicts)[0])
+        self.assertEqual(scan.with_verdicts([read], verdicts)[0]["verdict"]["class"], "blocked")
+
+    def test_the_newer_of_the_claude_and_codex_messages_is_what_was_read(self):
+        self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T01:00:00Z",
+                                                     codex_at="2026-10-07T02:00:00Z")), "2026-10-07T02:00:00Z")
+        self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T03:00:00Z",
+                                                     codex_at="2026-10-07T02:00:00Z")), "2026-10-07T03:00:00Z")
+
+    def write_session(self, name, queue_at, rows, result_at, verdicts):
+        session = self.root / name
+        session.mkdir()
+        (session / "review-queue.json").write_text(json.dumps({"generated_at": queue_at, "rows": rows}))
+        (session / "review-result.json").write_text(json.dumps({"queue_generated_at": result_at, "rows": verdicts}))
+
+    def test_every_session_s_classed_queue_feeds_the_store_and_bad_verdicts_do_not(self):
+        self.write_session("s1", "g1", [{"path": "/w/a", "read": "ka"}, {"path": "/w/b", "read": "kb"}], "g1",
+                           [{"path": "/w/a", "class": "blocked", "read": "forged"},
+                            {"path": "/w/b", "class": "made-up"}])
+        self.write_session("s2", "g2", [{"path": "/w/c", "read": "kc"}], "g2",
+                           [{"path": "/w/c", "class": "finished"}])
+        self.write_session("s3", "g3", [{"path": "/w/d", "read": "kd"}], "older",
+                           [{"path": "/w/d", "class": "finished"}])
+        self.store.write_text(json.dumps({"/w/old": {"read": "ko", "class": "finished"}}))
+
+        verdicts = scan.absorb_verdicts(self.store)
+
+        self.assertEqual(verdicts, {"/w/old": {"read": "ko", "class": "finished"},
+                                    "/w/a": {"class": "blocked", "read": "ka"},
+                                    "/w/c": {"class": "finished", "read": "kc"}})
+        self.assertEqual(json.loads(self.store.read_text()), verdicts)
+
+    def test_a_damaged_store_is_kept_aside_not_overwritten(self):
+        self.store.write_text("[1, 2")
+        self.write_session("s1", "g1", [{"path": "/w/a", "read": "ka"}], "g1", [{"path": "/w/a", "class": "blocked"}])
+
+        verdicts = scan.absorb_verdicts(self.store)
+
+        self.assertEqual(verdicts, {"/w/a": {"class": "blocked", "read": "ka"}})
+        self.assertEqual((self.root / "verdicts.json.bad").read_text(), "[1, 2")
 
 if __name__ == "__main__":
     unittest.main()
