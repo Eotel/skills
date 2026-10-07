@@ -35,6 +35,8 @@ Authoring rules, script and test conventions, and validation commands live in
   worktrees, waiting questions, and agents that never got a task; batch the
   answers and next steps, clear the done cards, and close the finished tabs
   and worktrees.
+- `orca-row-classify`: class the rows of an `orca-session-triage` review queue
+  in a fresh Sonnet context (invoked by `orca-session-triage`, not directly).
 - `plan-exec`: create and execute durable repo-local implementation plans.
 - `exec-plan-migration` (temporary): move a repository from the legacy
   `completed/` plan archive to forward-only plans. Requires `plan-exec` and

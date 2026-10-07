@@ -335,6 +335,9 @@ def waiting_reasons(row, decision_marker):
     return reasons
 
 
+NO_SESSION_REASON = "no agent session in this worktree"
+
+
 def classify(row, decision_marker):
     """Return (class, reasons): waiting > unstarted > working > unsure > finished > stalled.
 
@@ -379,7 +382,7 @@ def classify(row, decision_marker):
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
     if not (row["agents"] or row["claude"] or row["codex"]):
-        return "stalled", ["no agent session in this worktree"]
+        return "stalled", [NO_SESSION_REASON]
     return "stalled", [state] if state else []
 
 
@@ -627,8 +630,20 @@ def merged_after_final_message(row, pr):
     return said_at is not None and merged_at is not None and merged_at > said_at
 
 
+def merged_with_nothing_left(row, pr):
+    """A checkout no agent ran in whose own PR merged at HEAD.
+
+    Orca's PR link is often missing or still says open after the merge, so the
+    PR found by the lookup decides. A row an agent spoke in is not finished
+    here even when Jev read it as done: Jev's read is fast and shallow, so that
+    row waits in the review queue for a careful one.
+    """
+    return (row["class"] == "stalled" and row.get("reasons") == [NO_SESSION_REASON]
+            and pr.get("state") == "MERGED" and bool(pr.get("head_matches")))
+
+
 def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
-    """Return rows where each stalled or unsure row also carries its git and PR state.
+    """Return rows where each row a reader classes (stalled, unsure, waiting) also carries its git and PR state.
 
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
@@ -636,7 +651,7 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     """
     result = []
     for row in rows:
-        if row["class"] not in ("stalled", "unsure"):
+        if row["class"] not in READ_CLASSES:
             result.append(row)
             continue
         git = git_lookup(row["path"])
@@ -647,8 +662,126 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         row = {**row, "git": git, "pr": pr}
         if pr is not None and merged_after_final_message(row, pr):
             row = {**row, "class": "finished", "reasons": ["PR merged after the final message"]}
+        elif pr is not None and merged_with_nothing_left(row, pr):
+            row = {**row, "class": "finished", "reasons": ["PR merged"]}
         result.append(row)
     return result
+
+
+QUEUE_FIELDS = ("path", "repo", "class", "reasons", "comment", "jev", "pr", "git", "claude")
+VERDICTS_FILE = "~/.cache/orca-session-triage/verdicts.json"
+VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
+READ_CLASSES = ("unsure", "stalled", "waiting")
+
+
+def row_final_at(row):
+    """When the newest final message a reader would class was written (Claude or Codex), or None."""
+    codex = row.get("codex") or []
+    said = [at for at in ((row.get("claude") or {}).get("final_at"),
+                          codex[-1].get("last_assistant_at") if codex else None) if at]
+    return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
+
+
+def read_key(row):
+    """What a careful read of the row saw: its final message, its PR, and its tree. None without a message.
+
+    A verdict holds only while this key is unchanged, so a merge, a new push, or
+    new uncommitted work sends the row back for another read.
+    """
+    final_at = row_final_at(row)
+    if final_at is None:
+        return None
+    pr, git = row.get("pr") or {}, row.get("git") or {}
+    return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"), git.get("dirty")])
+
+
+def current_verdict(row, verdicts):
+    """The stored verdict for what the row shows now, or None."""
+    key = read_key(row)
+    verdict = verdicts.get(row["path"]) if key is not None else None
+    return verdict if isinstance(verdict, dict) and verdict.get("read") == key else None
+
+
+def review_queue(rows, verdicts=None):
+    """Rows a careful reader must class before anything closes.
+
+    Jev reads a final message fast and shallow, so every row it judged from one
+    (unsure, stalled, or waiting) is queued, and so is a stalled row whose own PR
+    merged although its message did not say it was done. A row keeps the verdict
+    orca-row-classify gave it while its message, PR, and tree stay as read, so
+    only new or changed rows are read again.
+    """
+    verdicts = verdicts or {}
+
+    def needs_reader(row):
+        merged = (row.get("pr") or {}).get("state") == "MERGED"
+        judged = row.get("jev") is not None and row["class"] in READ_CLASSES
+        if not (judged or row["class"] == "unsure" or (row["class"] == "stalled" and merged)):
+            return False
+        return current_verdict(row, verdicts) is None
+
+    return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             "codex": row["codex"][-1] if row.get("codex") else None,
+             "final_at": row_final_at(row), "read": read_key(row)}
+            for row in rows if needs_reader(row)]
+
+
+def read_json_file(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomically(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def load_verdicts(store_path):
+    """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
+    store = Path(os.path.expanduser(str(store_path)))
+    if not store.exists():
+        return {}
+    data = read_json_file(store)
+    if isinstance(data, dict):
+        return {path: v for path, v in data.items() if isinstance(v, dict)}
+    os.replace(store, store.with_name(store.name + ".bad"))
+    return {}
+
+
+def classed_queue(session):
+    """{path: verdict} from a session directory whose result answers its own queue, else {}."""
+    queue, result = read_json_file(session / "review-queue.json"), read_json_file(session / "review-result.json")
+    if not (isinstance(queue, dict) and isinstance(result, dict)
+            and result.get("queue_generated_at") == queue.get("generated_at")):
+        return {}
+    read = {e["path"]: e.get("read") for e in queue.get("rows") or [] if isinstance(e, dict) and "path" in e}
+    return {v["path"]: {**{k: x for k, x in v.items() if k not in ("path", "read")}, "read": read[v["path"]]}
+            for v in result.get("rows") or []
+            if isinstance(v, dict) and v.get("path") in read and v.get("class") in VERDICT_CLASSES
+            and read[v["path"]] is not None}
+
+
+def absorb_verdicts(store_path, write=True):
+    """Fold every session's classed queue (the store's sibling directories) into the store and return it."""
+    store = Path(os.path.expanduser(str(store_path)))
+    verdicts = load_verdicts(store)
+    for queue in sorted(store.parent.glob("*/review-queue.json"), key=lambda p: p.stat().st_mtime):
+        verdicts = {**verdicts, **classed_queue(queue.parent)}
+    if write:
+        write_json_atomically(store, verdicts)
+    return verdicts
+
+
+def with_verdicts(rows, verdicts):
+    """Rows a careful reader classed carry that verdict while what it read still holds."""
+    def marked(row):
+        verdict = current_verdict(row, verdicts) if row["class"] in READ_CLASSES else None
+        return {**row, "verdict": verdict} if verdict else row
+    return [marked(row) for row in rows]
 
 
 def read_codex(session_roots, since=None):
@@ -739,7 +872,22 @@ def parse_args(argv=None):
     parser.add_argument("--jev-key-file", default=JEV_KEY_FILE,
                         help="Jev (TypeSafe) API key file, read when TYPESAFE_API_KEY is unset "
                              "(default: %(default)s)")
+    parser.add_argument("--review-out",
+                        help="also write the rows a careful reader must class (every row Jev judged from a final "
+                             "message without a verdict for it yet, and a stalled row whose own PR merged) to this "
+                             "JSON file, for orca-row-classify; verdicts already written for any session's queue "
+                             "beside the store are kept in --verdicts first")
+    parser.add_argument("--verdicts", default=VERDICTS_FILE,
+                        help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
     return parser.parse_args(argv)
+
+
+def write_review_queue(path, rows, verdicts=None):
+    """Write {"generated_at", "rows"} so a later check can tell whether this scan's queue was classed."""
+    target = Path(os.path.expanduser(path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "rows": review_queue(rows, verdicts)}
+    write_json_atomically(target, payload)
 
 
 def main(argv=None):
@@ -757,6 +905,10 @@ def main(argv=None):
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args)))
+    verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
+    rows = with_verdicts(rows, verdicts)
+    if args.review_out:
+        write_review_queue(args.review_out, rows, verdicts)
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
