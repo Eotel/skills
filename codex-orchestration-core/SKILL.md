@@ -34,6 +34,11 @@ the shared safety and acceptance behavior.
 5. **Durable objective.** Long-running orchestration needs a verifiable end-state
    and a progress record that survives context loss. Use the harness's durable
    goal mechanism only while an active worker or monitor is advancing it.
+   Before ending a turn while a worker, critic, or check still runs, act on the
+   reports already waiting, then leave one wait armed that the harness itself
+   returns to you when the next report lands, and re-arm it after each wake. A
+   notice another process types into your terminal is a convenience, not that
+   wait.
 
 6. **Verify reports.** Inspect the actual diff, files, and command output after a
    worker finishes. An empty or out-of-scope diff contradicts a success report.

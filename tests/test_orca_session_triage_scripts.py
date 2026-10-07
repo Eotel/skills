@@ -643,6 +643,69 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
         self.assertEqual(result["/w/h"], ("stalled", ["final message waits on someone else (Jev 0.90)"]))
 
+    def test_a_turn_cut_off_by_an_api_error_is_stalled_even_behind_a_background_job(self):
+        # 2026-10-06 the Mac slept mid-response; a CI monitor kept Orca at working and the lead sat for 16 hours.
+        cut = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+        self.claude_says("/w/cut", user("go"), assistant(text("critic の判定待ちです。")),
+                         {**assistant(text(cut)), "isApiErrorMessage": True})
+        judged = []
+
+        def judge(message):
+            judged.append(message)
+            return verdict(0.1, "done" if message == "Merged." else "in_progress", 1.0)
+
+        self.claude_says("/w/merged", user("go"), assistant(text("merge しました。")),
+                         {**assistant(text(cut)), "isApiErrorMessage": True})
+        self.claude_says("/w/resumed", user("go"), {**assistant(text(cut)), "isApiErrorMessage": True},
+                         assistant(text("Merged.")))
+
+        result = {r["path"]: (r["class"], r["reasons"], r["closable"]) for r in self.inventory(
+            [worktree("/w/cut", "working", turn="done"),
+             worktree("/w/merged", "done", pr={"number": 1, "state": "merged"}),
+             worktree("/w/resumed", "done", pr={"number": 2, "state": "merged"})],
+            [terminal("/w/cut", "claude", "term_c"), terminal("/w/merged", "claude", "term_m"),
+             terminal("/w/resumed", "claude", "term_r")], judge=judge)}
+
+        # A cut-off turn is woken, never offered for closing, even after its PR merged.
+        self.assertEqual(result["/w/cut"], ("stalled", ["turn ended with an API error: " + cut], []))
+        self.assertEqual(result["/w/merged"], ("stalled", ["turn ended with an API error: " + cut], []))
+        self.assertEqual(result["/w/resumed"][0], "finished")
+        self.assertEqual(judged, ["Merged."])
+
+    def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self):
+        # 2026-10-06 a lead ended its turn while workers ran; their reports sat unread for 20 hours.
+        def at(minutes_ago):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - minutes_ago * 60))
+
+        def message(kind, minutes_ago, read=0, run="run_a"):
+            return {"run_id": run, "to_handle": "run:" + run, "type": kind, "read": read,
+                    "created_at": at(minutes_ago), "subject": kind}
+
+        mail = scan.unread_worker_mail(
+            [message("worker_done", 200), message("worker_done", 50), message("question", 40),
+             message("worker_done", 45, read=1), message("heartbeat", 30), message("escalation", 2),
+             message("worker_done", 20, run="run_b")],
+            [{"id": "run_a", "coordinator_handle": "term_lead"},
+             {"id": "run_b", "coordinator_handle": "term_asks"}])
+        asks = "#470 の扱いを返事ください。"
+        self.claude_says("/w/lead", {**user("go"), "timestamp": at(60)}, assistant(text("worker の報告を待ちます。")))
+        # A timestamp without a zone is UTC, like Orca's.
+        self.claude_says("/w/asks", {**user("go"), "timestamp": at(60).rstrip("Z")}, assistant(text(asks)))
+
+        result = scan.build_inventory(
+            [worktree("/w/lead", "done"), worktree("/w/asks", "done")],
+            [terminal("/w/lead", "claude", "term_lead"), terminal("/w/asks", "claude", "term_asks")],
+            self.projects, {}, "要判断", now=NOW, judge=judging({asks: verdict(0.9, "blocked_on_others")}),
+            mail=mail)
+
+        self.assertEqual({r["path"]: (r["class"], r["reasons"], r["closable"]) for r in result}, {
+            "/w/lead": ("stalled", [f"2 orchestration messages unread since its last turn began (oldest {at(50)})"],
+                        []),
+            "/w/asks": ("waiting", ["final message asks (Jev 0.90)",
+                                    f"1 orchestration message unread since its last turn began (oldest {at(20)})"],
+                        []),
+        })
+
     def test_a_worktree_no_agent_ever_worked_in_says_so(self):
         result = self.classes([worktree("/w/shell", None, pr={"number": 3, "state": "open"}, status="in-review")],
                               [terminal("/w/shell", None)])
@@ -856,6 +919,54 @@ class ScanCommandTests(unittest.TestCase):
         rows = {r["path"]: r["class"] for r in json.loads(out.getvalue())}
         self.assertEqual(rows, {"/w/new": "working", "/w/old": "unstarted"})
 
+
+    def test_reads_the_orchestration_mailbox_from_json_files(self):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/lead", "done")]}}))
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [terminal("/w/lead", "claude", "term_lead")]}}))
+        inbox = self.dir / "inbox.json"
+        inbox.write_text(json.dumps({"result": {"messages": [
+            {"run_id": "run_a", "to_handle": "run:run_a", "type": "worker_done", "read": 0,
+             "created_at": "2026-10-06T07:04:31Z", "subject": "#280 GREEN"}], "count": 1}}))
+        runs = self.dir / "runs.json"
+        runs.write_text(json.dumps({"result": {"runs": [{"id": "run_a", "coordinator_handle": "term_lead"}]}}))
+        claude = self.dir / "claude"
+        write_jsonl(scan.claude_project_dir(claude, "/w/lead") / "s.jsonl",
+                    [{**user("go"), "timestamp": "2026-10-06T06:56:00Z"}, assistant(text("レビューに回しました。"))])
+
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--claude-projects", str(claude),
+                       "--codex-sessions", str(self.dir / "none"),
+                       "--inbox-json", str(inbox), "--runs-json", str(runs)])
+
+        row = json.loads(out.getvalue())[0]
+        self.assertEqual((row["class"], row["reasons"]), ("stalled", [
+            "1 orchestration message unread since its last turn began (oldest 2026-10-06T07:04:31Z)"]))
+
+    def test_follows_every_page_of_runs_and_survives_an_orca_without_a_mailbox(self):
+        inbox = self.dir / "inbox.json"
+        inbox.write_text(json.dumps({"result": {"messages": [
+            {"run_id": run, "to_handle": "run:" + run, "type": "question", "read": 0,
+             "created_at": "2026-10-07T03:09:00Z", "subject": "Question"} for run in ("run_1", "run_2")]}}))
+        pages = {(): {"runs": [{"id": "run_1", "coordinator_handle": "term_1"}], "nextCursor": "c2"},
+                 ("--cursor", "c2"): {"runs": [{"id": "run_2", "coordinator_handle": "term_2"}], "nextCursor": None}}
+
+        def run_list(argv, **kwargs):
+            cursor = tuple(argv[argv.index("100") + 1:-1])
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "result": pages[cursor]}), "")
+
+        args = ["--ps-json", "ps.json", "--inbox-json", str(inbox)]
+        with patch.object(scan.subprocess, "run", side_effect=run_list):
+            mail = scan.read_mail(scan.parse_args(args))
+        self.assertEqual(sorted(mail), ["term_1", "term_2"])
+
+        err = io.StringIO()
+        with patch.object(scan.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "orca")), \
+                redirect_stderr(err):
+            self.assertEqual(scan.read_mail(scan.parse_args(args)), {})
+        self.assertIn("unread worker mail is not checked", err.getvalue())
 
     def test_shell_idle_minutes_sets_when_a_quiet_shell_becomes_closable(self):
         ps = self.dir / "ps.json"

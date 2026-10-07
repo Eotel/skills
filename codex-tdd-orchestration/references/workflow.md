@@ -56,6 +56,29 @@ after the fix and use a fresh critic for the next acceptance judgment. Stop at
 the retry cap; recurring defect classes require a structural change or user
 decision.
 
+## Between turns
+
+A worker's report reaches an Orca lead as mail in its Run. Orca types a
+"You have N orchestration messages" notice into an idle lead, but has typed
+none for hours: on 2026-10-06 and 07, two Claude Code leads ended their turns
+with workers still running and sat on seven reports and three questions until
+someone woke them.
+
+Before ending a turn while any Dispatch is unsettled:
+
+1. Act on the mail already waiting, including mail that arrived during this
+   turn: run the consuming `check`, answer questions, and validate each
+   `worker_done`.
+2. Arm the canonical loop's `check --wait` from `orca skills get orchestration`
+   as a background command, so its exit starts your next turn. When it returns,
+   process the batch and re-arm it with that batch acknowledged, as the loop
+   shows, so the batch does not replay.
+3. In a harness that cannot start a turn when a background command exits, keep
+   the wait in the foreground instead of ending the turn.
+
+A final message that asks the user something ends the turn as well: arm the
+wait before you ask.
+
 ## Integration
 
 Integrate one topic at a time in dependency order. Before accepting each topic:

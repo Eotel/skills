@@ -102,7 +102,7 @@ def read_claude(projects_root, worktree_path):
     path = max(candidates, key=lambda p: p.stat().st_mtime)
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
-    texts, final_at, asked, answered = [], None, {}, set()
+    texts, final_at, asked, answered, api_error = [], None, {}, set(), None
     for entry in rows[last + 1:]:
         content = message_of(entry).get("content")
         if not isinstance(content, list):
@@ -114,6 +114,7 @@ def read_claude(projects_root, worktree_path):
             if entry.get("type") == "assistant" and kind == "text" and block["text"].strip():
                 texts.append(block["text"])
                 final_at = entry.get("timestamp")
+                api_error = block["text"] if entry.get("isApiErrorMessage") else None
             elif kind == "tool_use" and block.get("name") == "AskUserQuestion":
                 asked[block.get("id")] = block.get("input")
             elif kind == "tool_result":
@@ -121,9 +122,11 @@ def read_claude(projects_root, worktree_path):
     return {
         "transcript": str(path),
         "last_user": user_text(rows[last]) if last >= 0 else None,
+        "last_user_at": rows[last].get("timestamp") if last >= 0 else None,
         "final_text": texts[-1] if texts else None,
         "final_at": final_at,
         "pending_questions": [q for i, q in asked.items() if i not in answered],
+        "api_error": api_error,
     }
 
 
@@ -281,6 +284,15 @@ def latest_message(row):
     return "claude", claude["final_text"]
 
 
+def cut_off(row):
+    """The API error that ended Claude's last turn, or None.
+
+    Claude Code does not resume such a turn, and a monitor it left running keeps
+    Orca at working, so only the transcript shows the agent stopped mid-task.
+    """
+    return (row["claude"] or {}).get("api_error")
+
+
 def is_sure_ask(asks):
     return asks is not None and asks >= ASKS_FROM
 
@@ -333,11 +345,14 @@ def classify(row, decision_marker):
     and its reason says what Jev read (work continues, waits on someone else,
     or done but not merged). A worktree Orca calls working only for a background
     job is read too: a question makes it waiting or unsure, and it never
-    finishes while the job runs.
+    finishes while the job runs. A turn an API error cut off, or a lead that
+    left its workers' mail unread, is stalled even then; unread mail is also
+    named on a waiting row.
     """
     reasons = waiting_reasons(row, decision_marker)
+    mail = [mail_reason(row["unread_mail"])] if row.get("unread_mail") else []
     if reasons:
-        return "waiting", reasons
+        return "waiting", reasons + mail
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
     silent = sorted({t["agent"] for t in row["terminals"] if t["agent"] in has_transcript
                      and not has_transcript[t["agent"]]})
@@ -346,6 +361,10 @@ def classify(row, decision_marker):
     jev = row.get("jev")
     if turn_runs(row):
         return "working", []
+    if cut_off(row):
+        return "stalled", ["turn ended with an API error: " + cut_off(row)]
+    if mail:
+        return "stalled", mail
     if is_working(row):
         if jev and (jev["asks"] is None or jev["asks"] >= SETTLED_BELOW):
             return "unsure", [unsure_reason(jev)]
@@ -376,10 +395,12 @@ def agents_done(row):
     """Nothing is pending on the agents: closing their tabs loses no work.
 
     An agent whose last message says work continues may be waiting on a
-    background job that its tab still holds.
+    background job that its tab still holds. A turn an API error cut off, and a
+    lead with unread worker mail, are woken in that tab.
     """
     still_working = (row.get("jev") or {}).get("status") == "in_progress"
-    return row["class"] in ("finished", "stalled") and not still_working
+    to_wake = cut_off(row) or row.get("unread_mail")
+    return row["class"] in ("finished", "stalled") and not still_working and not to_wake
 
 
 def closable_terminals(agents_closable, terms, now, idle_minutes):
@@ -425,11 +446,13 @@ def done_cards(agents, terms):
 
 
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
-                    now=None, shell_idle_minutes=30, judge=lambda message: None):
+                    now=None, shell_idle_minutes=30, judge=lambda message: None, mail=None):
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
     `asks`, `status`, and `confidence` (see jev_judge), or None when it failed.
+    `mail` maps a lead's terminal handle to its unread worker mail (see
+    unread_worker_mail).
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     now = time.time() if now is None else now
@@ -458,7 +481,8 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "claude": read_claude(claude_root, w["path"]),
             "codex": codex_by_cwd.get(w["path"], []),
         }
-        latest = None if turn_runs(row) else latest_message(row)
+        row["unread_mail"] = unread_since_turn(row, mail or {}, now)
+        latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes)
@@ -533,10 +557,54 @@ def gh_pr(slug, ref):
 
 
 def parse_time(value):
+    """An aware datetime; a time without a zone is UTC."""
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, ValueError):
         return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+WORKER_MAIL = ("worker_done", "question", "escalation")
+MAIL_GRACE_MINUTES = 5  # Orca types its own notice into an idle lead first
+
+
+def unread_worker_mail(messages, runs):
+    """Unread worker reports, questions, and escalations, keyed by the lead terminal they wait on."""
+    leads = {run.get("id"): run.get("coordinator_handle") for run in runs}
+    mail = {}
+    for m in messages:
+        run = m.get("run_id")
+        if m.get("read") or m.get("type") not in WORKER_MAIL or m.get("to_handle") != f"run:{run}":
+            continue
+        if leads.get(run):
+            mail.setdefault(leads[run], []).append(
+                {"type": m["type"], "created_at": m.get("created_at"), "subject": m.get("subject")})
+    return mail
+
+
+def unread_since_turn(row, mail, now, grace_minutes=MAIL_GRACE_MINUTES):
+    """The lead's unread worker mail that arrived after its last turn began, oldest first.
+
+    Orca types a notice into an idle lead, yet has left reports unread for hours.
+    Mail from before that turn is left out: a lead can read it with `--peek`,
+    which leaves it unread, and a notice or wake line that started the turn
+    already told it about that mail.
+    """
+    began = parse_time((row["claude"] or {}).get("last_user_at"))
+    if began is None:
+        return []
+    arrived = []
+    for m in (m for t in row["terminals"] for m in mail.get(t["handle"], [])):
+        at = parse_time(m.get("created_at"))
+        if at is not None and began < at and at.timestamp() <= now - grace_minutes * 60:
+            arrived.append(m)
+    return sorted(arrived, key=lambda m: m["created_at"])
+
+
+def mail_reason(unread):
+    noun = "message" if len(unread) == 1 else "messages"
+    return f"{len(unread)} orchestration {noun} unread since its last turn began (oldest {unread[0]['created_at']})"
 
 
 def final_message_at(row):
@@ -608,6 +676,38 @@ def orca_result(orca, args, key, json_file):
     return data.get("result", data)[key] if isinstance(data, dict) else data
 
 
+ORCA_TIMEOUT = 60
+
+
+def orca_runs(orca):
+    """Every orchestration Run; run-list returns at most 100 a page."""
+    runs, cursor, seen = [], None, set()
+    while True:
+        argv = [orca, "orchestration", "run-list", "--limit", "100", *(["--cursor", cursor] if cursor else []), "--json"]
+        out = subprocess.run(argv, capture_output=True, text=True, check=True, timeout=ORCA_TIMEOUT).stdout
+        page = json.loads(out)["result"]
+        runs.extend(page["runs"])
+        seen.add(cursor)
+        cursor = page.get("nextCursor")
+        if not cursor or cursor in seen:
+            return runs
+
+
+def read_mail(args):
+    """Unread worker mail by lead terminal; none when Orca state comes from files without a mailbox file."""
+    if args.ps_json and not args.inbox_json:
+        return {}
+    try:
+        messages = orca_result(args.orca, ["orchestration", "inbox", "--limit", "2000"], "messages",
+                               args.inbox_json)
+        runs = orca_result(args.orca, [], "runs", args.runs_json) if args.runs_json else orca_runs(args.orca)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError) as error:
+        print(f"could not read the orchestration mailbox ({error}): unread worker mail is not checked",
+              file=sys.stderr)
+        return {}
+    return unread_worker_mail(messages, runs)
+
+
 def expand_roots(patterns):
     roots = []
     for pattern in patterns:
@@ -615,12 +715,15 @@ def expand_roots(patterns):
     return roots
 
 
-def main(argv=None):
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
     parser.add_argument("--ps-json", help="read `orca worktree ps --json` output from this file")
     parser.add_argument("--terminals-json", help="read `orca terminal list --json` output from this file")
+    parser.add_argument("--inbox-json", help="read `orca orchestration inbox --json` output from this file; "
+                                             "with --ps-json and without it, worker mail is not checked")
+    parser.add_argument("--runs-json", help="read `orca orchestration run-list --json` output from this file")
     parser.add_argument("--claude-projects", default="~/.claude/projects",
                         help="Claude Code transcript root (default: ~/.claude/projects)")
     parser.add_argument("--codex-sessions", action="append",
@@ -636,8 +739,11 @@ def main(argv=None):
     parser.add_argument("--jev-key-file", default=JEV_KEY_FILE,
                         help="Jev (TypeSafe) API key file, read when TYPESAFE_API_KEY is unset "
                              "(default: %(default)s)")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
+
+def main(argv=None):
+    args = parse_args(argv)
     worktrees = orca_result(args.orca, ["worktree", "ps"], "worktrees", args.ps_json)
     terminals = orca_result(args.orca, ["terminal", "list"], "terminals", args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
@@ -649,7 +755,8 @@ def main(argv=None):
     judge = jev_judge(key) if key else (lambda message: None)
     rows = add_next_step_facts(build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects),
                                                codex, args.decision_marker,
-                                               shell_idle_minutes=args.shell_idle_minutes, judge=judge))
+                                               shell_idle_minutes=args.shell_idle_minutes, judge=judge,
+                                               mail=read_mail(args)))
     json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0

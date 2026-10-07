@@ -64,6 +64,9 @@ Let workers run until a milestone completes or produces evidence of a blocker.
 Intervene on completion, ownership drift, environment mismatch, retry exhaustion,
 or explicit user input—not merely because a worker has been quiet.
 
+Read the "Between turns" section of [references/workflow.md](references/workflow.md)
+before ending a turn while a worker or critic still runs.
+
 ## Completion
 
 The workflow is complete when every topic has a cold PASS, the integrated state

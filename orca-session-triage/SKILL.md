@@ -32,7 +32,11 @@ board's done cards; close what the user approves.
   whether the user `interrupted` it, the `prompt` it last got, and Orca's copy
   of its last message. The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
-  repository's main checkout is a row (`main`) while it hosts an agent.
+  repository's main checkout is a row (`main`) while it hosts an agent. A
+  Claude turn an API error cut off (`claude.api_error`), and a lead whose
+  workers' reports, questions, or escalations sit unread since its last turn
+  began (`unread_mail`, from Orca's orchestration mailbox), are `stalled` with
+  that reason; the mail reason is also added to a `waiting` row.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
 - `references/delivery.md`: batching questions and sending answers.
@@ -59,7 +63,9 @@ and each approved tab is gone from `orca terminal list`.
   nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
-  choice per item. Two exceptions act first and report after: a finished
-  worktree with no meaningful tab that `rm_check.py` clears is removed, and a
-  done card that leaves the user nothing to do has its tab closed.
+  choice per item. Three exceptions act first and report after: a finished
+  worktree with no meaningful tab that `rm_check.py` clears is removed, a
+  done card that leaves the user nothing to do has its tab closed, and a row
+  stalled by an API error or by unread worker mail gets one line that wakes it
+  to continue its own work.
 - Relay answers verbatim; the session answers the user's follow-up questions.
