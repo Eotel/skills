@@ -63,10 +63,11 @@ def ignored_paths(worktree, main):
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
     review, regenerable = [], []
-    for line in git(worktree, "status", "--porcelain", "--ignored=matching").stdout.splitlines():
-        if not line.startswith("!! ") or is_cache(line[3:]):
+    # -z gives each path unquoted, so a Japanese or spaced name is read as written.
+    for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
+        if not entry.startswith("!! ") or is_cache(entry[3:]):
             continue
-        rel = line[3:]
+        rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
         if holds_nothing(source) or (copy.exists() and same_tree(source, copy)):
             continue
@@ -77,12 +78,22 @@ def ignored_paths(worktree, main):
     return review, regenerable
 
 
-def unmerged_patches(worktree, head, base):
-    """Commits on HEAD whose patch has no equivalent in base (`git cherry`); None when git cannot tell."""
+def patches_in_base(worktree, head, base):
+    """Commits on HEAD outside base whose patch base already has (`git cherry`), or None.
+
+    None when git cannot tell, when any commit's patch is missing from base, or
+    when HEAD holds a merge commit: `git cherry` skips merges, so an edit made
+    while merging would pass unseen. A commit reverted in base after its patch
+    landed still counts as in base.
+    """
+    merges = git(worktree, "rev-list", "--merges", "%s..%s" % (base, head))
     out = git(worktree, "cherry", base, head)
-    if out.returncode != 0:
+    if merges.returncode != 0 or merges.stdout.strip() or out.returncode != 0:
         return None
-    return [line[2:] for line in out.stdout.splitlines() if line.startswith("+ ")]
+    lines = out.stdout.splitlines()
+    if not lines or any(not line.startswith("- ") for line in lines):
+        return None
+    return [line[2:] for line in lines]
 
 
 def compose_in(worktree, compose_projects):
@@ -97,7 +108,7 @@ def compose_in(worktree, compose_projects):
 
 
 def check(worktree, main, base, compose_projects, pr=None):
-    """Return {"ok", "blockers", "review", "regenerable", "containers"} for removing `worktree`."""
+    """Return {"ok", "blockers", "review", "regenerable", "merged_by_patch", "containers"} for removing `worktree`."""
     blockers = []
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
@@ -105,19 +116,23 @@ def check(worktree, main, base, compose_projects, pr=None):
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    merged_by_patch = []
     if base is None:
         blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
-    elif (git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0
-          and unmerged_patches(worktree, head, base) != []):
+    elif git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
         # A commit rebased before its PR merged has its patch in base under another hash.
-        if not pr:
+        merged_by_patch = patches_in_base(worktree, head, base) or []
+        if merged_by_patch:
+            pass
+        elif not pr:
             blockers.append("HEAD %s is not in %s" % (head[:8], base))
         elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
             blockers.append("HEAD %s is not in %s and PR #%s is %s"
                             % (head[:8], base, pr.get("number"), pr.get("state")))
     review, regenerable = ignored_paths(worktree, main)
     return {"ok": not blockers and not review, "blockers": blockers, "review": review,
-            "regenerable": regenerable, "containers": compose_in(worktree, compose_projects)}
+            "regenerable": regenerable, "merged_by_patch": merged_by_patch,
+            "containers": compose_in(worktree, compose_projects)}
 
 
 def main_checkout(worktree):

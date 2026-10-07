@@ -12,7 +12,10 @@ Run these per worktree, in order.
    have been squash-merged: a MERGED PR whose head equals HEAD counts as merged.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
      report them and leave the worktree. A commit whose patch is already in the
-     base under another hash (a PR rebased before it merged) does not block.
+     base under another hash (a PR rebased before it merged) does not block; it
+     is listed in `merged_by_patch`, so name it in the report. A merge commit
+     outside the base still blocks, and a patch that the base later reverted
+     still counts as in the base.
    - `review` lists ignored paths that are neither caches nor identical copies of
      the main checkout. Open each one: per-worktree `.env` ports, generated
      sources, and test output (screenshots, uploaded fixtures) are regenerable;

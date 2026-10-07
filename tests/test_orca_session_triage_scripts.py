@@ -1191,12 +1191,40 @@ class RmCheckTests(unittest.TestCase):
         git(self.main, "add", "base.txt")
         git(self.main, "commit", "-q", "-m", "base moves on")
         git(self.main, "cherry-pick", git(self.wt, "rev-parse", "HEAD"))
-        self.assertEqual(self.check()["blockers"], [])
+        rebased = self.check()
+        self.assertEqual(rebased["blockers"], [])
+        self.assertEqual(rebased["merged_by_patch"], [git(self.wt, "rev-parse", "HEAD")])
 
         (self.wt / "other.txt").write_text("only here\n")
         git(self.wt, "add", "other.txt")
         git(self.wt, "commit", "-q", "-m", "unmerged")
         self.assertEqual(len(self.check()["blockers"]), 1)
+
+    def test_a_merge_commit_s_own_changes_still_block(self):
+        # git cherry skips merge commits, so an edit made while merging the base must not pass.
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        git(self.main, "cherry-pick", git(self.wt, "rev-parse", "HEAD"))
+        (self.main / "base.txt").write_text("moved on\n")
+        git(self.main, "add", "base.txt")
+        git(self.main, "commit", "-q", "-m", "base moves on")
+        git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "main")
+        (self.wt / "base.txt").write_text("moved on\nhand edit\n")
+        git(self.wt, "commit", "-q", "--amend", "-a", "--no-edit")
+
+        self.assertEqual(len(self.check()["blockers"]), 1)
+
+    def test_only_regenerable_output_left_is_ok(self):
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\ne2e/screenshots/\n")
+        git(self.main, "commit", "-q", "-am", "ignore screenshots")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.wt / "e2e" / "screenshots").mkdir(parents=True)
+        (self.wt / "e2e" / "screenshots" / "受付 画面.png").write_text("x")
+
+        result = self.check()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["review"], result["regenerable"]), ([], ["e2e/screenshots/"]))
 
     def test_generated_sources_and_test_output_do_not_hold_up_removal(self):
         (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n__generated__/\nsrc/paraglide/\n"
