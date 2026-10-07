@@ -43,8 +43,10 @@ board's done cards; close what the user approves.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.
-- `references/hourly.md`: a run started as `/orca-session-triage hourly`, or
-  setting up the Orca automation that starts it.
+- `references/hourly.md`: a run started as `/orca-session-triage hourly`,
+  setting up the Orca automation that starts it, or ending any turn of the
+  session the automation runs in (a run it skipped while you worked is yours
+  to sweep).
 
 ## Done
 
