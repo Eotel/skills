@@ -186,9 +186,12 @@ JEV_QUESTIONS = {
                "instructions": "What is the state of the agent's work, judging from its last message?",
                "criteria": {
                    "in_progress": "still working, or waiting on its own helper, background job, or CI",
-                   "blocked_on_others": "its part is done and it waits on someone else, such as a "
-                                        "reviewer, a coordinator, or another team",
-                   "done": "the work is finished and nothing is left"}},
+                   # Agents end with what they did not verify; read as work left, a
+                   # merged and finished worktree stayed stalled (2026-10-06).
+                   "blocked_on_others": "its part is not finished until someone else acts, such as a "
+                                        "reviewer who has to review or merge, a coordinator, or another team",
+                   "done": "the work is finished; notes on what was not verified, or offers of "
+                           "optional follow-up such as deleting a branch, do not count as work left"}},
 }
 JEV_MAX_CHARS = 4000  # the ask sits at the end; earlier context rarely changes the answer
 JEV_TIMEOUT = 15
@@ -356,6 +359,8 @@ def classify(row, decision_marker):
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
+    if not (row["agents"] or row["claude"] or row["codex"]):
+        return "stalled", ["no agent session in this worktree"]
     return "stalled", [state] if state else []
 
 
@@ -509,12 +514,12 @@ def summarize_pr(data):
         # GitHub reports a deleted account's review with a null author, shown as "ghost".
         "reviews": [((r.get("author") or {}).get("login") or "ghost") + ":" + r.get("state", "")
                     for r in data.get("latestReviews") or []],
-        "merge_state": data.get("mergeStateStatus"), "checks": checks,
+        "merge_state": data.get("mergeStateStatus"), "merged_at": data.get("mergedAt"), "checks": checks,
     }
 
 
 PR_FIELDS = ("number,url,state,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
-             "mergeStateStatus,statusCheckRollup")
+             "mergeStateStatus,mergedAt,statusCheckRollup")
 
 
 def gh_pr(slug, ref):
@@ -527,11 +532,39 @@ def gh_pr(slug, ref):
         return None
 
 
+def parse_time(value):
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def final_message_at(row):
+    """When the final message Jev read was written, or None."""
+    if (row.get("jev") or {}).get("source") == "codex":
+        return parse_time((row.get("codex") or [{}])[-1].get("last_assistant_at"))
+    return parse_time((row.get("claude") or {}).get("final_at"))
+
+
+def merged_after_final_message(row, pr):
+    """The worktree's own PR merged after a final message that waited on someone else.
+
+    That message was written before the merge it was waiting for, often a
+    review or the user's own merge on GitHub, so the wait it reported is over.
+    """
+    if not (row["class"] == "stalled" and (row.get("jev") or {}).get("status") == "blocked_on_others"
+            and pr.get("state") == "MERGED" and pr.get("head_matches")):
+        return False
+    said_at, merged_at = final_message_at(row), parse_time(pr.get("merged_at"))
+    return said_at is not None and merged_at is not None and merged_at > said_at
+
+
 def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     """Return rows where each stalled or unsure row also carries its git and PR state.
 
     `pr.head_matches` is False when the PR found (a branch name can be reused)
-    does not point at the checkout's HEAD.
+    does not point at the checkout's HEAD. A stalled row whose final message
+    waited on someone else finishes once its PR merged after that message.
     """
     result = []
     for row in rows:
@@ -543,7 +576,10 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         pr = pr_lookup(git["github"], ref) if git and git.get("github") and ref else None
         if pr is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head")}
-        result.append({**row, "git": git, "pr": pr})
+        row = {**row, "git": git, "pr": pr}
+        if pr is not None and merged_after_final_message(row, pr):
+            row = {**row, "class": "finished", "reasons": ["PR merged after the final message"]}
+        result.append(row)
     return result
 
 

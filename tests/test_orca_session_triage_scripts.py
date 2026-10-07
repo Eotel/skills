@@ -643,6 +643,12 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
         self.assertEqual(result["/w/h"], ("stalled", ["final message waits on someone else (Jev 0.90)"]))
 
+    def test_a_worktree_no_agent_ever_worked_in_says_so(self):
+        result = self.classes([worktree("/w/shell", None, pr={"number": 3, "state": "open"}, status="in-review")],
+                              [terminal("/w/shell", None)])
+
+        self.assertEqual(result["/w/shell"], ("stalled", ["no agent session in this worktree"]))
+
 
 def jev_answer(asks, status="done", confidence=0.9):
     return io.BytesIO(json.dumps({"model": "jev-1.13.0", "answers": {
@@ -704,7 +710,7 @@ class NextStepFactTests(unittest.TestCase):
                 "reviewRequests": [{"login": "k-mizokami"}, {"name": "backend"}],
                 "latestReviews": [{"author": {"login": "hdknr"}, "state": "APPROVED"},
                                   {"author": None, "state": "COMMENTED"}],
-                "mergeStateStatus": "CLEAN", "headRefName": "fix-a", "headRefOid": "abc123",
+                "mergeStateStatus": "CLEAN", "headRefName": "fix-a", "headRefOid": "abc123", "mergedAt": None,
                 "url": "https://github.com/acme/app/pull/11263",
                 "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"},
                                       {"status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -715,7 +721,8 @@ class NextStepFactTests(unittest.TestCase):
             "number": 11263, "url": "https://github.com/acme/app/pull/11263", "state": "OPEN",
             "head": "fix-a", "head_oid": "abc123", "review": "APPROVED",
             "requested": ["k-mizokami", "backend"], "reviews": ["hdknr:APPROVED", "ghost:COMMENTED"],
-            "merge_state": "CLEAN", "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
+            "merge_state": "CLEAN", "merged_at": None,
+            "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
 
     def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
         with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
@@ -751,6 +758,42 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(scan.github_slug("https://github.com/spin-dd/taihei-report.git"), "spin-dd/taihei-report")
         self.assertIsNone(scan.github_slug("https://git.disroot.org/usvdh/collect.git"))
 
+
+    def test_a_pr_merged_after_the_final_message_ends_the_wait_it_reported(self):
+        def stalled(path, said_at, status="blocked_on_others", source="claude"):
+            transcripts = ({"claude": {"final_text": "PR を出しました。レビュー待ちです。", "final_at": said_at},
+                            "codex": []} if source == "claude" else
+                           {"claude": None, "codex": [{"last_assistant": "PR を出しました。",
+                                                       "last_assistant_at": said_at}]})
+            return {"path": path, "class": "stalled", "linked_pr": {"number": 7, "state": "open"},
+                    "reasons": ["final message waits on someone else (Jev 0.90)"],
+                    "jev": {"source": source, "asks": 0.1, "status": status, "confidence": 0.9}, **transcripts}
+
+        rows = [stalled("/w/merged-later", "2026-10-06T07:25:00.000Z"),
+                stalled("/w/codex-merged-later", "2026-10-06T07:25:00.000Z", source="codex"),
+                stalled("/w/merged-before", "2026-10-06T07:40:00.000Z"),
+                stalled("/w/continues", "2026-10-06T07:25:00.000Z", status="in_progress"),
+                stalled("/w/other-head", "2026-10-06T07:25:00.000Z")]
+        git = {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
+        heads = {"/w/other-head": "zzz"}
+        current = {}
+
+        def pr_lookup(slug, ref):
+            return {"number": ref, "state": "MERGED", "merged_at": "2026-10-06T07:35:27Z",
+                    "head_oid": heads.get(current["path"], "aaa")}
+
+        def git_lookup(path):
+            current["path"] = path
+            return git
+
+        result = {r["path"]: (r["class"], r["reasons"])
+                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+
+        self.assertEqual(result["/w/merged-later"], ("finished", ["PR merged after the final message"]))
+        self.assertEqual(result["/w/codex-merged-later"], ("finished", ["PR merged after the final message"]))
+        self.assertEqual(result["/w/merged-before"][0], "stalled")
+        self.assertEqual(result["/w/continues"][0], "stalled")
+        self.assertEqual(result["/w/other-head"][0], "stalled")
 
     def test_only_stalled_and_unsure_rows_get_git_and_pr_facts(self):
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
