@@ -46,6 +46,32 @@ Examples:
 EOF
 }
 
+die() {
+  echo "error: $*" >&2
+  exit 2
+}
+
+validate_python_version() {
+  case "$1" in
+    3.10|3.11|3.12|3.13) ;;
+    *) die "--python must be one of: 3.10, 3.11, 3.12, 3.13" ;;
+  esac
+}
+
+validate_project_name() {
+  case "$1" in
+    "") die "--name must not be empty" ;;
+  esac
+
+  if [[ ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    die "--name may only contain letters, numbers, '-' and '_'"
+  fi
+}
+
+sed_escape_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\&#]/\\&/g'
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --lang)            LANG_ARG="$2"; shift 2 ;;
@@ -92,6 +118,13 @@ if [ -z "$PROJECT_NAME" ]; then
   PROJECT_NAME="$(basename "$PWD")"
 fi
 
+validate_python_version "$PYTHON_VERSION"
+validate_project_name "$PROJECT_NAME"
+
+ESCAPED_PYTHON_VERSION="$(sed_escape_replacement "$PYTHON_VERSION")"
+ESCAPED_PROJECT_NAME="$(sed_escape_replacement "$PROJECT_NAME")"
+ESCAPED_PKG_NAME="$(sed_escape_replacement "${PROJECT_NAME//-/_}")"
+
 echo "[devenv-init] template: $TEMPLATE"
 echo "[devenv-init] cwd:      $PWD"
 nix flake init -t "github:Eotel/devenv-templates#$TEMPLATE"
@@ -117,21 +150,20 @@ patch_feature "services\\.sqlite" "$WITH_SQLITE"
 if [ "$LANG_ARG" = "python" ]; then
   PY_NUM="${PYTHON_VERSION//./}"
   if [ -f devenv.nix ]; then
-    sed -i.bak -E "s#(languages\\.python\\.version[[:space:]]*=[[:space:]]*)\"[0-9.]+\"#\\1\"${PYTHON_VERSION}\"#" devenv.nix
+    sed -i.bak -E "s#(languages\\.python\\.version[[:space:]]*=[[:space:]]*)\"[0-9.]+\"#\\1\"${ESCAPED_PYTHON_VERSION}\"#" devenv.nix
   fi
   if [ -f pyproject.toml ]; then
-    sed -i.bak -E "s#(requires-python[[:space:]]*=[[:space:]]*\")>=[0-9.]+(\")#\\1>=${PYTHON_VERSION}\\2#" pyproject.toml
+    sed -i.bak -E "s#(requires-python[[:space:]]*=[[:space:]]*\")>=[0-9.]+(\")#\\1>=${ESCAPED_PYTHON_VERSION}\\2#" pyproject.toml
     sed -i.bak -E "s#(target-version[[:space:]]*=[[:space:]]*\")py[0-9]+(\")#\\1py${PY_NUM}\\2#" pyproject.toml
   fi
   if [ -f pyrightconfig.json ]; then
-    sed -i.bak -E "s#(\"pythonVersion\"[[:space:]]*:[[:space:]]*\")[0-9.]+(\")#\\1${PYTHON_VERSION}\\2#" pyrightconfig.json
+    sed -i.bak -E "s#(\"pythonVersion\"[[:space:]]*:[[:space:]]*\")[0-9.]+(\")#\\1${ESCAPED_PYTHON_VERSION}\\2#" pyrightconfig.json
   fi
 fi
 
 if [ -n "$PROJECT_NAME" ] && [ -f pyproject.toml ]; then
-  PKG_NAME="${PROJECT_NAME//-/_}"
-  sed -i.bak -E "s#^(name[[:space:]]*=[[:space:]]*\")my-[a-z-]+(\")#\\1${PROJECT_NAME}\\2#" pyproject.toml
-  sed -i.bak -E "s#(packages[[:space:]]*=[[:space:]]*\\[\")src/my_[a-z_]+(\"\\])#\\1src/${PKG_NAME}\\2#" pyproject.toml
+  sed -i.bak -E "s#^(name[[:space:]]*=[[:space:]]*\")my-[a-z-]+(\")#\\1${ESCAPED_PROJECT_NAME}\\2#" pyproject.toml
+  sed -i.bak -E "s#(packages[[:space:]]*=[[:space:]]*\\[\")src/my_[a-z_]+(\"\\])#\\1src/${ESCAPED_PKG_NAME}\\2#" pyproject.toml
 fi
 
 if [ "$STRICT_TYPES" = "true" ] && [ -f pyrightconfig.json ]; then
