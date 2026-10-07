@@ -8,6 +8,8 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 
 | State | Next step |
 |---|---|
+| Reason "turn ended with an API error" | wake it now: send the lane one line saying its last turn was cut off and to continue from where it stopped; report it after |
+| Reason "N orchestration messages unread since its last turn began" | wake it now: send the lead one line naming the unread reports and `orca orchestration check --run <run>`; report it after. On a `waiting` row, ask the question as usual and send the wake line too |
 | Reason "final message says work continues, yet no agent runs" | read its screen: a helper, background job, or CI still running means it is working, so leave it; otherwise the lane continues or says where it stopped |
 | Reason "final message waits on someone else" | blocker: name who it waits on, no question |
 | Reason "no agent session in this worktree" | another agent or the user made the checkout and works elsewhere: report its PR state; ask before removing it |
