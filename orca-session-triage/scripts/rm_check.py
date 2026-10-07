@@ -15,6 +15,10 @@ CACHE_PARTS = {
     "coverage", "test-results", "playwright-report",
 }
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
+# Generated sources and e2e output a setup or a test run writes again. Matched by
+# path, not by any part, so a hand-made docs/screenshots/ still goes to review.
+REGENERABLE_PARTS = {"__generated__"}
+REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/")
 
 
 def git(cwd, *args):
@@ -24,6 +28,11 @@ def git(cwd, *args):
 def is_cache(relpath):
     parts = Path(relpath.rstrip("/")).parts
     return bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
+
+
+def is_regenerable(relpath):
+    rel = relpath if relpath.endswith("/") else relpath + "/"
+    return bool(REGENERABLE_PARTS.intersection(Path(relpath.rstrip("/")).parts)) or rel.startswith(REGENERABLE_PREFIXES)
 
 
 def same_tree(left, right):
@@ -46,21 +55,34 @@ def holds_nothing(path):
     return path.is_dir() and all(holds_nothing(child) for child in path.iterdir())
 
 
-def ignored_for_review(worktree, main):
-    """Ignored paths that hold something and are neither caches nor copies of the main checkout."""
-    review = []
-    for line in git(worktree, "status", "--porcelain", "--ignored").stdout.splitlines():
+def ignored_paths(worktree, main):
+    """(review, regenerable): ignored paths that hold something and are neither caches nor
+    copies of the main checkout, split into those to open and those a setup or test run writes again.
+
+    `--ignored=matching` names each path an ignore pattern matched, so a generated
+    directory deep inside an otherwise untracked tree is seen by its own path.
+    """
+    review, regenerable = [], []
+    for line in git(worktree, "status", "--porcelain", "--ignored=matching").stdout.splitlines():
         if not line.startswith("!! ") or is_cache(line[3:]):
             continue
         rel = line[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
-        if holds_nothing(source):
+        if holds_nothing(source) or (copy.exists() and same_tree(source, copy)):
             continue
-        if not copy.exists():
-            review.append(rel + " (not in main checkout)")
-        elif not same_tree(source, copy):
-            review.append(rel + " (differs from main checkout)")
-    return review
+        if is_regenerable(rel):
+            regenerable.append(rel)
+        else:
+            review.append(rel + (" (not in main checkout)" if not copy.exists() else " (differs from main checkout)"))
+    return review, regenerable
+
+
+def unmerged_patches(worktree, head, base):
+    """Commits on HEAD whose patch has no equivalent in base (`git cherry`); None when git cannot tell."""
+    out = git(worktree, "cherry", base, head)
+    if out.returncode != 0:
+        return None
+    return [line[2:] for line in out.stdout.splitlines() if line.startswith("+ ")]
 
 
 def compose_in(worktree, compose_projects):
@@ -75,7 +97,7 @@ def compose_in(worktree, compose_projects):
 
 
 def check(worktree, main, base, compose_projects, pr=None):
-    """Return {"ok", "blockers", "review", "containers"} for removing `worktree`."""
+    """Return {"ok", "blockers", "review", "regenerable", "containers"} for removing `worktree`."""
     blockers = []
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
@@ -85,15 +107,17 @@ def check(worktree, main, base, compose_projects, pr=None):
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
     if base is None:
         blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
-    elif git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
+    elif (git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0
+          and unmerged_patches(worktree, head, base) != []):
+        # A commit rebased before its PR merged has its patch in base under another hash.
         if not pr:
             blockers.append("HEAD %s is not in %s" % (head[:8], base))
         elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
             blockers.append("HEAD %s is not in %s and PR #%s is %s"
                             % (head[:8], base, pr.get("number"), pr.get("state")))
-    review = ignored_for_review(worktree, main)
+    review, regenerable = ignored_paths(worktree, main)
     return {"ok": not blockers and not review, "blockers": blockers, "review": review,
-            "containers": compose_in(worktree, compose_projects)}
+            "regenerable": regenerable, "containers": compose_in(worktree, compose_projects)}
 
 
 def main_checkout(worktree):

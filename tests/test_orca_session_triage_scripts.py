@@ -1183,6 +1183,38 @@ class RmCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["blockers"], ["2 uncommitted changes"])
 
+    def test_a_commit_whose_patch_reached_the_base_does_not_block(self):
+        # A PR rebased before its merge leaves the old commit here; its patch is in the base.
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        (self.main / "base.txt").write_text("moved on\n")
+        git(self.main, "add", "base.txt")
+        git(self.main, "commit", "-q", "-m", "base moves on")
+        git(self.main, "cherry-pick", git(self.wt, "rev-parse", "HEAD"))
+        self.assertEqual(self.check()["blockers"], [])
+
+        (self.wt / "other.txt").write_text("only here\n")
+        git(self.wt, "add", "other.txt")
+        git(self.wt, "commit", "-q", "-m", "unmerged")
+        self.assertEqual(len(self.check()["blockers"]), 1)
+
+    def test_generated_sources_and_test_output_do_not_hold_up_removal(self):
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n__generated__/\nsrc/paraglide/\n"
+                                               "e2e/screenshots/\ne2e/.state/\ne2e/.auth/\ndocs/screenshots/\n")
+        git(self.main, "commit", "-q", "-am", "ignore generated")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        for rel in ("apps/web/src/api/__generated__/graphql.ts", "src/paraglide/messages.js",
+                    "e2e/screenshots/a.png", "e2e/.state/default.sqlite3", "e2e/.auth/user.json",
+                    "docs/screenshots/handmade.png"):
+            (self.wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.wt / rel).write_text("x")
+
+        result = self.check()
+
+        self.assertEqual(result["review"], ["docs/screenshots/ (not in main checkout)"])
+        self.assertEqual(sorted(result["regenerable"]), ["apps/web/src/api/__generated__/", "e2e/.auth/",
+                                                        "e2e/.state/", "e2e/screenshots/", "src/paraglide/"])
+
     def test_unmerged_commit_blocks_unless_it_is_the_merged_pr_head(self):
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")

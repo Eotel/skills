@@ -11,12 +11,16 @@ Run these per worktree, in order.
 1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the PR may
    have been squash-merged: a MERGED PR whose head equals HEAD counts as merged.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
-     report them and leave the worktree.
+     report them and leave the worktree. A commit whose patch is already in the
+     base under another hash (a PR rebased before it merged) does not block.
    - `review` lists ignored paths that are neither caches nor identical copies of
      the main checkout. Open each one: per-worktree `.env` ports, generated
      sources, and test output (screenshots, uploaded fixtures) are regenerable;
      anything else (exports, reports, hand-written notes) goes back to the user
      before removal.
+   - `regenerable` lists generated sources and e2e output (`__generated__/`,
+     `src/paraglide/`, `e2e/screenshots/`, `e2e/.state/`, `e2e/.auth/`): a setup
+     or a test run writes them again, so they do not hold up the removal.
    - `containers` lists docker compose projects defined inside the worktree.
 2. Stop those projects with `docker compose -p <project> down` from the worktree.
    Keep named volumes unless the user approved deleting them, and say which
