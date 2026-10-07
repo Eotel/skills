@@ -19,7 +19,8 @@ board's done cards; close what the user approves.
   the probability that it waits on the user (0.7 or more is `waiting`), and
   `status` (`in_progress`, `blocked_on_others`, or `done`) with its
   `confidence`. Only `done` can finish; the other two keep the row `stalled`
-  with a reason. When `asks` is 0.3 to 0.7, `confidence` is below 0.6, or Jev
+  with a reason, unless the row waited on someone else and its own PR merged
+  after that message (`PR merged after the final message`). When `asks` is 0.3 to 0.7, `confidence` is below 0.6, or Jev
   gave no usable answer, the row is `unsure`: read its final message and class
   it yourself. Orca also reports an agent as working while its background
   shell, monitor, or helper runs after its turn. Jev reads that row too: a
