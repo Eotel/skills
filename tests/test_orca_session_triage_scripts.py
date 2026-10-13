@@ -31,6 +31,7 @@ scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
 precheck = load_script("precheck")
 stopcheck = load_script("stop_check")
+watchinbox = load_script("watch_inbox")
 
 
 def write_jsonl(path, rows):
@@ -1778,6 +1779,23 @@ class VerdictStoreTests(unittest.TestCase):
 
         self.assertEqual(verdicts, {"/w/a": {"class": "blocked", "read": "ka"}})
         self.assertEqual((self.root / "verdicts.json.bad").read_text(), "[1, 2")
+
+
+class WatchInboxTest(unittest.TestCase):
+    def test_a_restarted_watch_prints_each_report_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inbox = Path(tmp) / "inbox.jsonl"
+            inbox.write_text(json.dumps({"worktree": "a", "text": "first"}) + "\n")
+            lines, offset = watchinbox.read_new(inbox, 0)
+            self.assertEqual(lines, ["[a] first"])
+            with inbox.open("a") as handle:
+                handle.write(json.dumps({"worktree": "b", "text": "second"}) + "\n" + '{"worktree": "c", "te')
+            # A new watch starting from the saved offset sees only what arrived since, and
+            # leaves the half-written line for the next pass.
+            lines, offset = watchinbox.read_new(inbox, offset)
+            self.assertEqual(lines, ["[b] second"])
+            self.assertEqual(watchinbox.read_new(inbox, offset), ([], offset))
+
 
 if __name__ == "__main__":
     unittest.main()
