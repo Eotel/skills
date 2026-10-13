@@ -32,7 +32,9 @@ board's done cards; close what the user approves.
   question makes it `waiting` or `unsure`; otherwise it stays `working` with
   that reason, and never finishes while the job runs. A decision marker
   outlives its answer, so a `waiting` row's question is checked against its
-  latest message before you ask it. Each row lists its `done_cards`, one per agent Orca shows
+  latest message before you ask it; when that message settled it, rewrite the
+  comment without the marker so other tabs stop listing it. Each row lists its
+  `done_cards`, one per agent Orca shows
   as done: the `handle` that closes its tab (null while the tab sleeps),
   whether the user `interrupted` it, the `prompt` it last got, and Orca's copy
   of its last message. The board keeps a card in Done until its tab closes.

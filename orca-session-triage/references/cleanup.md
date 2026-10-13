@@ -8,8 +8,11 @@ checkout stays (`rm_check.py` blocks its removal).
 
 Run these per worktree, in order.
 
-1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the PR may
-   have been squash-merged: a MERGED PR whose head equals HEAD counts as merged.
+1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the worktree
+   has a PR: a MERGED PR whose head equals HEAD counts as merged (squash merges),
+   and the PR's fetched base branch becomes the base. Without it the base is the
+   remote branch the worktree started from, else the remote's default branch.
+   Pass `--base` when the output's `base` is not where the work merges.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
      report them and leave the worktree. A commit whose patch is already in the
      base under another hash (a PR rebased before it merged) does not block; it
@@ -31,7 +34,9 @@ Run these per worktree, in order.
 3. `orca worktree rm --worktree path:<path> --json`. Orca also deletes the
    checked-out local branch when it can prove it merged; a detached HEAD leaves
    the branch, so name it in the report.
-4. Confirm the path is gone from `orca worktree ps --json` and from disk.
+4. Confirm the path is gone from `orca worktree ps --json` and from disk. The
+   removal answers `removing: true` and finishes in the background, so poll for
+   up to a minute before reporting it stuck.
    `orca terminal show` keeps answering for the removed terminals with
    `orphaned: true, connected: false`: that is a stale record, not a live PTY.
 
