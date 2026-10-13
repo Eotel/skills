@@ -31,6 +31,8 @@ Authoring rules, script and test conventions, and validation commands live in
 - `devenv-init`: scaffold supported devenv.sh project environments.
 - `django`: refactor Django ORM/query boundaries and DRF-owned policies.
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
+- `natural-japanese`: review and revise human-facing Japanese word choices;
+  flag expressions for contextual review with a Python scanner.
 - `orca-session-triage`: sweep Orca agent sessions for finished or stalled
   worktrees, waiting questions, and agents that never got a task; batch the
   answers and next steps, clear the done cards, and close the finished tabs
