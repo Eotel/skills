@@ -64,7 +64,7 @@ validate_project_name() {
   esac
 
   if [[ ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
-    die "--name may only contain letters, numbers, '-' and '_'"
+    die "project name '$1' (--name, default: the directory name) may only contain letters, numbers, '-' and '_'"
   fi
 }
 

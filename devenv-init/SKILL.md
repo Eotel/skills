@@ -29,7 +29,7 @@ User says any of:
 | `--lang` | `python` | (required) | Other languages added incrementally. |
 | `--framework` | `django` / `fastapi` / `flask` | (none) | Pairs with `--lang python`. |
 | `--python` | `3.10` / `3.11` / `3.12` / `3.13` | `3.12` | Patches `languages.python.version`, `requires-python`, `target-version`, `pythonVersion`. |
-| `--name` | string | dirname | Patches `pyproject.toml` `name` and `packages = ["src/<name>"]`. |
+| `--name` | letters, digits, `-`, `_` | dirname | Patches `pyproject.toml` `name` and `packages = ["src/<name>"]`. |
 | `--with-direnv` / `--no-direnv` | flag | enabled | direnv hint module. |
 | `--with-delta` / `--no-delta` | flag | enabled | delta as local git pager. |
 | `--with-treefmt` / `--no-treefmt` | flag | enabled | treefmt + nixfmt. |
