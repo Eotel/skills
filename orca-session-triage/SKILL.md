@@ -67,9 +67,8 @@ board's done cards; close what the user approves.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.
 - `references/hourly.md`: a run started as `/orca-session-triage hourly`,
-  setting up the Orca automation that starts it, or ending any turn of the
-  session the automation runs in (a run it skipped while you worked is yours
-  to sweep).
+  setting up the Orca automation that starts it, or ending a turn of the
+  session the automation runs in.
 
 ## Done
 
@@ -89,9 +88,11 @@ and each approved tab is gone from `orca terminal list`.
   nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
-  choice per item. Three exceptions act first and report after: a finished
+  choice per item. Four exceptions act first and report after: a finished
   worktree with no meaningful tab that `rm_check.py` clears is removed, a
-  done card that leaves the user nothing to do has its tab closed, and a row
+  done card that leaves the user nothing to do has its tab closed, a row
   stalled by an API error or by unread worker mail gets one line that wakes it
-  to continue its own work.
+  to continue its own work, and a task the user approved as the follow-up of
+  another lane's result ("when A settles it, give B the task") goes to B once
+  A reports it.
 - Relay answers verbatim; the session answers the user's follow-up questions.

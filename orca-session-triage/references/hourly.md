@@ -22,15 +22,12 @@ triage workspace. Run the triage as usual; this page covers what differs.
 ## While this session works on a request
 
 The precheck skips every run while this session works, so a long request
-leaves the board unswept. On 2026-10-07 five runs (11:00 to 15:00) were
-skipped while this tab handled the user's other requests, and three agents'
-questions waited up to 2 hours 40 minutes.
-
-Before ending a turn in this session, list the automation's runs
-(`orca automations runs --id <id> --json`). When one was `skipped_precheck`
-since your last sweep, sweep before ending the turn: scan, ask every new
-question from the `waiting` rows, and wake the rows `next-step.md` says to
-wake. Leave the rest to the next scheduled run.
+leaves the board unswept. When the Stop hook names a skipped run, sweep before
+ending the turn: scan, ask every new question from the `waiting` rows, and
+wake the rows `next-step.md` says to wake. Leave the rest to the next
+scheduled run. Codex ignores the hook: there, before ending a turn, look for a
+`skipped_precheck` run since your last scan in
+`orca automations runs --id <id> --json`.
 
 ## The automation
 
