@@ -1,6 +1,7 @@
 """Offline behavior tests for the orca-session-triage command line tools."""
 
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 import importlib.util
 import http.client
 import io
@@ -1548,6 +1549,14 @@ class PrecheckTests(unittest.TestCase):
                 self.assertIn("skip: could not read Orca worktrees", out.getvalue())
 
 
+def triage_automation(automation_id, workspace, prompt="/orca-session-triage hourly"):
+    return {"id": automation_id, "prompt": prompt, "workspaceId": "repo1::" + workspace}
+
+
+def automation_run(status, started):
+    return {"status": status, "startedAt": int(datetime.fromisoformat(started).timestamp() * 1000)}
+
+
 class StopCheckTests(unittest.TestCase):
     """The Stop hook keeps a triage turn open while its review queue is not classed."""
 
@@ -1568,8 +1577,26 @@ class StopCheckTests(unittest.TestCase):
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": at, "rows": [{"path": p, "class": "blocked"} for p in paths]}))
 
-    def check(self, active=False):
-        return stopcheck.decide({"session_id": "s1", "stop_hook_active": active}, self.root)
+    def check(self, active=False, cwd=None, orca="false"):
+        hook = {"session_id": "s1", "stop_hook_active": active}
+        if cwd:
+            hook["cwd"] = cwd
+        return stopcheck.decide(hook, self.root, orca=orca)
+
+    def fake_orca(self, automations, runs):
+        """An Orca CLI that answers `automations list` and `automations runs --id <id>`."""
+        script = self.root / "orca"
+        script.write_text(
+            "#!/usr/bin/env python3\nimport json, sys\n"
+            f"automations = json.loads({json.dumps(automations)!r})\n"
+            f"runs = json.loads({json.dumps(runs)!r})\n"
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['automations', 'list']:\n"
+            "    print(json.dumps({'result': {'automations': automations}}))\n"
+            "else:\n"
+            "    print(json.dumps({'result': {'runs': runs.get(args[args.index('--id') + 1], [])}}))\n")
+        script.chmod(0o755)
+        return str(script)
 
     def test_lets_the_turn_end_without_a_queue_or_with_an_empty_one(self):
         self.assertIsNone(self.check())
@@ -1607,6 +1634,59 @@ class StopCheckTests(unittest.TestCase):
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": "2026-10-07T10:00:00+00:00", "rows": [{"path": "/w/a", "class": "maybe"}]}))
         self.assertEqual(self.check()["decision"], "block")
+
+    def test_blocks_once_when_the_hourly_run_skipped_a_run_after_the_last_scan(self):
+        self.queue(at="2026-10-13T02:00:00+00:00")
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00"),
+            automation_run("completed", "2026-10-13T02:00:40+00:00")]})
+
+        blocked = self.check(cwd="/w/triage", orca=orca)
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("skipped", blocked["reason"])
+        self.assertIn("references/hourly.md", blocked["reason"])
+        self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
+
+    def test_a_session_in_a_subdirectory_of_the_workspace_is_swept_too(self):
+        self.queue(at="2026-10-13T02:00:00+00:00")
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
+                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
+
+        self.assertEqual(self.check(cwd="/w/triage/review-response", orca=orca)["decision"], "block")
+        self.assertIsNone(self.check(cwd="/w/triage-other", orca=orca))
+
+    def test_an_absurd_start_time_lets_the_turn_end(self):
+        self.queue(at="2026-10-13T02:00:00+00:00")
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
+                              {"a1": [{"status": "skipped_precheck", "startedAt": 10 ** 20}]})
+
+        self.assertIsNone(self.check(cwd="/w/triage", orca=orca))
+
+    def test_lets_the_turn_end_unless_this_workspaces_triage_skipped_a_run_after_the_last_scan(self):
+        self.queue(at="2026-10-13T02:00:00+00:00")
+        later = automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")
+        cases = {
+            "skipped before the scan": ([triage_automation("a1", "/w/triage")],
+                                        {"a1": [automation_run("skipped_precheck", "2026-10-13T01:00:40+00:00")]}),
+            "ran after the scan": ([triage_automation("a1", "/w/triage")],
+                                   {"a1": [automation_run("completed", "2026-10-13T03:00:40+00:00")]}),
+            "another workspace": ([triage_automation("a1", "/w/other")], {"a1": [later]}),
+            "another automation": ([triage_automation("a1", "/w/triage", prompt="/daily-report")], {"a1": [later]}),
+        }
+        for name, (automations, runs) in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(self.check(cwd="/w/triage", orca=self.fake_orca(automations, runs)))
+
+    def test_a_session_that_never_scanned_or_a_failing_orca_lets_the_turn_end(self):
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
+                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
+        self.assertIsNone(self.check(cwd="/w/triage", orca=orca))
+
+        self.queue(at="2026-10-13T02:00:00+00:00")
+        for failing in (str(self.root / "missing-orca"), "false"):
+            with self.subTest(orca=failing):
+                self.assertIsNone(self.check(cwd="/w/triage", orca=failing))
 
     def test_a_damaged_queue_or_result_lets_the_turn_end(self):
         (self.dir / "review-queue.json").write_text(json.dumps({"generated_at": "g", "rows": [{"nopath": 1}]}))
