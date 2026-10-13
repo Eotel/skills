@@ -1,0 +1,44 @@
+id: node-import-native-path-js
+language: JavaScript
+severity: warning
+rule:
+  any:
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER])
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER], $$$OPTIONS)
+constraints:
+  SPAWN:
+    regex: '^(spawn|spawnSync|execFile|execFileSync|(cp|childProcess)\.(spawn|spawnSync|execFile|execFileSync))$'
+  PATH:
+    any:
+      - pattern: join($$$ARGS)
+      - pattern: resolve($$$ARGS)
+      - pattern: path.join($$$ARGS)
+      - pattern: path.resolve($$$ARGS)
+      - all:
+          - kind: identifier
+          - inside:
+              any:
+                - kind: statement_block
+                - kind: program
+              stopBy:
+                any:
+                  - kind: statement_block
+                  - kind: program
+              has:
+                any:
+                  - pattern: const $PATH = join($$$ARGS)
+                  - pattern: const $PATH = resolve($$$ARGS)
+                  - pattern: const $PATH = path.join($$$ARGS)
+                  - pattern: const $PATH = path.resolve($$$ARGS)
+                stopBy: neighbor
+message: Nodeの--importへ渡すOSのパスは、pathToFileURL(path).hrefでfile URLに変換する。
+note: |
+  Why: --import resolves ESM specifiers as URLs. Native paths containing # or ?
+  and Windows drive-letter paths can be interpreted incorrectly.
+  Scope: direct join/resolve calls, or const bindings in the same nearest block.
+  Helper returns, aliases, outer bindings, and --import=value are not inspected.
+  This syntax rule assumes join/resolve and spawn names are Node APIs; inspect
+  a finding if these names are bound to unrelated functions.
+  No automatic fix: pathToFileURL must be imported and relative paths need the
+  child's intended working directory before conversion.
+  https://nodejs.org/api/esm.html#urls

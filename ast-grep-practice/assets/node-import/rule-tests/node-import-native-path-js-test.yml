@@ -1,0 +1,35 @@
+id: node-import-native-path-js
+valid:
+  - |
+      spawn(process.execPath, ["--import", pathToFileURL(gate).href, cli]);
+  - |
+      spawn(process.execPath, ["--import", "node:fs", cli]);
+  - |
+      spawn(process.execPath, ["--import", "tsx", cli]);
+  - |
+      spawn(process.execPath, ["--import", "file:///tmp/start%23here.mjs", cli]);
+  - |
+      spawn(process.execPath, ["--import", new URL("./start.mjs", import.meta.url).href, cli]);
+  - |
+      const gate = pathToFileURL(join(cwd, "start.mjs")).href; spawn(process.execPath, ["--import", gate, cli]);
+  - |
+      const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--require", gate, cli]);
+  - |
+      const gate = join(cwd, "start.mjs"); spawn("other-cli", ["--import", gate]);
+  - |
+      function outer() { const gate = join(cwd, "start.mjs"); function inner(gate) { spawn(process.execPath, ["--import", gate]); } }
+  - |
+      function outer() { spawn(process.execPath, ["--import", gate]); function inner() { const gate = join(cwd, "start.mjs"); } }
+invalid:
+  - |
+      spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli]);
+  - |
+      spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {});
+  - |
+      const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 });
+  - |
+      async function run() { const gate = path.join(directory, "start.mjs"); await writeFile(gate, ""); const child = spawn(process.execPath, ["--import", gate, cli], {}); }
+  - |
+      const gate = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate, cli]);
+  - |
+      const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
