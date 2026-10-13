@@ -1,0 +1,23 @@
+id: no-ignored-error
+language: Go
+severity: error
+rule:
+  all:
+    - kind: short_var_declaration
+    - has:
+        kind: expression_list
+        field: left
+        has:
+          kind: identifier
+          regex: '^_$'
+    - has:
+        kind: expression_list
+        field: right
+        has:
+          kind: call_expression
+          nthChild: 1
+          not:
+            precedes:
+              regex: .
+message: Review discarded results from a single right-hand call.
+note: This example covers a single-call RHS only; it does not infer error types or align mixed RHS expressions.

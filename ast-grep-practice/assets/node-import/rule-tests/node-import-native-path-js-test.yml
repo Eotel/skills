@@ -20,11 +20,25 @@ valid:
       function outer() { const gate = join(cwd, "start.mjs"); function inner(gate) { spawn(process.execPath, ["--import", gate]); } }
   - |
       function outer() { spawn(process.execPath, ["--import", gate]); function inner() { const gate = join(cwd, "start.mjs"); } }
+  - |
+      spawn(process.execPath, ['--import', pathToFileURL(gate).href]);
+  - |
+      const gate = pathToFileURL(join(cwd, 'start.mjs')).href; spawn(process.execPath, ['--import', gate, cli]);
+  - |
+      spawn(process.execPath, ["cli.mjs", "--import", join(cwd, "input")]);
+  - |
+      spawn(process.execPath, ["--", "--import", join(cwd, "input")]);
+  - |
+      spawn(process.execPath, ["-", "--import", join(cwd, "input")]);
+  - |
+      spawn(process.execPath, ["--require", "--import", join(cwd, "input")]);
+  - |
+      spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {});
+  - |
+      const gate = path.resolve(cwd, 'start.mjs'); spawn(process.execPath, ['--trace-warnings', '--import', gate, cli], {});
 invalid:
   - |
       spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli]);
-  - |
-      spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {});
   - |
       const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 });
   - |
@@ -33,3 +47,9 @@ invalid:
       const gate = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate, cli]);
   - |
       const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
+  - |
+      const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+  - |
+      spawn(process.execPath, ['--import', join(cwd, 'start.mjs'), cli]);
+  - |
+      const gate = path.join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate]);

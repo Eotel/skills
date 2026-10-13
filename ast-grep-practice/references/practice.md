@@ -2,21 +2,37 @@
 
 Complement general-purpose lint tools (ESLint, oxlint, Biome, clippy, etc.) with ast-grep for patterns they cannot express. Always prefer reproducible static rules over natural-language prompts.
 
-## Installation
+## Tool provenance and installation
 
-```bash
-# npm (project-local recommended)
-npm install -D @ast-grep/cli
-npx ast-grep --help
+Use an ast-grep binary installed from a trusted source, such as the workstation's
+Nix or Homebrew packages. Locate and verify it outside the target repository,
+record its absolute path, and use that path when inspecting an unfamiliar repo.
+Check its version and help before selecting flags.
 
-# or cargo
-cargo install ast-grep --locked
+If the tool is missing, install it outside the target repository using trusted
+package-manager configuration and verified package metadata/checksums. A repo's
+`.npmrc` can replace the registry for `@ast-grep/cli`; disabling install scripts
+alone does not make a substituted binary safe to run. Keep tool provisioning
+outside that repo until its configuration is trusted.
 
-# or brew
-brew install ast-grep
-```
+Treat repository ast-grep configuration as executable too. Before any command
+that discovers or uses project configuration, review `sgconfig.yml`, especially
+`customLanguages.libraryPath` and referenced native libraries. In versions before
+0.50, those libraries load without an opt-in flag; a trusted binary alone does
+not isolate the target repository. See the
+[official native-library security note](https://ast-grep.github.io/blog/new-ver-50).
 
-**Package manager selection**: If the project's `package.json` has `packageManager` set, follow it (pnpm / yarn / etc.). Otherwise install locally with npm. Use the same tool in CI (mixing them splits lockfile and binary resolution paths). Keep global installs on dev machines only; CI and in-repo scripts must always use local references.
+For unfamiliar input, run from a trusted directory and pass a reviewed external
+`--config` explicitly, with the target repository as the scan path. The bundled
+Node preset is one such config; it declares no native libraries. A project's own
+config and custom parser remain outside this workflow until their code and
+provenance have been reviewed.
+
+Add a project-local dependency only when the project, its registry configuration,
+and lifecycle-script policy are trusted and dependency changes are in scope.
+Then follow `package.json`'s `packageManager`, use `@ast-grep/cli`, and use the same
+package manager in CI. Commands below that use npm, npx, pnpm, or project binaries
+assume this trusted-project condition; otherwise use the recorded trusted binary.
 
 ## Quick Start
 
@@ -371,8 +387,8 @@ severity: warning
 ## Testing
 
 There are two kinds of tests. Do not conflate them:
-- **Classification test** (`test --skip-snapshot-tests`): only verifies that the code listed under `valid` / `invalid` is classified correctly. This is the one to run in CI.
-- **Snapshot test** (`test` / `test -U`): pins the match positions and fix results on invalid code as snapshots and detects regressions. Generate for the first time with `-U`, then have humans review afterwards. Run at least once before CI.
+- **Classification test** (`test --skip-snapshot-tests`): only verifies that the code listed under `valid` / `invalid` is classified correctly. Use this during rule development before snapshots are ready.
+- **Snapshot test** (`test` / `test -U`): pins the match positions and fix results on invalid code as snapshots and detects regressions. Generate locally with `-U`, review, and commit. Run unskipped `test` in CI to detect changed ranges and fixes.
 
 ### Test file format
 
@@ -413,7 +429,7 @@ Test result markers:
 2. Write the rule under `rules/` (Green)
 3. Verify with `ast-grep test --skip-snapshot-tests`
 4. Generate snapshots with `ast-grep test -U`
-5. Review the snapshots and commit
+5. Review the snapshots, run unskipped `ast-grep test`, and commit
 
 ## CI integration
 
@@ -440,7 +456,7 @@ Align tools with the dev environment (use pnpm in CI if the project uses pnpm, n
 - run: npm ci   # for pnpm: pnpm install --frozen-lockfile
 
 - name: ast-grep rule tests
-  run: npx ast-grep test --skip-snapshot-tests
+  run: npx ast-grep test
 
 - name: ast-grep scan
   run: npx ast-grep scan --error
@@ -449,8 +465,8 @@ Align tools with the dev environment (use pnpm in CI if the project uses pnpm, n
 **severity and exit codes**:
 - `ast-grep scan` exits non-zero by default if at least one finding has `error` severity
 - Passing `--error` makes `warning` / `hint` also cause non-zero exit (use when CI should fail on warnings too)
-- You can specify a severity like `--error=error` to tighten gradually
-- `--format json` for structured output (for integrating with other tools)
+- `--error=my-rule` promotes only the named rule ID to error; its value is not a severity threshold
+- `--json` for structured output (for integrating with other tools)
 
 ## Looking up kind names
 
@@ -499,15 +515,9 @@ message: oldClient.fetch is deprecated. Migrate to newClient.request.
 
 ### Forbid a specific import
 
-```yaml
-id: no-lodash-import
-language: TypeScript
-severity: warning
-rule:
-  pattern: import $_ from 'lodash'
-message: Do not import lodash wholesale. Use lodash/xxx.
-fix: import $_ from 'lodash/xxx' // TODO: fix the correct path
-```
+See the tested rule [no-lodash-import](../assets/examples/rules/no-lodash-import.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/no-lodash-import-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### TypeScript: forbid direct fetch inside React components
 
@@ -583,44 +593,17 @@ ignores:
   - "src/bin/**"
 ```
 
-### Go: detect ignored errors
+### Go: review discarded results from a single call
 
-```yaml
-id: no-ignored-error
-language: Go
-severity: error
-rule:
-  kind: short_var_declaration
-  has:
-    kind: identifier
-    regex: '^_$'
-    field: left
-  has:
-    kind: call_expression
-    field: right
-    stopBy: end
-message: Do not ignore errors with _. Handle them appropriately.
-```
+See the tested rule [no-ignored-error](../assets/examples/rules/no-ignored-error.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/no-ignored-error-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### Go: prevent forgetting defer Close()
 
-```yaml
-id: defer-close-after-open
-language: Go
-severity: warning
-rule:
-  kind: short_var_declaration
-  has:
-    pattern: os.Open($PATH)
-    field: right
-    stopBy: end
-  not:
-    precedes:
-      pattern: defer $_.Close()
-      stopBy:
-        kind: return_statement
-message: Add defer Close() immediately after os.Open.
-```
+See the tested rule [defer-close-after-open](../assets/examples/rules/defer-close-after-open.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/defer-close-after-open-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### Python: forbid bare except
 
@@ -662,7 +645,7 @@ files:
 
 - [references/rule-yaml.md](rule-yaml.md) — all rule YAML fields, evaluation order, metavariable binding scope, `any:` + fix consolidation/splitting, `$$$ARGS` empty match, etc.
 - [references/testing.md](testing.md) — classification vs snapshot tests, multi-line code notation, snapshot operation
-- [references/cli.md](cli.md) — subcommands and flags in general, `--error` / exit codes / `--format json`
+- [references/cli.md](cli.md) — subcommands and flags in general, `--error` / exit codes / `--json`
 - [references/kind-catalog.md](kind-catalog.md) — per-language kind catalog (TypeScript / Rust / Go / Python)
 
 ### Official
@@ -672,3 +655,17 @@ files:
 - sgconfig: https://ast-grep.github.io/reference/sgconfig.html
 - Playground: https://ast-grep.github.io/playground.html
 - Rule catalog: https://ast-grep.github.io/catalog/
+
+## Snapshot coherence for bundled presets
+
+When maintaining the bundled presets, run
+[scripts/check_snapshots.py](../scripts/check_snapshots.py) from the skill root:
+
+```bash
+python3 scripts/check_snapshots.py assets/node-import assets/examples
+```
+
+It generates snapshots in isolation and compares them with the committed files,
+including obsolete records that `ast-grep test` may ignore. It never updates the
+baseline. When fixtures move from invalid to valid, regenerate the baseline from
+an empty snapshot directory with ast-grep and review the diff before committing.

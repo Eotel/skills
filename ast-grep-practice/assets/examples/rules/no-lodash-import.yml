@@ -1,0 +1,11 @@
+id: no-lodash-import
+language: TypeScript
+severity: warning
+rule:
+  kind: import_statement
+  has:
+    kind: string
+    field: source
+    regex: '^["'']lodash["'']$'
+message: Prefer a concrete lodash submodule when appropriate.
+note: Choose the module and preserve the binding manually; there is no generic safe rewrite.

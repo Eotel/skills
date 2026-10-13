@@ -1,0 +1,16 @@
+id: defer-close-after-open
+snapshots:
+  ? |
+    package main; func example() { f, _ := os.Open("a"); g, _ := os.Open("b"); defer g.Close() }
+  : labels:
+    - source: f, _ := os.Open("a")
+      style: primary
+      start: 31
+      end: 51
+  ? |
+    package main; func example() { f, err := os.Open("x") }
+  : labels:
+    - source: f, err := os.Open("x")
+      style: primary
+      start: 31
+      end: 53

@@ -27,9 +27,10 @@ ast-grep scan [PATH...]
 | `--inline-rules <YAML>` | コマンドライン上で YAML 直書き |
 | `--update-all` | 全 violation に fix を適用（破壊的） |
 | `--interactive` | 対話的に 1 件ずつ承認 |
-| `--format json` | JSON 出力（CI 連携用） |
-| `--report-style <pretty\|rich\|short>` | コンソール出力形式 |
-| `--error <severity>` | 指定 severity 以上で非ゼロ終了。`--error` 単独なら hint も含む |
+| `--json` | JSON 出力（CI 連携用） |
+| `--report-style <rich\|medium\|short>` | コンソール出力形式 |
+| `--error[=<RULE_ID>...]` | 指定したルールをerrorへ変更。IDなしならすべてのルールが対象 |
+| `--min-severity <SEVERITY>` | 指定したseverityより低いルールを探索から除外 |
 
 ### `--error` の挙動
 
@@ -37,16 +38,14 @@ ast-grep scan [PATH...]
 |---|---|
 | なし（デフォルト） | `error` severity が 1 件でもあれば非ゼロ終了 |
 | `--error` | `hint` / `warning` / `error` 全部で非ゼロ終了 |
-| `--error=warning` | `warning` 以上で非ゼロ終了 |
-| `--error=error` | `error` のみで非ゼロ終了（デフォルトと同じ） |
+| `--error=my-rule` | IDが`my-rule`のルールだけをerrorへ変更 |
 
-CI で `warning` も落としたい場合は `--error` を付ける。段階導入したい場合はデフォルトで開始 → 段階的に厳しくする。
+CI で warning も失敗にする場合は `--error` を付ける。特定のルールを段階的に導入する場合は `--error=ルールID` を使う。値はseverityの名前ではなくルールID。
 
 ### exit code
 
-- `0` — 違反なし、または閾値以下の違反のみ
-- `1` — 検出された violation が `--error` 閾値を超えた
-- それ以外 — 設定エラー / 構文エラー（exit 4 等）
+- `0` — errorの検出なし。warningだけの場合も含む。
+- 非ゼロ — errorの検出、または設定・引数のエラー。診断内容を確認する。
 
 ## test の主要フラグ
 
@@ -56,7 +55,7 @@ ast-grep test
 
 | フラグ | 意味 |
 |---|---|
-| `--skip-snapshot-tests` | 分類テストのみ実行（スナップショット差分は無視）。CI 用 |
+| `--skip-snapshot-tests` | 分類テストのみ実行（スナップショット差分は無視）。ルール開発中の分類確認用 |
 | `-U` / `--update-all` | スナップショットを生成・更新 |
 | `--interactive` | スナップショット差分を 1 件ずつ承認 |
 | `--filter <REGEX>` | テスト id 絞り込み |
@@ -93,7 +92,7 @@ ast-grep run --pattern 'YOUR_CODE' --lang typescript --debug-query=cst
 
 複雑なパターンを書く前に必ず実行して構造を確認。
 
-## --format json の出力構造
+## --json の出力構造
 
 ```json
 [
@@ -125,5 +124,5 @@ PR コメント生成、SARIF 変換、独自レポート作成等で使用。
 
 - `npx ast-grep` か `pnpm exec ast-grep` 等、プロジェクトと同じパッケージマネージャ経由で呼ぶ
 - グローバル install を CI で使うとバージョン揺れの原因
-- `--format json` で JSON を保存し、別ステップで GitHub PR コメントに整形する手もある
-- snapshot test は CI で skip し、開発者責務にする（`references/testing.md` 参照）
+- `--json` で JSON を保存し、別ステップで GitHub PR コメントに整形する手もある
+- CIでは`ast-grep test`でコミット済みsnapshotとの一致を確認する。更新はローカルで生成・レビューしてコミットする（[testing.md](testing.md)参照）。

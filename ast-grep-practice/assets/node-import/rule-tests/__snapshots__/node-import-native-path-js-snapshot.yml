@@ -7,6 +7,18 @@ snapshots:
       style: primary
       start: 112
       end: 164
+    - source: gate
+      style: secondary
+      start: 29
+      end: 33
+    - source: path.join(directory, "start.mjs")
+      style: secondary
+      start: 36
+      end: 69
+    - source: gate = path.join(directory, "start.mjs")
+      style: secondary
+      start: 29
+      end: 69
     - source: const gate = path.join(directory, "start.mjs");
       style: secondary
       start: 23
@@ -22,6 +34,18 @@ snapshots:
       style: primary
       start: 37
       end: 108
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 35
+    - source: gate = join(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 35
     - source: const gate = join(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -32,12 +56,80 @@ snapshots:
       start: 0
       end: 110
   ? |
+    const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate])
+      style: primary
+      start: 37
+      end: 80
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 35
+    - source: gate = join(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 35
+    - source: const gate = join(cwd, "start.mjs");
+      style: secondary
+      start: 0
+      end: 36
+    - source: |
+        const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 82
+  ? |
+    const gate = path.join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate]);
+  : labels:
+    - source: spawn(process.execPath, ['--import', gate])
+      style: primary
+      start: 42
+      end: 85
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.join(cwd, 'start.mjs')
+      style: secondary
+      start: 13
+      end: 40
+    - source: gate = path.join(cwd, 'start.mjs')
+      style: secondary
+      start: 6
+      end: 40
+    - source: const gate = path.join(cwd, 'start.mjs');
+      style: secondary
+      start: 0
+      end: 41
+    - source: |
+        const gate = path.join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate]);
+      style: secondary
+      start: 0
+      end: 87
+  ? |
     const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
   : labels:
     - source: cp.spawn(process.execPath, ["--import", gate, cli])
       style: primary
       start: 45
       end: 96
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.resolve(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 43
+    - source: gate = path.resolve(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 43
     - source: const gate = path.resolve(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -54,6 +146,18 @@ snapshots:
       style: primary
       start: 40
       end: 95
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: resolve(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 38
+    - source: gate = resolve(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 38
     - source: const gate = resolve(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -71,9 +175,9 @@ snapshots:
       start: 0
       end: 66
   ? |
-    spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {});
+    spawn(process.execPath, ['--import', join(cwd, 'start.mjs'), cli]);
   : labels:
-    - source: spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {})
+    - source: spawn(process.execPath, ['--import', join(cwd, 'start.mjs'), cli])
       style: primary
       start: 0
-      end: 102
+      end: 66
