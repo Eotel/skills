@@ -2,21 +2,24 @@
 
 Complement general-purpose lint tools (ESLint, oxlint, Biome, clippy, etc.) with ast-grep for patterns they cannot express. Always prefer reproducible static rules over natural-language prompts.
 
-## Installation
+## Tool provenance and installation
 
-```bash
-# npm (project-local recommended)
-npm install -D @ast-grep/cli
-npx ast-grep --help
+Use an ast-grep binary installed from a trusted source, such as the workstation's
+Nix or Homebrew packages. Locate and verify it outside the target repository,
+record its absolute path, and use that path when inspecting an unfamiliar repo.
+Check its version and help before selecting flags.
 
-# or cargo
-cargo install ast-grep --locked
+If the tool is missing, install it outside the target repository using trusted
+package-manager configuration and verified package metadata/checksums. A repo's
+`.npmrc` can replace the registry for `@ast-grep/cli`; disabling install scripts
+alone does not make a substituted binary safe to run. Keep tool provisioning
+outside that repo until its configuration is trusted.
 
-# or brew
-brew install ast-grep
-```
-
-**Package manager selection**: If the project's `package.json` has `packageManager` set, follow it (pnpm / yarn / etc.). Otherwise install locally with npm. Use the same tool in CI (mixing them splits lockfile and binary resolution paths). Keep global installs on dev machines only; CI and in-repo scripts must always use local references.
+Add a project-local dependency only when the project, its registry configuration,
+and lifecycle-script policy are trusted and dependency changes are in scope.
+Then follow `package.json`'s `packageManager`, use `@ast-grep/cli`, and use the same
+package manager in CI. Commands below that use npm, npx, pnpm, or project binaries
+assume this trusted-project condition; otherwise use the recorded trusted binary.
 
 ## Quick Start
 
