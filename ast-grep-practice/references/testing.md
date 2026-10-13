@@ -9,7 +9,7 @@ SKILL.md「テスト」節の詳細。
 | 分類テスト | `ast-grep test --skip-snapshot-tests` | `valid` / `invalid` の分類が正しいか（ルール検出の正否） |
 | スナップショットテスト | `ast-grep test` / `ast-grep test -U` | invalid コードへのマッチ位置・fix 適用結果が固定されているか（回帰検出） |
 
-**CI**: 分類テスト（`--skip-snapshot-tests`）を回す。スナップショット差分は開発者レビューが必要なので CI で強制通過させない。
+**CI**: `ast-grep test`を実行し、分類とコミット済みスナップショットの両方を確認する。差分が出たら失敗にする。
 
 **ローカル開発**: `-U` でスナップショット生成・更新、人の目で diff レビュー、commit。
 
@@ -91,9 +91,9 @@ ast-grep test --interactive
 
 ### CI でのスナップショット扱い
 
-- `--skip-snapshot-tests` で skip: 分類テストのみ実行、snapshot 差分は失敗扱いしない
-- `-U` を CI で走らせない（生成されても commit されない、意味がない）
-- snapshot の維持は開発者責務にする
+- `ast-grep test`でコミット済みsnapshotと比較し、差分を検出する。
+- `--skip-snapshot-tests`は開発中の分類確認に使う。
+- 更新はローカルで`-U`を実行し、差分をレビューしてコミットする。CIでは自動更新しない。
 
 ## テスト駆動フロー
 
@@ -101,7 +101,7 @@ ast-grep test --interactive
 2. **Green**: `rules/foo.yml` にルールを書く → `ast-grep test --skip-snapshot-tests` がパス
 3. **Snapshot**: `ast-grep test -U` でスナップショット生成、内容レビュー
 4. **Commit**: ルール / テスト / スナップショットを一緒に commit
-5. **CI**: 分類テスト + scan（`references/cli.md` 参照）
+5. **CI**: 分類・snapshotテスト + scan（[cli.md](cli.md)参照）
 
 ## よくある落とし穴
 

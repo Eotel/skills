@@ -7,6 +7,18 @@ snapshots:
       style: primary
       start: 112
       end: 164
+    - source: gate
+      style: secondary
+      start: 29
+      end: 33
+    - source: path.join(directory, "start.mjs")
+      style: secondary
+      start: 36
+      end: 69
+    - source: gate = path.join(directory, "start.mjs")
+      style: secondary
+      start: 29
+      end: 69
     - source: const gate = path.join(directory, "start.mjs");
       style: secondary
       start: 23
@@ -16,12 +28,51 @@ snapshots:
       start: 21
       end: 167
   ? |
+    async function run() { const gate: string = path.join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate], {}); }
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate], {})
+      style: primary
+      start: 73
+      end: 120
+    - source: gate
+      style: secondary
+      start: 29
+      end: 33
+    - source: path.join(cwd, "start.mjs")
+      style: secondary
+      start: 44
+      end: 71
+    - source: 'gate: string = path.join(cwd, "start.mjs")'
+      style: secondary
+      start: 29
+      end: 71
+    - source: 'const gate: string = path.join(cwd, "start.mjs");'
+      style: secondary
+      start: 23
+      end: 72
+    - source: '{ const gate: string = path.join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate], {}); }'
+      style: secondary
+      start: 21
+      end: 123
+  ? |
     const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 });
   : labels:
     - source: 'spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 })'
       style: primary
       start: 37
       end: 108
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 35
+    - source: gate = join(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 35
     - source: const gate = join(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -32,12 +83,80 @@ snapshots:
       start: 0
       end: 110
   ? |
+    const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate])
+      style: primary
+      start: 37
+      end: 80
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 35
+    - source: gate = join(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 35
+    - source: const gate = join(cwd, "start.mjs");
+      style: secondary
+      start: 0
+      end: 36
+    - source: |
+        const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 82
+  ? |
+    const gate = path.join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate]);
+  : labels:
+    - source: spawn(process.execPath, ['--import', gate])
+      style: primary
+      start: 42
+      end: 85
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.join(cwd, 'start.mjs')
+      style: secondary
+      start: 13
+      end: 40
+    - source: gate = path.join(cwd, 'start.mjs')
+      style: secondary
+      start: 6
+      end: 40
+    - source: const gate = path.join(cwd, 'start.mjs');
+      style: secondary
+      start: 0
+      end: 41
+    - source: |
+        const gate = path.join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate]);
+      style: secondary
+      start: 0
+      end: 87
+  ? |
     const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
   : labels:
     - source: cp.spawn(process.execPath, ["--import", gate, cli])
       style: primary
       start: 45
       end: 96
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.resolve(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 43
+    - source: gate = path.resolve(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 43
     - source: const gate = path.resolve(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -48,12 +167,52 @@ snapshots:
       start: 0
       end: 98
   ? |
+    const gate = path.resolve(cwd, 'start.mjs'); spawn(process.execPath, ['--trace-warnings', '--import', gate, cli], {});
+  : labels:
+    - source: spawn(process.execPath, ['--trace-warnings', '--import', gate, cli], {})
+      style: primary
+      start: 45
+      end: 117
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.resolve(cwd, 'start.mjs')
+      style: secondary
+      start: 13
+      end: 43
+    - source: gate = path.resolve(cwd, 'start.mjs')
+      style: secondary
+      start: 6
+      end: 43
+    - source: const gate = path.resolve(cwd, 'start.mjs');
+      style: secondary
+      start: 0
+      end: 44
+    - source: |
+        const gate = path.resolve(cwd, 'start.mjs'); spawn(process.execPath, ['--trace-warnings', '--import', gate, cli], {});
+      style: secondary
+      start: 0
+      end: 119
+  ? |
     const gate = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate, cli]);
   : labels:
     - source: execFileSync(process.execPath, ["--import", gate, cli])
       style: primary
       start: 40
       end: 95
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: resolve(cwd, "start.mjs")
+      style: secondary
+      start: 13
+      end: 38
+    - source: gate = resolve(cwd, "start.mjs")
+      style: secondary
+      start: 6
+      end: 38
     - source: const gate = resolve(cwd, "start.mjs");
       style: secondary
       start: 0
@@ -64,9 +223,184 @@ snapshots:
       start: 0
       end: 97
   ? |
+    const gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, cli]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate, cli])
+      style: primary
+      start: 45
+      end: 93
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 21
+      end: 43
+    - source: 'gate: string = join(cwd, "start.mjs")'
+      style: secondary
+      start: 6
+      end: 43
+    - source: 'const gate: string = join(cwd, "start.mjs");'
+      style: secondary
+      start: 0
+      end: 44
+    - source: |
+        const gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, cli]);
+      style: secondary
+      start: 0
+      end: 95
+  ? |
+    const gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate])
+      style: primary
+      start: 45
+      end: 88
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 21
+      end: 43
+    - source: 'gate: string = join(cwd, "start.mjs")'
+      style: secondary
+      start: 6
+      end: 43
+    - source: 'const gate: string = join(cwd, "start.mjs");'
+      style: secondary
+      start: 0
+      end: 44
+    - source: |
+        const gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 90
+  ? |
+    const gate: string = join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate, cli]);
+  : labels:
+    - source: spawn(process.execPath, ['--import', gate, cli])
+      style: primary
+      start: 45
+      end: 93
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: join(cwd, 'start.mjs')
+      style: secondary
+      start: 21
+      end: 43
+    - source: 'gate: string = join(cwd, ''start.mjs'')'
+      style: secondary
+      start: 6
+      end: 43
+    - source: 'const gate: string = join(cwd, ''start.mjs'');'
+      style: secondary
+      start: 0
+      end: 44
+    - source: |
+        const gate: string = join(cwd, 'start.mjs'); spawn(process.execPath, ['--import', gate, cli]);
+      style: secondary
+      start: 0
+      end: 95
+  ? |
+    const gate: string = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate]);
+  : labels:
+    - source: cp.spawn(process.execPath, ["--import", gate])
+      style: primary
+      start: 53
+      end: 99
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: path.resolve(cwd, "start.mjs")
+      style: secondary
+      start: 21
+      end: 51
+    - source: 'gate: string = path.resolve(cwd, "start.mjs")'
+      style: secondary
+      start: 6
+      end: 51
+    - source: 'const gate: string = path.resolve(cwd, "start.mjs");'
+      style: secondary
+      start: 0
+      end: 52
+    - source: |
+        const gate: string = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 101
+  ? |
+    const gate: string = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate]);
+  : labels:
+    - source: execFileSync(process.execPath, ["--import", gate])
+      style: primary
+      start: 48
+      end: 98
+    - source: gate
+      style: secondary
+      start: 6
+      end: 10
+    - source: resolve(cwd, "start.mjs")
+      style: secondary
+      start: 21
+      end: 46
+    - source: 'gate: string = resolve(cwd, "start.mjs")'
+      style: secondary
+      start: 6
+      end: 46
+    - source: 'const gate: string = resolve(cwd, "start.mjs");'
+      style: secondary
+      start: 0
+      end: 47
+    - source: |
+        const gate: string = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 100
+  ? |
+    const other = 0, gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate])
+      style: primary
+      start: 56
+      end: 99
+    - source: gate
+      style: secondary
+      start: 17
+      end: 21
+    - source: join(cwd, "start.mjs")
+      style: secondary
+      start: 32
+      end: 54
+    - source: 'gate: string = join(cwd, "start.mjs")'
+      style: secondary
+      start: 17
+      end: 54
+    - source: 'const other = 0, gate: string = join(cwd, "start.mjs");'
+      style: secondary
+      start: 0
+      end: 55
+    - source: |
+        const other = 0, gate: string = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate]);
+      style: secondary
+      start: 0
+      end: 101
+  ? |
     spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli]);
   : labels:
     - source: spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli])
+      style: primary
+      start: 0
+      end: 66
+  ? |
+    spawn(process.execPath, ['--import', join(cwd, 'start.mjs'), cli]);
+  : labels:
+    - source: spawn(process.execPath, ['--import', join(cwd, 'start.mjs'), cli])
       style: primary
       start: 0
       end: 66

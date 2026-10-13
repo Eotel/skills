@@ -3,8 +3,14 @@ language: TypeScript
 severity: warning
 rule:
   any:
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH])
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH], $$$OPTIONS)
     - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER])
     - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH])
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH, $$$AFTER])
+    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH, $$$AFTER], $$$OPTIONS)
 constraints:
   SPAWN:
     regex: '^(spawn|spawnSync|execFile|execFileSync|(cp|childProcess)\.(spawn|spawnSync|execFile|execFileSync))$'
@@ -25,17 +31,30 @@ constraints:
                   - kind: statement_block
                   - kind: program
               has:
-                any:
-                  - pattern: const $PATH = join($$$ARGS)
-                  - pattern: const $PATH = resolve($$$ARGS)
-                  - pattern: const $PATH = path.join($$$ARGS)
-                  - pattern: const $PATH = path.resolve($$$ARGS)
+                all:
+                  - kind: lexical_declaration
+                  - regex: '^const\b'
+                  - has:
+                      kind: variable_declarator
+                      all:
+                        - has:
+                            kind: identifier
+                            field: name
+                            pattern: $PATH
+                        - has:
+                            field: value
+                            any:
+                              - pattern: join($$$ARGS)
+                              - pattern: resolve($$$ARGS)
+                              - pattern: path.join($$$ARGS)
+                              - pattern: path.resolve($$$ARGS)
                 stopBy: neighbor
 message: Nodeの--importへ渡すOSのパスは、pathToFileURL(path).hrefでfile URLに変換する。
 note: |
   Why: --import resolves ESM specifiers as URLs. Native paths containing # or ?
   and Windows drive-letter paths can be interpreted incorrectly.
-  Scope: direct join/resolve calls, or const bindings in the same nearest block.
+  Scope: direct join/resolve calls, or direct const declarations in the same nearest block.
+  TypeScript type annotations and single- or double-quoted --import flags are covered.
   Helper returns, aliases, outer bindings, and --import=value are not inspected.
   This syntax rule assumes join/resolve and spawn names are Node APIs; inspect
   a finding if these names are bound to unrelated functions.

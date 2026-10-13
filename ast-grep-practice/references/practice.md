@@ -371,8 +371,8 @@ severity: warning
 ## Testing
 
 There are two kinds of tests. Do not conflate them:
-- **Classification test** (`test --skip-snapshot-tests`): only verifies that the code listed under `valid` / `invalid` is classified correctly. This is the one to run in CI.
-- **Snapshot test** (`test` / `test -U`): pins the match positions and fix results on invalid code as snapshots and detects regressions. Generate for the first time with `-U`, then have humans review afterwards. Run at least once before CI.
+- **Classification test** (`test --skip-snapshot-tests`): only verifies that the code listed under `valid` / `invalid` is classified correctly. Use this during rule development before snapshots are ready.
+- **Snapshot test** (`test` / `test -U`): pins the match positions and fix results on invalid code as snapshots and detects regressions. Generate locally with `-U`, review, and commit. Run unskipped `test` in CI to detect changed ranges and fixes.
 
 ### Test file format
 
@@ -413,7 +413,7 @@ Test result markers:
 2. Write the rule under `rules/` (Green)
 3. Verify with `ast-grep test --skip-snapshot-tests`
 4. Generate snapshots with `ast-grep test -U`
-5. Review the snapshots and commit
+5. Review the snapshots, run unskipped `ast-grep test`, and commit
 
 ## CI integration
 
@@ -440,7 +440,7 @@ Align tools with the dev environment (use pnpm in CI if the project uses pnpm, n
 - run: npm ci   # for pnpm: pnpm install --frozen-lockfile
 
 - name: ast-grep rule tests
-  run: npx ast-grep test --skip-snapshot-tests
+  run: npx ast-grep test
 
 - name: ast-grep scan
   run: npx ast-grep scan --error
@@ -449,8 +449,8 @@ Align tools with the dev environment (use pnpm in CI if the project uses pnpm, n
 **severity and exit codes**:
 - `ast-grep scan` exits non-zero by default if at least one finding has `error` severity
 - Passing `--error` makes `warning` / `hint` also cause non-zero exit (use when CI should fail on warnings too)
-- You can specify a severity like `--error=error` to tighten gradually
-- `--format json` for structured output (for integrating with other tools)
+- `--error=my-rule` promotes only the named rule ID to error; its value is not a severity threshold
+- `--json` for structured output (for integrating with other tools)
 
 ## Looking up kind names
 
@@ -504,9 +504,11 @@ id: no-lodash-import
 language: TypeScript
 severity: warning
 rule:
-  pattern: import $_ from 'lodash'
-message: Do not import lodash wholesale. Use lodash/xxx.
-fix: import $_ from 'lodash/xxx' // TODO: fix the correct path
+  any:
+    - pattern: import $_ from 'lodash'
+    - pattern: import $_ from "lodash"
+message: Prefer a concrete lodash submodule when appropriate.
+note: Choose the module and preserve the binding manually; there is no generic safe rewrite.
 ```
 
 ### TypeScript: forbid direct fetch inside React components
@@ -590,16 +592,21 @@ id: no-ignored-error
 language: Go
 severity: error
 rule:
-  kind: short_var_declaration
-  has:
-    kind: identifier
-    regex: '^_$'
-    field: left
-  has:
-    kind: call_expression
-    field: right
-    stopBy: end
-message: Do not ignore errors with _. Handle them appropriately.
+  all:
+    - kind: short_var_declaration
+    - has:
+        kind: expression_list
+        field: left
+        has:
+          kind: identifier
+          regex: '^_$'
+    - has:
+        kind: expression_list
+        field: right
+        has:
+          kind: call_expression
+message: Review discarded call results and handle any errors.
+note: This detects discarded values, not their Go types.
 ```
 
 ### Go: prevent forgetting defer Close()
@@ -662,7 +669,7 @@ files:
 
 - [references/rule-yaml.md](rule-yaml.md) — all rule YAML fields, evaluation order, metavariable binding scope, `any:` + fix consolidation/splitting, `$$$ARGS` empty match, etc.
 - [references/testing.md](testing.md) — classification vs snapshot tests, multi-line code notation, snapshot operation
-- [references/cli.md](cli.md) — subcommands and flags in general, `--error` / exit codes / `--format json`
+- [references/cli.md](cli.md) — subcommands and flags in general, `--error` / exit codes / `--json`
 - [references/kind-catalog.md](kind-catalog.md) — per-language kind catalog (TypeScript / Rust / Go / Python)
 
 ### Official
