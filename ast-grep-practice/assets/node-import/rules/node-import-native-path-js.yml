@@ -3,14 +3,14 @@ language: JavaScript
 severity: warning
 rule:
   any:
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH])
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH], $$$OPTIONS)
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER])
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, "--import", $PATH, $$$AFTER], $$$OPTIONS)
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH])
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH], $$$OPTIONS)
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH, $$$AFTER])
-    - pattern: $SPAWN(process.execPath, [$$$BEFORE, '--import', $PATH, $$$AFTER], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, ["--import", $PATH])
+    - pattern: $SPAWN(process.execPath, ["--import", $PATH], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, ["--import", $PATH, $$$AFTER])
+    - pattern: $SPAWN(process.execPath, ["--import", $PATH, $$$AFTER], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, ['--import', $PATH])
+    - pattern: $SPAWN(process.execPath, ['--import', $PATH], $$$OPTIONS)
+    - pattern: $SPAWN(process.execPath, ['--import', $PATH, $$$AFTER])
+    - pattern: $SPAWN(process.execPath, ['--import', $PATH, $$$AFTER], $$$OPTIONS)
 constraints:
   SPAWN:
     regex: '^(spawn|spawnSync|execFile|execFileSync|(cp|childProcess)\.(spawn|spawnSync|execFile|execFileSync))$'
@@ -55,6 +55,8 @@ note: |
   and Windows drive-letter paths can be interpreted incorrectly.
   Scope: direct join/resolve calls, or direct const declarations in the same nearest block.
   TypeScript type annotations and single- or double-quoted --import flags are covered.
+  The literal --import flag must be the first array element; prefixes are outside
+  this guard to avoid mistaking script arguments or option values for preloads.
   Helper returns, aliases, outer bindings, and --import=value are not inspected.
   This syntax rule assumes join/resolve and spawn names are Node APIs; inspect
   a finding if these names are bound to unrelated functions.

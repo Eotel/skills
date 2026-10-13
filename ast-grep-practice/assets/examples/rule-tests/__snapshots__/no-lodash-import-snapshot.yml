@@ -1,12 +1,49 @@
 id: no-lodash-import
 snapshots:
   ? |
+    import "lodash";
+  : labels:
+    - source: import "lodash";
+      style: primary
+      start: 0
+      end: 16
+    - source: '"lodash"'
+      style: secondary
+      start: 7
+      end: 15
+  ? |
+    import lodash, * as methods from "lodash";
+  : labels:
+    - source: import lodash, * as methods from "lodash";
+      style: primary
+      start: 0
+      end: 42
+    - source: '"lodash"'
+      style: secondary
+      start: 33
+      end: 41
+  ? |
+    import lodash, { map } from "lodash";
+  : labels:
+    - source: import lodash, { map } from "lodash";
+      style: primary
+      start: 0
+      end: 37
+    - source: '"lodash"'
+      style: secondary
+      start: 28
+      end: 36
+  ? |
     import pick from "lodash";
   : labels:
     - source: import pick from "lodash";
       style: primary
       start: 0
       end: 26
+    - source: '"lodash"'
+      style: secondary
+      start: 17
+      end: 25
   ? |
     import pick from 'lodash';
   : labels:
@@ -14,3 +51,7 @@ snapshots:
       style: primary
       start: 0
       end: 26
+    - source: '''lodash'''
+      style: secondary
+      start: 17
+      end: 25

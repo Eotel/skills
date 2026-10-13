@@ -9,3 +9,9 @@ invalid:
       import pick from "lodash";
   - |
       import pick from 'lodash';
+  - |
+      import lodash, { map } from "lodash";
+  - |
+      import lodash, * as methods from "lodash";
+  - |
+      import "lodash";

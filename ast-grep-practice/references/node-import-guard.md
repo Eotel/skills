@@ -21,6 +21,11 @@ preset so it remains versioned through the skill's APM source.
 
 ## Scope
 
+The literal --import flag must be the first array element. Prefixes are outside
+this guard: static patterns cannot reliably distinguish Node options, their
+values, and the program entrypoint. Verify those shapes with a runtime test. See
+the [Node CLI synopsis](https://nodejs.org/api/cli.html#synopsis).
+
 JavaScript and TypeScript rules flag direct join/resolve expressions and const
 bindings in the same nearest block passed to Node's --import. TypeScript type
 annotations, multiple const declarators, either quote style, and import-only

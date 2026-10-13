@@ -5,3 +5,5 @@ valid:
 invalid:
   - |
       package main; func example() { f, err := os.Open("x") }
+  - |
+      package main; func example() { f, _ := os.Open("a"); g, _ := os.Open("b"); defer g.Close() }
