@@ -2,15 +2,18 @@
 
 ## While it runs
 
-- No CLI lists cloud sessions. Write each session ID beside its task when you
-  start it (a `sessions.md` next to the briefs).
+- `claude --teleport` and `/tasks` list sessions only interactively. Write each
+  session ID beside its task when you start it (a `sessions.md` next to the
+  briefs).
 - Send a message without attaching:
   `claude -p "<message>" --cloud <session-id> --output-format json < /dev/null`.
-  `{"ok": true}` means it was queued; the session reads it at its next step.
-- Progress shows on GitHub first: PRs whose head branch starts with `claude/`.
-  Open the session page only when you need its own words.
-- A session that stops on a permission prompt waits for the user. Tell them
-  which session and what it asks; do not answer it for them.
+  `{"ok": true, ...}` means it was queued; the session reads it at its next
+  step.
+- Progress shows on GitHub first: PRs whose head branch starts with `claude/`
+  (seen 2026-10-13). Open the session page only when you need its own words.
+- A session that stops on a permission prompt waits for the user, and can
+  expire while it waits (docs). Tell them at once which session and what it
+  asks; do not answer it for them.
 
 ## When its PR appears
 
@@ -20,8 +23,8 @@
   force push) and watch CI again before merging. A check that fails only after
   that merge may be a flaky test another open PR fixes: read the failing test
   before sending the failure back.
-- Merge as the repository's practice says, against the head you reviewed
+- When the user asked you to merge, merge against the head you reviewed
   (`gh pr merge --match-head-commit <sha>`). On a squash, write the commit
   message yourself, and compare the squash commit's tree with the branch tip's.
 - Do what the session could not: tracker entries, review requests, the note to
-  a local lane whose work the PR touches.
+  another local session whose work the PR touches.

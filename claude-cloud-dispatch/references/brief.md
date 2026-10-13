@@ -1,19 +1,23 @@
 # The brief
 
 The session reads the repository (its `AGENTS.md`, `CLAUDE.md`, committed
-skills) and this text. Rules that live only on this machine, or that you give
-local lanes by habit, do not exist for it unless written here.
+skills), the environment's `~/.claude/CLAUDE.md`, and this text. Rules that
+live only on this machine, or that you give local sessions by habit, do not
+exist for it unless one of those carries them.
 
 ## What it carries
 
 - **The task and its contract**: the issue number, and where the acceptance
   criteria are (the issue body, or a named comment on it).
-- **How to read GitHub**: `gh api repos/<owner>/<repo>/issues/<n>` and
+- **Where to read it**: `gh api repos/<owner>/<repo>/issues/<n>` and
   `.../comments`.
-- **Rules the repository does not state but the user holds**, for example:
-  tests check behavior, none that only pin wording or comments; no AI
-  attribution lines in commits or the PR body when the repository forbids them
-  (a cloud session adds them by default); the language of the PR; the assignee.
+- **Rules the user holds for this repository or task** that neither the
+  repository nor the environment states, for example: tests check behavior,
+  none that only pin wording or comments; the language of the PR; the assignee.
+- **Attribution**: a session adds a `Claude-Session` trailer to its commits and
+  the session link to the PR body. Where the repository forbids such lines,
+  `attribution.sessionUrl: false` in its committed `.claude/settings.json`
+  turns both off (docs); until that is there, the brief says to leave them out.
 - **The boundary**: whether it may merge; that it requests no reviews and
   writes to no tracker it cannot reach; that findings outside the task are
   reported, not fixed; that an open decision is written in the PR as a point to
@@ -23,23 +27,25 @@ local lanes by habit, do not exist for it unless written here.
 
 ## Shape
 
+Write it in the language the repository's PRs use.
+
 ```text
-<repo> の issue #<n> を実装して PR を出してください。
+Implement issue #<n> in <owner>/<repo> and open a PR.
 
-## 読むもの
-- issue の本文とコメント（gh api ...）。「Agent Brief」のコメントが受け入れ条件の正本。
-- AGENTS.md と、issue が挙げる設計書。
+## Read
+- The issue body and its comments (gh api ...). <Which one> holds the acceptance criteria.
+- AGENTS.md, and the design documents the issue names.
 
-## 進め方
-- 直す前に今の動きを確かめる。足すテストは振る舞いを確かめるものだけ。
-- PR を出し（assignee ...）、CI が green になるまで見る。
+## Work
+- Check the current behavior before changing it. Add only tests that check behavior.
+- Open the PR (assignee ...) and watch CI until it is green.
 
-## しないこと
-- merge、レビューの依頼、<tracker> への書き込み。
-- 範囲を超える直し、決まっていないことの決定。
+## Do not
+- Merge, request reviews, or write to <tracker>.
+- Fix anything outside the task, or decide what is still undecided.
 
-## 終わり方
-PR の URL、受け入れ条件ごとの結果、流したテスト、確かめられなかったこと。
+## Finish with
+The PR URL, the result per acceptance criterion, the tests you ran, and what you could not verify.
 ```
 
 Add a section for what is particular to the task: a dependency on another PR,
