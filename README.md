@@ -30,6 +30,9 @@ Authoring rules, script and test conventions, and validation commands live in
 - `business-logic-extraction`: move framework-neutral business decisions into
   named domain units.
 - `class-sweep`: find sibling occurrences of a plausibly repeated defect class.
+- `claude-cloud-dispatch`: send a self-contained task to a Claude Code cloud
+  session (`claude --cloud`), prepare a repository's cloud environment, and
+  bring the session's PR back reviewed.
 - `devenv-init`: scaffold supported devenv.sh project environments.
 - `diagnosing-bugs`: reproduce and repair hard bugs and performance regressions.
   Eotel maintains the MIT-licensed copy from mattpocock/skills.
