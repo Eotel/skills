@@ -1,0 +1,16 @@
+name: Checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Skill script tests
+        run: python3 -m unittest discover -s tests
+      - name: Structural rule fixtures and snapshots
+        run: npx --yes --package @ast-grep/cli@0.45.3 ast-grep test --config ast-grep-practice/assets/node-import/sgconfig.yml

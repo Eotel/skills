@@ -1,0 +1,79 @@
+id: node-import-native-path-js
+snapshots:
+  ? |
+    async function run() { const gate = path.join(directory, "start.mjs"); await writeFile(gate, ""); const child = spawn(process.execPath, ["--import", gate, cli], {}); }
+  : labels:
+    - source: spawn(process.execPath, ["--import", gate, cli], {})
+      style: primary
+      start: 112
+      end: 164
+    - source: const gate = path.join(directory, "start.mjs");
+      style: secondary
+      start: 23
+      end: 70
+    - source: '{ const gate = path.join(directory, "start.mjs"); await writeFile(gate, ""); const child = spawn(process.execPath, ["--import", gate, cli], {}); }'
+      style: secondary
+      start: 21
+      end: 167
+  ? |
+    const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 });
+  : labels:
+    - source: 'spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 })'
+      style: primary
+      start: 37
+      end: 108
+    - source: const gate = join(cwd, "start.mjs");
+      style: secondary
+      start: 0
+      end: 36
+    - source: |
+        const gate = join(cwd, "start.mjs"); spawn(process.execPath, ["--import", gate, ...args], { timeout: 5000 });
+      style: secondary
+      start: 0
+      end: 110
+  ? |
+    const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
+  : labels:
+    - source: cp.spawn(process.execPath, ["--import", gate, cli])
+      style: primary
+      start: 45
+      end: 96
+    - source: const gate = path.resolve(cwd, "start.mjs");
+      style: secondary
+      start: 0
+      end: 44
+    - source: |
+        const gate = path.resolve(cwd, "start.mjs"); cp.spawn(process.execPath, ["--import", gate, cli]);
+      style: secondary
+      start: 0
+      end: 98
+  ? |
+    const gate = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate, cli]);
+  : labels:
+    - source: execFileSync(process.execPath, ["--import", gate, cli])
+      style: primary
+      start: 40
+      end: 95
+    - source: const gate = resolve(cwd, "start.mjs");
+      style: secondary
+      start: 0
+      end: 39
+    - source: |
+        const gate = resolve(cwd, "start.mjs"); execFileSync(process.execPath, ["--import", gate, cli]);
+      style: secondary
+      start: 0
+      end: 97
+  ? |
+    spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli]);
+  : labels:
+    - source: spawn(process.execPath, ["--import", join(cwd, "start.mjs"), cli])
+      style: primary
+      start: 0
+      end: 66
+  ? |
+    spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {});
+  : labels:
+    - source: spawnSync(process.execPath, ["--trace-warnings", "--import", path.resolve(cwd, "start.mjs"), cli], {})
+      style: primary
+      start: 0
+      end: 102

@@ -25,12 +25,18 @@ Authoring rules, script and test conventions, and validation commands live in
 
 - `agentic-docs`: create or reorganize agent-readable repository documentation.
 - `apm-usage`: operate APM manifests, packages, targets, and lockfiles.
+- `ast-grep-practice`: create structural lint rules and use the shared Node import guard.
+  Eotel maintains the MIT-licensed copy from mizchi/skills.
 - `business-logic-extraction`: move framework-neutral business decisions into
   named domain units.
 - `class-sweep`: find sibling occurrences of a plausibly repeated defect class.
 - `devenv-init`: scaffold supported devenv.sh project environments.
+- `diagnosing-bugs`: reproduce and repair hard bugs and performance regressions.
+  Eotel maintains the MIT-licensed copy from mattpocock/skills.
 - `django`: refactor Django ORM/query boundaries and DRF-owned policies.
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
+- `natural-japanese`: review and revise human-facing Japanese word choices;
+  flag expressions for contextual review with a Python scanner.
 - `orca-session-triage`: sweep Orca agent sessions for finished or stalled
   worktrees, waiting questions, and agents that never got a task; batch the
   answers and next steps, clear the done cards, and close the finished tabs

@@ -98,9 +98,19 @@ package manager.
 
 ## Verification
 
-Run the check-only scripts. Then create a temporary invalid Markdown file under
-one ignored directory, verify that neither tool reports it, and remove only that
-file and directory after confirming they were created by the current check.
+Trace the repository's package script, hook, or CI command through any wrapper
+before measuring its selected files and bytes. Label a broader ad hoc scan
+separately. Why: `remark .` can scan thousands of files while the configured task
+selects only a small documentation set.
+
+Run the check-only scripts. For an isolated CLI fixture, add its own
+`package.json` and pass explicit config and ignore paths where supported; first
+prove that invalid, non-ignored input fails. Why: configuration discovery can
+inherit a parent repository and make an ignore test exercise the wrong setup.
+Then put invalid Markdown under an ignored directory and verify that the normal
+wrapper skips it. If a formatting wrapper also accepts explicit filenames, check
+that it preserves the excluded file's bytes. Remove only fixture paths created
+by the current check.
 
 Report:
 
