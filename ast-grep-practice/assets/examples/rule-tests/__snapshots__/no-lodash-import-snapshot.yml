@@ -1,0 +1,16 @@
+id: no-lodash-import
+snapshots:
+  ? |
+    import pick from "lodash";
+  : labels:
+    - source: import pick from "lodash";
+      style: primary
+      start: 0
+      end: 26
+  ? |
+    import pick from 'lodash';
+  : labels:
+    - source: import pick from 'lodash';
+      style: primary
+      start: 0
+      end: 26

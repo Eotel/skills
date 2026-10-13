@@ -1,0 +1,25 @@
+id: no-ignored-error
+snapshots:
+  ? |
+    package main; func example() { data, _ := f() }
+  : labels:
+    - source: data, _ := f()
+      style: primary
+      start: 31
+      end: 45
+    - source: _
+      style: secondary
+      start: 37
+      end: 38
+    - source: data, _
+      style: secondary
+      start: 31
+      end: 38
+    - source: f()
+      style: secondary
+      start: 42
+      end: 45
+    - source: f()
+      style: secondary
+      start: 42
+      end: 45

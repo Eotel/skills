@@ -1,0 +1,7 @@
+id: defer-close-after-open
+valid:
+  - |
+      package main; func example() { f, err := os.Open("x"); defer f.Close() }
+invalid:
+  - |
+      package main; func example() { f, err := os.Open("x") }

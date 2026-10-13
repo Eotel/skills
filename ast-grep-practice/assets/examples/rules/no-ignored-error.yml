@@ -1,0 +1,19 @@
+id: no-ignored-error
+language: Go
+severity: error
+rule:
+  all:
+    - kind: short_var_declaration
+    - has:
+        kind: expression_list
+        field: left
+        has:
+          kind: identifier
+          regex: '^_$'
+    - has:
+        kind: expression_list
+        field: right
+        has:
+          kind: call_expression
+message: Review discarded call results and handle any errors.
+note: This detects discarded values, not their Go types.

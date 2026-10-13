@@ -1,0 +1,11 @@
+id: no-lodash-import
+valid:
+  - |
+      import pick from "lodash/pick";
+  - |
+      import pick from 'lodash/pick';
+invalid:
+  - |
+      import pick from "lodash";
+  - |
+      import pick from 'lodash';

@@ -502,17 +502,9 @@ message: oldClient.fetch is deprecated. Migrate to newClient.request.
 
 ### Forbid a specific import
 
-```yaml
-id: no-lodash-import
-language: TypeScript
-severity: warning
-rule:
-  any:
-    - pattern: import $_ from 'lodash'
-    - pattern: import $_ from "lodash"
-message: Prefer a concrete lodash submodule when appropriate.
-note: Choose the module and preserve the binding manually; there is no generic safe rewrite.
-```
+See the tested rule [no-lodash-import](../assets/examples/rules/no-lodash-import.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/no-lodash-import-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### TypeScript: forbid direct fetch inside React components
 
@@ -590,47 +582,15 @@ ignores:
 
 ### Go: detect ignored errors
 
-```yaml
-id: no-ignored-error
-language: Go
-severity: error
-rule:
-  all:
-    - kind: short_var_declaration
-    - has:
-        kind: expression_list
-        field: left
-        has:
-          kind: identifier
-          regex: '^_$'
-    - has:
-        kind: expression_list
-        field: right
-        has:
-          kind: call_expression
-message: Review discarded call results and handle any errors.
-note: This detects discarded values, not their Go types.
-```
+See the tested rule [no-ignored-error](../assets/examples/rules/no-ignored-error.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/no-ignored-error-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### Go: prevent forgetting defer Close()
 
-```yaml
-id: defer-close-after-open
-language: Go
-severity: warning
-rule:
-  kind: short_var_declaration
-  has:
-    pattern: os.Open($PATH)
-    field: right
-    stopBy: end
-  not:
-    precedes:
-      pattern: defer $_.Close()
-      stopBy:
-        kind: return_statement
-message: Add defer Close() immediately after os.Open.
-```
+See the tested rule [defer-close-after-open](../assets/examples/rules/defer-close-after-open.yml) and its
+[valid/invalid fixtures](../assets/examples/rule-tests/defer-close-after-open-test.yml).
+The examples are checked in CI with `ast-grep test --config assets/examples/sgconfig.yml`.
 
 ### Python: forbid bare except
 

@@ -1,0 +1,19 @@
+id: defer-close-after-open
+language: Go
+severity: warning
+rule:
+  kind: short_var_declaration
+  has:
+    kind: expression_list
+    field: right
+    has:
+      pattern:
+        context: 'package main; func example() { f, err := os.Open($PATH) }'
+        selector: call_expression
+      stopBy: end
+  not:
+    precedes:
+      pattern: defer $_.Close()
+      stopBy:
+        kind: return_statement
+message: Add defer Close() immediately after os.Open.

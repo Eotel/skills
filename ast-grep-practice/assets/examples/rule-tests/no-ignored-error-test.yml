@@ -1,0 +1,9 @@
+id: no-ignored-error
+valid:
+  - |
+      package main; func example() { data, err := f() }
+  - |
+      package main; func example() { _, value := 1, 2 }
+invalid:
+  - |
+      package main; func example() { data, _ := f() }
