@@ -39,6 +39,10 @@ Run these per worktree, in order.
    up to a minute before reporting it stuck.
    `orca terminal show` keeps answering for the removed terminals with
    `orphaned: true, connected: false`: that is a stale record, not a live PTY.
+5. When the lane reported to a lead in another tab, send the lead one line
+   naming the removed worktree and where its results remain, so the lead does
+   not go looking for it. A send refused with `agent_prompt_blocked` (seen while
+   the lead's tab shows a selector) typed nothing: send it on a later pass.
 
 A merged remote branch the user approved deleting: check
 `gh api repos/<owner>/<repo>/compare/<default>...<branch>` reports `ahead_by: 0`,
