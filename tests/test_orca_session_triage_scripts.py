@@ -1648,6 +1648,16 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("references/hourly.md", blocked["reason"])
         self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
+    def test_the_first_block_names_an_unclassed_queue_and_a_skipped_run_together(self):
+        self.queue("/w/a", at="2026-10-13T02:00:00+00:00")
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
+                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
+
+        reason = self.check(cwd="/w/triage", orca=orca)["reason"]
+
+        self.assertIn("orca-row-classify", reason)
+        self.assertIn("references/hourly.md", reason)
+
     def test_a_session_in_a_subdirectory_of_the_workspace_is_swept_too(self):
         self.queue(at="2026-10-13T02:00:00+00:00")
         orca = self.fake_orca([triage_automation("a1", "/w/triage")],

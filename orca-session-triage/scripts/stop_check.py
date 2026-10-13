@@ -45,11 +45,13 @@ def decide(hook_input, state_dir, orca="orca"):
     queue = read_json(session / "review-queue.json")
     if not isinstance(queue, dict):
         return None
-    return unclassed(session, queue) or unswept(hook_input.get("cwd"), queue, orca)
+    # Both reasons go in the one block: the repeated stop goes through and checks nothing.
+    reasons = [r for r in (unclassed(session, queue), unswept(hook_input.get("cwd"), queue, orca)) if r]
+    return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
 
 
 def unclassed(session, queue):
-    """Block while a row of this scan's review queue has no verdict."""
+    """Why to stay while a row of this scan's review queue has no verdict, or None."""
     queued = [row["path"] for row in queue.get("rows") or [] if isinstance(row, dict) and row.get("path")]
     if not queued:
         return None
@@ -61,10 +63,9 @@ def unclassed(session, queue):
     missing = [path for path in queued if path not in classed]
     if not missing:
         return None
-    return {"decision": "block", "reason": (
-        f"orca-session-triage: {len(missing)} row(s) in this scan's review queue have no verdict. "
-        f"Invoke the orca-row-classify skill with {session} and act on its verdicts before ending "
-        "the turn: " + ", ".join(missing))}
+    return (f"orca-session-triage: {len(missing)} row(s) in this scan's review queue have no verdict. "
+            f"Invoke the orca-row-classify skill with {session} and act on its verdicts before ending "
+            "the turn: " + ", ".join(missing) + ".")
 
 
 def orca_result(orca, *args):
@@ -94,7 +95,7 @@ def skipped_run(orca, workspace, since_ms):
 
 
 def unswept(workspace, queue, orca):
-    """Block when the hourly triage of this workspace skipped a run after this session's last scan."""
+    """Why to stay when the hourly triage of this workspace skipped a run after this session's last scan, or None."""
     if not workspace:
         return None
     try:
@@ -106,10 +107,9 @@ def unswept(workspace, queue, orca):
     except (OSError, OverflowError, subprocess.SubprocessError, ValueError, LookupError, TypeError,
             AttributeError):
         return None
-    return {"decision": "block", "reason": (
-        f"orca-session-triage: the hourly run at {at} was skipped (skipped_precheck) after this session's "
-        "last scan. Sweep before ending the turn, as references/hourly.md says under "
-        "\"While this session works on a request\".")}
+    return (f"orca-session-triage: the hourly run at {at} was skipped (skipped_precheck) after this session's "
+            "last scan. Sweep before ending the turn, as references/hourly.md says under "
+            "\"While this session works on a request\".")
 
 
 def main():

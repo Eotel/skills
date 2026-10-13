@@ -67,8 +67,8 @@ board's done cards; close what the user approves.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.
 - `references/hourly.md`: a run started as `/orca-session-triage hourly`,
-  setting up the Orca automation that starts it, or a skipped run the Stop
-  hook names.
+  setting up the Orca automation that starts it, or ending a turn of the
+  session the automation runs in.
 
 ## Done
 

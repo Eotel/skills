@@ -25,7 +25,9 @@ The precheck skips every run while this session works, so a long request
 leaves the board unswept. When the Stop hook names a skipped run, sweep before
 ending the turn: scan, ask every new question from the `waiting` rows, and
 wake the rows `next-step.md` says to wake. Leave the rest to the next
-scheduled run.
+scheduled run. Codex ignores the hook: there, before ending a turn, look for a
+`skipped_precheck` run since your last scan in
+`orca automations runs --id <id> --json`.
 
 ## The automation
 
