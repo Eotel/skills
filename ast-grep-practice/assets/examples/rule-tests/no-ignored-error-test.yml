@@ -4,6 +4,10 @@ valid:
       package main; func example() { data, err := f() }
   - |
       package main; func example() { _, value := 1, 2 }
+  - |
+      package main; func example() { value, _ := f(), 1 }
+  - |
+      package main; func example() { _, value := 1, f() }
 invalid:
   - |
       package main; func example() { data, _ := f() }

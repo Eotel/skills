@@ -15,5 +15,9 @@ rule:
         field: right
         has:
           kind: call_expression
-message: Review discarded call results and handle any errors.
-note: This detects discarded values, not their Go types.
+          nthChild: 1
+          not:
+            precedes:
+              regex: .
+message: Review discarded results from a single right-hand call.
+note: This example covers a single-call RHS only; it does not infer error types or align mixed RHS expressions.

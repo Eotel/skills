@@ -16,3 +16,5 @@ jobs:
         run: |
           npx --yes --package @ast-grep/cli@0.45.3 ast-grep test --config ast-grep-practice/assets/node-import/sgconfig.yml
           npx --yes --package @ast-grep/cli@0.45.3 ast-grep test --config ast-grep-practice/assets/examples/sgconfig.yml
+      - name: Snapshot coherence
+        run: npx --yes --package @ast-grep/cli@0.45.3 -c 'python3 ast-grep-practice/scripts/check_snapshots.py ast-grep-practice/assets/node-import ast-grep-practice/assets/examples'

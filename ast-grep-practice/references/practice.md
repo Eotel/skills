@@ -15,6 +15,19 @@ package-manager configuration and verified package metadata/checksums. A repo's
 alone does not make a substituted binary safe to run. Keep tool provisioning
 outside that repo until its configuration is trusted.
 
+Treat repository ast-grep configuration as executable too. Before any command
+that discovers or uses project configuration, review `sgconfig.yml`, especially
+`customLanguages.libraryPath` and referenced native libraries. In versions before
+0.50, those libraries load without an opt-in flag; a trusted binary alone does
+not isolate the target repository. See the
+[official native-library security note](https://ast-grep.github.io/blog/new-ver-50).
+
+For unfamiliar input, run from a trusted directory and pass a reviewed external
+`--config` explicitly, with the target repository as the scan path. The bundled
+Node preset is one such config; it declares no native libraries. A project's own
+config and custom parser remain outside this workflow until their code and
+provenance have been reviewed.
+
 Add a project-local dependency only when the project, its registry configuration,
 and lifecycle-script policy are trusted and dependency changes are in scope.
 Then follow `package.json`'s `packageManager`, use `@ast-grep/cli`, and use the same
@@ -580,7 +593,7 @@ ignores:
   - "src/bin/**"
 ```
 
-### Go: detect ignored errors
+### Go: review discarded results from a single call
 
 See the tested rule [no-ignored-error](../assets/examples/rules/no-ignored-error.yml) and its
 [valid/invalid fixtures](../assets/examples/rule-tests/no-ignored-error-test.yml).
@@ -642,3 +655,17 @@ files:
 - sgconfig: https://ast-grep.github.io/reference/sgconfig.html
 - Playground: https://ast-grep.github.io/playground.html
 - Rule catalog: https://ast-grep.github.io/catalog/
+
+## Snapshot coherence for bundled presets
+
+When maintaining the bundled presets, run
+[scripts/check_snapshots.py](../scripts/check_snapshots.py) from the skill root:
+
+```bash
+python3 scripts/check_snapshots.py assets/node-import assets/examples
+```
+
+It generates snapshots in isolation and compares them with the committed files,
+including obsolete records that `ast-grep test` may ignore. It never updates the
+baseline. When fixtures move from invalid to valid, regenerate the baseline from
+an empty snapshot directory with ast-grep and review the diff before committing.

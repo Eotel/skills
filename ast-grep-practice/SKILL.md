@@ -34,7 +34,8 @@ intended files. State any excluded syntax and false-positive assumptions.
 
 For an unfamiliar repository, use a tool installed outside it from a trusted
 source. Read the tool-provenance section of [references/practice.md](references/practice.md)
-before installing or executing a project-local binary.
+before installing or executing a project-local binary, or loading project
+configuration and native parser libraries.
 
 Preserve the repository's existing checks. Apply rewrites only within the
 requested scope; review changes that need imports or runtime context manually.
