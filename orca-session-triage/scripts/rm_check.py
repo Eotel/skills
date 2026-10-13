@@ -145,18 +145,51 @@ def main_checkout(worktree):
 BASE_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
 
 
+def ref_exists(worktree, ref):
+    return git(worktree, "rev-parse", "--verify", "--quiet", ref).returncode == 0
+
+
 def default_base(worktree):
     """The first existing remote default branch, or None when the repository has none."""
     for ref in BASE_CANDIDATES:
-        if git(worktree, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
+        if ref_exists(worktree, ref):
             return ref
     return None
+
+
+def start_base(worktree):
+    """The remote branch the checked-out branch was created from, read from its reflog, or None.
+
+    Orca and `git worktree add -b` record "branch: Created from origin/<base>", which names
+    where the work merges when that is not the remote's default branch. A branch started
+    from its own remote branch (origin/<same name>) holds pushed work, not merged work.
+    """
+    branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    if not branch:
+        return None
+    entries = git(worktree, "reflog", "show", "--format=%gs", "refs/heads/" + branch).stdout.splitlines()
+    created = entries[-1] if entries else ""
+    if not created.startswith("branch: Created from "):
+        return None
+    ref = created[len("branch: Created from "):].strip()
+    ref = ref[len("refs/remotes/"):] if ref.startswith("refs/remotes/") else ref
+    own = ref.split("/", 1)[-1] == branch
+    if own or ref.endswith("/HEAD") or not ref_exists(worktree, "refs/remotes/" + ref):
+        return None
+    return ref
+
+
+def pr_base(worktree, pr):
+    """origin/<the PR's base branch> when that ref exists: where the work merges."""
+    name = (pr or {}).get("baseRefName")
+    ref = "origin/%s" % name if name else None
+    return ref if ref and ref_exists(worktree, ref) else None
 
 
 def pull_request(worktree, number):
     """Return (pr, error): the PR's number/state/head, or why `gh` could not tell."""
     try:
-        out = subprocess.run(["gh", "pr", "view", str(number), "--json", "number,state,headRefOid"],
+        out = subprocess.run(["gh", "pr", "view", str(number), "--json", "number,state,headRefOid,baseRefName"],
                              cwd=worktree, capture_output=True, text=True, check=True).stdout
         return json.loads(out), None
     except subprocess.CalledProcessError as error:
@@ -178,7 +211,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worktree", required=True, help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
-    parser.add_argument("--base", help="ref that merged work must be in (default: origin/HEAD)")
+    parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD)")
     parser.add_argument("--pr", type=int, help="PR number; a MERGED PR whose head is HEAD counts as merged (squash merges)")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     args = parser.parse_args(argv)
@@ -189,15 +222,21 @@ def main(argv=None):
         print()
         return 2
     main = str(Path(args.main or main_checkout(worktree)).resolve())
-    base = args.base or default_base(worktree)
     pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
+    by_pr = pr_base(worktree, pr)
+    base = args.base or by_pr or start_base(worktree) or default_base(worktree)
     projects = [] if args.no_docker else compose_projects()
     result = check(worktree, main, base, projects or [], pr)
+    notes = []
     if pr_error:
         result["blockers"].append("PR #%d lookup failed: %s" % (args.pr, pr_error))
         result["ok"] = False
+    if not args.base and not by_pr and (pr or {}).get("baseRefName"):
+        notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr["baseRefName"]))
     if projects is None:
-        result["notes"] = ["docker compose unavailable: containers not checked"]
+        notes.append("docker compose unavailable: containers not checked")
+    if notes:
+        result["notes"] = notes
     json.dump({"worktree": worktree, "main": main, "base": base, **result}, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0 if result["ok"] else 1

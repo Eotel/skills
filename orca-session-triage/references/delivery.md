@@ -4,6 +4,10 @@
   titles and options come from the rollout. A request marked
   `answered_in_chat_later` was usually answered by a later user message: confirm
   before listing it. Put a recommended option first.
+- Before asking a decision that a verdict or final message leaves open, search
+  that lane's user messages for it. A final message that offers to change
+  course ("if you decide otherwise, I will fix the PR") reports a decision
+  already made: ask only the step still open, such as the merge.
 - Read each row's `done_cards` with its final message. What is left for the
   user (a decision, an approval, a login or check only they can do, a request
   they cut short) is a question in this pass, quoting what is left. A card with

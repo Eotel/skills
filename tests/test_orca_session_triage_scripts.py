@@ -1337,6 +1337,83 @@ class RmCheckTests(unittest.TestCase):
             code = rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--no-docker", *argv])
         return code, json.loads(out.getvalue())
 
+    def run_main_without_base(self, *argv, pr=None):
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "gh":
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(pr), stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        out = io.StringIO()
+        with patch.object(rmcheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
+            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker", *argv])
+        return code, json.loads(out.getvalue())
+
+    def remote_default_and_working_base(self):
+        """origin/HEAD -> origin/main at the first commit; origin/develop holds the worktree's commit."""
+        first = git(self.main, "rev-parse", "main")
+        git(self.main, "update-ref", "refs/remotes/origin/main", first)
+        git(self.main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        head = git(self.wt, "rev-parse", "HEAD")
+        git(self.main, "update-ref", "refs/remotes/origin/develop", head)
+        return head
+
+    def test_command_checks_against_the_base_branch_of_the_pr(self):
+        # A repository whose default branch is not where the work merges (cxc merges into feat/nature).
+        head = self.remote_default_and_working_base()
+        pr = {"number": 7, "state": "OPEN", "headRefOid": head, "baseRefName": "develop"}
+
+        default_code, default = self.run_main_without_base()
+        pr_code, by_pr = self.run_main_without_base("--pr", "7", pr=pr)
+
+        self.assertEqual((default_code, default["base"]), (1, "origin/HEAD"))
+        self.assertEqual((pr_code, by_pr["base"], by_pr["blockers"]), (0, "origin/develop", []))
+
+    def test_a_pr_base_branch_missing_locally_is_named_in_the_notes(self):
+        head = self.remote_default_and_working_base()
+        pr = {"number": 7, "state": "OPEN", "headRefOid": head, "baseRefName": "release"}
+
+        code, result = self.run_main_without_base("--pr", "7", pr=pr)
+
+        self.assertEqual((code, result["base"]), (1, "origin/HEAD"))
+        self.assertEqual(result["notes"], ["PR #7 base origin/release is not fetched: fetch it or pass --base"])
+
+    def test_command_checks_against_the_remote_branch_the_worktree_started_from(self):
+        first = git(self.main, "rev-parse", "main")
+        for ref in ("refs/remotes/origin/main", "refs/remotes/origin/develop"):
+            git(self.main, "update-ref", ref, first)
+        git(self.main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.wt = Path(self.tmp.name) / "topic"
+        git(self.main, "worktree", "add", "-q", "-b", "topic", str(self.wt), "refs/remotes/origin/develop")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        git(self.main, "update-ref", "refs/remotes/origin/develop", git(self.wt, "rev-parse", "HEAD"))
+
+        code, result = self.run_main_without_base()
+
+        self.assertEqual((code, result["base"], result["blockers"]), (0, "origin/develop", []))
+
+    def test_a_branch_started_from_its_own_remote_branch_is_not_its_base(self):
+        # `git worktree add -b topic <path> origin/topic`: pushed work is on the remote, not merged.
+        first = git(self.main, "rev-parse", "main")
+        for ref in ("refs/remotes/origin/main", "refs/remotes/origin/topic"):
+            git(self.main, "update-ref", ref, first)
+        git(self.main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.wt = Path(self.tmp.name) / "topic"
+        git(self.main, "worktree", "add", "-q", "-b", "topic", str(self.wt), "refs/remotes/origin/topic")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "work in progress")
+        head = git(self.wt, "rev-parse", "HEAD")
+        git(self.main, "update-ref", "refs/remotes/origin/topic", head)
+
+        code, result = self.run_main_without_base()
+
+        self.assertEqual((code, result["base"], result["blockers"]),
+                         (1, "origin/HEAD", ["HEAD %s is not in origin/HEAD" % head[:8]]))
+
     def test_command_finds_the_main_checkout_and_fails_when_blocked(self):
         (self.main / ".env").write_text("A=1\n")
         (self.wt / ".env").write_text("A=1\n")
