@@ -1785,11 +1785,11 @@ class WatchInboxTest(unittest.TestCase):
     def test_a_restarted_watch_prints_each_report_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             inbox = Path(tmp) / "inbox.jsonl"
-            inbox.write_text(json.dumps({"worktree": "a", "text": "first"}) + "\n")
+            inbox.write_text(json.dumps({"lane": "a", "text": "first"}) + "\n")
             lines, offset = watchinbox.read_new(inbox, 0)
             self.assertEqual(lines, ["[a] first"])
             with inbox.open("a") as handle:
-                handle.write(json.dumps({"worktree": "b", "text": "second"}) + "\n" + '{"worktree": "c", "te')
+                handle.write(json.dumps({"lane": "b", "text": "second"}) + "\n" + '{"lane": "c", "te')
             # A new watch starting from the saved offset sees only what arrived since, and
             # leaves the half-written line for the next pass.
             lines, offset = watchinbox.read_new(inbox, offset)
