@@ -41,6 +41,23 @@ Treat the loop as a product. Once you have _a_ loop, **tighten** it:
 
 A 30-second flaky loop is barely better than no loop; a 2-second deterministic one is tight, a debugging superpower.
 
+### Runtime and plugin initialization
+
+For a CLI or plugin startup failure, record the resolved executable path, runtime
+version, architecture, and distribution or build source. Check the plugin's
+supported host versions before changing the dependency tree.
+
+Hold the application and its dependencies fixed, then vary only the runtime
+binary. Compare builds with the same version when available; matching version
+strings do not establish that the binaries behave alike.
+
+Reduce native initialization to a failing probe and put that probe in the owning
+package's install check. Also exercise the affected interactive command: version
+and help flags can exit before initialization.
+
+Why: a native loader can depend on the runtime's generated machine code, so a
+version-compatible runtime can pass metadata checks and still fail at startup.
+
 ### Child-process and pipe failures
 
 Gate the child's trigger with IPC or an equivalent handshake. Register its exit
