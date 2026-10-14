@@ -13,7 +13,10 @@
   (seen 2026-10-13). Open the session page only when you need its own words.
 - A session that stops on a permission prompt waits for the user, and can
   expire while it waits (docs). Tell them at once which session and what it
-  asks; do not answer it for them.
+  asks; do not answer it for them. A session with no `claude/` branch an hour
+  after its launch is likely held on one: open its page. Seen 2026-10-14: an
+  `rm -rf` on a variable path, adding a repository to read, and an edit under
+  `.claude/`.
 
 ## When its PR appears
 

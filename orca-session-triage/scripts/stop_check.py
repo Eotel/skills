@@ -21,6 +21,8 @@ import sys
 
 STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
+# Skipped runs in a row after which the turn-end sweep does the whole triage: no scheduled run is cleaning up.
+WHOLE_TRIAGE_AFTER = 3
 
 
 def read_json(path):
@@ -74,24 +76,31 @@ def orca_result(orca, *args):
     return data.get("result", data)
 
 
-def skipped_run(orca, workspace, since_ms):
-    """Start (epoch ms) of the newest triage run for this workspace its precheck skipped after since_ms, or None.
+def skipped_runs(orca, workspace, since_ms):
+    """The newest triage run for this workspace its precheck skipped after since_ms, and the skips in a row up to now.
 
-    The session may run in a subdirectory of the workspace the automation names.
+    Returns (start in epoch ms, count), or (None, 0) when no run was skipped since. The session may run in a
+    subdirectory of the workspace the automation names.
     """
     here = Path(os.path.realpath(workspace))
-    newest = None
+    newest, in_a_row = None, 0
     for automation in orca_result(orca, "automations", "list")["automations"]:
         target = (automation.get("workspaceId") or "").split("::", 1)[-1]
         if not target or not here.is_relative_to(os.path.realpath(target)):
             continue
         if not (automation.get("prompt") or "").startswith(TRIAGE_PROMPT):
             continue
-        for run in orca_result(orca, "automations", "runs", "--id", automation["id"])["runs"]:
-            started = run.get("startedAt") or 0
-            if run.get("status") == "skipped_precheck" and started > max(since_ms, newest or 0):
-                newest = started
-    return newest
+        runs = sorted(orca_result(orca, "automations", "runs", "--id", automation["id"])["runs"],
+                      key=lambda run: run.get("startedAt") or 0, reverse=True)
+        skips = 0
+        for run in runs:
+            if run.get("status") != "skipped_precheck":
+                break
+            skips += 1
+        started = runs[0].get("startedAt") or 0 if skips else 0
+        if started > max(since_ms, newest or 0):
+            newest, in_a_row = started, skips
+    return newest, in_a_row
 
 
 def unswept(workspace, queue, orca):
@@ -100,16 +109,20 @@ def unswept(workspace, queue, orca):
         return None
     try:
         since_ms = datetime.fromisoformat(queue["generated_at"]).timestamp() * 1000
-        skipped = skipped_run(orca, workspace, since_ms)
+        skipped, in_a_row = skipped_runs(orca, workspace, since_ms)
         if skipped is None:
             return None
         at = datetime.fromtimestamp(skipped / 1000).astimezone().strftime("%H:%M")
     except (OSError, OverflowError, subprocess.SubprocessError, ValueError, LookupError, TypeError,
             AttributeError):
         return None
+    where = "as references/hourly.md says under \"While this session works on a request\"."
+    if in_a_row >= WHOLE_TRIAGE_AFTER:
+        return (f"orca-session-triage: the hourly triage skipped {in_a_row} runs in a row (skipped_precheck, the "
+                f"last at {at}), so no scheduled run is cleaning up. Run the whole triage before ending the turn, "
+                f"cleanup included, {where}")
     return (f"orca-session-triage: the hourly run at {at} was skipped (skipped_precheck) after this session's "
-            "last scan. Sweep before ending the turn, as references/hourly.md says under "
-            "\"While this session works on a request\".")
+            f"last scan. Sweep before ending the turn, {where}")
 
 
 def main():
