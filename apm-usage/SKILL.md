@@ -31,13 +31,9 @@ commit. Treat `--force` as an overwrite boundary, not as an update mechanism.
 
 ## Workflow
 
-1. Before changing package state, read the applicable `apm.yml`, lockfile, and
-   resolved targets.
-2. Confirm the installed CLI version and the exact command flags from `--help`.
-3. Run the narrow command that matches the requested outcome.
-4. Verify the resulting package, ref, and target using `apm deps list` and
-   `apm targets`; inspect the lockfile diff when it changed.
-5. Report any generated or deployed files separately from source changes.
+For an install or update, or when investigating what a client actually loads,
+read [references/deployment-verification.md](references/deployment-verification.md)
+for manifest reconciliation, targeted selection, and verification of deployed contents.
 
 Project lockfiles are normally committed. User-scope lockfiles may instead be
 managed by the user's dotfile system; use the `chezmoi-management` skill only
@@ -69,7 +65,7 @@ skill's own content and APM only for packaging, installation, and distribution.
 
 ## Completion
 
-Stop when the requested package state is visible in APM's inspection commands
-and the manifest/lockfile diff contains only the intended change. If APM's local
-help contradicts these instructions, follow the installed CLI and report the
-documentation drift.
+Stop when the intended published package contents are present at every requested
+resolved target and the manifest/lockfile diff contains only the intended change.
+If APM's local help contradicts these instructions, follow the installed CLI and
+report the documentation drift.
