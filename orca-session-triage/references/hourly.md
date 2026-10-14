@@ -25,8 +25,10 @@ The precheck skips every run while this session works, so a long request
 leaves the board unswept. When the Stop hook names a skipped run, sweep before
 ending the turn: scan, ask every new question from the `waiting` rows, and
 wake the rows `next-step.md` says to wake. Leave the rest to the next
-scheduled run. Codex ignores the hook: there, before ending a turn, look for a
-`skipped_precheck` run since your last scan in
+scheduled run, unless the hook says several runs in a row were skipped: then
+no scheduled run is cleaning up, so run the whole triage, cleanup included.
+Codex ignores the hook: there, before ending a turn, look for
+`skipped_precheck` runs since your last scan in
 `orca automations runs --id <id> --json`.
 
 ## The automation
@@ -48,6 +50,9 @@ orca automations create --name "session triage" --trigger hourly \
   workspace works, is blocked, or waits. A skipped run is recorded with the
   precheck's output (`orca automations runs --id <id> --json`). A manual
   `orca automations run` does not run the precheck.
+- Any agent in the triage workspace holds the run, not only the triage
+  session. A tab there that leads other lanes for hours skips every run (22 in
+  a row, seen 2026-10-13): keep such tabs in another workspace.
 - Orca runs the precheck through `/bin/sh` with the login `PATH`, but in the
   repo's main checkout rather than the workspace, so the command names the
   workspace.
