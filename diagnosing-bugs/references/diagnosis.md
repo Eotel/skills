@@ -132,6 +132,14 @@ Tool preference:
 
 **Tag every debug log** with a unique prefix, e.g. `[DEBUG-a4f2]`. Cleanup at the end becomes a single grep. Untagged logs survive; tagged logs die.
 
+**Timing-sensitive failures.** Record the trigger, run count, outcomes, and
+whether diagnostics were enabled. After removing instrumentation, repeat the
+trigger under ordinary launch settings. Preserve earlier failure artifacts and
+report unexplained differences between runs as unconfirmed.
+
+Why: diagnostic I/O and synchronization can change scheduling; a passing
+instrumented run alone does not establish that the original failure was fixed.
+
 **Perf branch.** For performance regressions, logs are usually wrong. Instead: establish a baseline measurement (timing harness, `performance.now()`, profiler, query plan), then bisect. Measure first, fix second.
 
 ## Phase 5: Fix + regression test
