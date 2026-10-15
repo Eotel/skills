@@ -1303,6 +1303,18 @@ class RmCheckTests(unittest.TestCase):
                          [".env (not in main checkout; values .env.example does not have: API_KEY, EXTRA)"])
         self.assertNotIn("from-the-vendor", json.dumps(with_values))
 
+    def test_an_env_with_a_multiline_value_stays_in_review_without_key_names(self):
+        (self.main / ".env.example").write_text('PORT=8000\nSIGNING_KEY="-----BEGIN KEY-----\nexample\n-----END KEY-----"\n')
+        git(self.main, "add", ".env.example")
+        git(self.main, "commit", "-q", "-m", "env example")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.wt / ".env").write_text('PORT=8001\nSIGNING_KEY="-----BEGIN KEY-----\nc2VjcmV0PQ==\n-----END KEY-----"\n')
+
+        result = self.check()
+
+        self.assertEqual((result["review"], result["regenerable"]), ([".env (not in main checkout)"], []))
+        self.assertNotIn("c2VjcmV0", json.dumps(result))
+
     def test_reports_compose_projects_defined_in_the_worktree(self):
         projects = [
             {"Name": "app-wt", "Status": "running(2)", "ConfigFiles": str(self.wt / "compose.yaml")},
