@@ -20,13 +20,19 @@ Run these per worktree, in order.
      outside the base still blocks, and a patch that the base later reverted
      still counts as in the base.
    - `review` lists ignored paths that are neither caches nor identical copies of
-     the main checkout. Open each one: per-worktree `.env` ports, generated
-     sources, and test output (screenshots, uploaded fixtures) are regenerable;
-     anything else (exports, reports, hand-written notes) goes back to the user
-     before removal.
+     the main checkout. Open each one: generated sources and test output
+     (screenshots, uploaded fixtures) are regenerable; anything else (exports,
+     reports, hand-written notes) goes back to the user before removal. A `.env`
+     entry names the keys whose values its `.env.example` lacks, never the
+     values: they may be the only copy of an API key. A scratch investigation
+     folder (`.investigate/` and the like) in a worktree the user chose to remove
+     moves next to the lane's brief and report, and the removal goes on without
+     another question.
    - `regenerable` lists generated sources and e2e output (`__generated__/`,
      `src/paraglide/`, `e2e/screenshots/`, `e2e/.state/`, `e2e/.auth/`): a setup
-     or a test run writes them again, so they do not hold up the removal.
+     or a test run writes them again, so they do not hold up the removal. Neither
+     does a `.env` that differs from its `.env.example` only in ports, which the
+     example and fresh ports rebuild.
    - `containers` lists docker compose projects defined inside the worktree.
 2. Stop those projects with `docker compose -p <project> down` from the worktree.
    Keep named volumes unless the user approved deleting them, and say which

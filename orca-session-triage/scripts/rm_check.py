@@ -6,6 +6,7 @@ import filecmp
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -19,6 +20,10 @@ CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
 REGENERABLE_PARTS = {"__generated__"}
 REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/")
+# A per-worktree .env may move these away from its .env.example and still be written again.
+ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
+ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def git(cwd, *args):
@@ -55,6 +60,42 @@ def holds_nothing(path):
     return path.is_dir() and all(holds_nothing(child) for child in path.iterdir())
 
 
+def env_values(path):
+    """KEY=value pairs, or None when a line is not one (a multiline value such as a PEM key):
+    its continuation lines would otherwise vanish or surface as key names."""
+    values = {}
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not ENV_KEY.fullmatch(key):
+            return None
+        if value[:1] in ("'", '"') and (len(value) < 2 or value[-1] != value[0]):
+            return None
+        values[key] = value
+    return values
+
+
+def env_keys_beyond_example(env):
+    """Keys whose values the .env.example beside `env` lacks, ports aside; None without an example.
+
+    Only key names are returned: the values may be API keys held nowhere else.
+    """
+    example = env.with_name(env.name + ".example")
+    if not example.is_file():
+        return None
+    expected, actual = env_values(example), env_values(env)
+    if expected is None or actual is None:
+        return None
+    return [key for key, value in actual.items()
+            if expected.get(key) != value
+            and key not in ENV_LOCAL_KEYS and not key.endswith(ENV_LOCAL_KEY_SUFFIXES)]
+
+
 def ignored_paths(worktree, main):
     """(review, regenerable): ignored paths that hold something and are neither caches nor
     copies of the main checkout, split into those to open and those a setup or test run writes again.
@@ -73,8 +114,16 @@ def ignored_paths(worktree, main):
             continue
         if is_regenerable(rel):
             regenerable.append(rel)
-        else:
-            review.append(rel + (" (not in main checkout)" if not copy.exists() else " (differs from main checkout)"))
+            continue
+        where = "not in main checkout" if not copy.exists() else "differs from main checkout"
+        if source.name == ".env" and source.is_file():
+            keys = env_keys_beyond_example(source)
+            if keys == []:
+                regenerable.append(rel)
+                continue
+            if keys:
+                where += "; values .env.example does not have: " + ", ".join(keys)
+        review.append("%s (%s)" % (rel, where))
     return review, regenerable
 
 
