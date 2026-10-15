@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Poll a re-read list of owner/repo#N PRs and persist event history as JSON."""
+"""Poll a re-read list of owner/repo#N PRs and persist event history as JSON.
+
+Events: merged or closed, CI result per head, conflicts, new reviews and comments,
+and each Codex review's status, which Codex edits into one summary comment.
+"""
 
 import argparse
 import json
@@ -12,6 +16,10 @@ import time
 
 SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
+# Codex edits one summary comment in place, so its review progress never arrives as a new comment.
+CODEX_MARKER = re.compile(r"<!--\s*(codex-review-state|codex-security-review):v1\s*(\{.*?\})\s*-->", re.S)
+# The visible table row, e.g. "| 📝 **Code Review** | ✅ **Completed** ... | `38e31d6` |".
+CODEX_ROW = re.compile(r"\*\*(Code|Security) Review\*\*\s*\|[^|]*?\*\*(\w+)\*\*[^|]*\|\s*`([0-9a-f]{7,40})`")
 
 
 def finished_checks(checks):
@@ -29,6 +37,31 @@ def finished_checks(checks):
         if result in FAILURE:
             failed.append(check.get("name") or check.get("context") or "?")
     return bool(checks), failed
+
+
+def codex_reviews(comments):
+    """Map each Codex review kind to (commit sha, status, has_any_findings) from its summary comment."""
+    reviews = {}
+    for item in comments:
+        if not (item.get("user") or {}).get("login", "").startswith("chatgpt-codex-connector"):
+            continue
+        for marker, raw in CODEX_MARKER.findall(item.get("body") or ""):
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                continue
+            if marker == "codex-review-state":
+                for kind in ("code_review", "security_review"):
+                    review = data.get(kind) or {}
+                    if review.get("status"):
+                        reviews[kind] = (review.get("commit_sha") or "", review["status"], review.get("has_any_findings"))
+            elif data.get("status"):
+                # This marker carries only the security review.
+                reviews.setdefault("security_review", (data.get("headSha") or "", data["status"], None))
+        # Without the state marker, the code review shows only in the table.
+        for review, status, sha in CODEX_ROW.findall(item.get("body") or ""):
+            reviews.setdefault(f"{review.lower()}_review", (sha, status.lower(), None))
+    return reviews
 
 
 def diff_events(spec, previous, snapshot, me):
@@ -85,6 +118,14 @@ def diff_events(spec, previous, snapshot, me):
             body = " ".join((item.get("body") or "").split())[:120]
             events.append(f"{spec} NEW {kind} by {who} {extra} :: {body}")
     state["seen"] = sorted(seen)
+    codex = dict(state.get("codex") or {})
+    for kind, (sha, status, findings) in sorted(codex_reviews(snapshot.get("comments") or []).items()):
+        signature = [sha, status, findings]
+        if codex.get(kind) != signature:
+            note = {True: ", findings", False: ", no findings"}.get(findings, "")
+            events.append(f"{spec} CODEX {kind} {status.upper()} (head {sha[:9]}{note})")
+        codex[kind] = signature
+    state["codex"] = codex
     return events, state
 
 
