@@ -439,6 +439,37 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(repeated, [])
         return events, state
 
+    def codex_summary(self, status, findings=None):
+        state = {"commit_sha": "a" * 40, "status": status, "has_any_findings": findings}
+        body = "<!-- codex-review-state:v1 " + json.dumps({"code_review": state, "security_review": state}) + " -->"
+        return [{"id": 7, "user": {"login": "chatgpt-codex-connector[bot]"}, "body": body}]
+
+    def test_codex_summary_edited_in_place_reports_each_review(self):
+        events, _ = self.transition(
+            self.snapshot(comments=self.codex_summary("running")),
+            self.snapshot(comments=self.codex_summary("completed", findings=False)),
+        )
+        self.assertEqual(sorted(events), [
+            "acme/api#12 CODEX code_review COMPLETED (head aaaaaaaaa, no findings)",
+            "acme/api#12 CODEX security_review COMPLETED (head aaaaaaaaa, no findings)",
+        ])
+
+    def test_codex_summary_table_reports_reviews_without_the_state_marker(self):
+        def summary(word):
+            marker = json.dumps({"headSha": "a" * 40, "status": word.lower()})
+            body = (
+                f"<!-- codex-security-review:v1 {marker} -->\n"
+                f"| 📝 **Code Review** | ✅ **{word}** <relative-time>x</relative-time> | `aaaaaaa` | New commits |\n"
+                f"| 🔒 **Security Review** | ✅ **{word}** | `aaaaaaa` | New commits |"
+            )
+            return [{"id": 7, "user": {"login": "chatgpt-codex-connector[bot]"}, "body": body}]
+
+        events, _ = self.transition(self.snapshot(comments=summary("Running")), self.snapshot(comments=summary("Completed")))
+        self.assertEqual(sorted(events), [
+            "acme/api#12 CODEX code_review COMPLETED (head aaaaaaa)",
+            "acme/api#12 CODEX security_review COMPLETED (head aaaaaaaaa)",
+        ])
+
     def test_success_and_failure_completion_events(self):
         for conclusion, word in (("SUCCESS", "SUCCESS"), ("FAILURE", "FAILURE")):
             with self.subTest(conclusion=conclusion):
