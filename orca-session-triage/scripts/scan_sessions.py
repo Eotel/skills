@@ -753,16 +753,33 @@ def load_verdicts(store_path):
 
 
 def classed_queue(session):
-    """{path: verdict} from a session directory whose result answers its own queue, else {}."""
+    """{path: verdict} from a session directory whose result answers its own queue, else {}.
+
+    Each verdict carries `queued_at`, when its queue was written, so a later read wins over an earlier one.
+    """
     queue, result = read_json_file(session / "review-queue.json"), read_json_file(session / "review-result.json")
     if not (isinstance(queue, dict) and isinstance(result, dict)
             and result.get("queue_generated_at") == queue.get("generated_at")):
         return {}
     read = {e["path"]: e.get("read") for e in queue.get("rows") or [] if isinstance(e, dict) and "path" in e}
-    return {v["path"]: {**{k: x for k, x in v.items() if k not in ("path", "read")}, "read": read[v["path"]]}
+    queued_at = str(queue.get("generated_at") or "")
+    return {v["path"]: {**{k: x for k, x in v.items() if k not in ("path", "read", "queued_at")},
+                        "read": read[v["path"]], "queued_at": queued_at}
             for v in result.get("rows") or []
             if isinstance(v, dict) and v.get("path") in read and v.get("class") in VERDICT_CLASSES
             and read[v["path"]] is not None}
+
+
+def newer_verdicts(verdicts, incoming):
+    """`verdicts` updated with each incoming verdict whose read is not older than the one it replaces.
+
+    A session directory keeps its last classed queue, so an old session's read is folded in on every
+    scan; it must not undo a later read of the same worktree that another session already stored.
+    """
+    def older(path, verdict):
+        held = verdicts.get(path)
+        return held is not None and str(verdict.get("queued_at") or "") < str(held.get("queued_at") or "")
+    return {**verdicts, **{path: v for path, v in incoming.items() if not older(path, v)}}
 
 
 def absorb_verdicts(store_path, write=True):
@@ -770,7 +787,7 @@ def absorb_verdicts(store_path, write=True):
     store = Path(os.path.expanduser(str(store_path)))
     verdicts = load_verdicts(store)
     for queue in sorted(store.parent.glob("*/review-queue.json"), key=lambda p: p.stat().st_mtime):
-        verdicts = {**verdicts, **classed_queue(queue.parent)}
+        verdicts = newer_verdicts(verdicts, classed_queue(queue.parent))
     if write:
         write_json_atomically(store, verdicts)
     return verdicts
