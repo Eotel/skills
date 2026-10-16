@@ -63,6 +63,8 @@ board's done cards; close what the user approves.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
 - `references/delivery.md`: batching questions and sending answers.
+- `references/coordination.md`: giving lanes work or a brief, and receiving their
+  reports without text landing in this tab.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.
