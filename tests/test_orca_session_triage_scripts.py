@@ -1808,9 +1808,25 @@ class VerdictStoreTests(unittest.TestCase):
         verdicts = scan.absorb_verdicts(self.store)
 
         self.assertEqual(verdicts, {"/w/old": {"read": "ko", "class": "finished"},
-                                    "/w/a": {"class": "blocked", "read": "ka"},
-                                    "/w/c": {"class": "finished", "read": "kc"}})
+                                    "/w/a": {"class": "blocked", "read": "ka", "queued_at": "g1"},
+                                    "/w/c": {"class": "finished", "read": "kc", "queued_at": "g2"}})
         self.assertEqual(json.loads(self.store.read_text()), verdicts)
+
+    def test_an_older_session_s_read_does_not_replace_a_newer_one_in_the_store(self):
+        self.write_session("old", "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "read": "k-old"}],
+                           "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "class": "blocked"}])
+        self.write_session("new", "2026-10-16T00:08:40+00:00", [{"path": "/w/a", "read": "k-new"}],
+                           "2026-10-16T00:08:40+00:00", [{"path": "/w/a", "class": "blocked"}])
+        os.utime(self.root / "old" / "review-queue.json", (1, 1))
+        self.assertEqual(scan.absorb_verdicts(self.store)["/w/a"]["read"], "k-new")
+
+        # The next scan found /w/a still as read, so the new session's queue no longer holds it.
+        (self.root / "new" / "review-queue.json").write_text(
+            json.dumps({"generated_at": "2026-10-16T01:08:40+00:00", "rows": []}))
+        (self.root / "new" / "review-result.json").write_text(
+            json.dumps({"queue_generated_at": "2026-10-16T01:08:40+00:00", "rows": []}))
+
+        self.assertEqual(scan.absorb_verdicts(self.store)["/w/a"]["read"], "k-new")
 
     def test_a_damaged_store_is_kept_aside_not_overwritten(self):
         self.store.write_text("[1, 2")
@@ -1818,7 +1834,7 @@ class VerdictStoreTests(unittest.TestCase):
 
         verdicts = scan.absorb_verdicts(self.store)
 
-        self.assertEqual(verdicts, {"/w/a": {"class": "blocked", "read": "ka"}})
+        self.assertEqual(verdicts, {"/w/a": {"class": "blocked", "read": "ka", "queued_at": "g1"}})
         self.assertEqual((self.root / "verdicts.json.bad").read_text(), "[1, 2")
 
 if __name__ == "__main__":
