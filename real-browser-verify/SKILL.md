@@ -41,7 +41,7 @@ functional path. A passing suite or loaded page proves a different claim.
 
 4. **Capture evidence**
    - Screenshot of the target screen post-operation (light/dark/mobile when the
-     change is visual).
+     change is visual; forced colors when changing a native control indicator).
    - Console errors and relevant network failures captured, not just eyeballed.
    - Completion reports must include the evidence; a narrative "verified working"
      without artifacts does not count.
