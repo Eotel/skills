@@ -8,14 +8,17 @@ verdicts to `review-result.json` beside it. While a queued row has no verdict
 for that same queue, the hook blocks the stop once and names the rows. It also
 blocks once when the hourly triage of this workspace skipped a run (its precheck
 saw this session busy) after this session's last scan, so the skipped sweep is
-done before the turn ends. A repeated stop (`stop_hook_active`) goes through, so
-a broken classifier cannot trap the session.
+done before the turn ends. It blocks once, too, while an artifact this session
+published is still watched live: Orca counts the tab as working while the watch
+runs, so the precheck skips every hourly run. A repeated stop
+(`stop_hook_active`) goes through, so a broken classifier cannot trap the session.
 """
 
 from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -23,6 +26,12 @@ STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
 # Skipped runs in a row after which the turn-end sweep does the whole triage: no scheduled run is cleaning up.
 WHOLE_TRIAGE_AFTER = 3
+# Kept in the session's state directory: how far the transcript was read and which artifacts are still watched.
+WATCH_STATE = "artifact-watches.json"
+# `liveSubscription` of an Artifact publish result that leaves a live watch running.
+LIVE_SUBSCRIPTIONS = ("arming", "connected")
+# Claude Code's notice that a watch ended on its own (connection lost, artifact not found).
+WATCH_LIFECYCLE = "<task-type>artifact-watch-lifecycle</task-type>"
 
 
 def read_json(path):
@@ -44,12 +53,77 @@ def decide(hook_input, state_dir, orca="orca"):
     if hook_input.get("stop_hook_active") or not hook_input.get("session_id"):
         return None
     session = Path(state_dir) / hook_input["session_id"]
+    # Every reason goes in the one block: the repeated stop goes through and checks nothing.
+    reasons = [watched(session, hook_input.get("transcript_path"))]
     queue = read_json(session / "review-queue.json")
-    if not isinstance(queue, dict):
-        return None
-    # Both reasons go in the one block: the repeated stop goes through and checks nothing.
-    reasons = [r for r in (unclassed(session, queue), unswept(hook_input.get("cwd"), queue, orca)) if r]
+    if isinstance(queue, dict):
+        reasons += [unclassed(session, queue), unswept(hook_input.get("cwd"), queue, orca)]
+    reasons = [r for r in reasons if r]
     return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
+
+
+def watched(session, transcript):
+    """Why to stay while an artifact this session published is still watched live, or None.
+
+    Reads only the transcript lines written since the last stop. An Artifact publish whose result has a live
+    subscription starts a watch; an ArtifactComments watch-stop result for the same URL, or Claude Code's notice
+    that the watch ended on its own, ends it.
+    """
+    if not transcript:
+        return None
+    state_file = session / WATCH_STATE
+    state = read_json(state_file)
+    if not isinstance(state, dict) or state.get("transcript") != transcript:
+        state = {}
+    offset = state.get("offset") if isinstance(state.get("offset"), int) else 0
+    kept = state.get("watched") if isinstance(state.get("watched"), list) else []
+    urls = dict.fromkeys(url for url in kept if isinstance(url, str))
+    try:
+        with open(transcript, "rb") as lines:
+            if os.fstat(lines.fileno()).st_size < offset:
+                offset, urls = 0, {}
+            lines.seek(offset)
+            for line in lines:
+                if not line.endswith(b"\n"):
+                    break  # still being written; read it at the next stop
+                offset += len(line)
+                if b'"liveSubscription"' in line or b'"unwatch"' in line or b"artifact-watch-lifecycle" in line:
+                    follow_watch(line, urls)
+    except OSError:
+        return None
+    try:
+        session.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps({"transcript": transcript, "offset": offset, "watched": list(urls)}))
+    except OSError:
+        pass  # the next stop reads the same lines again
+    if not urls:
+        return None
+    return ("orca-session-triage: a live watch still runs on " + ", ".join(urls) + ". Stop each with the "
+            "ArtifactComments tool (action:\"watch\", on:false, url:<that URL>) before ending the turn: a live "
+            "watch keeps Orca counting this tab as working, so the hourly run is skipped.")
+
+
+def follow_watch(line, urls):
+    """Add the URL a publish result starts watching to urls, or drop the one a watch-stop result or notice names."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(entry, dict):
+        return
+    notice = entry.get("attachment")
+    if isinstance(notice, dict) and isinstance(notice.get("prompt"), str) and WATCH_LIFECYCLE in notice["prompt"]:
+        for url in re.findall(r"Watch on (\S+) ended", notice["prompt"]):
+            urls.pop(url, None)
+        return
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict):
+        return
+    stopped = result.get("unwatch")
+    if isinstance(stopped, dict) and isinstance(stopped.get("url"), str):
+        urls.pop(stopped["url"], None)
+    elif result.get("liveSubscription") in LIVE_SUBSCRIPTIONS and isinstance(result.get("url"), str):
+        urls[result["url"]] = None
 
 
 def unclassed(session, queue):
