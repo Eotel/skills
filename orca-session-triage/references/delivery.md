@@ -19,6 +19,11 @@
   `unstarted` agent's task reuses its repository's established request form,
   found in that repository's earlier transcripts (for example
   `$ship <issue URL>`).
+- Before asking the user about a Backlog ticket or posting to it, run
+  `~/.cache/orca-briefs/bin/ticket-activity <KEY>` and drop the questions and
+  posts another tab already settled. On 2026-10-19 the triage asked about two
+  tickets and drafted a reply on a third that a lead tab in another workspace
+  had already settled.
 - Questions go stale within minutes. Right before sending, re-read each target
   session's latest message and composer and drop answers that no longer apply.
 - Send each answer as one line:

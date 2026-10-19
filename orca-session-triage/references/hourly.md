@@ -15,9 +15,12 @@ triage workspace. Run the triage as usual; this page covers what differs.
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
-- End the run with no background shell, monitor, or helper left. Orca counts
-  the session as working while one runs, and the precheck then skips every run
-  until it exits.
+- End the run with no background shell, monitor, helper, or artifact watch
+  left. Orca counts the session as working while one runs, and the precheck
+  then skips every run until it exits. Publishing an Artifact starts a live
+  watch (its result says `Live subscription: arming`): stop it right after
+  publishing with ArtifactComments `action: "watch"`, `on: false`, and the
+  artifact's `url`. The Stop hook names a watch still running.
 
 ## While this session works on a request
 

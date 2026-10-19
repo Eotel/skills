@@ -1585,6 +1585,30 @@ def automation_run(status, started):
     return {"status": status, "startedAt": int(datetime.fromisoformat(started).timestamp() * 1000)}
 
 
+def tool_result(content, result):
+    """A transcript entry holding a tool's result, as Claude Code writes it."""
+    return {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}]}, "toolUseResult": result}
+
+
+def published(url, live="arming"):
+    return tool_result(f"Published page.html at {url} (Version 1)\n\nLive subscription: {live} in the background",
+                       {"url": url, "liveSubscription": live})
+
+
+def unwatched(url):
+    return tool_result(f"Stopped watching {url}; republishes of it will no longer be reported in this session.",
+                       {"unwatch": {"url": url, "was_watching": True}})
+
+
+def watch_ended(url):
+    """Claude Code's notice that a watch ended on its own, as the connection kept failing."""
+    return {"type": "attachment", "attachment": {"type": "queued_command", "prompt": (
+        "<task-notification>\n<task-type>artifact-watch-lifecycle</task-type>\n"
+        f"<event>Watch on {url} ended — the live connection kept failing and reconnecting has stopped.</event>\n"
+        "</task-notification>")}}
+
+
 class StopCheckTests(unittest.TestCase):
     """The Stop hook keeps a triage turn open while its review queue is not classed."""
 
@@ -1605,10 +1629,12 @@ class StopCheckTests(unittest.TestCase):
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": at, "rows": [{"path": p, "class": "blocked"} for p in paths]}))
 
-    def check(self, active=False, cwd=None, orca="false"):
+    def check(self, active=False, cwd=None, orca="false", transcript=None):
         hook = {"session_id": "s1", "stop_hook_active": active}
         if cwd:
             hook["cwd"] = cwd
+        if transcript:
+            hook["transcript_path"] = str(transcript)
         return stopcheck.decide(hook, self.root, orca=orca)
 
     def fake_orca(self, automations, runs):
@@ -1739,6 +1765,34 @@ class StopCheckTests(unittest.TestCase):
         for failing in (str(self.root / "missing-orca"), "false"):
             with self.subTest(orca=failing):
                 self.assertIsNone(self.check(cwd="/w/triage", orca=failing))
+
+    def test_blocks_while_an_artifact_this_session_published_is_still_watched(self):
+        transcript = self.root / "session.jsonl"
+        write_jsonl(transcript, [published("https://claude.ai/artifact/A"),
+                                 published("https://claude.ai/artifact/B", live="flag_off")])
+
+        blocked = self.check(transcript=transcript)
+
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("https://claude.ai/artifact/A", blocked["reason"])
+        self.assertNotIn("artifact/B", blocked["reason"])
+        self.assertIn("ArtifactComments", blocked["reason"])
+        self.assertIsNone(self.check(active=True, transcript=transcript))
+
+        def append(entry):
+            with transcript.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+
+        append(user("a later turn that never stops the watch"))
+        self.assertEqual(self.check(transcript=transcript)["decision"], "block")
+        append(unwatched("https://claude.ai/artifact/A"))
+        self.assertIsNone(self.check(transcript=transcript))
+
+    def test_a_watch_that_ended_on_its_own_lets_the_turn_end(self):
+        transcript = self.root / "session.jsonl"
+        write_jsonl(transcript, [published("https://claude.ai/artifact/A"), watch_ended("https://claude.ai/artifact/A")])
+
+        self.assertIsNone(self.check(transcript=transcript))
 
     def test_a_damaged_queue_or_result_lets_the_turn_end(self):
         (self.dir / "review-queue.json").write_text(json.dumps({"generated_at": "g", "rows": [{"nopath": 1}]}))
