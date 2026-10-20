@@ -26,6 +26,10 @@
   had already settled.
 - Questions go stale within minutes. Right before sending, re-read each target
   session's latest message and composer and drop answers that no longer apply.
+- Before relaying a lane's question to the user, write one concrete example: who
+  uses which screen, does what, and what happens. If the lane's question cannot
+  support that example, return it to the lane for a clearer question before
+  asking the user.
 - Send each answer as one line:
   `orca terminal send --terminal <handle> --text "<answer>" --enter --wait-submit 15 --json`.
   It landed when `result.send.prompt.stages` contains `turn_started`. A busy
