@@ -30,6 +30,15 @@
   uses which screen, does what, and what happens. If the lane's question cannot
   support that example, return it to the lane for a clearer question before
   asking the user.
+- A null `handle` on a done card can mean its tab is asleep or no live tab can
+  be assigned to it uniquely. Check the worktree's agent terminals and
+  transcript first.
+  Use a live terminal only when it clearly belongs to that session. If no tab
+  of that agent type is live, reopen the same session in its worktree using the
+  transcript's session ID and the resume command in `cleanup.md`, then ask it
+  to rewrite the question. If tab ownership remains ambiguous or the session
+  cannot be reopened, report a blocked next step with the reason; keep the
+  unclear question out of the user's decision list.
 - Send each answer as one line:
   `orca terminal send --terminal <handle> --text "<answer>" --enter --wait-submit 15 --json`.
   It landed when `result.send.prompt.stages` contains `turn_started`. A busy
