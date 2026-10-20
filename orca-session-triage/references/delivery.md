@@ -30,6 +30,11 @@
   uses which screen, does what, and what happens. If the lane's question cannot
   support that example, return it to the lane for a clearer question before
   asking the user.
+- If that lane's done card has a null handle, its tab is asleep. Reopen the same
+  session in its worktree using the transcript's session ID and the resume
+  command in `cleanup.md`, then ask it to rewrite the question. If the session
+  cannot be reopened, report a blocked next step with the reason; keep the
+  unclear question out of the user's decision list.
 - Send each answer as one line:
   `orca terminal send --terminal <handle> --text "<answer>" --enter --wait-submit 15 --json`.
   It landed when `result.send.prompt.stages` contains `turn_started`. A busy
