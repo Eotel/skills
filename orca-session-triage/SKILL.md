@@ -35,7 +35,8 @@ board's done cards; close what the user approves.
   latest message before you ask it; when that message settled it, rewrite the
   comment without the marker so other tabs stop listing it. Each row lists its
   `done_cards`, one per agent Orca shows
-  as done: the `handle` that closes its tab (null while the tab sleeps),
+  as done: the `handle` that closes its tab (null while the tab sleeps or
+  no live tab can be assigned to it uniquely),
   whether the user `interrupted` it, the `prompt` it last got, and Orca's copy
   of its last message. The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A

@@ -97,9 +97,13 @@ are empty), then:
 - A lead whose helper still works, and a session with the user's draft in its
   composer, stay: report each with that reason.
 
-A null `handle` is a sleeping tab. `orca terminal close --worktree path:<path>
---all --json` retires every tab of that worktree, shells included: use it when
-the worktree's live tabs are all in `closable`, and otherwise report the card
-as asleep. A card whose worktree is removed goes with it; what it left for the
-user is still a question. Confirm each closed card is gone from its worktree's
-`agents` in `orca worktree ps --json`.
+A null `handle` means the tab is asleep or no live tab can be assigned to the
+card uniquely. Check the worktree's agent terminals and transcript before
+closing.
+If ownership remains ambiguous, keep the card and report why. If no tab of
+that agent type is live, `orca terminal close --worktree path:<path> --all --json`
+retires every tab of that worktree, shells included: use it when the worktree's
+live tabs are all in `closable`, and otherwise report the card as asleep. A
+card whose worktree is removed goes with it; what it left for the user is still
+a question. Confirm each closed card is gone from its worktree's `agents` in
+`orca worktree ps --json`.
