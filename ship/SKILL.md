@@ -29,16 +29,16 @@ turn.
 6. **Clear remote gates.** Monitor required checks to green. Diagnose and fix
    failures caused by the change, then rerun the affected local check before
    pushing again.
-7. **Resolve review.** Collect all current review comments, address valid findings,
-   and respond with evidence when a finding does not apply. Recheck comments and
-   CI after updates.
+7. **Resolve review.** When the PR is open, follow
+   [review completion](references/review-completion.md).
 
 ## Completion boundary
 
 Shipping is complete when the requested outcome holds in the relevant
-environment, required CI is green, and no required review comment remains
-unresolved. Report blocked real-environment or production verification
-separately; do not substitute a mock or weaker check.
+environment, required CI is green, configured automated reviews have finished
+on the current head, and no required review feedback remains unresolved.
+Report blocked real-environment or production verification separately; do not
+substitute a mock or weaker check.
 
 Opening a PR is authorized by the ship request. Merge, close, production writes,
 and destructive cleanup still require explicit user authorization.
