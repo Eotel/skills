@@ -30,8 +30,9 @@ turn.
    failures caused by the change, then rerun the affected local check before
    pushing again.
 7. **Resolve review.** Collect all current review comments, address valid findings,
-   and respond with evidence when a finding does not apply. Recheck comments and
-   CI after updates.
+   and respond with evidence when a finding does not apply. Before merge, wait
+   for configured automated reviews on the current head to finish, then recheck
+   unresolved threads and CI.
 
 ## Completion boundary
 
