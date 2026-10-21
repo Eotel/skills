@@ -894,6 +894,8 @@ def parse_args(argv=None):
                              "message without a verdict for it yet, and a stalled row whose own PR merged) to this "
                              "JSON file, for orca-row-classify; verdicts already written for any session's queue "
                              "beside the store are kept in --verdicts first")
+    parser.add_argument("--summary", action="store_true",
+                        help="print class counts, review queue rows, and finished worktree/tab counts instead of JSON")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
                         help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
     return parser.parse_args(argv)
@@ -905,6 +907,22 @@ def write_review_queue(path, rows, verdicts=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "rows": review_queue(rows, verdicts)}
     write_json_atomically(target, payload)
+
+
+def print_summary(rows, verdicts):
+    counts = {}
+    for row in rows:
+        counts[row["class"]] = counts.get(row["class"], 0) + 1
+    print("classes: " + ", ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+    queue = review_queue(rows, verdicts)
+    print(f"review queue: {len(queue)}")
+    for row in queue:
+        print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
+    finished = [row for row in rows if row["class"] == "finished"
+                or (row.get("verdict") or {}).get("class") == "finished"]
+    print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
+    for row in finished:
+        print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
 
 
 def main(argv=None):
@@ -926,8 +944,11 @@ def main(argv=None):
     rows = with_verdicts(rows, verdicts)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts)
-    json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
-    print()
+    if args.summary:
+        print_summary(rows, verdicts)
+    else:
+        json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
+        print()
     return 0
 
 

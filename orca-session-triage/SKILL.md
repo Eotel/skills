@@ -18,7 +18,8 @@ board's done cards; close what the user approves.
 
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus
   Claude and Codex transcripts, lists the tabs it could close (`closable`), and
-  gives each `stalled`, `unsure`, and `waiting` row its `git` and `pr` state. Jev
+  gives each `stalled`, `unsure`, and `waiting` row its `git` and `pr` state.
+  `--summary` prints class counts, review rows, and finished worktree/tab counts. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
   reads each idle worktree's newest final message and returns `jev`: `asks`,
   the probability that it waits on the user (0.7 or more is `waiting`), and

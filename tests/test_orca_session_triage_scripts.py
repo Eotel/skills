@@ -1020,6 +1020,26 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(written["rows"][0]["claude"]["final_text"], "PR を出しました。")
         self.assertTrue(written["generated_at"])
 
+    def test_summary_lists_review_rows_and_finished_worktree_tabs(self):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [
+            worktree("/w/idle", "done"), worktree("/w/finished", "done", status="completed")]}}))
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [
+            terminal("/w/idle", "claude", "t1"), terminal("/w/finished", "shell", "t2"),
+            terminal("/w/finished", "shell", "t3")]}}))
+        claude = self.dir / "claude"
+        write_jsonl(scan.claude_project_dir(claude, "/w/idle") / "s.jsonl",
+                    [user("go"), assistant(text("PR を出しました。"))])
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = scan.main(["--ps-json", str(ps), "--terminals-json", str(terms),
+                              "--claude-projects", str(claude), "--codex-sessions", str(self.dir / "none"),
+                              "--jev-key-file", str(self.dir / "no-key"), "--summary"])
+        self.assertEqual(code, 0)
+        self.assertIn("review queue: 1\n  app/idle [unsure]", out.getvalue())
+        self.assertIn("finished: 1 worktrees, 2 tabs\n  app/finished (2 tabs)", out.getvalue())
+
     def test_reads_the_orchestration_mailbox_from_json_files(self):
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/lead", "done")]}}))
@@ -1502,6 +1522,23 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("skip: an agent in /w/triage is working (a background job after its turn)", out)
 
+    def test_watch_inbox_alone_leaves_the_workspace_idle(self):
+        job = ("/bin/zsh -c eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'",
+               ["python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset"])
+        with patch.object(precheck, "background_jobs", return_value=[job]):
+            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+        self.assertEqual(code, 0)
+        self.assertIn("run: no agent", out)
+
+    def test_another_background_job_still_skips_the_run(self):
+        watch = ("eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'",
+                 ["python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset"])
+        other = ("eval 'sleep 100'", ["sleep 100"])
+        with patch.object(precheck, "background_jobs", return_value=[watch, other]):
+            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+        self.assertEqual(code, 1)
+        self.assertIn("background job", out)
+
     def test_runs_when_the_workspace_agents_are_done_whatever_other_worktrees_do(self):
         code, out = self.run_precheck([worktree("/w/triage", "done"), worktree("/w/lane", "waiting")])
 
@@ -1629,13 +1666,14 @@ class StopCheckTests(unittest.TestCase):
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": at, "rows": [{"path": p, "class": "blocked"} for p in paths]}))
 
-    def check(self, active=False, cwd=None, orca="false", transcript=None):
+    def check(self, active=False, cwd=None, orca="false", transcript=None, watch_running=True):
         hook = {"session_id": "s1", "stop_hook_active": active}
         if cwd:
             hook["cwd"] = cwd
         if transcript:
             hook["transcript_path"] = str(transcript)
-        return stopcheck.decide(hook, self.root, orca=orca)
+        with patch.object(stopcheck, "inbox_watch_running", return_value=watch_running):
+            return stopcheck.decide(hook, self.root, orca=orca)
 
     def fake_orca(self, automations, runs):
         """An Orca CLI that answers `automations list` and `automations runs --id <id>`."""
@@ -1701,6 +1739,24 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("skipped", blocked["reason"])
         self.assertIn("references/hourly.md", blocked["reason"])
         self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
+
+    def test_warns_when_the_triage_tab_has_no_inbox_monitor(self):
+        self.queue()
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": []})
+        reason = self.check(cwd="/w/triage", orca=orca, watch_running=False)["reason"]
+        self.assertIn("watch-inbox", reason)
+        self.assertIn("~/.cache/orca-briefs/offsets/", reason)
+        self.assertIsNone(self.check(cwd="/w/triage", orca=orca, watch_running=True))
+
+    def test_inbox_monitor_must_have_a_live_child_in_this_session(self):
+        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s1\\012eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'\n"
+                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset\n")
+        with patch.object(stopcheck.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, commands)):
+            self.assertTrue(stopcheck.inbox_watch_running("s1"))
+            self.assertFalse(stopcheck.inbox_watch_running("s2"))
+        with patch.object(stopcheck.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, commands.splitlines()[0] + "\n")):
+            self.assertFalse(stopcheck.inbox_watch_running("s1"))
 
     def test_asks_for_the_whole_triage_when_several_runs_in_a_row_were_skipped(self):
         self.queue(at="2026-10-13T02:30:00+00:00")
