@@ -1,5 +1,7 @@
 # Batching questions and sending answers
 
+- Before showing Miura a file for business users, check it against the current
+  acceptance criteria for those files.
 - Quote each `waiting` session's question from its transcript; Codex request
   titles and options come from the rollout. A request marked
   `answered_in_chat_later` was usually answered by a later user message: confirm
