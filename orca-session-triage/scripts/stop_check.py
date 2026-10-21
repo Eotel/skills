@@ -10,8 +10,8 @@ blocks once when the hourly triage of this workspace skipped a run (its precheck
 saw this session busy) after this session's last scan, so the skipped sweep is
 done before the turn ends. It blocks once, too, while an artifact this session
 published is still watched live: Orca counts the tab as working while the watch
-    runs, so the precheck skips every hourly run. A missing inbox Monitor is
-    named only when no tab in the workspace owns one. A repeated stop
+runs, so the precheck skips every hourly run. A missing inbox Monitor is named
+when no tab in the workspace owns an unfiltered watch. A repeated stop
 (`stop_hook_active`) goes through, so a broken classifier cannot trap the session.
 """
 
@@ -161,7 +161,7 @@ def triage_automations(orca, workspace):
 
 
 def inbox_watch_running(session_id, workspace=None):
-    """A live watch in this session, or one held by another tab in this workspace."""
+    """A live unfiltered watch in this session or another tab in this workspace."""
     lines = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,command="], capture_output=True,
                            text=True, check=True, timeout=10).stdout.splitlines()
     processes = {}
@@ -176,7 +176,8 @@ def inbox_watch_running(session_id, workspace=None):
         if not re.search(r"(?:^|/)watch-inbox(?:\s|$)", command):
             continue
         children = [child for parent, child in processes.values()
-                    if parent == pid and re.search(r"(?:^|/)watch-inbox(?:\s|$)", child)]
+                    if parent == pid and re.search(r"(?:^|/)watch-inbox(?:\s|$)", child)
+                    and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
         if not children:
             continue
         if (f"CLAUDE_CODE_SESSION_ID={session_id}" in command
@@ -205,8 +206,8 @@ def missing_inbox_watch(workspace, session_id, orca):
             return None
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return None
-    return ("orca-session-triage: no triage inbox watch is running in this workspace. "
-            "Run ~/.cache/orca-briefs/bin/watch-inbox in Monitor with its offset file under "
+    return ("orca-session-triage: no unfiltered triage inbox watch is running in this workspace. "
+            "Run ~/.cache/orca-briefs/bin/watch-inbox without --only in Monitor with its offset file under "
             "~/.cache/orca-briefs/offsets/.")
 
 

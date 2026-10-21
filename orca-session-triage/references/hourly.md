@@ -1,9 +1,10 @@
 # Hourly run
 
 An Orca automation starts `/orca-session-triage hourly` every hour in the
-triage workspace. The tab already running `watch-inbox` there with an offset
-under `~/.cache/orca-briefs/offsets/` leads triage. If no tab owns that watch,
-this run leads.
+triage workspace. The tab already running `watch-inbox` there without `--only`
+and with an offset under `~/.cache/orca-briefs/offsets/` leads triage. A
+`--only` watch receives reports for selected lanes; it does not appoint a lead.
+If no tab owns the unfiltered watch, this run leads.
 
 ## In the run
 

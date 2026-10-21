@@ -533,8 +533,10 @@ def summarize_pr(data, reviews=()):
     for check in data.get("statusCheckRollup") or []:
         key = (check.get("conclusion") or check.get("state") or check.get("status") or "UNKNOWN").upper()
         checks[key] = checks.get(key, 0) + 1
+    author = (data.get("author") or {}).get("login")
     human_reviews = [r for r in reviews if (r.get("user") or {}).get("type") == "User"
-                     and (r.get("user") or {}).get("login") and r.get("submitted_at")]
+                     and (r.get("user") or {}).get("login") and r.get("submitted_at")
+                     and (not author or r["user"]["login"].casefold() != author.casefold())]
     latest = max(human_reviews, key=lambda r: r["submitted_at"], default=None)
     return {
         "number": data.get("number"), "url": data.get("url"), "state": data.get("state"),
@@ -550,7 +552,7 @@ def summarize_pr(data, reviews=()):
     }
 
 
-PR_FIELDS = ("number,url,state,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
+PR_FIELDS = ("number,url,state,author,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
              "mergeStateStatus,mergedAt,statusCheckRollup")
 
 

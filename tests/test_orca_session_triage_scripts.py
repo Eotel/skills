@@ -806,6 +806,14 @@ class NextStepFactTests(unittest.TestCase):
                          {"author": "reviewer", "state": "CHANGES_REQUESTED",
                           "submitted_at": "2026-10-21T02:00:00Z"})
 
+    def test_pr_authors_comment_is_not_an_external_review(self):
+        review = {"user": {"login": "author", "type": "User"}, "state": "COMMENTED",
+                  "submitted_at": "2026-10-21T07:39:59Z"}
+
+        pr = scan.summarize_pr({"number": 42, "author": {"login": "author"}}, [review])
+
+        self.assertIsNone(pr["latest_human_review"])
+
     def test_gh_pr_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
         pr = subprocess.CompletedProcess([], 0, '{"number": 42, "state": "OPEN"}')
         reviews = subprocess.CompletedProcess([], 0, json.dumps([[{
@@ -1795,6 +1803,25 @@ class StopCheckTests(unittest.TestCase):
                 patch.object(stopcheck.subprocess, "run", side_effect=process):
             self.assertIsNone(stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
             self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/other", "s1", "orca"))
+
+    def test_another_tabs_only_watch_does_not_replace_the_triage_watch(self):
+        offset = Path.home() / ".cache/orca-briefs/offsets/only-one-lane.offset"
+        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
+                    f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020'\n"
+                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020\n")
+
+        def process(command, **kwargs):
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(command, 0, commands)
+            if command[0] == "lsof":
+                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
+            self.fail(command)
+
+        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
+                patch.object(stopcheck.subprocess, "run", side_effect=process):
+            reason = stopcheck.missing_inbox_watch("/w/triage", "s1", "orca")
+            self.assertIsNotNone(reason)
+            self.assertIn("watch-inbox", reason)
 
     def test_no_tabs_inbox_monitor_still_needs_a_notice(self):
         with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
