@@ -17,7 +17,7 @@ starting a watch or changing the workspace comment.
 
 When this run leads:
 
-- If `~/.cache/orca-briefs/bin/backlog-watch` exists, run it and include new notices and issues awaiting your reply in the hourly report.
+- Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
 - Ask with AskUserQuestion and set the triage workspace's Orca comment to
   「要判断: …」. The open question holds the session, and later runs skip until
   the user answers, so each question is asked once.
