@@ -1,9 +1,20 @@
 # Hourly run
 
 An Orca automation starts `/orca-session-triage hourly` every hour in the
-triage workspace. Run the triage as usual; this page covers what differs.
+triage workspace. The tab already running `watch-inbox` there with an offset
+under `~/.cache/orca-briefs/offsets/` leads triage. If no tab owns that watch,
+this run leads.
 
 ## In the run
+
+When another tab leads, scan and review the rows, then do only the cleanup
+allowed before a user choice by the Boundary and `cleanup.md`. Send questions
+and instructions for other lanes to the lead in one `triage-notify --kind ask`
+message, including any cleanup done. With nothing to hand off, report cleanup
+with `--kind info`. The lead asks the user and directs the lanes. End without
+starting a watch or changing the workspace comment.
+
+When this run leads:
 
 - Ask with AskUserQuestion and set the triage workspace's Orca comment to
   「要判断: …」. The open question holds the session, and later runs skip until
@@ -15,7 +26,7 @@ triage workspace. Run the triage as usual; this page covers what differs.
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
-- Keep only the `watch-inbox` Monitor running after the turn; put its offset under
+- Keep `watch-inbox` running in Monitor after the turn, with its offset under
   `~/.cache/orca-briefs/offsets/`. Other background jobs make the precheck skip
   hourly runs. Publishing an Artifact starts a live
   watch (its result says `Live subscription: arming`): stop it right after
@@ -24,12 +35,13 @@ triage workspace. Run the triage as usual; this page covers what differs.
 
 ## While this session works on a request
 
-The precheck skips every run while this session works, so a long request
-leaves the board unswept. When the Stop hook names a skipped run, sweep before
+The precheck skips every run while the lead works, so a long request leaves the
+board unswept. When the Stop hook names a skipped run, the lead sweeps before
 ending the turn: scan, ask every new question from the `waiting` rows, and
 wake the rows `next-step.md` says to wake. Leave the rest to the next
 scheduled run, unless the hook says several runs in a row were skipped: then
 no scheduled run is cleaning up, so run the whole triage, cleanup included.
+When another tab leads, scan and hand off as described above.
 Codex ignores the hook: there, before ending a turn, look for
 `skipped_precheck` runs since your last scan in
 `orca automations runs --id <id> --json`.

@@ -58,8 +58,9 @@ board's done cards; close what the user approves.
   lane with `next_step`, `done_unmerged` is a review-or-merge choice, and
   `finished` goes to `cleanup.md`. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
-  `verdict` until that row's final message changes; act on it the same way in
-  every run. A Stop hook keeps the turn open while a queued row has no verdict.
+  `verdict` until its final message, PR, latest human review, or tree changes;
+  act on it the same way in every run. A Stop hook keeps the turn open while a
+  queued row has no verdict.
   Codex ignores the fork, the model, and the hook: there, follow
   `orca-row-classify` in this session with that directory.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
@@ -81,6 +82,8 @@ sent answer or step reached `turn_started` or is reported as queued, every done
 card is closed, asked about, or reported with the reason it stays, each
 approved or left-behind worktree is gone from `orca worktree ps` and from disk,
 and each approved tab is gone from `orca terminal list`.
+When another tab in the hourly workspace owns the inbox watch, completion is
+the scan, permitted cleanup, and any handoff in `references/hourly.md`.
 
 ## Boundary
 
@@ -98,3 +101,5 @@ and each approved tab is gone from `orca terminal list`.
   another lane's result ("when A settles it, give B the task") goes to B once
   A reports it.
 - Relay answers verbatim; the session answers the user's follow-up questions.
+- In an hourly run, the tab that owns the inbox watch directs the lanes;
+  `references/hourly.md` bounds the other tab's work.
