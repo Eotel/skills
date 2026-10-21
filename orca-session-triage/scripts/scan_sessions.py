@@ -527,12 +527,17 @@ def git_state(path):
     }
 
 
-def summarize_pr(data):
+def summarize_pr(data, reviews=()):
     """Reduce `gh pr view --json` output to what decides a stalled worktree's next step."""
     checks = {}
     for check in data.get("statusCheckRollup") or []:
         key = (check.get("conclusion") or check.get("state") or check.get("status") or "UNKNOWN").upper()
         checks[key] = checks.get(key, 0) + 1
+    author = (data.get("author") or {}).get("login")
+    human_reviews = [r for r in reviews if (r.get("user") or {}).get("type") == "User"
+                     and (r.get("user") or {}).get("login") and r.get("submitted_at")
+                     and (not author or r["user"]["login"].casefold() != author.casefold())]
+    latest = max(human_reviews, key=lambda r: r["submitted_at"], default=None)
     return {
         "number": data.get("number"), "url": data.get("url"), "state": data.get("state"),
         "head": data.get("headRefName"), "head_oid": data.get("headRefOid"),
@@ -541,11 +546,13 @@ def summarize_pr(data):
         # GitHub reports a deleted account's review with a null author, shown as "ghost".
         "reviews": [((r.get("author") or {}).get("login") or "ghost") + ":" + r.get("state", "")
                     for r in data.get("latestReviews") or []],
+        "latest_human_review": {"author": latest["user"]["login"], "state": latest["state"],
+                                "submitted_at": latest["submitted_at"]} if latest else None,
         "merge_state": data.get("mergeStateStatus"), "merged_at": data.get("mergedAt"), "checks": checks,
     }
 
 
-PR_FIELDS = ("number,url,state,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
+PR_FIELDS = ("number,url,state,author,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
              "mergeStateStatus,mergedAt,statusCheckRollup")
 
 
@@ -554,7 +561,17 @@ def gh_pr(slug, ref):
     try:
         out = subprocess.run(["gh", "pr", "view", str(ref), "-R", slug, "--json", PR_FIELDS],
                              capture_output=True, text=True, timeout=30)
-        return summarize_pr(json.loads(out.stdout)) if out.returncode == 0 else None
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout)
+        try:
+            reviews = subprocess.run(["gh", "api", "--paginate", "--slurp",
+                                      f"repos/{slug}/pulls/{data['number']}/reviews"],
+                                     capture_output=True, text=True, timeout=30)
+            pages = json.loads(reviews.stdout) if reviews.returncode == 0 else []
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError):
+            pages = []
+        return summarize_pr(data, [review for page in pages for review in page])
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
 
@@ -683,16 +700,16 @@ def row_final_at(row):
 
 
 def read_key(row):
-    """What a careful read of the row saw: its final message, its PR, and its tree. None without a message.
+    """What a careful read saw: final message, PR, latest human review, and tree. None without a message.
 
-    A verdict holds only while this key is unchanged, so a merge, a new push, or
-    new uncommitted work sends the row back for another read.
+    A verdict holds only while this key is unchanged.
     """
     final_at = row_final_at(row)
     if final_at is None:
         return None
     pr, git = row.get("pr") or {}, row.get("git") or {}
-    return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"), git.get("dirty")])
+    return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
+                       pr.get("latest_human_review"), git.get("dirty")])
 
 
 def current_verdict(row, verdicts):
@@ -708,7 +725,7 @@ def review_queue(rows, verdicts=None):
     Jev reads a final message fast and shallow, so every row it judged from one
     (unsure, stalled, or waiting) is queued, and so is a stalled row whose own PR
     merged although its message did not say it was done. A row keeps the verdict
-    orca-row-classify gave it while its message, PR, and tree stay as read, so
+    orca-row-classify gave it while its message, PR, review, and tree stay as read, so
     only new or changed rows are read again.
     """
     verdicts = verdicts or {}

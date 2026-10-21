@@ -786,8 +786,46 @@ class NextStepFactTests(unittest.TestCase):
             "number": 11263, "url": "https://github.com/acme/app/pull/11263", "state": "OPEN",
             "head": "fix-a", "head_oid": "abc123", "review": "APPROVED",
             "requested": ["k-mizokami", "backend"], "reviews": ["hdknr:APPROVED", "ghost:COMMENTED"],
+            "latest_human_review": None,
             "merge_state": "CLEAN", "merged_at": None,
             "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
+
+    def test_latest_human_review_ignores_newer_bot_reviews(self):
+        reviews = [
+            {"user": {"login": "reviewer", "type": "User"}, "state": "APPROVED",
+             "submitted_at": "2026-10-21T01:00:00Z"},
+            {"user": {"login": "review-bot[bot]", "type": "Bot"}, "state": "COMMENTED",
+             "submitted_at": "2026-10-21T04:00:00Z"},
+            {"user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
+             "submitted_at": "2026-10-21T02:00:00Z"},
+        ]
+
+        pr = scan.summarize_pr({"number": 42}, reviews)
+
+        self.assertEqual(pr["latest_human_review"],
+                         {"author": "reviewer", "state": "CHANGES_REQUESTED",
+                          "submitted_at": "2026-10-21T02:00:00Z"})
+
+    def test_pr_authors_comment_is_not_an_external_review(self):
+        review = {"user": {"login": "author", "type": "User"}, "state": "COMMENTED",
+                  "submitted_at": "2026-10-21T07:39:59Z"}
+
+        pr = scan.summarize_pr({"number": 42, "author": {"login": "author"}}, [review])
+
+        self.assertIsNone(pr["latest_human_review"])
+
+    def test_gh_pr_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
+        pr = subprocess.CompletedProcess([], 0, '{"number": 42, "state": "OPEN"}')
+        reviews = subprocess.CompletedProcess([], 0, json.dumps([[{
+            "user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-10-21T02:00:00Z"}]]))
+        with patch.object(scan.subprocess, "run", side_effect=[pr, reviews]) as run:
+            self.assertEqual(scan.gh_pr("acme/app", 42)["latest_human_review"]["state"],
+                             "CHANGES_REQUESTED")
+            self.assertEqual(run.call_args_list[1].args[0],
+                             ["gh", "api", "--paginate", "--slurp", "repos/acme/app/pulls/42/reviews"])
+        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.CompletedProcess([], 1, "")]):
+            self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
 
     def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
         with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
@@ -1748,6 +1786,49 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("~/.cache/orca-briefs/offsets/", reason)
         self.assertIsNone(self.check(cwd="/w/triage", orca=orca, watch_running=True))
 
+    def test_another_tabs_inbox_monitor_in_the_workspace_needs_no_notice(self):
+        offset = Path.home() / ".cache/orca-briefs/offsets/close-done-triage.offset"
+        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
+                    f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset}'\n"
+                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset}\n")
+
+        def process(command, **kwargs):
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(command, 0, commands)
+            if command[0] == "lsof":
+                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
+            self.fail(command)
+
+        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
+                patch.object(stopcheck.subprocess, "run", side_effect=process):
+            self.assertIsNone(stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
+            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/other", "s1", "orca"))
+
+    def test_another_tabs_only_watch_does_not_replace_the_triage_watch(self):
+        offset = Path.home() / ".cache/orca-briefs/offsets/only-one-lane.offset"
+        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
+                    f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020'\n"
+                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020\n")
+
+        def process(command, **kwargs):
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(command, 0, commands)
+            if command[0] == "lsof":
+                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
+            self.fail(command)
+
+        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
+                patch.object(stopcheck.subprocess, "run", side_effect=process):
+            reason = stopcheck.missing_inbox_watch("/w/triage", "s1", "orca")
+            self.assertIsNotNone(reason)
+            self.assertIn("watch-inbox", reason)
+
+    def test_no_tabs_inbox_monitor_still_needs_a_notice(self):
+        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
+                patch.object(stopcheck.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 0, "")):
+            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
+
     def test_inbox_monitor_must_have_a_live_child_in_this_session(self):
         commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s1\\012eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'\n"
                     "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset\n")
@@ -1892,6 +1973,19 @@ class VerdictStoreTests(unittest.TestCase):
         self.assertNotIn("verdict", scan.with_verdicts([self.row("/w/none", final_at=None)], verdicts)[0])
         self.assertNotIn("verdict", scan.with_verdicts([{**read, "class": "working"}], verdicts)[0])
         self.assertEqual(scan.with_verdicts([read], verdicts)[0]["verdict"]["class"], "blocked")
+
+    def test_a_new_human_review_returns_a_row_to_the_review_queue(self):
+        pr = {"state": "OPEN", "number": 42, "head_oid": "a",
+              "latest_human_review": {"author": "reviewer", "state": "COMMENTED",
+                                      "submitted_at": "2026-10-21T01:00:00Z"}}
+        read = self.row("/w/review-lane", pr=pr)
+        verdicts = {read["path"]: {"read": scan.read_key(read), "class": "blocked"}}
+        self.assertEqual(scan.review_queue([read], verdicts), [])
+
+        changed = self.row(read["path"], pr={**pr, "latest_human_review": {
+            "author": "reviewer", "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-10-21T02:00:00Z"}})
+        self.assertEqual([row["path"] for row in scan.review_queue([changed], verdicts)], [read["path"]])
 
     def test_the_newer_of_the_claude_and_codex_messages_is_what_was_read(self):
         self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T01:00:00Z",

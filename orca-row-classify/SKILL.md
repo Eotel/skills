@@ -24,16 +24,19 @@ judge each row from its own facts.
   message (its last part). `claude.last_user`: the prompt it answered.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
-  CLOSED, `review`, `requested` reviewers, `checks`), or null.
+  CLOSED, `review`, `latest_human_review` from a person other than the PR author,
+  `requested` reviewers, `checks`), or null.
 - `git`: `dirty` (uncommitted paths) and `unpushed` (commits not pushed).
 - `reasons`, `jev`: why the scan could not settle the row.
 
 ## Rules
 
 1. **Facts beat claims.** `pr` and `git` are read live; the message and the
-   comment may be hours old. A message saying "未コミット" while `git.dirty` is
-   0 has been committed since; a comment saying "merge 待ち" while `pr.state` is
-   MERGED is merged. On a merged PR, `git.unpushed` above 0 or `head_matches`
+   comment may be hours old. A new `pr.latest_human_review` from another person
+   supersedes an older message about waiting for review. A message saying
+   "未コミット" while `git.dirty` is 0 has been committed since; a comment saying
+   "merge 待ち" while `pr.state` is MERGED is merged. On a merged PR,
+   `git.unpushed` above 0 or `head_matches`
    false is what a squash merge or a later merge of main leaves behind: it does
    not keep the row open. When the message reports work on other PRs than `pr`
    (the worktree moved on to new work), those PRs decide; say so in `evidence`.
