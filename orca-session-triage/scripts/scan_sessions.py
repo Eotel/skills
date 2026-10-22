@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -278,7 +279,9 @@ def latest_message(row):
     latest = row["codex"][-1] if row["codex"] else {}
     codex_spoke = latest.get("last_role") == "assistant" and latest.get("last_assistant")
     if not claude.get("final_text"):
-        return ("codex", latest["last_assistant"]) if codex_spoke else None
+        if codex_spoke:
+            return "codex", latest["last_assistant"]
+        return ("orca", row["orca_message"]["text"]) if row.get("orca_message") else None
     claude_at, codex_at = claude.get("final_at"), latest.get("last_assistant_at")
     if codex_spoke and claude_at and codex_at and codex_at > claude_at:
         return "codex", latest["last_assistant"]
@@ -329,6 +332,8 @@ def waiting_reasons(row, decision_marker):
         reasons.append("Codex request pending")
     if is_sure_ask(asks) and jev["source"] == "codex":
         reasons.append(f"Codex final message asks (Jev {asks:.2f})")
+    if is_sure_ask(asks) and jev["source"] == "orca":
+        reasons.append(f"Orca final message asks (Jev {asks:.2f})")
     if any(a["state"] == "waiting" for a in row["agents"]):
         reasons.append("Orca agent waiting")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
@@ -359,6 +364,7 @@ def classify(row, decision_marker):
         return "waiting", reasons + mail
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
     silent = sorted({t["agent"] for t in row["terminals"] if t["agent"] in has_transcript
+                     and not row.get("orca_message")
                      and not has_transcript[t["agent"]]})
     if silent:
         return "unstarted", [agent + " terminal without a recent transcript" for agent in silent]
@@ -465,15 +471,17 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         # Orphaned and disconnected is the stale record of a closed tab; a tab
         # Orca detached from the window stays connected and still runs.
         if term.get("connected") or not term.get("orphaned"):
-            by_worktree.setdefault(term.get("worktreeId"), []).append(term)
+            by_worktree.setdefault((term.get("_environment"), term.get("worktreeId")), []).append(term)
     rows = []
     for w in worktrees:
+        remote = bool(w.get("_environment"))
         main = bool(w.get("isMainWorktree"))
         if main and not w.get("agents"):
             continue
-        terms = by_worktree.get(w.get("worktreeId"), [])
+        terms = by_worktree.get((w.get("_environment"), w.get("worktreeId")), [])
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
+            "host_id": w.get("hostId"), "environment": w.get("_environment"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
             "status": w.get("workspaceStatus"),
             "unread": bool(w.get("unread")),
@@ -482,9 +490,15 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
                           for t in terms],
             "done_cards": done_cards(w.get("agents") or [], terms),
-            "claude": read_claude(claude_root, w["path"]),
-            "codex": codex_by_cwd.get(w["path"], []),
+            "claude": None if remote else read_claude(claude_root, w["path"]),
+            "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
+        if remote:
+            spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
+            if spoken:
+                newest = max(spoken, key=lambda a: a.get("updatedAt") or 0)
+                row["orca_message"] = {"text": newest["lastAssistantMessage"],
+                                       "at": iso_time(newest.get("updatedAt"))}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
         latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
@@ -500,6 +514,24 @@ def github_slug(remote_url):
     """owner/repo of a github.com remote; None for any other host."""
     match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", remote_url or "")
     return match.group(1) if match else None
+
+
+PR_URL = re.compile(r"https://github\.com/([^/\s)]+/[^/\s)]+)/pull/(\d+)")
+
+
+def remote_git_hint(row):
+    """PR lookup hints from Orca, without claiming the remote checkout was inspected."""
+    linked = row.get("linked_pr") or {}
+    found = PR_URL.search(linked.get("url") or "")
+    if not found:
+        urls = set(PR_URL.findall((row.get("orca_message") or {}).get("text") or ""))
+        if len(urls) == 1:
+            slug, number = next(iter(urls))
+            found = PR_URL.search(f"https://github.com/{slug}/pull/{number}")
+    return {"branch": (row.get("branch") or "").removeprefix("refs/heads/") or None,
+            "head": None, "dirty": None, "unpushed": None,
+            "github": found.group(1) if found else None,
+            "pr_number": int(found.group(2)) if found else linked.get("number")}
 
 
 def git_state(path):
@@ -528,7 +560,24 @@ def git_state(path):
     }
 
 
-def summarize_pr(data, reviews=()):
+def latest_human_activity(author, reviews=(), comments=(), line_comments=()):
+    """Newest non-author human PR activity from the three GitHub comment surfaces."""
+    candidates = []
+    for kind, entries, timestamp in (("review", reviews, "submitted_at"),
+                                     ("comment", comments, "created_at"),
+                                     ("line_comment", line_comments, "created_at")):
+        for entry in entries:
+            user = entry.get("user") or {}
+            login = user.get("login")
+            at = entry.get(timestamp)
+            if (user.get("type") == "User" and login and at
+                    and (not author or login.casefold() != author.casefold())):
+                candidates.append({"author": login, "kind": kind, "at": at,
+                                   **({"state": entry.get("state")} if kind == "review" else {})})
+    return max(candidates, key=lambda item: item["at"], default=None)
+
+
+def summarize_pr(data, reviews=(), comments=(), line_comments=()):
     """Reduce `gh pr view --json` output to what decides a stalled worktree's next step."""
     checks = {}
     for check in data.get("statusCheckRollup") or []:
@@ -539,6 +588,14 @@ def summarize_pr(data, reviews=()):
                      and (r.get("user") or {}).get("login") and r.get("submitted_at")
                      and (not author or r["user"]["login"].casefold() != author.casefold())]
     latest = max(human_reviews, key=lambda r: r["submitted_at"], default=None)
+    activity = latest_human_activity(author, reviews, comments, line_comments)
+    commits = data.get("commits") or []
+    last_commit_at = commits[-1].get("committedDate") if commits else None
+    # GitHub exposes commit time here, not the time a commit was pushed. Keep
+    # the source visible so a reader does not mistake this for an exact push time.
+    reply_after_commit = bool(activity and last_commit_at and parse_time(activity["at"])
+                              and parse_time(last_commit_at)
+                              and parse_time(activity["at"]) > parse_time(last_commit_at))
     return {
         "number": data.get("number"), "url": data.get("url"), "state": data.get("state"),
         "head": data.get("headRefName"), "head_oid": data.get("headRefOid"),
@@ -549,12 +606,14 @@ def summarize_pr(data, reviews=()):
                     for r in data.get("latestReviews") or []],
         "latest_human_review": {"author": latest["user"]["login"], "state": latest["state"],
                                 "submitted_at": latest["submitted_at"]} if latest else None,
+        "latest_human_activity": activity, "last_commit_at": last_commit_at,
+        "reply_after_last_commit": reply_after_commit,
         "merge_state": data.get("mergeStateStatus"), "merged_at": data.get("mergedAt"), "checks": checks,
     }
 
 
 PR_FIELDS = ("number,url,state,author,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
-             "mergeStateStatus,mergedAt,statusCheckRollup")
+             "mergeStateStatus,mergedAt,statusCheckRollup,commits")
 GH_TIMEOUT = 15
 
 
@@ -566,16 +625,20 @@ def gh_pr(slug, ref):
         if out.returncode != 0:
             return None
         data = json.loads(out.stdout)
-        try:
-            reviews = subprocess.run(["gh", "api", "--paginate", "--slurp",
-                                      f"repos/{slug}/pulls/{data['number']}/reviews"],
-                                     capture_output=True, text=True, timeout=GH_TIMEOUT)
-            pages = json.loads(reviews.stdout) if reviews.returncode == 0 else []
-        except subprocess.TimeoutExpired:
-            return None
-        except (OSError, json.JSONDecodeError, KeyError):
-            pages = []
-        return summarize_pr(data, [review for page in pages for review in page])
+        def read_pages(endpoint):
+            try:
+                result = subprocess.run(["gh", "api", "--paginate", "--slurp",
+                                         f"repos/{slug}/{endpoint}"], capture_output=True,
+                                        text=True, timeout=GH_TIMEOUT)
+                pages = json.loads(result.stdout) if result.returncode == 0 else []
+                return [entry for page in pages for entry in page]
+            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
+                return []
+
+        number = data["number"]
+        return summarize_pr(data, read_pages(f"pulls/{number}/reviews"),
+                            read_pages(f"issues/{number}/comments"),
+                            read_pages(f"pulls/{number}/comments"))
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
 
@@ -670,14 +733,15 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
     """
-    git_by_path = {row["path"]: git_lookup(row["path"]) for row in rows if row["class"] in READ_CLASSES}
+    git_by_row = {id(row): (remote_git_hint(row) if row.get("environment") else git_lookup(row["path"]))
+                   for row in rows if row["class"] in READ_CLASSES}
     keys = []
     seen = set()
     for row in rows:
         if row["class"] not in READ_CLASSES:
             continue
-        git = git_by_path.get(row["path"])
-        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("branch")
+        git = git_by_row.get(id(row))
+        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         if git and git.get("github") and ref:
             key = (git["github"], ref)
             if key not in seen:
@@ -700,12 +764,15 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         if row["class"] not in READ_CLASSES:
             result.append(row)
             continue
-        git = git_by_path[row["path"]]
-        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("branch")
+        git = git_by_row[id(row)]
+        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
         if pr is not None:
-            pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head")}
+            pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
         row = {**row, "git": git, "pr": pr}
+        if pr is not None and pr.get("state") == "OPEN" and pr.get("reply_after_last_commit"):
+            row = {**row, "waits_on": "self",
+                   "reasons": [*row.get("reasons", []), "human PR response after the latest commit"]}
         if pr is not None and merged_after_final_message(row, pr):
             row = {**row, "class": "finished", "reasons": ["PR merged after the final message"]}
         elif pr is not None and merged_with_nothing_left(row, pr):
@@ -714,7 +781,8 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     return result
 
 
-QUEUE_FIELDS = ("path", "repo", "class", "reasons", "comment", "jev", "pr", "git", "claude")
+QUEUE_FIELDS = ("path", "repo", "environment", "class", "reasons", "waits_on", "comment",
+                "jev", "pr", "git", "claude", "orca_message")
 VERDICTS_FILE = "~/.cache/orca-session-triage/verdicts.json"
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
 READ_CLASSES = ("unsure", "stalled", "waiting")
@@ -724,7 +792,8 @@ def row_final_at(row):
     """When the newest final message a reader would class was written (Claude or Codex), or None."""
     codex = row.get("codex") or []
     said = [at for at in ((row.get("claude") or {}).get("final_at"),
-                          codex[-1].get("last_assistant_at") if codex else None) if at]
+                          codex[-1].get("last_assistant_at") if codex else None,
+                          (row.get("orca_message") or {}).get("at")) if at]
     return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
 
 
@@ -738,13 +807,18 @@ def read_key(row):
         return None
     pr, git = row.get("pr") or {}, row.get("git") or {}
     return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
-                       pr.get("latest_human_review"), git.get("dirty")])
+                       pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty")])
+
+
+def row_identity(row):
+    """Keep equal paths on different Orca servers distinct in the verdict store."""
+    return f"{row['environment']}::{row['path']}" if row.get("environment") else row["path"]
 
 
 def current_verdict(row, verdicts):
     """The stored verdict for what the row shows now, or None."""
     key = read_key(row)
-    verdict = verdicts.get(row["path"]) if key is not None else None
+    verdict = verdicts.get(row_identity(row)) if key is not None else None
     return verdict if isinstance(verdict, dict) and verdict.get("read") == key else None
 
 
@@ -767,6 +841,7 @@ def review_queue(rows, verdicts=None):
         return current_verdict(row, verdicts) is None
 
     return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             **({"identity": row_identity(row)} if row.get("environment") else {}),
              "codex": row["codex"][-1] if row.get("codex") else None,
              "final_at": row_final_at(row), "read": read_key(row)}
             for row in rows if needs_reader(row)]
@@ -807,13 +882,15 @@ def classed_queue(session):
     if not (isinstance(queue, dict) and isinstance(result, dict)
             and result.get("queue_generated_at") == queue.get("generated_at")):
         return {}
-    read = {e["path"]: e.get("read") for e in queue.get("rows") or [] if isinstance(e, dict) and "path" in e}
+    read = {e.get("identity") or e["path"]: e.get("read") for e in queue.get("rows") or []
+            if isinstance(e, dict) and "path" in e}
     queued_at = str(queue.get("generated_at") or "")
-    return {v["path"]: {**{k: x for k, x in v.items() if k not in ("path", "read", "queued_at")},
-                        "read": read[v["path"]], "queued_at": queued_at}
+    return {v.get("identity") or v["path"]: {**{k: x for k, x in v.items()
+                                                if k not in ("path", "identity", "read", "queued_at")},
+                        "read": read[v.get("identity") or v["path"]], "queued_at": queued_at}
             for v in result.get("rows") or []
-            if isinstance(v, dict) and v.get("path") in read and v.get("class") in VERDICT_CLASSES
-            and read[v["path"]] is not None}
+            if isinstance(v, dict) and (v.get("identity") or v.get("path")) in read
+            and v.get("class") in VERDICT_CLASSES and read[v.get("identity") or v["path"]] is not None}
 
 
 def newer_verdicts(verdicts, incoming):
@@ -863,13 +940,53 @@ def read_codex(session_roots, since=None):
     return by_cwd
 
 
-def orca_result(orca, args, key, json_file):
+def orca_payload(orca, args, json_file=None):
     if json_file:
         data = json.loads(Path(json_file).read_text())
     else:
-        out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True, check=True).stdout
+        out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True,
+                             check=True, timeout=ORCA_TIMEOUT).stdout
         data = json.loads(out)
-    return data.get("result", data)[key] if isinstance(data, dict) else data
+    return data.get("result", data) if isinstance(data, dict) else data
+
+
+def orca_result(orca, args, key, json_file):
+    return orca_payload(orca, args, json_file)[key]
+
+
+def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
+    """Read this Mac and the paired Orca servers named in its scope."""
+    local = orca_payload(orca, ["worktree", "ps"], ps_json)
+    worktrees = list(local["worktrees"])
+    terminals = orca_result(orca, ["terminal", "list"], "terminals", terminals_json)
+    if ps_json:
+        return worktrees, terminals
+    selectors = local.get("hostScope", {}).get("omittedHostSelectors") or []
+    for omitted in selectors:
+        selector = omitted.get("selector") or ""
+        try:
+            parts = shlex.split(selector)
+        except ValueError:
+            parts = []
+        if len(parts) != 2 or parts[0] != "--environment":
+            print(f"cannot scan host {omitted.get('hostId')}: no Orca environment selector", file=sys.stderr)
+            continue
+        environment = parts[1]
+        try:
+            remote = orca_payload(orca, ["worktree", "ps", "--environment", environment])
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            print(f"cannot scan Orca environment {environment}: {error}; local rows remain available",
+                  file=sys.stderr)
+            continue
+        worktrees.extend({**worktree, "_environment": environment} for worktree in remote["worktrees"])
+        try:
+            remote_terms = orca_result(orca, ["terminal", "list", "--environment", environment],
+                                       "terminals", None)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            print(f"cannot read terminals in Orca environment {environment}: {error}", file=sys.stderr)
+            remote_terms = []
+        terminals.extend({**term, "_environment": environment} for term in remote_terms)
+    return worktrees, terminals
 
 
 ORCA_TIMEOUT = 60
@@ -973,8 +1090,7 @@ def print_summary(rows, verdicts):
 
 def main(argv=None):
     args = parse_args(argv)
-    worktrees = orca_result(args.orca, ["worktree", "ps"], "worktrees", args.ps_json)
-    terminals = orca_result(args.orca, ["terminal", "list"], "terminals", args.terminals_json)
+    worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
     key = jev_key(os.environ, args.jev_key_file)

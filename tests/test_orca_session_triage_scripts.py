@@ -787,7 +787,8 @@ class NextStepFactTests(unittest.TestCase):
             "number": 11263, "url": "https://github.com/acme/app/pull/11263", "state": "OPEN",
             "head": "fix-a", "head_oid": "abc123", "review": "APPROVED",
             "requested": ["k-mizokami", "backend"], "reviews": ["hdknr:APPROVED", "ghost:COMMENTED"],
-            "latest_human_review": None,
+            "latest_human_review": None, "latest_human_activity": None,
+            "last_commit_at": None, "reply_after_last_commit": False,
             "merge_state": "CLEAN", "merged_at": None,
             "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
 
@@ -815,22 +816,60 @@ class NextStepFactTests(unittest.TestCase):
 
         self.assertIsNone(pr["latest_human_review"])
 
+    def test_each_human_comment_surface_returns_the_wait_to_us_after_the_last_commit(self):
+        data = {"number": 42, "author": {"login": "Author"},
+                "commits": [{"committedDate": "2026-10-21T02:00:00Z"}]}
+        reviewer = {"user": {"login": "reviewer", "type": "User"},
+                    "state": "COMMENTED", "submitted_at": "2026-10-21T02:01:00Z"}
+        conversation = {"user": {"login": "reviewer", "type": "User"},
+                        "created_at": "2026-10-21T02:02:00Z"}
+        line = {"user": {"login": "reviewer", "type": "User"},
+                "created_at": "2026-10-21T02:03:00Z"}
+        for reviews, comments, lines, kind in (([reviewer], [], [], "review"),
+                                               ([], [conversation], [], "comment"),
+                                               ([], [], [line], "line_comment")):
+            with self.subTest(kind=kind):
+                pr = scan.summarize_pr(data, reviews, comments, lines)
+                self.assertTrue(pr["reply_after_last_commit"])
+                self.assertEqual(pr["latest_human_activity"]["kind"], kind)
+        bot = {"user": {"login": "bot", "type": "Bot"},
+               "created_at": "2026-10-21T03:00:00Z"}
+        author = {"user": {"login": "author", "type": "User"},
+                  "created_at": "2026-10-21T04:00:00Z"}
+        earlier = {**conversation, "created_at": "2026-10-21T01:00:00Z"}
+        pr = scan.summarize_pr(data, [], [bot, author, earlier], [])
+        self.assertFalse(pr["reply_after_last_commit"])
+        self.assertEqual(pr["latest_human_activity"]["at"], earlier["created_at"])
+
+    def test_remote_pr_comment_marks_the_row_as_our_turn(self):
+        row = {"path": "/remote/w", "class": "stalled", "environment": "macbook-pro-16",
+               "branch": "refs/heads/fix-a", "linked_pr": None,
+               "orca_message": {"text": "PR https://github.com/acme/app/pull/42", "at": "2026-10-21T01:00:00Z"},
+               "reasons": ["review pending"], "jev": {"source": "orca", "status": "blocked_on_others"}}
+        pr = {"number": 42, "head_oid": "aaa", "state": "OPEN", "reply_after_last_commit": True}
+        result = scan.add_next_step_facts([row], pr_lookup=lambda slug, ref: pr)[0]
+        self.assertEqual(result["git"]["github"], "acme/app")
+        self.assertIsNone(result["pr"]["head_matches"])
+        self.assertEqual(result["waits_on"], "self")
+        self.assertIn("human PR response after the latest commit", result["reasons"])
+
     def test_gh_pr_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
         pr = subprocess.CompletedProcess([], 0, '{"number": 42, "state": "OPEN"}')
         reviews = subprocess.CompletedProcess([], 0, json.dumps([[{
             "user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
             "submitted_at": "2026-10-21T02:00:00Z"}]]))
-        with patch.object(scan.subprocess, "run", side_effect=[pr, reviews]) as run:
+        empty = subprocess.CompletedProcess([], 0, "[[]]")
+        with patch.object(scan.subprocess, "run", side_effect=[pr, reviews, empty, empty]) as run:
             self.assertEqual(scan.gh_pr("acme/app", 42)["latest_human_review"]["state"],
                              "CHANGES_REQUESTED")
             self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list],
-                             [scan.GH_TIMEOUT, scan.GH_TIMEOUT])
+                             [scan.GH_TIMEOUT] * 4)
             self.assertEqual(run.call_args_list[1].args[0],
                              ["gh", "api", "--paginate", "--slurp", "repos/acme/app/pulls/42/reviews"])
-        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.CompletedProcess([], 1, "")]):
+        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.CompletedProcess([], 1, ""), empty, empty]):
             self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
-        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.TimeoutExpired("gh", 15)]):
-            self.assertIsNone(scan.gh_pr("acme/app", 42))
+        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.TimeoutExpired("gh", 15), empty, empty]):
+            self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
 
     def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
         with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
@@ -969,8 +1008,10 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual([e["path"] for e in queue], ["/w/unsure", "/w/merged-but-continues", "/w/blocked-by-jev",
                                                        "/w/asks-by-jev", "/w/changed-since"])
         self.assertEqual(queue[0], {
-            "path": "/w/unsure", "repo": "app", "class": "unsure", "reasons": ["r"], "comment": "c",
+            "path": "/w/unsure", "repo": "app", "environment": None, "class": "unsure", "reasons": ["r"],
+            "waits_on": None, "comment": "c",
             "jev": {"asks": 0.5}, "pr": None, "git": {"dirty": 0},
+            "orca_message": None,
             "claude": {"last_user": "u", "final_text": "f", "final_at": "t1", "transcript": "/x.jsonl"},
             "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
             "final_at": "t1", "read": scan.read_key(rows[0])})
@@ -1041,6 +1082,42 @@ class ScanCommandTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
+        local = {"worktrees": [worktree("/local/w", "done")],
+                 "hostScope": {"omittedHostSelectors": [
+                     {"hostId": "remote-1", "selector": "--environment macbook-pro-16"}]}}
+        remote = {"worktrees": [worktree("/remote/enhancements-9-mbp16", "done", agent="codex")]}
+        calls = []
+
+        def payload(orca, args, json_file=None):
+            calls.append(args)
+            return remote if "--environment" in args else local
+
+        with patch.object(scan, "orca_payload", side_effect=payload), \
+                patch.object(scan, "orca_result", return_value=[]):
+            trees, terminals = scan.collect_worktrees_and_terminals("orca")
+        self.assertEqual([w["path"] for w in trees], ["/local/w", "/remote/enhancements-9-mbp16"])
+        self.assertEqual(trees[1]["_environment"], "macbook-pro-16")
+        self.assertEqual(terminals, [])
+        self.assertIn(["worktree", "ps", "--environment", "macbook-pro-16"], calls)
+
+        with patch.object(scan, "orca_payload", side_effect=[local, subprocess.CalledProcessError(1, "orca")]), \
+                patch.object(scan, "orca_result", return_value=[]), redirect_stderr(io.StringIO()) as err:
+            trees, _ = scan.collect_worktrees_and_terminals("orca")
+        self.assertEqual([w["path"] for w in trees], ["/local/w"])
+        self.assertIn("macbook-pro-16", err.getvalue())
+
+    def test_remote_orca_final_message_is_classified_without_a_local_transcript(self):
+        remote = {**worktree("/remote/w", "done", agent="codex"), "_environment": "macbook-pro-16"}
+        remote["agents"][0].update({"lastAssistantMessage": "PR を出しました。レビュー待ちです。",
+                                     "updatedAt": 1792567646152})
+        term = {**terminal("/remote/w", "codex"), "_environment": "macbook-pro-16"}
+        rows = scan.build_inventory([remote], [term], str(self.dir / "claude"), {}, "要判断",
+                                    judge=lambda message: verdict(0.1, "blocked_on_others"))
+        self.assertEqual(rows[0]["class"], "stalled")
+        self.assertEqual(rows[0]["jev"]["source"], "orca")
+        self.assertEqual(rows[0]["environment"], "macbook-pro-16")
 
     def test_reads_orca_json_files_and_skips_old_rollouts(self):
         ps = self.dir / "ps.json"
@@ -2016,6 +2093,40 @@ class VerdictStoreTests(unittest.TestCase):
             "author": "reviewer", "state": "CHANGES_REQUESTED",
             "submitted_at": "2026-10-21T02:00:00Z"}})
         self.assertEqual([row["path"] for row in scan.review_queue([changed], verdicts)], [read["path"]])
+
+    def test_remote_and_local_rows_with_the_same_path_keep_separate_verdicts(self):
+        local = self.row("/same/path")
+        remote = {**self.row("/same/path"), "environment": "macbook-pro-16"}
+        queued = scan.review_queue([local, remote])
+        self.assertNotIn("identity", queued[0])
+        self.assertEqual(queued[1]["identity"], "macbook-pro-16::/same/path")
+        self.assertEqual([scan.row_identity(local), scan.row_identity(remote)],
+                         ["/same/path", "macbook-pro-16::/same/path"])
+        verdicts = {scan.row_identity(local): {"read": scan.read_key(local), "class": "blocked"}}
+        self.assertEqual([entry.get("identity") for entry in scan.review_queue([local, remote], verdicts)],
+                         ["macbook-pro-16::/same/path"])
+
+        session = self.root / "remote-session"
+        session.mkdir()
+        (session / "review-queue.json").write_text(json.dumps(
+            {"generated_at": "g1", "rows": queued}))
+        (session / "review-result.json").write_text(json.dumps(
+            {"queue_generated_at": "g1", "rows": [
+                {"path": "/same/path", "class": "blocked"},
+                {"path": "/same/path", "identity": queued[1]["identity"], "class": "in_progress"}]}))
+        self.assertEqual({key: value["class"] for key, value in scan.classed_queue(session).items()},
+                         {"/same/path": "blocked", "macbook-pro-16::/same/path": "in_progress"})
+
+    def test_a_new_pr_comment_returns_a_row_to_the_review_queue(self):
+        old = self.row("/w/review-lane", pr={"state": "OPEN", "number": 42,
+                                             "latest_human_activity": None})
+        verdicts = {old["path"]: {"read": scan.read_key(old), "class": "blocked"}}
+        updated = self.row(old["path"], pr={"state": "OPEN", "number": 42,
+                                           "latest_human_activity": {"author": "reviewer",
+                                                                     "kind": "comment",
+                                                                     "at": "2026-10-21T02:00:00Z"}})
+        self.assertEqual(scan.review_queue([old], verdicts), [])
+        self.assertEqual([row["path"] for row in scan.review_queue([updated], verdicts)], [old["path"]])
 
     def test_the_newer_of_the_claude_and_codex_messages_is_what_was_read(self):
         self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T01:00:00Z",
