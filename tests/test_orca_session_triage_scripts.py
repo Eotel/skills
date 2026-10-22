@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Event
 import time
 import unittest
 from unittest.mock import patch
@@ -822,10 +823,14 @@ class NextStepFactTests(unittest.TestCase):
         with patch.object(scan.subprocess, "run", side_effect=[pr, reviews]) as run:
             self.assertEqual(scan.gh_pr("acme/app", 42)["latest_human_review"]["state"],
                              "CHANGES_REQUESTED")
+            self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list],
+                             [scan.GH_TIMEOUT, scan.GH_TIMEOUT])
             self.assertEqual(run.call_args_list[1].args[0],
                              ["gh", "api", "--paginate", "--slurp", "repos/acme/app/pulls/42/reviews"])
         with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.CompletedProcess([], 1, "")]):
             self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
+        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.TimeoutExpired("gh", 15)]):
+            self.assertIsNone(scan.gh_pr("acme/app", 42))
 
     def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
         with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
@@ -863,12 +868,16 @@ class NextStepFactTests(unittest.TestCase):
 
 
     def test_a_pr_merged_after_the_final_message_ends_the_wait_it_reported(self):
+        numbers = {name: number for number, name in enumerate(
+            ("merged-later", "codex-merged-later", "merged-before", "continues", "other-head"), 7)}
+
         def stalled(path, said_at, status="blocked_on_others", source="claude"):
             transcripts = ({"claude": {"final_text": "PR を出しました。レビュー待ちです。", "final_at": said_at},
                             "codex": []} if source == "claude" else
                            {"claude": None, "codex": [{"last_assistant": "PR を出しました。",
                                                        "last_assistant_at": said_at}]})
-            return {"path": path, "class": "stalled", "linked_pr": {"number": 7, "state": "open"},
+            return {"path": path, "class": "stalled",
+                    "linked_pr": {"number": numbers[path.rsplit("/", 1)[-1]], "state": "open"},
                     "reasons": ["final message waits on someone else (Jev 0.90)"],
                     "jev": {"source": source, "asks": 0.1, "status": status, "confidence": 0.9}, **transcripts}
 
@@ -878,15 +887,13 @@ class NextStepFactTests(unittest.TestCase):
                 stalled("/w/continues", "2026-10-06T07:25:00.000Z", status="in_progress"),
                 stalled("/w/other-head", "2026-10-06T07:25:00.000Z")]
         git = {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
-        heads = {"/w/other-head": "zzz"}
-        current = {}
+        heads = {numbers["other-head"]: "zzz"}
 
         def pr_lookup(slug, ref):
             return {"number": ref, "state": "MERGED", "merged_at": "2026-10-06T07:35:27Z",
-                    "head_oid": heads.get(current["path"], "aaa")}
+                    "head_oid": heads.get(ref, "aaa")}
 
         def git_lookup(path):
-            current["path"] = path
             return git
 
         result = {r["path"]: (r["class"], r["reasons"])
@@ -912,18 +919,16 @@ class NextStepFactTests(unittest.TestCase):
                     jev={"source": "claude", "asks": 0.1, "status": "in_progress", "confidence": 0.9}),
                 row("/w/no-session-other-head", ["no agent session in this worktree"]),
                 row("/w/no-session-open", ["no agent session in this worktree"])]
-        heads = {"/w/no-session-other-head": "zzz"}
-        states = {"/w/no-session-open": "OPEN"}
-        current = {}
+        heads = {"no-session-other-head": "zzz"}
+        states = {"no-session-open": "OPEN"}
 
         def git_lookup(path):
-            current["path"] = path
-            return {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
+            return {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
+                    "unpushed": 0, "github": "acme/app"}
 
         def pr_lookup(slug, ref):
-            path = current["path"]
-            return {"number": 7, "state": states.get(path, "MERGED"), "merged_at": "2026-10-06T07:35:27Z",
-                    "head_oid": heads.get(path, "aaa")}
+            return {"number": 7, "state": states.get(ref, "MERGED"), "merged_at": "2026-10-06T07:35:27Z",
+                    "head_oid": heads.get(ref, "aaa")}
 
         result = {r["path"]: (r["class"], r["reasons"])
                   for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
@@ -989,13 +994,38 @@ class NextStepFactTests(unittest.TestCase):
 
         result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
 
-        self.assertEqual(asked, [("acme/app", 7), ("acme/app", "fix-b"), ("acme/app", 8)])
+        self.assertCountEqual(asked, [("acme/app", 7), ("acme/app", "fix-b"), ("acme/app", 8)])
         self.assertEqual([(r.get("git"), r.get("pr")) for r in result], [
             (gits["/w/linked"], {"number": 7, "head_oid": "aaa", "head_matches": True}),
             (gits["/w/branch"], {"number": "fix-b", "head_oid": "aaa", "head_matches": False}),
             (gits["/w/forgejo"], None),
             (gits["/w/asks"], {"number": 8, "head_oid": "aaa", "head_matches": True}), (None, None)])
         self.assertNotIn("git", rows[0])
+
+    def test_pr_timeout_does_not_hold_other_rows_and_duplicate_pr_is_read_once(self):
+        rows = [{"path": path, "class": "unsure", "linked_pr": {"number": number}}
+                for path, number in (("/w/slow", 7), ("/w/fast", 8), ("/w/fast-again", 8))]
+        gits = {path: {"branch": path, "head": "aaa", "github": "acme/app"}
+                for path in ("/w/slow", "/w/fast", "/w/fast-again")}
+        fast_started = Event()
+        calls = []
+
+        def pr_lookup(slug, ref):
+            calls.append((slug, ref))
+            if ref == 7:
+                parallel = fast_started.wait(2)
+                if not parallel:
+                    raise AssertionError("the independent PR lookup did not start")
+                raise subprocess.TimeoutExpired("gh", 15)
+            fast_started.set()
+            return {"number": 8, "head_oid": "aaa", "state": "OPEN"}
+
+        result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
+
+        self.assertEqual([row["path"] for row in result], [row["path"] for row in rows])
+        self.assertIsNone(result[0]["pr"])
+        self.assertEqual([row["pr"]["number"] for row in result[1:]], [8, 8])
+        self.assertCountEqual(calls, [("acme/app", 7), ("acme/app", 8)])
 
 
 class ScanCommandTests(unittest.TestCase):
