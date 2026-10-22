@@ -14,6 +14,8 @@ and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
 with `--kind info`. The lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment.
+Name any Orca environment the scan could not reach in the handoff. Review
+rows from the reachable Macs in the same run.
 
 When this run leads:
 

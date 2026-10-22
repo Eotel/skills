@@ -19,6 +19,11 @@ board's done cards; close what the user approves.
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus
   Claude and Codex transcripts, lists the tabs it could close (`closable`), and
   gives each `stalled`, `unsure`, and `waiting` row its `git` and `pr` state.
+  It reads the paired Orca environments listed by this Mac. A remote row
+  carries `environment` and uses Orca's last agent message when its transcript
+  is unavailable locally. Remote `git.dirty`, `git.unpushed`, and
+  `pr.head_matches` are unknown until checked on that host. A failed remote
+  connection is reported on stderr while the other hosts still scan.
   `--summary` prints class counts, review rows, and finished worktree/tab counts. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
   reads each idle worktree's newest final message and returns `jev`: `asks`,
@@ -58,7 +63,7 @@ board's done cards; close what the user approves.
   lane with `next_step`, `done_unmerged` is a review-or-merge choice, and
   `finished` goes to `cleanup.md`. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
-  `verdict` until its final message, PR, latest review from a person other than
+  `verdict` until its final message, PR, latest review or comment from a person other than
   the PR author, or tree changes; act on it the same way in every run. A Stop
   hook keeps the turn open while a queued row has no verdict.
   Codex ignores the fork, the model, and the hook: there, follow

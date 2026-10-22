@@ -18,6 +18,7 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 | `pr.head_matches` is false | the PR found is not this checkout's HEAD (a reused branch name): confirm the PR before using its state |
 | `git.dirty` or `git.unpushed` above 0 | the lane commits and pushes, or discards |
 | No PR, commits beyond the base | the lane opens a PR |
+| Open PR with `pr.reply_after_last_commit` true | the lane reads the new human review, PR comment, or line comment and responds; `waits_on: self` names the next actor |
 | `pr.review` is `APPROVED` and checks pass | merge |
 | No review requested and none given | request a review, or merge |
 | Review requested, none given yet | blocker: waiting on that reviewer, no question |
@@ -30,6 +31,11 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
   and the repository's agent memory.
 - Open items written in the Orca comment or the latest message ("要確認",
   "残り", "未確認") are questions: list them with the row.
+- GitHub's PR API gives the last commit's time, not a guaranteed push time.
+  `reply_after_last_commit` is a prompt to read the activity, especially if a
+  commit was prepared before it was pushed. On a remote row, use `--environment
+  <row.environment>` for Orca commands and inspect its checkout there before
+  deciding whether it has local changes or unpushed commits.
 - When one row waits on another's merge or deploy, say which row unblocks which
   and order the steps that way.
 - Send the chosen step to the row's lane as one line, as with answers, so the

@@ -19,20 +19,22 @@ judge each row from its own facts.
 
 ## Each row carries
 
-- `path`, `repo`: the worktree.
-- `claude.final_text` / `codex.last_assistant`: the agent's newest final
+- `path`, `repo`: the worktree. A remote row has `environment` and `identity`;
+  copy its `identity` into the verdict so equal paths on different Macs stay distinct.
+- `claude.final_text` / `codex.last_assistant` / `orca_message.text`: the agent's newest final
   message (its last part). `claude.last_user`: the prompt it answered.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
-  CLOSED, `review`, `latest_human_review` from a person other than the PR author,
+  CLOSED, `review`, `latest_human_activity` from a person other than the PR author,
   `requested` reviewers, `checks`), or null.
-- `git`: `dirty` (uncommitted paths) and `unpushed` (commits not pushed).
+- `git`: `dirty` (uncommitted paths) and `unpushed` (commits not pushed). Both
+  are unknown on a remote Mac until its checkout is inspected there.
 - `reasons`, `jev`: why the scan could not settle the row.
 
 ## Rules
 
-1. **Facts beat claims.** `pr` and `git` are read live; the message and the
-   comment may be hours old. A new `pr.latest_human_review` from another person
+1. **Facts beat claims.** `pr` and `git` are read live where available; the message and the
+   comment may be hours old. A new `pr.latest_human_activity` from another person
    supersedes an older message about waiting for review. A message saying
    "未コミット" while `git.dirty` is 0 has been committed since; a comment saying
    "merge 待ち" while `pr.state` is MERGED is merged. On a merged PR,
@@ -41,6 +43,11 @@ judge each row from its own facts.
    not keep the row open. When the message reports work on other PRs than `pr`
    (the worktree moved on to new work), those PRs decide; say so in `evidence`.
    A claim the facts disprove is not a leftover: leave it out of `remaining`.
+   `pr.reply_after_last_commit` and `waits_on: self` mean a human added a
+   review, PR comment, or line comment after the latest commit date. Read it
+   and give the lane `in_progress` if it can respond now. GitHub does not
+   guarantee that the commit date equals its push time; do not claim exact push
+   order from this flag alone.
 2. **Who must act decides the class.** When several fit, the first one in this
    list wins.
    - `waiting`: the message or comment asks **the user who runs the triage** to
@@ -96,7 +103,7 @@ judge each row from its own facts.
 
 ```json
 {"queue_generated_at": "<generated_at copied from review-queue.json>",
- "rows": [{"path": "<row path>", "class": "blocked",
+ "rows": [{"path": "<row path>", "identity": "<remote row identity, if present>", "class": "blocked",
            "question": null, "waits_on": "hdknr (PR #358 review)、k-mizokami (PR #827 review)",
            "next_step": "none until the review arrives",
            "remaining": ["..."], "needs_user": [],
@@ -104,7 +111,7 @@ judge each row from its own facts.
            "confidence": 0.9}]}
 ```
 
-One entry per queued `path`, in queue order. A field that does not apply is
+One entry per queued row, in queue order. Copy `identity` when present. A field that does not apply is
 null (`question`, `waits_on`) or `[]` (`remaining`, `needs_user`); `waits_on`
 is one string, several parties joined with "、". Write the free-text fields in
 the language of the row's messages, keeping quotes as written; `next_step` is
