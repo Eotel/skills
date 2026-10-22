@@ -2,6 +2,7 @@
 """Inventory Orca agent sessions from Orca state and agent transcripts."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import glob
 import http.client
@@ -554,22 +555,25 @@ def summarize_pr(data, reviews=()):
 
 PR_FIELDS = ("number,url,state,author,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
              "mergeStateStatus,mergedAt,statusCheckRollup")
+GH_TIMEOUT = 15
 
 
 def gh_pr(slug, ref):
     """Summary of a GitHub PR by number or head branch, or None when gh finds none or fails."""
     try:
         out = subprocess.run(["gh", "pr", "view", str(ref), "-R", slug, "--json", PR_FIELDS],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=GH_TIMEOUT)
         if out.returncode != 0:
             return None
         data = json.loads(out.stdout)
         try:
             reviews = subprocess.run(["gh", "api", "--paginate", "--slurp",
                                       f"repos/{slug}/pulls/{data['number']}/reviews"],
-                                     capture_output=True, text=True, timeout=30)
+                                     capture_output=True, text=True, timeout=GH_TIMEOUT)
             pages = json.loads(reviews.stdout) if reviews.returncode == 0 else []
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError):
+        except subprocess.TimeoutExpired:
+            return None
+        except (OSError, json.JSONDecodeError, KeyError):
             pages = []
         return summarize_pr(data, [review for page in pages for review in page])
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -666,14 +670,39 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
     """
+    git_by_path = {row["path"]: git_lookup(row["path"]) for row in rows if row["class"] in READ_CLASSES}
+    keys = []
+    seen = set()
+    for row in rows:
+        if row["class"] not in READ_CLASSES:
+            continue
+        git = git_by_path.get(row["path"])
+        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("branch")
+        if git and git.get("github") and ref:
+            key = (git["github"], ref)
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+
+    def lookup(key):
+        try:
+            return pr_lookup(*key)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    prs = {}
+    if keys:
+        with ThreadPoolExecutor(max_workers=min(8, len(keys))) as pool:
+            prs = dict(zip(keys, pool.map(lookup, keys)))
+
     result = []
     for row in rows:
         if row["class"] not in READ_CLASSES:
             result.append(row)
             continue
-        git = git_lookup(row["path"])
+        git = git_by_path[row["path"]]
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("branch")
-        pr = pr_lookup(git["github"], ref) if git and git.get("github") and ref else None
+        pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
         if pr is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head")}
         row = {**row, "git": git, "pr": pr}
