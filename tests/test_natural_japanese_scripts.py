@@ -97,6 +97,12 @@ class NaturalJapaneseScriptsTests(unittest.TestCase):
         self.assertEqual([item["rule_id"] for item in findings],
                          ["silent-breakage"] * 2 + ["effective"] * 3)
 
+    def test_guard_noun_is_a_candidate_without_flagging_the_verb(self):
+        findings = self.findings("止めが効いていない。止めを通り抜けた。止めを確実に効かせる。\n"
+                                 "処理を止める。歯止めがかかった。\n")
+        self.assertEqual([item["match"] for item in findings if item["rule_id"] == "guard-noun"],
+                         ["止め", "止め", "止め"])
+
     def test_opt_in_exit_status_means_review_is_needed(self):
         result = run_check("正本です。", "--fail-on-findings", "--format", "json")
         self.assertEqual(result.returncode, 1)
