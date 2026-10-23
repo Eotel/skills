@@ -1088,10 +1088,15 @@ class ScanCommandTests(unittest.TestCase):
                  "hostScope": {"omittedHostSelectors": [
                      {"hostId": "remote-1", "selector": "--environment macbook-pro-16"}]}}
         remote = {"worktrees": [worktree("/remote/enhancements-9-mbp16", "done", agent="codex")]}
+        environments = [{"id": "remote-1", "name": "macbook-pro-16",
+                         "preferredEndpointId": "ws-1", "endpoints": [
+                             {"id": "ws-1", "endpoint": "ws://remote.example:6768"}]}]
         calls = []
 
         def payload(orca, args, json_file=None):
             calls.append(args)
+            if args == ["environment", "list"]:
+                return {"environments": environments}
             return remote if "--environment" in args else local
 
         with patch.object(scan, "orca_payload", side_effect=payload), \
@@ -1103,10 +1108,33 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn(["worktree", "ps", "--environment", "macbook-pro-16"], calls)
 
         with patch.object(scan, "orca_payload", side_effect=[local, subprocess.CalledProcessError(1, "orca")]), \
-                patch.object(scan, "orca_result", return_value=[]), redirect_stderr(io.StringIO()) as err:
+                patch.object(scan, "orca_result", side_effect=[[], environments]), \
+                patch.object(scan.socket, "create_connection", side_effect=ConnectionRefusedError("refused")), \
+                redirect_stderr(io.StringIO()) as err:
             trees, _ = scan.collect_worktrees_and_terminals("orca")
         self.assertEqual([w["path"] for w in trees], ["/local/w"])
         self.assertIn("macbook-pro-16", err.getvalue())
+        self.assertIn("ws://remote.example:6768", err.getvalue())
+        self.assertIn("TCP port 6768 reachable from this Mac: no", err.getvalue())
+
+        with patch.object(scan, "orca_payload", side_effect=payload), \
+                patch.object(scan, "orca_result", side_effect=[[], environments,
+                    subprocess.CalledProcessError(1, "orca")]), \
+                patch.object(scan.socket, "create_connection", side_effect=ConnectionRefusedError("refused")), \
+                redirect_stderr(io.StringIO()) as err:
+            scan.collect_worktrees_and_terminals("orca")
+        self.assertIn("cannot read terminals", err.getvalue())
+        self.assertIn("ws://remote.example:6768", err.getvalue())
+
+    def test_removed_host_id_is_named_when_no_environment_selector_exists(self):
+        local = {"worktrees": [], "hostScope": {"omittedHostSelectors": [
+            {"hostId": "runtime:deleted-id", "selector": None}]}}
+        with patch.object(scan, "orca_payload", return_value=local), \
+                patch.object(scan, "orca_result", side_effect=[[], []]), \
+                redirect_stderr(io.StringIO()) as err:
+            scan.collect_worktrees_and_terminals("orca")
+        self.assertIn("runtime:deleted-id", err.getvalue())
+        self.assertIn("not in orca environment list", err.getvalue())
 
     def test_remote_orca_final_message_is_classified_without_a_local_transcript(self):
         remote = {**worktree("/remote/w", "done", agent="codex"), "_environment": "macbook-pro-16"}

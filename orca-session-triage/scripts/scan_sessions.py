@@ -11,10 +11,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 DEFAULT_CODEX_SESSIONS = [
     "~/Library/Application Support/orca/codex-accounts/*/home/sessions",
@@ -954,6 +956,33 @@ def orca_result(orca, args, key, json_file):
     return orca_payload(orca, args, json_file)[key]
 
 
+def endpoint_diagnostic(environment, environments):
+    """Describe the saved endpoint and whether this Mac can connect to its TCP port."""
+    if environments is None:
+        return "saved endpoint and TCP port could not be checked"
+    saved = next((row for row in environments
+                  if environment in (row.get("id"), row.get("name"))), None)
+    if saved is None:
+        return f"{environment} is not in orca environment list"
+    endpoints = saved.get("endpoints") or []
+    endpoint = next((row.get("endpoint") for row in endpoints
+                     if row.get("id") == saved.get("preferredEndpointId")), None)
+    endpoint = endpoint or next((row.get("endpoint") for row in endpoints if row.get("endpoint")), None)
+    if not endpoint:
+        return "no saved endpoint; TCP port could not be checked"
+    try:
+        parsed = urlsplit(endpoint)
+        if not parsed.hostname or not parsed.port:
+            raise ValueError("missing host or port")
+    except ValueError as error:
+        return f"saved endpoint {endpoint}; TCP port could not be checked ({error})"
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=2):
+            return f"saved endpoint {endpoint}; TCP port {parsed.port} reachable from this Mac: yes"
+    except OSError as error:
+        return f"saved endpoint {endpoint}; TCP port {parsed.port} reachable from this Mac: no ({error})"
+
+
 def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
     """Read this Mac and the paired Orca servers named in its scope."""
     local = orca_payload(orca, ["worktree", "ps"], ps_json)
@@ -962,6 +991,12 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
     if ps_json:
         return worktrees, terminals
     selectors = local.get("hostScope", {}).get("omittedHostSelectors") or []
+    if not selectors:
+        return worktrees, terminals
+    try:
+        environments = orca_result(orca, ["environment", "list"], "environments", None)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        environments = None
     for omitted in selectors:
         selector = omitted.get("selector") or ""
         try:
@@ -969,13 +1004,18 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
         except ValueError:
             parts = []
         if len(parts) != 2 or parts[0] != "--environment":
-            print(f"cannot scan host {omitted.get('hostId')}: no Orca environment selector", file=sys.stderr)
+            host_id = omitted.get("hostId")
+            listed_ids = {row.get("id") for row in environments} if environments is not None else None
+            missing = ("; ID is not in orca environment list" if listed_ids is not None and
+                       str(host_id).removeprefix("runtime:") not in listed_ids else "")
+            print(f"cannot scan host ID {host_id}: no Orca environment selector{missing}", file=sys.stderr)
             continue
         environment = parts[1]
         try:
             remote = orca_payload(orca, ["worktree", "ps", "--environment", environment])
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
-            print(f"cannot scan Orca environment {environment}: {error}; local rows remain available",
+            detail = endpoint_diagnostic(environment, environments)
+            print(f"cannot scan Orca environment {environment}: {error}; {detail}; local rows remain available",
                   file=sys.stderr)
             continue
         worktrees.extend({**worktree, "_environment": environment} for worktree in remote["worktrees"])
@@ -983,7 +1023,9 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
             remote_terms = orca_result(orca, ["terminal", "list", "--environment", environment],
                                        "terminals", None)
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
-            print(f"cannot read terminals in Orca environment {environment}: {error}", file=sys.stderr)
+            detail = endpoint_diagnostic(environment, environments)
+            print(f"cannot read terminals in Orca environment {environment}: {error}; {detail}",
+                  file=sys.stderr)
             remote_terms = []
         terminals.extend({**term, "_environment": environment} for term in remote_terms)
     return worktrees, terminals
