@@ -37,6 +37,8 @@ When this run leads:
   publishing with ArtifactComments `action: "watch"`, `on: false`, and the
   artifact's `url`. The Stop hook names a watch still running.
 
+Monitor command: `~/.cache/orca-briefs/bin/watch-inbox ~/.cache/orca-briefs/offsets/close-done-triage.offset 2>&1`
+
 ## While this session works on a request
 
 The precheck skips every run while the lead works, so a long request leaves the

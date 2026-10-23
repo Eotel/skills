@@ -209,6 +209,17 @@ class CodexRolloutTests(unittest.TestCase):
             "answered_in_chat_later": True,
         }])
 
+    def test_api_failure_in_rollout_is_cleared_by_a_later_assistant_message(self):
+        path = self.rollout("rollout-error.jsonl", "/w/cut", [
+            codex_user("2026-10-01T01:00:00Z", "finish the work"),
+            codex_row("2026-10-01T01:01:00Z", "event_msg", {
+                "type": "error", "message": "Selected model is at capacity"}),
+        ])
+        self.assertEqual(scan.summarize_rollout(path)[1]["api_error"], "Selected model is at capacity")
+        with open(path, "a") as handle:
+            handle.write(json.dumps(codex_assistant("2026-10-01T01:02:00Z", "Recovered.")) + "\n")
+        self.assertIsNone(scan.summarize_rollout(path)[1]["api_error"])
+
 
 def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress",
              turn=None):
@@ -674,6 +685,17 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/merged"], ("stalled", ["turn ended with an API error: " + cut], []))
         self.assertEqual(result["/w/resumed"][0], "finished")
         self.assertEqual(judged, ["Merged."])
+
+    def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self):
+        failure = "■ Selected model is at capacity"
+        codex = {"/w/cut": [{"rollout": "r", "last_user": "finish", "last_role": "assistant",
+                              "last_assistant": "Done.", "last_assistant_at": "2026-10-01T01:00:00Z",
+                              "pending_requests": []}]}
+        row = self.inventory(
+            [worktree("/w/cut", "done", agent="codex", pr={"number": 1, "state": "merged"})],
+            [terminal("/w/cut", "codex", preview="Done.\n" + failure + "\n")], codex)[0]
+        self.assertEqual((row["class"], row["reasons"], row["closable"]),
+                         ("stalled", ["turn ended with an API error: " + failure], []))
 
     def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self):
         # 2026-10-06 a lead ended its turn while workers ran; their reports sat unread for 20 hours.
@@ -1703,6 +1725,22 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("run: no agent", out)
 
+    def test_exec_watch_inbox_is_found_as_a_direct_claude_child(self):
+        commands = ("10 1 claude\n"
+                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset\n")
+
+        def process(command, **kwargs):
+            if command[0] == "ps":
+                return subprocess.CompletedProcess(command, 0, commands)
+            if command[0] == "lsof":
+                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
+            self.fail(command)
+
+        with patch.object(precheck.subprocess, "run", side_effect=process):
+            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+        self.assertEqual(code, 0)
+        self.assertIn("run: no agent", out)
+
     def test_another_background_job_still_skips_the_run(self):
         watch = ("eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'",
                  ["python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset"])
@@ -1979,6 +2017,18 @@ class StopCheckTests(unittest.TestCase):
         with patch.object(stopcheck.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, commands.splitlines()[0] + "\n")):
             self.assertFalse(stopcheck.inbox_watch_running("s1"))
+
+    def test_exec_inbox_monitor_counts_with_a_triage_offset(self):
+        offset = Path.home() / ".cache/orca-briefs/offsets/triage.offset"
+        commands = ("10 1 claude\n"
+                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset}\n")
+        with patch.object(stopcheck.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, commands)):
+            self.assertTrue(stopcheck.inbox_watch_running("s2"))
+        only = commands.replace(f"{offset}\n", f"{offset} --only lane\n")
+        with patch.object(stopcheck.subprocess, "run",
+                          return_value=subprocess.CompletedProcess([], 0, only)):
+            self.assertFalse(stopcheck.inbox_watch_running("s2"))
 
     def test_asks_for_the_whole_triage_when_several_runs_in_a_row_were_skipped(self):
         self.queue(at="2026-10-13T02:30:00+00:00")
