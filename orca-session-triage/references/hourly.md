@@ -1,15 +1,15 @@
 # Hourly run
 
 An Orca automation starts `/orca-session-triage hourly` every hour in the
-triage workspace. The tab already running `watch-inbox` there without `--only`
-and with an offset under `~/.cache/orca-briefs/offsets/` leads triage. A
+triage workspace. A tab anywhere on this Mac that runs `watch-inbox` without
+`--only` and with an offset under `~/.cache/orca-briefs/offsets/` leads triage. A
 `--only` watch receives reports for selected lanes; it does not appoint a lead.
 If no tab owns the unfiltered watch, this run leads.
 
 ## In the run
 
-When another tab leads, scan and review the rows, then do only the cleanup
-allowed before a user choice by the Boundary and `cleanup.md`. Send questions
+When another tab on this Mac leads, scan and review the rows, then do only the
+cleanup allowed before a user choice by the Boundary and `cleanup.md`. Send questions
 and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
 with `--kind info`. The lead asks the user and directs the lanes. End without

@@ -1893,7 +1893,7 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("~/.cache/orca-briefs/offsets/", reason)
         self.assertIsNone(self.check(cwd="/w/triage", orca=orca, watch_running=True))
 
-    def test_another_tabs_inbox_monitor_in_the_workspace_needs_no_notice(self):
+    def test_another_tabs_inbox_monitor_in_another_workspace_needs_no_notice(self):
         offset = Path.home() / ".cache/orca-briefs/offsets/close-done-triage.offset"
         commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
                     f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset}'\n"
@@ -1902,14 +1902,11 @@ class StopCheckTests(unittest.TestCase):
         def process(command, **kwargs):
             if command[0] == "ps":
                 return subprocess.CompletedProcess(command, 0, commands)
-            if command[0] == "lsof":
-                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
             self.fail(command)
 
         with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
                 patch.object(stopcheck.subprocess, "run", side_effect=process):
             self.assertIsNone(stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
-            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/other", "s1", "orca"))
 
     def test_another_tabs_only_watch_does_not_replace_the_triage_watch(self):
         offset = Path.home() / ".cache/orca-briefs/offsets/only-one-lane.offset"
@@ -1929,6 +1926,15 @@ class StopCheckTests(unittest.TestCase):
             reason = stopcheck.missing_inbox_watch("/w/triage", "s1", "orca")
             self.assertIsNotNone(reason)
             self.assertIn("watch-inbox", reason)
+
+    def test_another_tabs_watch_with_an_offset_outside_offsets_needs_a_notice(self):
+        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
+                    "eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/other.offset'\n"
+                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/other.offset\n")
+        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
+                patch.object(stopcheck.subprocess, "run",
+                             return_value=subprocess.CompletedProcess([], 0, commands)):
+            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
 
     def test_no_tabs_inbox_monitor_still_needs_a_notice(self):
         with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
