@@ -138,16 +138,34 @@ def message_text(payload):
     return " ".join(c.get("text", "") for c in payload.get("content") or [] if isinstance(c, dict))
 
 
+API_FAILURE = re.compile(
+    r"(?:Selected model is at capacity|API Error:|rate limit(?:ed| exceeded)?|"
+    r"request failed|connection error|stream error|server error)", re.IGNORECASE)
+
+
+def api_failure(text):
+    """Return a Codex API failure line, ignoring ordinary discussion of an error."""
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if (line.startswith("■ ") or line.startswith("API Error:")) and API_FAILURE.search(line):
+            return line
+    return None
+
+
 def summarize_rollout(path):
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
-    last_assistant = last_assistant_at = None
+    last_assistant = last_assistant_at = api_error = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
         cwd = cwd or payload.get("cwd")
         kind = payload.get("type")
+        if row.get("type") == "event_msg" and kind in ("error", "stream_error"):
+            message = payload.get("message") or payload.get("error")
+            if isinstance(message, str) and API_FAILURE.search(message):
+                api_error = message.strip()
         if kind in ("function_call", "custom_tool_call") and "user_input" in (payload.get("name") or ""):
             try:
                 questions = json.loads(payload.get("arguments") or "{}").get("questions")
@@ -164,6 +182,7 @@ def summarize_rollout(path):
             value = message_text(payload)
             if value:
                 last_assistant, last_assistant_at, last_role = value, row.get("timestamp"), "assistant"
+                api_error = api_failure(value)
     pending = []
     for call_id, ask in asks.items():
         if call_id in outputs:
@@ -176,6 +195,7 @@ def summarize_rollout(path):
         "last_assistant": last_assistant,
         "last_assistant_at": last_assistant_at,
         "last_role": last_role,
+        "api_error": api_error,
         "pending_requests": pending,
     }
 
@@ -291,12 +311,14 @@ def latest_message(row):
 
 
 def cut_off(row):
-    """The API error that ended Claude's last turn, or None.
+    """The API error that ended the last Claude or Codex turn, or None.
 
     Claude Code does not resume such a turn, and a monitor it left running keeps
     Orca at working, so only the transcript shows the agent stopped mid-task.
     """
-    return (row["claude"] or {}).get("api_error")
+    codex = row["codex"][-1] if row["codex"] else {}
+    return (row.get("codex_screen_error") or codex.get("api_error")
+            or (row["claude"] or {}).get("api_error"))
 
 
 def is_sure_ask(asks):
@@ -491,6 +513,8 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
                        for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"), "agent": t.get("agentIdentity"), "title": t.get("title")}
                           for t in terms],
+            "codex_screen_error": next((error for t in terms if t.get("agentIdentity") == "codex"
+                                        if (error := api_failure(t.get("preview")))), None),
             "done_cards": done_cards(w.get("agents") or [], terms),
             "claude": None if remote else read_claude(claude_root, w["path"]),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),

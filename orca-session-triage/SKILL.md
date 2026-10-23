@@ -47,7 +47,7 @@ board's done cards; close what the user approves.
   of its last message. The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
   repository's main checkout is a row (`main`) while it hosts an agent. A
-  Claude turn an API error cut off (`claude.api_error`), and a lead whose
+  Claude or Codex turn an API error cut off, and a lead whose
   workers' reports, questions, or escalations sit unread since its last turn
   began (`unread_mail`, from Orca's orchestration mailbox), are `stalled` with
   that reason; the mail reason is also added to a `waiting` row.

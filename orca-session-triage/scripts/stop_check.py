@@ -171,20 +171,25 @@ def inbox_watch_running(session_id):
             pid, ppid, command = parts
             processes[int(pid)] = (int(ppid), command)
     offsets = Path.home() / ".cache/orca-briefs/offsets"
+    marker = r"(?:^|/)watch-inbox\s+(\S+)"
     for pid, (_, command) in processes.items():
-        if "CLAUDE_CODE_SESSION_ID=" not in command or "eval " not in command:
+        if "CLAUDE_CODE_SESSION_ID=" in command and "eval " in command:
+            children = [child for parent, child in processes.values()
+                        if parent == pid and re.search(marker, child)
+                        and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
+        elif re.match(r"(?:\S*/)?claude(?:\s|$)", command):
+            # With `exec`, Monitor's Python process is Claude's direct child.
+            children = [child for parent, child in processes.values()
+                        if parent == pid and re.search(marker, child)
+                        and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
+        else:
             continue
-        if not re.search(r"(?:^|/)watch-inbox(?:\s|$)", command):
-            continue
-        children = [child for parent, child in processes.values()
-                    if parent == pid and re.search(r"(?:^|/)watch-inbox(?:\s|$)", child)
-                    and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
         if not children:
             continue
         if (f"CLAUDE_CODE_SESSION_ID={session_id}" in command
                 or f"CLAUDE_CODE_SESSION_ID='{session_id}'" in command):
             return True
-        if any((match := re.search(r"(?:^|/)watch-inbox\s+(\S+)", child))
+        if any((match := re.search(marker, child))
                and Path(os.path.realpath(os.path.expanduser(match.group(1)))).is_relative_to(offsets)
                for child in children):
             return True

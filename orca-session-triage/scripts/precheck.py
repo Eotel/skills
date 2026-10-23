@@ -75,7 +75,14 @@ def background_jobs(workspace):
                 roots.append(pid)
         jobs = []
         for pid, (parent, command) in processes.items():
-            if parent not in roots or "CLAUDE_CODE_SESSION_ID=" not in command or "eval " not in command:
+            if parent not in roots:
+                continue
+            if re.search(r"(?:^|/)watch-inbox(?:\s|$)", command):
+                # `exec watch-inbox` replaces Monitor's shell, leaving the Python
+                # process directly under Claude rather than under a zsh child.
+                jobs.append((command, [command]))
+                continue
+            if "CLAUDE_CODE_SESSION_ID=" not in command or "eval " not in command:
                 continue
             children = [child for child_parent, child in processes.values() if child_parent == pid]
             jobs.append((command, children))
