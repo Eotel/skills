@@ -2,6 +2,7 @@
 """Check that an Orca worktree is safe to remove."""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import filecmp
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 CACHE_PARTS = {
     "node_modules", ".venv", ".devenv", ".direnv", "__pycache__", ".pytest_cache", ".ruff_cache",
@@ -229,6 +231,53 @@ def default_base(worktree):
     return None
 
 
+def remote_identity(url):
+    """Match FETCH_HEAD's display URL to a remote across HTTPS/SSH URL changes."""
+    if "://" in url:
+        parsed = urlsplit(url)
+        host, path = parsed.hostname or "", parsed.path
+    elif ":" in url and not url.startswith("/"):
+        authority, path = url.split(":", 1)
+        host = authority.rpartition("@")[2]
+    else:
+        host, path = "", url
+    return host.lower(), path.strip("/").removesuffix(".git")
+
+
+def stale_fetch_note(worktree, base, pr_head):
+    """Warn when no worktree has fetched the base remote in the last day."""
+    ref = (base or "").removeprefix("refs/remotes/")
+    remote, separator, _ = ref.partition("/")
+    if not separator:
+        return None
+    url = git(worktree, "remote", "get-url", remote)
+    common = git(worktree, "rev-parse", "--git-common-dir")
+    if url.returncode != 0 or common.returncode != 0:
+        return None
+    remote_url = remote_identity(url.stdout.strip())
+    common_dir = (Path(worktree) / common.stdout.strip()).resolve()
+    fetch_heads = [common_dir / "FETCH_HEAD", *(common_dir / "worktrees").glob("*/FETCH_HEAD")]
+    fetched_at = []
+    for path in fetch_heads:
+        try:
+            with path.open(errors="replace") as handle:
+                if any(" of " in line and remote_identity(line.rpartition(" of ")[-1].strip()) == remote_url
+                       for line in handle):
+                    fetched_at.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not fetched_at:
+        return None
+    latest = datetime.fromtimestamp(max(fetched_at), timezone.utc)
+    if datetime.now(timezone.utc) - latest <= timedelta(days=1):
+        return None
+    when = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+    note = "%s の参照は %s の fetch のままです。" % (remote, when)
+    if pr_head:
+        return note + "渡された --pr-head を使って判定しました。"
+    return note + "merge 済み PR の head を別の Mac で確認し、--pr-head <sha> を渡してください。"
+
+
 def start_base(worktree):
     """The remote branch the checked-out branch was created from, read from its reflog, or None.
 
@@ -323,7 +372,10 @@ def main(argv=None):
             notes.append("git fetch failed; remote refs may be stale. Using the supplied merged PR head")
         else:
             notes.append("git fetch failed; remote refs may be stale. Confirm the PR is MERGED on a host with gh and pass --pr-head <sha>")
-    if (not args.pr_head and (not pr or pr.get("state") == "MERGED")
+    stale_note = stale_fetch_note(worktree, base, args.pr_head)
+    if stale_note:
+        notes.append(stale_note)
+    if (not stale_note and not args.pr_head and (not pr or pr.get("state") == "MERGED")
             and any(blocker.startswith("HEAD ") or blocker.startswith("no base ref")
                     for blocker in result["blockers"])):
         notes.append("For a merged PR, confirm its head on a host with gh and pass --pr-head <sha>")

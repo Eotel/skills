@@ -1649,6 +1649,31 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(blocked_code, 1)
         self.assertIn("ahead of merged PR head", " ".join(blocked["blockers"]))
 
+    def test_stale_origin_fetch_is_reported_from_shared_git_state(self):
+        bare = Path(self.tmp.name) / "remote.git"
+        bare.mkdir()
+        git(bare, "init", "--bare", "-q")
+        git(self.main, "remote", "add", "origin", str(bare))
+        git(self.main, "push", "-q", "origin", "main")
+        git(self.main, "fetch", "-q", "origin", "main")
+        common = Path(git(self.wt, "rev-parse", "--git-common-dir"))
+        fetched = common / "FETCH_HEAD"
+        fetched.write_text(fetched.read_text().replace(
+            str(bare).removesuffix(".git"), "https://git.example.invalid/team/remote"))
+        git(self.main, "remote", "set-url", "origin", "git@git.example.invalid:team/remote.git")
+        old = datetime.fromisoformat("2020-01-02T00:00:00+00:00").timestamp()
+        os.utime(fetched, (old, old))
+
+        _, stale = self.run_main_without_base()
+        git(self.main, "remote", "set-url", "origin", str(bare))
+        git(self.wt, "fetch", "-q", "origin", "main")
+        _, fresh = self.run_main_without_base()
+
+        self.assertEqual(stale["base"], "origin/main")
+        self.assertIn("origin の参照は 2020-01-02T00:00:00Z の fetch のまま", " ".join(stale["notes"]))
+        self.assertIn("--pr-head", " ".join(stale["notes"]))
+        self.assertNotIn("origin の参照は", " ".join(fresh.get("notes", [])))
+
     def run_main(self, *argv):
         out = io.StringIO()
         with redirect_stdout(out):
