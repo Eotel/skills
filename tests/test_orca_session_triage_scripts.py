@@ -1574,6 +1574,80 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(result["blockers"], ["PR #7 lookup failed: gh"])
+        self.assertIn("--pr-head", " ".join(result["notes"]))
+
+    def test_command_accepts_a_merged_pr_head_without_fetched_base(self):
+        (self.wt / "app.txt").write_text("merged change\n")
+        git(self.wt, "commit", "-q", "-am", "merged change")
+        head = git(self.wt, "rev-parse", "HEAD")
+
+        code, result = self.run_main("--pr-head", head, "--fetch-failed")
+
+        self.assertEqual((code, result["ok"], result["blockers"]), (0, True, []))
+        self.assertIn("git fetch failed", " ".join(result["notes"]))
+
+    def test_command_accepts_an_ancestor_of_the_merged_pr_head(self):
+        (self.wt / "app.txt").write_text("earlier PR commit\n")
+        git(self.wt, "commit", "-q", "-am", "earlier PR commit")
+        earlier = git(self.wt, "rev-parse", "HEAD")
+        (self.wt / "later.txt").write_text("later PR commit\n")
+        git(self.wt, "add", "later.txt")
+        git(self.wt, "commit", "-q", "-m", "later PR commit")
+        pr_head = git(self.wt, "rev-parse", "HEAD")
+        git(self.wt, "reset", "--hard", earlier)
+
+        code, result = self.run_main("--pr-head", pr_head)
+
+        self.assertEqual((code, result["ok"], result["blockers"]), (0, True, []))
+
+    def test_command_blocks_unpushed_commit_after_the_merged_pr_head(self):
+        (self.wt / "app.txt").write_text("merged change\n")
+        git(self.wt, "commit", "-q", "-am", "merged change")
+        pr_head = git(self.wt, "rev-parse", "HEAD")
+        (self.wt / "draft.txt").write_text("unpublished work\n")
+        git(self.wt, "add", "draft.txt")
+        git(self.wt, "commit", "-q", "-m", "local draft")
+
+        code, result = self.run_main("--pr-head", pr_head)
+
+        self.assertEqual(code, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("ahead of merged PR head", " ".join(result["blockers"]))
+
+    def test_a_commit_after_pr_head_blocks_even_if_its_patch_is_in_base(self):
+        (self.wt / "app.txt").write_text("merged change\n")
+        git(self.wt, "commit", "-q", "-am", "merged change")
+        pr_head = git(self.wt, "rev-parse", "HEAD")
+        (self.wt / "draft.txt").write_text("later patch\n")
+        git(self.wt, "add", "draft.txt")
+        git(self.wt, "commit", "-q", "-m", "later patch")
+        (self.main / "base.txt").write_text("base moved separately\n")
+        git(self.main, "add", "base.txt")
+        git(self.main, "commit", "-q", "-m", "base moved separately")
+        git(self.main, "cherry-pick", pr_head)
+        git(self.main, "cherry-pick", git(self.wt, "rev-parse", "HEAD"))
+
+        code, result = self.run_main("--pr-head", pr_head)
+
+        self.assertEqual(code, 1)
+        self.assertIn("ahead of merged PR head", " ".join(result["blockers"]))
+
+    def test_command_uses_compare_when_the_pr_head_object_is_missing(self):
+        (self.wt / "app.txt").write_text("older PR commit\n")
+        git(self.wt, "commit", "-q", "-am", "older PR commit")
+        missing_pr_head = "a" * 40
+
+        unknown_code, unknown = self.run_main("--pr-head", missing_pr_head)
+        cleared_code, cleared = self.run_main(
+            "--pr-head", missing_pr_head, "--head-ahead-of-pr", "0")
+        blocked_code, blocked = self.run_main(
+            "--pr-head", missing_pr_head, "--head-ahead-of-pr", "1")
+
+        self.assertEqual(unknown_code, 1)
+        self.assertIn("--head-ahead-of-pr", " ".join(unknown["notes"]))
+        self.assertEqual((cleared_code, cleared["ok"], cleared["blockers"]), (0, True, []))
+        self.assertEqual(blocked_code, 1)
+        self.assertIn("ahead of merged PR head", " ".join(blocked["blockers"]))
 
     def run_main(self, *argv):
         out = io.StringIO()
