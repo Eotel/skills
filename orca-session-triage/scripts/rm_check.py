@@ -2,6 +2,7 @@
 """Check that an Orca worktree is safe to remove."""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import filecmp
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 CACHE_PARTS = {
     "node_modules", ".venv", ".devenv", ".direnv", "__pycache__", ".pytest_cache", ".ruff_cache",
@@ -145,6 +147,19 @@ def patches_in_base(worktree, head, base):
     return [line[2:] for line in lines]
 
 
+def pr_head_relation(worktree, head, pr_head, head_ahead_of_pr):
+    """Whether HEAD is in the merged PR head's history; trust compare only if that object is absent."""
+    if git(worktree, "cat-file", "-e", pr_head + "^{commit}").returncode != 0:
+        if head_ahead_of_pr is not None:
+            return "contained" if head_ahead_of_pr == 0 else "ahead"
+        return "unknown"
+    if git(worktree, "merge-base", "--is-ancestor", head, pr_head).returncode == 0:
+        return "contained"
+    if git(worktree, "merge-base", "--is-ancestor", pr_head, head).returncode == 0:
+        return "ahead"
+    return "diverged"
+
+
 def compose_in(worktree, compose_projects):
     """Compose projects (from `docker compose ls --all --format json`) defined inside the worktree."""
     prefix = str(Path(worktree).resolve()) + "/"
@@ -156,7 +171,7 @@ def compose_in(worktree, compose_projects):
     return found
 
 
-def check(worktree, main, base, compose_projects, pr=None):
+def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):
     """Return {"ok", "blockers", "review", "regenerable", "merged_by_patch", "containers"} for removing `worktree`."""
     blockers = []
     if Path(worktree).resolve() == Path(main).resolve():
@@ -166,18 +181,28 @@ def check(worktree, main, base, compose_projects, pr=None):
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
     merged_by_patch = []
-    if base is None:
-        blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
-    elif git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
-        # A commit rebased before its PR merged has its patch in base under another hash.
-        merged_by_patch = patches_in_base(worktree, head, base) or []
-        if merged_by_patch:
-            pass
-        elif not pr:
-            blockers.append("HEAD %s is not in %s" % (head[:8], base))
-        elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
-            blockers.append("HEAD %s is not in %s and PR #%s is %s"
-                            % (head[:8], base, pr.get("number"), pr.get("state")))
+    if base is None or git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
+        merged_head = pr_head or ((pr or {}).get("headRefOid") if (pr or {}).get("state") == "MERGED" else None)
+        relation = pr_head_relation(worktree, head, merged_head, head_ahead_of_pr) if merged_head else None
+        # Do not let an equivalent patch hide work committed after the PR head.
+        if relation == "ahead":
+            blockers.append("HEAD %s is ahead of merged PR head %s" % (head[:8], merged_head[:8]))
+        elif relation != "contained":
+            # A commit rebased before its PR merged has its patch in base under another hash.
+            merged_by_patch = (patches_in_base(worktree, head, base) or []) if base else []
+            if merged_by_patch:
+                pass
+            elif relation == "diverged":
+                blockers.append("HEAD %s diverged from merged PR head %s" % (head[:8], merged_head[:8]))
+            elif relation == "unknown":
+                blockers.append("HEAD %s cannot be compared with merged PR head %s" % (head[:8], merged_head[:8]))
+            elif base is None:
+                blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
+            elif not pr:
+                blockers.append("HEAD %s is not in %s" % (head[:8], base))
+            elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
+                blockers.append("HEAD %s is not in %s and PR #%s is %s"
+                                % (head[:8], base, pr.get("number"), pr.get("state")))
     review, regenerable = ignored_paths(worktree, main)
     return {"ok": not blockers and not review, "blockers": blockers, "review": review,
             "regenerable": regenerable, "merged_by_patch": merged_by_patch,
@@ -204,6 +229,53 @@ def default_base(worktree):
         if ref_exists(worktree, ref):
             return ref
     return None
+
+
+def remote_identity(url):
+    """Match FETCH_HEAD's display URL to a remote across HTTPS/SSH URL changes."""
+    if "://" in url:
+        parsed = urlsplit(url)
+        host, path = parsed.hostname or "", parsed.path
+    elif ":" in url and not url.startswith("/"):
+        authority, path = url.split(":", 1)
+        host = authority.rpartition("@")[2]
+    else:
+        host, path = "", url
+    return host.lower(), path.strip("/").removesuffix(".git")
+
+
+def stale_fetch_note(worktree, base, pr_head):
+    """Warn when no worktree has fetched the base remote in the last day."""
+    ref = (base or "").removeprefix("refs/remotes/")
+    remote, separator, _ = ref.partition("/")
+    if not separator:
+        return None
+    url = git(worktree, "remote", "get-url", remote)
+    common = git(worktree, "rev-parse", "--git-common-dir")
+    if url.returncode != 0 or common.returncode != 0:
+        return None
+    remote_url = remote_identity(url.stdout.strip())
+    common_dir = (Path(worktree) / common.stdout.strip()).resolve()
+    fetch_heads = [common_dir / "FETCH_HEAD", *(common_dir / "worktrees").glob("*/FETCH_HEAD")]
+    fetched_at = []
+    for path in fetch_heads:
+        try:
+            with path.open(errors="replace") as handle:
+                if any(" of " in line and remote_identity(line.rpartition(" of ")[-1].strip()) == remote_url
+                       for line in handle):
+                    fetched_at.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not fetched_at:
+        return None
+    latest = datetime.fromtimestamp(max(fetched_at), timezone.utc)
+    if datetime.now(timezone.utc) - latest <= timedelta(days=1):
+        return None
+    when = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+    note = "%s の参照は %s の fetch のままです。" % (remote, when)
+    if pr_head:
+        return note + "渡された --pr-head を使って判定しました。"
+    return note + "merge 済み PR の head を別の Mac で確認し、--pr-head <sha> を渡してください。"
 
 
 def start_base(worktree):
@@ -262,8 +334,15 @@ def main(argv=None):
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
     parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD)")
     parser.add_argument("--pr", type=int, help="PR number; a MERGED PR whose head is HEAD counts as merged (squash merges)")
+    parser.add_argument("--pr-head", help="full SHA of a PR head confirmed MERGED on a host with gh; HEAD may be its ancestor")
+    parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
+    parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     args = parser.parse_args(argv)
+    if args.pr_head and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", args.pr_head):
+        parser.error("--pr-head must be a full commit SHA")
+    if args.head_ahead_of_pr is not None and (not args.pr_head or args.head_ahead_of_pr < 0):
+        parser.error("--head-ahead-of-pr needs --pr-head and a non-negative ahead_by")
 
     worktree = str(Path(args.worktree).resolve())
     if git(worktree, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
@@ -275,11 +354,33 @@ def main(argv=None):
     by_pr = pr_base(worktree, pr)
     base = args.base or by_pr or start_base(worktree) or default_base(worktree)
     projects = [] if args.no_docker else compose_projects()
-    result = check(worktree, main, base, projects or [], pr)
+    supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
+    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
     notes = []
     if pr_error:
-        result["blockers"].append("PR #%d lookup failed: %s" % (args.pr, pr_error))
+        if not args.pr_head:
+            result["blockers"].append("PR #%d lookup failed: %s" % (args.pr, pr_error))
+            result["ok"] = False
+            notes.append("PR #%d lookup failed: %s; confirm it is MERGED on a host with gh, then pass --pr-head <sha>" % (args.pr, pr_error))
+        else:
+            notes.append("PR #%d lookup failed: %s; using the supplied merged PR head" % (args.pr, pr_error))
+    if pr and args.pr_head and pr.get("headRefOid") != args.pr_head:
+        result["blockers"].append("--pr-head does not match PR #%d head" % args.pr)
         result["ok"] = False
+    if args.fetch_failed:
+        if args.pr_head:
+            notes.append("git fetch failed; remote refs may be stale. Using the supplied merged PR head")
+        else:
+            notes.append("git fetch failed; remote refs may be stale. Confirm the PR is MERGED on a host with gh and pass --pr-head <sha>")
+    stale_note = stale_fetch_note(worktree, base, args.pr_head)
+    if stale_note:
+        notes.append(stale_note)
+    if (not stale_note and not args.pr_head and (not pr or pr.get("state") == "MERGED")
+            and any(blocker.startswith("HEAD ") or blocker.startswith("no base ref")
+                    for blocker in result["blockers"])):
+        notes.append("For a merged PR, confirm its head on a host with gh and pass --pr-head <sha>")
+    if any("cannot be compared" in blocker for blocker in result["blockers"]):
+        notes.append("PR head object is absent locally; compare <pr-head>...<HEAD> with gh on another host and pass its ahead_by as --head-ahead-of-pr <number>")
     if not args.base and not by_pr and (pr or {}).get("baseRefName"):
         notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr["baseRefName"]))
     if projects is None:
