@@ -32,6 +32,8 @@ scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
 precheck = load_script("precheck")
 stopcheck = load_script("stop_check")
+inbox_service = load_script("inbox_watch_service")
+inbox_read = load_script("inbox_read")
 
 
 def write_jsonl(path, rows):
@@ -1816,36 +1818,8 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("skip: an agent in /w/triage is working (a background job after its turn)", out)
 
-    def test_watch_inbox_alone_leaves_the_workspace_idle(self):
-        job = ("/bin/zsh -c eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'",
-               ["python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset"])
-        with patch.object(precheck, "background_jobs", return_value=[job]):
-            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
-        self.assertEqual(code, 0)
-        self.assertIn("run: no agent", out)
-
-    def test_exec_watch_inbox_is_found_as_a_direct_claude_child(self):
-        commands = ("10 1 claude\n"
-                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset\n")
-
-        def process(command, **kwargs):
-            if command[0] == "ps":
-                return subprocess.CompletedProcess(command, 0, commands)
-            if command[0] == "lsof":
-                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
-            self.fail(command)
-
-        with patch.object(precheck.subprocess, "run", side_effect=process):
-            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
-        self.assertEqual(code, 0)
-        self.assertIn("run: no agent", out)
-
-    def test_another_background_job_still_skips_the_run(self):
-        watch = ("eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'",
-                 ["python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset"])
-        other = ("eval 'sleep 100'", ["sleep 100"])
-        with patch.object(precheck, "background_jobs", return_value=[watch, other]):
-            code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+    def test_background_watch_still_blocks_reuse(self):
+        code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
         self.assertEqual(code, 1)
         self.assertIn("background job", out)
 
@@ -1938,6 +1912,69 @@ def tool_result(content, result):
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}]}, "toolUseResult": result}
 
 
+class InboxWatchServiceTests(unittest.TestCase):
+    def test_plist_runs_the_existing_watch_with_the_existing_offset(self):
+        with tempfile.TemporaryDirectory() as root:
+            payload = inbox_service.plistlib.loads(inbox_service.plist_bytes(
+                root, python="/test/bin/python3", orca="/app/bin/orca"))
+            self.assertEqual(payload["ProgramArguments"], [
+                "/test/bin/python3",
+                f"{root}/.cache/orca-briefs/bin/watch-inbox",
+                f"{root}/.cache/orca-briefs/offsets/close-done-triage.offset"])
+            self.assertTrue(payload["KeepAlive"])
+            self.assertIn("/app/bin", payload["EnvironmentVariables"]["PATH"])
+
+    def test_activation_refuses_a_second_reader_of_the_offset(self):
+        with tempfile.TemporaryDirectory() as root:
+            plist, watch, offset, _ = inbox_service.paths(root)
+            watch.parent.mkdir(parents=True)
+            watch.write_text("#!/bin/sh\n")
+            watch.chmod(0o700)
+            with patch.object(inbox_service, "status", return_value=(False, "stopped")), \
+                    patch.object(inbox_service, "offset_readers", return_value=[44]):
+                with self.assertRaisesRegex(RuntimeError, "PID 44"):
+                    inbox_service.activate(root)
+            self.assertFalse(plist.exists())
+
+    def test_status_requires_launchd_pid_to_own_the_offset(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(inbox_service, "launchd_pid", return_value=42), \
+                    patch.object(inbox_service, "offset_readers", return_value=[43]):
+                self.assertFalse(inbox_service.status(root)[0])
+            with patch.object(inbox_service, "launchd_pid", return_value=42), \
+                    patch.object(inbox_service, "offset_readers", return_value=[42, 43]):
+                self.assertFalse(inbox_service.status(root)[0])
+            with patch.object(inbox_service, "launchd_pid", return_value=42), \
+                    patch.object(inbox_service, "offset_readers", return_value=[42]):
+                self.assertTrue(inbox_service.status(root)[0])
+
+
+class InboxReadTests(unittest.TestCase):
+    def test_late_remote_report_is_read_even_with_an_old_timestamp(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            write_jsonl(inbox, [{"ts": "2026-10-25T10:00:00+09:00", "kind": "done", "text": "first"}])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["initialize"]), 0)
+                with inbox.open("a") as stream:
+                    stream.write(json.dumps({"ts": "2026-10-24T10:00:00+09:00", "kind": "ask",
+                                             "text": "late from remote"}) + "\n")
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read"]), 0)
+                self.assertIn("late from remote", output.getvalue())
+                self.assertNotIn("first", output.getvalue())
+                position = int(output.getvalue().split("NEXT_OFFSET=")[1])
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["ack", str(position)]), 0)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read"]), 0)
+                self.assertEqual(output.getvalue(), f"NEXT_OFFSET={position}\n")
+
+
 def published(url, live="arming"):
     return tool_result(f"Published page.html at {url} (Version 1)\n\nLive subscription: {live} in the background",
                        {"url": url, "liveSubscription": live})
@@ -1982,7 +2019,7 @@ class StopCheckTests(unittest.TestCase):
             hook["cwd"] = cwd
         if transcript:
             hook["transcript_path"] = str(transcript)
-        with patch.object(stopcheck, "inbox_watch_running", return_value=watch_running):
+        with patch.object(stopcheck, "inbox_service_running", return_value=watch_running):
             return stopcheck.decide(hook, self.root, orca=orca)
 
     def fake_orca(self, automations, runs):
@@ -2050,84 +2087,28 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("references/hourly.md", blocked["reason"])
         self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
-    def test_warns_when_the_triage_tab_has_no_inbox_monitor(self):
+    def test_warns_when_the_external_inbox_service_is_stopped(self):
         self.queue()
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": []})
         reason = self.check(cwd="/w/triage", orca=orca, watch_running=False)["reason"]
         self.assertIn("watch-inbox", reason)
-        self.assertIn("~/.cache/orca-briefs/offsets/", reason)
+        self.assertIn("~/.cache/orca-briefs/offsets/close-done-triage.offset", reason)
         self.assertIsNone(self.check(cwd="/w/triage", orca=orca, watch_running=True))
 
-    def test_another_tabs_inbox_monitor_in_another_workspace_needs_no_notice(self):
-        offset = Path.home() / ".cache/orca-briefs/offsets/close-done-triage.offset"
-        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
-                    f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset}'\n"
-                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset}\n")
-
-        def process(command, **kwargs):
-            if command[0] == "ps":
-                return subprocess.CompletedProcess(command, 0, commands)
-            self.fail(command)
-
+    def test_monitor_in_another_tab_does_not_replace_external_service(self):
         with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
-                patch.object(stopcheck.subprocess, "run", side_effect=process):
-            self.assertIsNone(stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
+                patch.object(stopcheck, "inbox_service_running", return_value=False):
+            reason = stopcheck.missing_inbox_watch("/w/triage", "orca")
+        self.assertIn("external triage inbox service", reason)
 
-    def test_another_tabs_only_watch_does_not_replace_the_triage_watch(self):
-        offset = Path.home() / ".cache/orca-briefs/offsets/only-one-lane.offset"
-        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
-                    f"eval '~/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020'\n"
-                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset} --only issue-triage-20261020\n")
-
-        def process(command, **kwargs):
-            if command[0] == "ps":
-                return subprocess.CompletedProcess(command, 0, commands)
-            if command[0] == "lsof":
-                return subprocess.CompletedProcess(command, 0, "p10\nfcwd\nn/w/triage\n")
-            self.fail(command)
-
-        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
-                patch.object(stopcheck.subprocess, "run", side_effect=process):
-            reason = stopcheck.missing_inbox_watch("/w/triage", "s1", "orca")
-            self.assertIsNotNone(reason)
-            self.assertIn("watch-inbox", reason)
-
-    def test_another_tabs_watch_with_an_offset_outside_offsets_needs_a_notice(self):
-        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s2\\012"
-                    "eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/other.offset'\n"
-                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/other.offset\n")
-        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
-                patch.object(stopcheck.subprocess, "run",
-                             return_value=subprocess.CompletedProcess([], 0, commands)):
-            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
-
-    def test_no_tabs_inbox_monitor_still_needs_a_notice(self):
-        with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
-                patch.object(stopcheck.subprocess, "run",
-                             return_value=subprocess.CompletedProcess([], 0, "")):
-            self.assertIn("watch-inbox", stopcheck.missing_inbox_watch("/w/triage", "s1", "orca"))
-
-    def test_inbox_monitor_must_have_a_live_child_in_this_session(self):
-        commands = ("10 1 /bin/zsh -c export CLAUDE_CODE_SESSION_ID=s1\\012eval '~/.cache/orca-briefs/bin/watch-inbox /tmp/offset'\n"
-                    "11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox /tmp/offset\n")
-        with patch.object(stopcheck.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, commands)):
-            self.assertTrue(stopcheck.inbox_watch_running("s1"))
-            self.assertFalse(stopcheck.inbox_watch_running("s2"))
+    def test_external_service_status_controls_stop_notice(self):
         with patch.object(stopcheck.subprocess, "run",
-                          return_value=subprocess.CompletedProcess([], 0, commands.splitlines()[0] + "\n")):
-            self.assertFalse(stopcheck.inbox_watch_running("s1"))
-
-    def test_exec_inbox_monitor_counts_with_a_triage_offset(self):
-        offset = Path.home() / ".cache/orca-briefs/offsets/triage.offset"
-        commands = ("10 1 claude\n"
-                    f"11 10 python3 /Users/me/.cache/orca-briefs/bin/watch-inbox {offset}\n")
+                          return_value=subprocess.CompletedProcess([], 0, "running")) as run:
+            self.assertTrue(stopcheck.inbox_service_running())
+        self.assertEqual(run.call_args.args[0][-1], "status")
         with patch.object(stopcheck.subprocess, "run",
-                          return_value=subprocess.CompletedProcess([], 0, commands)):
-            self.assertTrue(stopcheck.inbox_watch_running("s2"))
-        only = commands.replace(f"{offset}\n", f"{offset} --only lane\n")
-        with patch.object(stopcheck.subprocess, "run",
-                          return_value=subprocess.CompletedProcess([], 0, only)):
-            self.assertFalse(stopcheck.inbox_watch_running("s2"))
+                          return_value=subprocess.CompletedProcess([], 1, "stopped")):
+            self.assertFalse(stopcheck.inbox_service_running())
 
     def test_asks_for_the_whole_triage_when_several_runs_in_a_row_were_skipped(self):
         self.queue(at="2026-10-13T02:30:00+00:00")

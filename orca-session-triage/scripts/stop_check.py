@@ -10,8 +10,8 @@ blocks once when the hourly triage of this workspace skipped a run (its precheck
 saw this session busy) after this session's last scan, so the skipped sweep is
 done before the turn ends. It blocks once, too, while an artifact this session
 published is still watched live: Orca counts the tab as working while the watch
-runs, so the precheck skips every hourly run. A missing inbox Monitor is named
-when no tab on this Mac owns an unfiltered watch. A repeated stop
+runs, so the precheck skips every hourly run. A missing external inbox service
+is named when the triage automation is installed. A repeated stop
 (`stop_hook_active`) goes through, so a broken classifier cannot trap the session.
 """
 
@@ -59,7 +59,7 @@ def decide(hook_input, state_dir, orca="orca"):
     queue = read_json(session / "review-queue.json")
     if isinstance(queue, dict):
         reasons += [unclassed(session, queue), unswept(hook_input.get("cwd"), queue, orca),
-                    missing_inbox_watch(hook_input.get("cwd"), hook_input["session_id"], orca)]
+                    missing_inbox_watch(hook_input.get("cwd"), orca)]
     reasons = [r for r in reasons if r]
     return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
 
@@ -160,53 +160,24 @@ def triage_automations(orca, workspace):
             and (a.get("prompt") or "").startswith(TRIAGE_PROMPT)]
 
 
-def inbox_watch_running(session_id):
-    """A live unfiltered watch in this session or another tab on this Mac with a triage offset."""
-    lines = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,command="], capture_output=True,
-                           text=True, check=True, timeout=10).stdout.splitlines()
-    processes = {}
-    for line in lines:
-        parts = line.strip().split(None, 2)
-        if len(parts) == 3:
-            pid, ppid, command = parts
-            processes[int(pid)] = (int(ppid), command)
-    offsets = Path.home() / ".cache/orca-briefs/offsets"
-    marker = r"(?:^|/)watch-inbox\s+(\S+)"
-    for pid, (_, command) in processes.items():
-        if "CLAUDE_CODE_SESSION_ID=" in command and "eval " in command:
-            children = [child for parent, child in processes.values()
-                        if parent == pid and re.search(marker, child)
-                        and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
-        elif re.match(r"(?:\S*/)?claude(?:\s|$)", command):
-            # With `exec`, Monitor's Python process is Claude's direct child.
-            children = [child for parent, child in processes.values()
-                        if parent == pid and re.search(marker, child)
-                        and not re.search(r"(?:^|\s)--only(?:\s|=|$)", child)]
-        else:
-            continue
-        if not children:
-            continue
-        if (f"CLAUDE_CODE_SESSION_ID={session_id}" in command
-                or f"CLAUDE_CODE_SESSION_ID='{session_id}'" in command):
-            return True
-        if any((match := re.search(marker, child))
-               and Path(os.path.realpath(os.path.expanduser(match.group(1)))).is_relative_to(offsets)
-               for child in children):
-            return True
-    return False
+def inbox_service_running():
+    script = Path(__file__).with_name("inbox_watch_service.py")
+    result = subprocess.run([sys.executable, str(script), "status"], capture_output=True,
+                            text=True, timeout=15)
+    return result.returncode == 0
 
 
-def missing_inbox_watch(workspace, session_id, orca):
+def missing_inbox_watch(workspace, orca):
     if not workspace:
         return None
     try:
-        if not triage_automations(orca, workspace) or inbox_watch_running(session_id):
+        if not triage_automations(orca, workspace) or inbox_service_running():
             return None
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return None
-    return ("orca-session-triage: no unfiltered triage inbox watch is running on this Mac. "
-            "Run ~/.cache/orca-briefs/bin/watch-inbox without --only in Monitor with its offset file under "
-            "~/.cache/orca-briefs/offsets/.")
+    return ("orca-session-triage: the external triage inbox service is not running. "
+            "See references/hourly.md for the watch-inbox service status and cutover steps; "
+            "do not start another reader of ~/.cache/orca-briefs/offsets/close-done-triage.offset.")
 
 
 def skipped_runs(orca, workspace, since_ms):

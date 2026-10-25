@@ -8,7 +8,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -32,69 +31,12 @@ def busy_states(page, workspace):
     if row is None:
         return None
     agents = [a for a in row.get("agents") or [] if a.get("state") in BUSY_STATES]
-    if agents and all(background_only(a) for a in agents):
-        jobs = background_jobs(workspace)
-        if len(agents) == len(jobs) == 1 and watch_inbox(jobs[0]):
-            return []
     return [busy_label(a) for a in agents]
 
 
 def background_only(agent):
     main = agent.get("mainAgent")
     return agent.get("state") == "working" and isinstance(main, dict) and main.get("state") == "done"
-
-
-def background_jobs(workspace):
-    """Live Claude tool shells in this workspace, with their live child commands.
-
-    Orca reports that a background job exists, but not which command it runs.
-    Inspect the local Claude processes only for the after-turn exception.
-    An unavailable process census returns no jobs and keeps the run skipped.
-    """
-    try:
-        lines = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,command="], capture_output=True,
-                               text=True, check=True, timeout=10).stdout.splitlines()
-        processes = {}
-        for line in lines:
-            parts = line.strip().split(None, 2)
-            if len(parts) == 3:
-                pid, ppid, command = parts
-                processes[int(pid)] = (int(ppid), command)
-        roots = []
-        here = os.path.realpath(workspace)
-        for pid, (_, command) in processes.items():
-            if not re.match(r"(?:\S*/)?claude(?:\s|$)", command):
-                continue
-            try:
-                cwd = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                                     capture_output=True, text=True, check=True, timeout=5).stdout
-            except (OSError, subprocess.SubprocessError):
-                continue  # another Claude process can exit during the snapshot
-            if any(os.path.realpath(line[1:]) == here
-                   for line in cwd.splitlines() if line.startswith("n")):
-                roots.append(pid)
-        jobs = []
-        for pid, (parent, command) in processes.items():
-            if parent not in roots:
-                continue
-            if re.search(r"(?:^|/)watch-inbox(?:\s|$)", command):
-                # `exec watch-inbox` replaces Monitor's shell, leaving the Python
-                # process directly under Claude rather than under a zsh child.
-                jobs.append((command, [command]))
-                continue
-            if "CLAUDE_CODE_SESSION_ID=" not in command or "eval " not in command:
-                continue
-            children = [child for child_parent, child in processes.values() if child_parent == pid]
-            jobs.append((command, children))
-        return jobs
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-
-
-def watch_inbox(job):
-    command, children = job
-    marker = r"(?:^|/)watch-inbox(?:\s|$)"
-    return bool(re.search(marker, command) and any(re.search(marker, child) for child in children))
 
 
 def busy_label(agent):
