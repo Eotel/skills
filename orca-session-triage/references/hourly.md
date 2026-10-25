@@ -1,14 +1,19 @@
 # Hourly run
 
 An Orca automation starts `/orca-session-triage hourly` every hour in the
-triage workspace. A tab anywhere on this Mac that runs `watch-inbox` without
-`--only` and with an offset under `~/.cache/orca-briefs/offsets/` leads triage. A
-`--only` watch receives reports for selected lanes; it does not appoint a lead.
-If no tab owns the unfiltered watch, this run leads.
+triage workspace. The automation's session leads triage. The unfiltered
+`watch-inbox` runs as a macOS user service outside Orca tabs; owning a watch no
+longer appoints a lead. A `--only` watch receives selected lanes' reports.
+At the start of each run, use `scripts/inbox_read.py read` to see new inbox
+entries in append order. After handling them, pass its `NEXT_OFFSET` to
+`scripts/inbox_read.py ack <NEXT_OFFSET>`. The reader keeps its own cursor and
+does not touch the watch's offset. A report pulled late from another Mac is
+still shown even if its original timestamp is old. The service's output is in
+`~/.cache/orca-briefs/triage-watch.log` for diagnosis.
 
 ## In the run
 
-When another tab on this Mac leads, scan and review the rows, then do only the
+When another tab has explicitly been appointed lead, scan and review the rows, then do only the
 cleanup allowed before a user choice by the Boundary and `cleanup.md`. Send questions
 and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
@@ -30,14 +35,50 @@ When this run leads:
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
-- Keep `watch-inbox` running in Monitor after the turn, with its offset under
-  `~/.cache/orca-briefs/offsets/`. Other background jobs make the precheck skip
-  hourly runs. Publishing an Artifact starts a live
+- Leave no Monitor or other background job in this tab after the turn. A
+  background job makes Orca report the tab as working and prevents reuse by
+  the next hourly run. Publishing an Artifact starts a live
   watch (its result says `Live subscription: arming`): stop it right after
   publishing with ArtifactComments `action: "watch"`, `on: false`, and the
   artifact's `url`. The Stop hook names a watch still running.
 
-Monitor command: `~/.cache/orca-briefs/bin/watch-inbox ~/.cache/orca-briefs/offsets/close-done-triage.offset 2>&1`
+Check the external watch with
+`python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py status`.
+The Stop hook names a stopped service. Do not start a replacement Monitor in
+the tab.
+
+## External inbox service and cutover
+
+`scripts/inbox_watch_service.py render` prints the launchd user agent for
+review. It runs the existing `~/.cache/orca-briefs/bin/watch-inbox` with the
+existing `~/.cache/orca-briefs/offsets/close-done-triage.offset`, restarts it
+after exits, and appends its output to `~/.cache/orca-briefs/triage-watch.log`.
+The generated service pins the local `python3` and `orca` paths so launchd can
+run the watch and its Orca Task reconciliation without a login shell.
+The inbox itself remains the source for hourly reads. Only one process may read
+this offset at a time.
+
+After the PR is merged and this skill is installed, get approval for this
+cutover before changing the live watch:
+
+1. Have the lead handle the reports already in the inbox. Then run
+   `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_read.py initialize`
+   once while the old Monitor is still running. The new reader starts at that
+   byte position; later arrivals are retained.
+2. Ask the lead to stop the old `watch-inbox` Monitor in its tab and end its
+   turn. Do not send terminal input to that tab. New inbox lines remain in the
+   inbox while the watch is stopped.
+3. Run `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate`.
+   It refuses to start if any process still reads the existing offset. Do not
+   reset or copy the offset.
+4. Run the same script with `status`, inspect `triage-watch.log`, and use
+   `inbox_read.py read` to check delivery. The lead tab remains free of
+   Monitors. Check the next scheduled run's tab before claiming reuse works.
+
+An immediate alert for `kind=ask` could be added to this service later, with
+a macOS notification containing the worktree and a prompt to read the inbox.
+That would alert the person promptly; it would not wake or type into the lead
+tab. Design and implementation need separate approval.
 
 ## While this session works on a request
 

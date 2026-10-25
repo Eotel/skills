@@ -87,9 +87,8 @@ sent answer or step reached `turn_started` or is reported as queued, every done
 card is closed, asked about, or reported with the reason it stays, each
 approved or left-behind worktree is gone from `orca worktree ps` and from disk,
 and each approved tab is gone from `orca terminal list`.
-When another tab on this Mac owns the inbox watch without `--only` with an
-offset under `~/.cache/orca-briefs/offsets/`, completion is the scan, permitted
-cleanup, and any handoff in `references/hourly.md`.
+When another tab has explicitly been appointed lead, completion is the scan,
+permitted cleanup, and any handoff in `references/hourly.md`.
 
 ## Boundary
 
@@ -107,6 +106,6 @@ cleanup, and any handoff in `references/hourly.md`.
   another lane's result ("when A settles it, give B the task") goes to B once
   A reports it.
 - Relay answers verbatim; the session answers the user's follow-up questions.
-- In an hourly run, the tab on this Mac that owns the inbox watch without `--only`
-  with an offset under `~/.cache/orca-briefs/offsets/` directs the lanes;
-  `references/hourly.md` bounds the other tab's work.
+- In an hourly run, the automation's session directs the lanes unless another
+  tab was explicitly appointed lead; `references/hourly.md` bounds the other
+  tab's work and explains the external inbox service.
