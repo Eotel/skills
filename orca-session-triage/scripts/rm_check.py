@@ -171,8 +171,33 @@ def compose_in(worktree, compose_projects):
     return found
 
 
+def process_cwds(pids):
+    """Current directories by PID, from /proc on Linux or one lsof inventory on macOS."""
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        found = {}
+        for pid in pids:
+            try:
+                found[pid] = os.readlink("/proc/%d/cwd" % pid)
+            except OSError:
+                continue
+        return found
+    try:
+        output = subprocess.run(["lsof", "-n", "-P", "-Fpn", "-d", "cwd"],
+                                capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    found = {}
+    pid = None
+    for line in output.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif pid in pids and line.startswith("n"):
+            found[pid] = line[1:]
+    return found
+
+
 def processes_in(worktree):
-    """Processes whose command contains the worktree path, excluding this check's ancestors."""
+    """Processes using the worktree in their command or current directory, excluding ancestors."""
     path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
     try:
         output = subprocess.run(
@@ -197,9 +222,16 @@ def processes_in(worktree):
     while pid in processes and pid not in ancestors:
         ancestors.add(pid)
         pid = processes[pid][0]
-    return [{"pid": pid, "command": command[:160]}
-            for pid, (_, command) in processes.items()
-            if pid not in ancestors and path.search(command)]
+    cwds = process_cwds(processes)
+    if cwds is None:
+        return None
+    found = []
+    for pid, (_, command) in processes.items():
+        cwd = cwds.get(pid)
+        inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
+        if pid not in ancestors and (path.search(command) or inside):
+            found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
+    return found
 
 
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):

@@ -19,17 +19,21 @@ board's done cards; close what the user approves.
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus
   Claude and Codex transcripts, lists the tabs it could close (`closable`), and
   gives each `stalled`, `unsure`, and `waiting` row its `git` and `pr` state.
+  `open_pr_cleanup` marks a checkout with no current agent, no local changes,
+  and HEAD at its open PR head for removal without asking; a historical
+  transcript's question still gets its usual class and must be relayed.
   It reads the paired Orca environments listed by this Mac. A remote row
   carries `environment` and uses Orca's last agent message when its transcript
   is unavailable locally. Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
-  `--summary` prints class counts, review rows, and finished worktree/tab counts. Jev
+  `--summary` prints class counts, review rows, finished worktree/tab counts,
+  and open PR cleanup rows. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
   reads each idle worktree's newest final message and returns `jev`: `asks`,
   the probability that it waits on the user (0.7 or more is `waiting`), and
   `status` (`in_progress`, `blocked_on_others`, or `done`) with its
-  `confidence`. Only `done` can finish; the other two keep the row `stalled`
+  `confidence`. Only `done` can finish from Jev's verdict; the other two keep the row `stalled`
   with a reason, unless the row waited on someone else and its own PR merged
   after that message (`PR merged after the final message`). When `asks` is 0.3 to 0.7, `confidence` is below 0.6, or Jev
   gave no usable answer, the row is `unsure`. Jev's read is a fast first pass:

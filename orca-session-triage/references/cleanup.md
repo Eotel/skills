@@ -5,10 +5,19 @@ remove it without asking when `rm_check.py` reports `ok` with no `containers`,
 and report it afterwards.
 
 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
-This also applies when a readable shell tab remains; the process check below
-still protects work running there. Every other worktree waits for the user's
-choice. A row with `main: true` is a repository's own checkout: its tabs close
-and the checkout stays (`rm_check.py` blocks its removal).
+The scan marks these rows `open_pr_cleanup: true`. HEAD matching the PR head
+proves it was pushed to that PR; `git.unpushed` may still be positive when the
+branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
+them, even when their class is `waiting` or a readable shell tab remains. Relay
+any pending question or result before removal; the removal itself needs no
+question. For a remote row, check the current agent, HEAD, PR head, and local
+changes on its host before applying the same rule; the scan leaves those git
+facts unknown until that check. The process check below protects work running
+in a tab.
+
+Every other worktree waits for the user's choice. A row with `main: true` is a
+repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
+blocks its removal).
 
 Run these per worktree, in order.
 
@@ -39,8 +48,9 @@ Run these per worktree, in order.
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild.
    - `containers` lists docker compose projects defined inside the worktree.
-   - `processes` lists commands using the path. `orca worktree rm` stops its
-     PTYs before Git removal, but this preflight runs first. If the only process
+   - `processes` lists commands or current directories using the path. `orca
+     worktree rm` stops its PTYs before Git removal, but this preflight runs
+     first. If the only process
      blocker is an Orca-owned login shell and its `direnv export zsh`,
      `setup-runner.sh`, or `direnv exec` children waiting on setup, inspect all
      tabs and their process trees with `orca terminal list --worktree

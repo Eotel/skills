@@ -1018,7 +1018,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/no-session-other-head"][0], "stalled")
         self.assertEqual(result["/w/no-session-open"], ("finished", ["no local work beyond open PR head"]))
 
-    def test_open_pr_without_agent_keeps_a_checkout_with_local_work_or_another_head(self):
+    def test_open_pr_cleanup_uses_published_head_not_upstream(self):
         names = ("clean", "human-replied", "dirty", "unpushed", "other-head", "unknown-unpushed")
         rows = [{"path": "/w/" + name, "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
                  "linked_pr": None, "claude": None, "codex": []} for name in names]
@@ -1033,12 +1033,38 @@ class NextStepFactTests(unittest.TestCase):
             return {"number": 7, "state": "OPEN", "head_oid": "bbb" if ref == "other-head" else "aaa",
                     "reply_after_last_commit": ref == "human-replied"}
 
-        classes = {row["path"].rsplit("/", 1)[-1]: row["class"] for row in scan.add_next_step_facts(
+        result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
             rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
 
-        self.assertEqual(classes, {"clean": "finished", "human-replied": "finished",
-                                   "dirty": "stalled", "unpushed": "stalled",
-                                   "other-head": "stalled", "unknown-unpushed": "stalled"})
+        self.assertEqual({name: (row["class"], row.get("open_pr_cleanup", False)) for name, row in result.items()},
+                         {"clean": ("finished", True), "human-replied": ("finished", True),
+                          "dirty": ("stalled", False), "unpushed": ("finished", True),
+                          "other-head": ("stalled", False), "unknown-unpushed": ("finished", True)})
+
+    def test_open_pr_cleanup_preserves_a_historical_transcript_question(self):
+        rows = [
+            {"path": "/w/history", "class": "waiting", "reasons": ["final message asks"],
+             "agents": [], "terminals": [], "linked_pr": None, "claude": {"final_text": "merge?"}},
+            {"path": "/w/agent", "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+             "agents": [{"type": "codex"}], "terminals": [], "linked_pr": None},
+            {"path": "/w/agent-tab", "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+             "agents": [], "terminals": [{"agent": "codex"}], "linked_pr": None},
+        ]
+
+        def git_lookup(path):
+            return {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
+                    "unpushed": 1, "github": "acme/app"}
+
+        def pr_lookup(slug, ref):
+            return {"number": 7, "state": "OPEN", "head_oid": "aaa"}
+
+        result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
+            rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+
+        self.assertEqual(result["history"]["class"], "waiting")
+        self.assertTrue(result["history"]["open_pr_cleanup"])
+        self.assertNotIn("open_pr_cleanup", result["agent"])
+        self.assertNotIn("open_pr_cleanup", result["agent-tab"])
 
     def test_the_review_queue_holds_every_row_a_reader_must_class(self):
         # Jev reads fast and shallow: every row it judged from a final message gets
@@ -1447,6 +1473,23 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main()
         self.assertEqual((code, result["processes"]), (0, []))
 
+    def test_process_running_from_worktree_blocks_without_path_in_command(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)"],
+            cwd=self.wt, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            code, result = self.run_main()
+
+            self.assertEqual(code, 1)
+            self.assertEqual([item["pid"] for item in result["processes"]], [process.pid])
+            self.assertEqual(result["processes"][0]["cwd"], str(self.wt.resolve()))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+
     def test_check_does_not_count_itself_or_its_shell(self):
         command = (f'{sys.executable} {rmcheck.__file__} --worktree {self.wt} '
                    '--base main --no-docker; :')
@@ -1463,7 +1506,7 @@ class RmCheckTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
              str(sibling.resolve() / "server.js")],
-            stdout=subprocess.PIPE, text=True,
+            cwd=sibling, stdout=subprocess.PIPE, text=True,
         )
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
