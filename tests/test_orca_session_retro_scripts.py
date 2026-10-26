@@ -188,6 +188,79 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(facts.exists())
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
+    def test_adoption_receipt_timeout_recovers_without_a_second_write(self):
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
+        original_record = ledger.record
+        ledger.record = mock.Mock(side_effect=subprocess.TimeoutExpired("ledger record", 30))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
+        self.assertIn(proposal_id, retro.load(self.state)["applied_actions"])
+        facts = retro.facts_path(self.target)
+        self.assertEqual(facts.read_text().count(retro.MARKER), 1)
+        ledger.record = original_record
+        retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
+        self.assertTrue(ledger.items[proposal_id]["implemented_at"])
+        self.assertEqual(facts.read_text().count(retro.MARKER), 1)
+        self.assertNotIn(proposal_id, retro.load(self.state)["applied_actions"])
+
+    def test_revocation_removes_a_note_without_an_applied_receipt(self):
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
+        original_record = ledger.record
+        ledger.record = mock.Mock(side_effect=subprocess.TimeoutExpired("ledger record", 30))
+        with self.assertRaises(subprocess.TimeoutExpired):
+            retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
+        ledger.record = original_record
+        data = retro.load(self.state)
+        data["applied_actions"].clear()  # Simulate losing the receipt checkpoint after the file write.
+        data["target_versions"].clear()
+        retro.save(data, self.state)
+        ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
+        retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
+        self.assertTrue(ledger.items[proposal_id]["reverted_at"])
+        self.assertFalse(retro.facts_path(self.target).exists())
+        self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
+
+    def test_batch_stops_at_per_skill_note_limit(self):
+        data = retro.load(self.state)
+        for index in range(2):
+            retro.adopt({"id": str(uuid.uuid4()), "note": f"Existing tool {index}.py works.",
+                         "target_skill": "orca-session-triage"}, self.root)
+        retro.remember_versions(data, self.target, retro.facts_path(self.target))
+        retro.save(data, self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+        evidence = retro.extract_events(self.transcript)[1:3]
+        candidates = [{"note": f"New tool {index}.py returns JSON.", "target_skill": "orca-session-triage",
+                       "category": "fact", "first_failure": "read failed", "final_success": "read succeeded",
+                       "review": {"supported": True, "duplicate": False, "low_risk": True},
+                       "evidence": evidence} for index in range(3)]
+        ledger = FakeLedger()
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "build_proposals", return_value=candidates):
+                self.assertIn("3 proposals", retro.process_once(self.state, self.root,
+                                                                  ignore_load=True, ledger=ledger))
+        self.assertEqual([item["status"] for item in ledger.list()].count("adopted"), 1)
+        self.assertEqual([item["status"] for item in ledger.list()].count("pending"), 2)
+        self.assertEqual(retro.facts_path(self.target).read_text().count(retro.MARKER), 3)
+
+    def test_reference_content_is_available_to_overlap_review(self):
+        reference = self.target.parent / "references" / "hourly.md"
+        reference.parent.mkdir(parents=True)
+        note = "scan_sessions.py の scan.json は行の list"
+        reference.write_text(f"# Hourly\n\n{note}。\n")
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            result = retro.nearby_knowledge(note, self.root, "orca-session-triage")
+        self.assertIn(str(reference), result)
+        self.assertIn(note, result)
+
     def test_repository_local_skill_is_an_adoption_candidate(self):
         project_skill = self.home / "ghq/github.com/example/project/.claude/skills/project-triage/SKILL.md"
         project_skill.parent.mkdir(parents=True)
@@ -266,6 +339,14 @@ class RetroTests(unittest.TestCase):
             self.assertIn("deferred: adoption ledger", retro.process_once(
                 self.state, self.root, ignore_load=True, ledger=ledger))
             model.assert_not_called()
+
+    def test_decision_writer_needs_a_stable_name(self):
+        config = self.home / "hosts.json"
+        ledger = retro.LedgerClient(decision_config=config)
+        config.write_text(json.dumps({"decision_writer": True}))
+        self.assertFalse(ledger.writer_enabled())
+        config.write_text(json.dumps({"decision_writer": True, "name": "board"}))
+        self.assertTrue(ledger.writer_enabled())
 
     def test_failed_session_is_visible_and_can_be_retried(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):

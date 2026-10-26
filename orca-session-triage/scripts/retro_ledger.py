@@ -3,6 +3,7 @@
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -53,6 +54,9 @@ class LedgerClient:
     def writer_enabled(self):
         config = self.decision_config or DEFAULT_DECISION_CONFIG
         try:
-            return json.loads(config.read_text(encoding="utf-8")).get("decision_writer") is True
+            values = json.loads(config.read_text(encoding="utf-8"))
+            return (values.get("decision_writer") is True
+                    and isinstance(values.get("name"), str)
+                    and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", values["name"]) is not None)
         except (OSError, ValueError, AttributeError):
             return False

@@ -98,12 +98,14 @@ def atomic_text(path, content, mode=0o600):
 def load(state=STATE):
     state_file = paths(state)[1]
     if not state_file.exists():
-        return {"offset": 0, "sessions": {}, "target_versions": {}, "action_attempts": {}}
+        return {"offset": 0, "sessions": {}, "target_versions": {},
+                "action_attempts": {}, "applied_actions": {}}
     data = json.loads(state_file.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not all(k in data for k in ("offset", "sessions")):
         raise ValueError(f"invalid worker state: {state_file}")
     data.setdefault("target_versions", {})
     data.setdefault("action_attempts", {})
+    data.setdefault("applied_actions", {})
     return data
 
 
@@ -311,9 +313,12 @@ def run_claude(prompt, schema, claude="claude"):
     return output
 
 
-def nearby_knowledge(note, root=SOURCE):
+def nearby_knowledge(note, root=SOURCE, target_skill=None):
     """Retrieve related skill, memory, and ledger passages for the independent review."""
     files = list(skill_catalog(root).values())
+    target = skill_target(target_skill, root) if target_skill else None
+    references = set((target.parent / "references").rglob("*.md")) if target else set()
+    files.extend(references)
     files += list((Path.home() / ".claude/projects").glob("*/memory/MEMORY.md"))
     files += [Path.home() / ".claude/CLAUDE.md"]
     grams = {note[i:i+3] for i in range(max(0, len(note)-2)) if note[i:i+3].strip()}
@@ -328,7 +333,7 @@ def nearby_knowledge(note, root=SOURCE):
                 continue
             overlap = sum(1 for gram in grams if gram in section)
             if overlap:
-                scored.append((overlap, str(path), section[:1200]))
+                scored.append((overlap + (100 if path in references else 0), str(path), section[:1200]))
     scored.sort(reverse=True)
     return "\n".join(f"{path}: {section}" for _, path, section in scored[:12])[:15_000]
 
@@ -378,7 +383,8 @@ def build_proposals(transcript, root=SOURCE, claude="claude", existing=()):
         return []
     knowledge = "\n\n".join(
         f"RELATED FILE PASSAGES FOR CANDIDATE INDEX {i} (not ledger proposals):\n"
-        f"{nearby_knowledge(c['note'], root)}" for i, c in enumerate(candidates))
+        f"{nearby_knowledge(c['note'], root, c['target_skill'])}"
+        for i, c in enumerate(candidates))
     for candidate in candidates:
         target_path = skill_target(candidate["target_skill"], root)
         if target_path is None:
@@ -451,6 +457,15 @@ def source_checkout_ready(target, data):
                                       or data.get("target_versions", {}).get(str(resolved)) != digest):
             return "書き込み先に別の変更がある"
     return None
+
+
+def remember_versions(data, *targets):
+    for target in targets:
+        key = str(target.resolve())
+        if target.exists():
+            data["target_versions"][key] = hashlib.sha256(target.read_bytes()).hexdigest()
+        else:
+            data["target_versions"].pop(key, None)
 
 
 def eligible_auto(proposal, data, ledger_items=(), root=SOURCE):
@@ -628,8 +643,8 @@ def as_existing(items):
     return result
 
 
-def sync_decisions(ledger, data, root=SOURCE):
-    """Apply or reverse decisions for this worker's skill proposals, then record the result."""
+def sync_decisions(ledger, data, root=SOURCE, state=None):
+    """Reconcile decisions; callers hold the worker and state locks when state is set."""
     changed = 0
     for item in ledger.list():
         target = item.get("target") or ""
@@ -640,73 +655,91 @@ def sync_decisions(ledger, data, root=SOURCE):
             continue
         _, _, skill, category = parts
         status = item["status"]
+        proposal_id = item["proposal_id"]
         if status not in ("adopted", "revoked"):
             continue
-        if status == "adopted" and item.get("implemented_at"):
+        if ((status == "adopted" and item.get("implemented_at"))
+                or (status == "revoked" and item.get("reverted_at"))):
+            data["applied_actions"].pop(proposal_id, None)
             continue
-        if status == "revoked" and item.get("reverted_at"):
+        action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
+        if data["action_attempts"].get(action_key, 0) >= 3 and proposal_id not in data["applied_actions"]:
             continue
-        action_key = f"{item['proposal_id']}:{status}:{item.get(status + '_at')}"
-        if data["action_attempts"].get(action_key, 0) >= 3:
-            continue
-        proposal = {"id": item["proposal_id"], "note": item["proposal"], "target_skill": skill}
+        proposal = {"id": proposal_id, "note": item["proposal"], "target_skill": skill}
+        writing_completed = False
         try:
             if category == "script" and status == "adopted":
                 raise ValueError("script change requires a separate implementation")
+            router = skill_target(skill, root)
+            if router is None:
+                raise ValueError("target skill is missing")
+            reference = facts_path(router)
+            line = note_line(proposal)
+            expected = {"target": str(reference.resolve()), "router": str(router.resolve()), "line": line}
+            contents = reference.read_text(encoding="utf-8") if reference.is_file() else ""
+            if MARKER + proposal_id in contents and contents.count(line) != 1:
+                raise ValueError("adopted line changed; review target before retry")
             if status == "adopted":
-                auto = any(d.get("decision") == "adopt" and d.get("actor") == "triage-retro"
-                           for d in item.get("decisions", []))
-                current_target = skill_target(skill, root)
-                if current_target is None:
-                    raise ValueError("target skill is missing")
-                source_reason = source_checkout_ready(current_target, data)
-                if source_reason:
-                    raise ValueError(source_reason)
-                path = adopt(proposal, root, auto=auto)
-                token = json.dumps({"target": str(path), "router": str(current_target.resolve()),
-                                    "line": note_line(proposal)}, ensure_ascii=False)
-                result = f"appended to {path}"
-                outcome = "applied"
+                stored = data["applied_actions"].get(proposal_id)
+                if stored is not None and stored != expected:
+                    raise ValueError("saved adoption target does not match the skill")
+                if stored is not None or (contents.count(line) == 1
+                                          and ROUTER_SECTION in router.read_text(encoding="utf-8")):
+                    if contents.count(line) != 1 or ROUTER_SECTION not in router.read_text(encoding="utf-8"):
+                        raise ValueError("adopted note or router pointer is missing")
+                    path = reference.resolve()
+                else:
+                    source_reason = source_checkout_ready(router, data)
+                    if source_reason:
+                        raise ValueError(source_reason)
+                    auto = any(d.get("decision") == "adopt" and d.get("actor") == "triage-retro"
+                               for d in item.get("decisions", []))
+                    path = adopt(proposal, root, auto=auto)
+                    remember_versions(data, router, path)
+                data["applied_actions"][proposal_id] = expected
+                writing_completed = True
+                if state is not None:
+                    save(data, state)
+                ledger.record({"proposal_id": proposal_id, "outcome": "applied",
+                               "actor": "triage-retro", "result": f"appended to {path}",
+                               "undo": json.dumps(expected, ensure_ascii=False)})
             else:
                 applied = next((e for e in reversed(item.get("executions", []))
                                 if e.get("outcome") == "applied"), None)
-                if applied:
-                    token_data = json.loads(applied["undo"])
-                    proposal["target_path"] = token_data["target"]
-                    proposal["router_path"] = token_data["router"]
-                    if token_data["line"] != note_line(proposal):
-                        raise ValueError("undo token does not match the adopted line")
-                    current_target = skill_target(skill, root)
-                    if (current_target is None or Path(token_data["router"]).resolve() != current_target.resolve()
-                            or Path(token_data["target"]).resolve() != facts_path(current_target).resolve()):
+                token = (json.loads(applied["undo"]) if applied else
+                         data["applied_actions"].get(proposal_id))
+                if token is None and contents.count(line) == 1:
+                    token = expected  # The note was written before its execution receipt.
+                if token is not None:
+                    if token != expected:
                         raise ValueError("undo target does not match the skill")
+                    proposal.update({"target_path": token["target"], "router_path": token["router"]})
+                    track_versions = source_checkout_ready(router, data) is None
                     undo(proposal)
-                    path = Path(proposal["target_path"])
-                    result = f"removed adopted line from {path}"
-                else:
-                    path = None
-                    result = "no skill line was applied"
-                token = None
-                outcome = "reverted"
-            if path:
-                router = skill_target(skill, root)
-                for changed_path in (router, path):
-                    if changed_path.exists():
-                        data["target_versions"][str(changed_path.resolve())] = hashlib.sha256(
-                            changed_path.read_bytes()).hexdigest()
+                    if track_versions:
+                        remember_versions(data, router, reference)
                     else:
-                        data["target_versions"].pop(str(changed_path.resolve()), None)
-            receipt = {"proposal_id": item["proposal_id"], "outcome": outcome,
-                       "actor": "triage-retro", "result": result}
-            if token:
-                receipt["undo"] = token
-            ledger.record(receipt)
+                        for changed_path in (router, reference):
+                            data["target_versions"].pop(str(changed_path.resolve()), None)
+                    result = f"removed adopted line from {reference}"
+                else:
+                    result = "no skill line was applied"
+                writing_completed = True
+                if state is not None:
+                    save(data, state)
+                ledger.record({"proposal_id": proposal_id, "outcome": "reverted",
+                               "actor": "triage-retro", "result": result})
+            data["applied_actions"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
             changed += 1
         except (OSError, ValueError, RuntimeError) as exc:
+            if writing_completed:
+                raise  # A written note or reversal needs a receipt, not another local edit.
             data["action_attempts"][action_key] = (3 if category == "script" else
                                                    data["action_attempts"].get(action_key, 0) + 1)
-            ledger.record({"proposal_id": item["proposal_id"], "outcome": "failed",
+            if state is not None:
+                save(data, state)
+            ledger.record({"proposal_id": proposal_id, "outcome": "failed",
                            "actor": "triage-retro", "result": str(exc)[:500]})
     return changed
 
@@ -722,7 +755,7 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
             ingest(data, state)
             pending = next(((sid, s) for sid, s in data["sessions"].items()
                             if s["status"] == "pending" and s["attempts"] < 3), None)
-            changed = sync_decisions(ledger, data, root)
+            changed = sync_decisions(ledger, data, root, state)
             save(data, state)
         if pending is None:
             return f"empty; reconciled {changed} decisions"
@@ -751,15 +784,30 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
                         if eligible:
                             ledger.decide({"proposal_id": candidate["id"], "decision": "adopt",
                                            "actor": "triage-retro", "reason": "verified low-risk fact"})
+                            with locked(paths(state)[2]):
+                                data = load(state)
+                                changed += sync_decisions(ledger, data, root, state)
+                                save(data, state)
+                    items = ledger.list()
+                    known = {item["proposal_id"]: item for item in items}
                     continue
                 eligible, reason = eligible_auto(candidate, data, items, root)
                 ledger.propose(ledger_payload(candidate, sid, session["transcript"], reason))
                 if eligible:
                     ledger.decide({"proposal_id": candidate["id"], "decision": "adopt",
                                    "actor": "triage-retro", "reason": "verified low-risk fact"})
+                    with locked(paths(state)[2]):
+                        data = load(state)
+                        changed += sync_decisions(ledger, data, root, state)
+                        save(data, state)
                 items = ledger.list()
                 known = {item["proposal_id"]: item for item in items}
-            changed += sync_decisions(ledger, data, root)
+            with locked(paths(state)[2]):
+                data = load(state)
+                changed += sync_decisions(ledger, data, root, state)
+                data["sessions"][sid]["status"] = "done"
+                data["sessions"][sid]["processed_at"] = now()
+                save(data, state)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             with locked(paths(state)[2]):
                 data = load(state)
@@ -769,10 +817,6 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
                     data["sessions"][sid]["status"] = "failed"
                 save(data, state)
             return f"error: {sid}: {exc}"
-        with locked(paths(state)[2]):
-            data["sessions"][sid]["status"] = "done"
-            data["sessions"][sid]["processed_at"] = now()
-            save(data, state)
         return f"processed: {sid}: {len(candidates)} proposals; reconciled {changed} decisions"
 
 
