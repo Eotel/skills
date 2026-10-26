@@ -10,7 +10,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+
+import hourly_runtime
 
 
 def paths():
@@ -83,6 +86,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     inbox, cursor = paths()
     try:
+        if (args.action != "initialize" and not os.environ.get("TRIAGE_READ_OFFSET") and
+                not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
+            raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
         if args.action == "read":
             read(inbox, cursor)
             return 0
@@ -98,7 +104,7 @@ def main(argv=None):
         save(cursor, args.position)
         print(f"acknowledged through {args.position}")
         return 0
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         print(f"inbox-read: {exc}", file=sys.stderr)
         return 1
 

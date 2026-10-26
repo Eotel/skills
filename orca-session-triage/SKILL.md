@@ -104,10 +104,12 @@ permitted cleanup, and any handoff in `references/hourly.md`.
   nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
-  choice per item. Five exceptions act first and report after:
+  choice per item. These exceptions act first and report after:
   - A finished worktree with no meaningful tab that `rm_check.py` clears is removed.
   - 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
   - A done card that leaves the user nothing to do has its tab closed.
+  - A previous scheduled-run tab that `references/hourly.md` verifies as
+    finished, idle, and free of unanswered questions is closed at the next run.
   - A row stalled by an API error or by unread worker mail gets one line that
     wakes it to continue its own work.
   - A task the user approved as the follow-up of another lane's result ("when
