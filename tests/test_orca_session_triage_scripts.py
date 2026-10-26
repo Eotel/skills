@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from threading import Event
 import time
@@ -1386,6 +1387,40 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["processes"], [])
+
+    def test_running_process_using_the_worktree_blocks_removal(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
+             str(self.wt.resolve())],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            code, result = self.run_main()
+
+            self.assertEqual(code, 1)
+            self.assertFalse(result["ok"])
+            self.assertEqual([item["pid"] for item in result["processes"]], [process.pid])
+            self.assertIn("python3", result["processes"][0]["command"])
+            self.assertIn("PID", " ".join(result["blockers"]))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["processes"]), (0, []))
+
+    def test_check_does_not_count_itself_or_its_shell(self):
+        command = (f'{sys.executable} {rmcheck.__file__} --worktree {self.wt} '
+                   '--base main --no-docker; :')
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["processes"], [])
 
     def test_the_main_checkout_is_never_removable(self):
         result = rmcheck.check(self.main, self.main, base="main", compose_projects=[])

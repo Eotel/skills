@@ -171,8 +171,38 @@ def compose_in(worktree, compose_projects):
     return found
 
 
+def processes_in(worktree):
+    """Processes whose command contains the worktree path, excluding this check's ancestors."""
+    try:
+        output = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,ppid=,command="],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    processes = {}
+    for line in output.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid, ppid = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        processes[pid] = (ppid, fields[2])
+
+    ancestors = set()
+    pid = os.getpid()
+    while pid in processes and pid not in ancestors:
+        ancestors.add(pid)
+        pid = processes[pid][0]
+    return [{"pid": pid, "command": command[:160]}
+            for pid, (_, command) in processes.items()
+            if pid not in ancestors and worktree in command]
+
+
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):
-    """Return {"ok", "blockers", "review", "regenerable", "merged_by_patch", "containers"} for removing `worktree`."""
+    """Return the removal verdict, including containers and processes using `worktree`."""
     blockers = []
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
@@ -204,9 +234,14 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
     review, regenerable = ignored_paths(worktree, main)
+    processes = processes_in(str(Path(worktree).resolve()))
+    if processes is None:
+        blockers.append("processes could not be checked; check running processes before removing the worktree")
+    elif processes:
+        blockers.append("作業場を使うプロセスがあります。その PID を止めてから消してください。起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。")
     return {"ok": not blockers and not review, "blockers": blockers, "review": review,
             "regenerable": regenerable, "merged_by_patch": merged_by_patch,
-            "containers": compose_in(worktree, compose_projects)}
+            "containers": compose_in(worktree, compose_projects), "processes": processes or []}
 
 
 def main_checkout(worktree):
