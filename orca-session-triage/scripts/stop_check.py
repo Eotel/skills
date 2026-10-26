@@ -11,6 +11,8 @@ Orca counts the tab as working while the watch runs. A missing external inbox se
 is named when the triage automation is installed. A repeated stop
 (`stop_hook_active`) goes through for those checks, so a broken classifier cannot
 trap the session. An unread ask keeps blocking until the inbox cursor is acked.
+After the checks pass, an hourly transcript path is queued for the external
+retrospective worker.
 """
 
 import json
@@ -21,6 +23,7 @@ import subprocess
 import sys
 
 import inbox_read
+import retro
 
 STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
@@ -203,6 +206,11 @@ def main():
     decision = decide(hook_input, os.path.expanduser(STATE_DIR), os.environ.get("ORCA_CLI_COMMAND", "orca"))
     if decision:
         json.dump(decision, sys.stdout)
+    else:
+        try:
+            retro.enqueue(hook_input)
+        except OSError:
+            pass  # The queue is best-effort; a write failure must not trap the triage tab.
     return 0
 
 
