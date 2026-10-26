@@ -171,6 +171,42 @@ class RetroTests(unittest.TestCase):
                          ledger.list()[0]["decisions"][-1]["id"])
         self.assertEqual(data["sessions"][self.sid]["status"], "done")
 
+    def test_real_adoption_ledger_records_support_application_and_reversal(self):
+        config = self.home / "hosts.json"
+        config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
+        ledger = retro.LedgerClient(
+            script=ROOT / "adoption-triage/scripts/ledger.py",
+            events=self.home / "events.jsonl", imports=self.home / "imports",
+            decision_config=config)
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id,
+                        "source": {"session": self.sid, "worktree": str(self.root)},
+                        "fact": "Tool failed, then succeeded.",
+                        "proposal": "Tool.py returns JSON.",
+                        "reason": "The failure and success were observed.",
+                        "recommendation": "adopt", "priority": "normal",
+                        "evidence": ["first failure", "later success"],
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.add_evidence({"proposal_id": proposal_id,
+                             "source": {"session": str(uuid.uuid4()), "worktree": str(self.root)},
+                             "evidence": ["another run succeeded"]})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
+        data = retro.load(self.state)
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        adopted = ledger.list()[0]
+        self.assertEqual(len(adopted["evidence"]), 3)
+        self.assertTrue(adopted["implemented_at"])
+        self.assertEqual(adopted["executions"][-1]["decision_id"], adopted["decisions"][-1]["id"])
+        self.assertIn(proposal_id, retro.facts_path(self.target).read_text())
+
+        ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        revoked = ledger.list()[0]
+        self.assertTrue(revoked["reverted_at"])
+        self.assertEqual(revoked["executions"][-1]["decision_id"], revoked["decisions"][-1]["id"])
+        self.assertFalse(retro.facts_path(self.target).exists())
+        self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
+
     def test_policy_change_waits_for_a_button(self):
         proposal = sample_candidate()
         proposal["category"] = "rule"
