@@ -1,7 +1,8 @@
 # Hourly run
 
 An Orca automation starts `/orca-session-triage hourly` every hour in the
-triage workspace. The automation's session leads triage. The unfiltered
+triage workspace. The automation's session leads triage unless another tab is
+explicitly appointed lead. The unfiltered
 `watch-inbox` runs as a macOS user service outside Orca tabs; owning a watch no
 longer appoints a lead. A `--only` watch receives selected lanes' reports.
 The triage workspace holds scheduled-run tabs only. Start requests outside the
@@ -9,17 +10,34 @@ hourly sweep in a different workspace, so they cannot hold the next run.
 Read `references/hourly-state.md` for decisions shared across fresh sessions.
 At the start of each run, use `scripts/inbox_read.py read` to see new inbox
 entries in append order. After handling them, pass its `NEXT_OFFSET` to
-`scripts/inbox_read.py ack <NEXT_OFFSET>`. The reader keeps its own cursor and
-does not touch the watch's offset. A report pulled late from another Mac is
-still shown even if its original timestamp is old. The service's output is in
+`scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
+`~/.cache/orca-session-triage/inbox-read.offset` cursor. The separately
+appointed lead in a separate worktree (currently `triage-lead` on the local
+Mac) reads with
+`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-inbox-read.offset"`
+on both `read` and `ack`. When appointing a lead, hand over the unresolved
+decisions first, then initialize that cursor once with the same environment
+variable and `scripts/inbox_read.py initialize`. The command refuses to replace
+an existing cursor; never reset it to skip unread entries. Neither tab
+advances the other's cursor. Both see every
+entry, but the lead owns answers to `ask` and directions to lanes. The hourly
+run uses `info` and `done` for its sweep and sends unanswered `ask` entries
+from other lanes to the lead in one handoff. It does not reforward its own
+handoff entry. The lead checks inbox IDs and shared hourly state
+before answering so a later hourly handoff cannot repeat an answered question.
+The lead may read `info` and `done` for context but leaves the scheduled sweep
+to the hourly run. A report pulled late from another Mac is still shown even
+if its original timestamp is old. The watch and notification services each
+keep their own cursor. The watch's output is in
 `~/.cache/orca-briefs/triage-watch.log` for diagnosis.
 The Stop hook keeps a scheduled run open while an `ask` is past the acknowledged
-cursor, including on a repeated stop. Read and handle that report, then ack the
-reader's `NEXT_OFFSET` before ending the turn.
+cursor, including on a repeated stop. Read it, handle it or hand it to the
+appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
 
 ## In the run
 
-When another tab has explicitly been appointed lead, scan and review the rows, then do only the
+When another tab has explicitly been appointed lead, scan and review the rows,
+then do only the
 cleanup allowed before a user choice by the Boundary and `cleanup.md`. Send questions
 and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
