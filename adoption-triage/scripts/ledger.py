@@ -4,6 +4,7 @@
 import argparse
 import datetime as dt
 import fcntl
+import heapq
 import json
 import os
 from pathlib import Path
@@ -61,12 +62,42 @@ def all_rows(events, imports):
     if imports.exists():
         paths.extend(sorted(imports.glob("*.jsonl")))
     seen = {}
+    edges = set()
     for path in paths:
+        previous_id = None
         for row in read_rows(path):
             old = seen.setdefault(row["id"], row)
             if old != row:
                 raise ValueError(f"conflicting event id: {row['id']}")
-    return sorted(seen.values(), key=lambda row: (timestamp(row["ts"]), row["id"]))
+            if previous_id is not None:
+                edges.add((previous_id, row["id"]))
+            previous_id = row["id"]
+    for row in seen.values():
+        if row.get("after_id"):
+            edges.add((row["after_id"], row["id"]))
+    followers = {event_id: [] for event_id in seen}
+    incoming = {event_id: 0 for event_id in seen}
+    for before, after in edges:
+        if before not in seen:
+            raise ValueError(f"missing predecessor event: {before}")
+        if before != after:
+            followers[before].append(after)
+            incoming[after] += 1
+    ready = [(timestamp(row["ts"]), row["id"]) for row in seen.values()
+             if incoming[row["id"]] == 0]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        _, event_id = heapq.heappop(ready)
+        ordered.append(seen[event_id])
+        for following in followers[event_id]:
+            incoming[following] -= 1
+            if incoming[following] == 0:
+                row = seen[following]
+                heapq.heappush(ready, (timestamp(row["ts"]), following))
+    if len(ordered) != len(seen):
+        raise ValueError("event order contains a cycle")
+    return ordered
 
 
 def project(rows):
@@ -80,7 +111,8 @@ def project(rows):
                                       "rejected_at": None, "held_at": None, "revoked_at": None,
                                       "implemented_at": None, "reverted_at": None,
                                       "evidence": list(row.get("evidence", [])),
-                                      "supporting_events": [], "decisions": [], "executions": []}
+                                      "supporting_events": [], "decisions": [], "executions": [],
+                                      "latest_event_id": row["id"]}
     for row in rows:
         proposal_id = row["proposal_id"]
         if row["type"] == "proposal":
@@ -93,6 +125,7 @@ def project(rows):
                 if value not in item["evidence"]:
                     item["evidence"].append(value)
             item["supporting_events"].append(row)
+            item["latest_event_id"] = row["id"]
         elif row["type"] == "decision":
             if proposal_id not in proposals:
                 raise ValueError(f"decision without proposal: {proposal_id}")
@@ -113,6 +146,7 @@ def project(rows):
             item[{"adopt": "adopted_at", "reject": "rejected_at", "hold": "held_at",
                   "revoke": "revoked_at"}[decision]] = row["ts"]
             item["decisions"].append(row)
+            item["latest_event_id"] = row["id"]
         elif row["type"] == "execution":
             if proposal_id not in proposals:
                 raise ValueError(f"execution without proposal: {proposal_id}")
@@ -129,6 +163,7 @@ def project(rows):
             if outcome == "reverted":
                 item["reverted_at"] = row["ts"]
             item["executions"].append(row)
+            item["latest_event_id"] = row["id"]
         else:
             raise ValueError(f"invalid event type: {row['type']}")
     return sorted(proposals.values(), key=lambda item: (
@@ -153,7 +188,7 @@ def validate_proposal(body):
     if not isinstance(source, dict) or set(source) != {"session", "worktree"}:
         raise ValueError("source requires session and worktree")
     source = {key: required_text(source[key], key, 240) for key in ("session", "worktree")}
-    proposal_id = body.get("proposal_id") or str(uuid.uuid4())
+    proposal_id = body.get("proposal_id", str(uuid.uuid4()))
     if not isinstance(proposal_id, str):
         raise ValueError("proposal_id must be a UUID string")
     uuid.UUID(proposal_id)
@@ -168,7 +203,7 @@ def validate_proposal(body):
             not isinstance(value, str) or len(value) > 1000 for value in evidence):
         raise ValueError("evidence must be a list of short strings")
     target = optional_text(body.get("target"), "target", 500)
-    row = {**envelope("proposal", proposal_id), **body, "source": source,
+    row = {**body, **envelope("proposal", proposal_id), "source": source,
            "evidence": evidence, "target": target}
     return row
 
@@ -254,6 +289,8 @@ def append(events, imports, row):
         else:
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
+        if row["type"] != "proposal":
+            row["after_id"] = known[proposal_id]["latest_event_id"]
         data = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         if os.write(fd, data) != len(data):
             raise OSError("partial event write")
@@ -292,8 +329,6 @@ def collect(config, imports):
                 else:
                     raise OSError(result.stderr.decode(errors="replace").strip())
             rows = read_rows(temporary_path)
-            if any(row["host"] != name for row in rows):
-                raise ValueError(f"host mismatch: {name}")
             previous = {row["id"]: row for row in read_rows(path)}
             current = {row["id"]: row for row in rows}
             if any(current.get(key) != value for key, value in previous.items()):

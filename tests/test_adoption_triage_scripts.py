@@ -94,6 +94,32 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNone(item["implemented_at"])
         self.assertIsNone(item["revoked_at"])
 
+    def test_remote_clock_ahead_keeps_decision_and_execution_in_order(self):
+        proposal_id = self.proposal()
+        self.imports.mkdir()
+        row = json.loads(self.events.read_text().strip())
+        row["ts"] = "2026-10-26T23:00:00+09:00"
+        (self.imports / "remote.jsonl").write_text(json.dumps(row) + "\n")
+        self.events.unlink()
+        decision = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(decision.returncode, 0, decision.stderr)
+        applied = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "outcome": "applied", "actor": "worker", "result": "commit abc"})
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        view = self.run_ledger(["list", "--json"])
+        self.assertEqual(view.returncode, 0, view.stderr)
+        self.assertEqual(json.loads(view.stdout)["items"][0]["status"], "adopted")
+        self.assertEqual(len(json.loads(view.stdout)["items"][0]["executions"]), 1)
+
+    def test_empty_proposal_id_does_not_append(self):
+        result = self.run_ledger(["propose"], {
+            "proposal_id": "", "source": {"session": "triage", "worktree": "triage"},
+            "fact": "失敗", "proposal": "設定を直す", "reason": "繰り返す",
+            "recommendation": "adopt", "priority": "high"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.events.exists())
+
     def test_imports_are_read_without_changing_local_log(self):
         self.imports.mkdir()
         remote = self.imports / "other-mac.jsonl"
@@ -112,7 +138,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         proposal_id = self.proposal()
         remote = Path(self.temp.name) / "remote.jsonl"
         rows = [json.loads(line) for line in self.events.read_text().splitlines()]
-        rows[0]["host"] = "other-mac"
+        rows[0]["host"] = "renamed-os-host"
         remote.write_text(json.dumps(rows[0], ensure_ascii=False) + "\n")
         self.events.unlink()
         bin_dir = Path(self.temp.name) / "bin"
