@@ -31,6 +31,9 @@ If the skill source checkout has a different path, set
 Use the adoption-policy dashboard for morning decisions. `retro.py status`
 shows queue and proposal counts. `retro.py process-once`
 processes at most one pending session when the load permits.
+If `status` lists a failed session ID, inspect `service.log`, then run
+`retro.py retry --session-id UUID` to queue that session again. The service
+will pick it up on its next check.
 
 Automatic changes in the skill source checkout require the normal Eotel/skills
 PR, merge, and Mac-family installation before all Macs receive them. Review

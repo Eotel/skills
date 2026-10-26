@@ -714,9 +714,25 @@ def run_service(state=STATE, root=SOURCE, ledger=None):
         time.sleep(300)
 
 
+def retry_failed(state, session_id):
+    if not SESSION_ID.fullmatch(session_id):
+        raise ValueError("session ID must be a UUID")
+    with locked(state / "worker.lock"):
+        with locked(paths(state)[2]):
+            data = load(state)
+            ingest(data, state)
+            session = data["sessions"].get(session_id)
+            if session is None or session["status"] != "failed":
+                raise ValueError("session is not failed")
+            session["status"] = "pending"
+            session["attempts"] = 0
+            session.pop("error", None)
+            save(data, state)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("process-once", "run-service", "status", "enqueue"))
+    parser.add_argument("action", choices=("process-once", "run-service", "status", "enqueue", "retry"))
     parser.add_argument("--state", type=Path, default=STATE, help=f"worker state directory (default: {STATE})")
     parser.add_argument("--source", type=Path, default=SOURCE, help=f"Eotel/skills source checkout (default: {SOURCE})")
     parser.add_argument("--ledger-script", type=Path, default=DEFAULT_SCRIPT,
@@ -724,6 +740,7 @@ def main(argv=None):
     parser.add_argument("--events", type=Path, help="adoption ledger events path for an isolated test")
     parser.add_argument("--imports", type=Path, help="adoption ledger imports path for an isolated test")
     parser.add_argument("--ignore-load", action="store_true", help="manual processing only")
+    parser.add_argument("--session-id", help="failed hourly session to retry")
     args = parser.parse_args(argv)
     ledger = LedgerClient(args.ledger_script, args.events, args.imports)
     try:
@@ -733,6 +750,9 @@ def main(argv=None):
             print(process_once(args.state, args.source, ignore_load=args.ignore_load, ledger=ledger))
         elif args.action == "run-service":
             run_service(args.state, args.source, ledger)
+        elif args.action == "retry":
+            retry_failed(args.state, args.session_id or "")
+            print(f"retry queued: {args.session_id}")
         elif args.action == "status":
             with locked(paths(args.state)[2]):
                 data = load(args.state)
@@ -741,6 +761,8 @@ def main(argv=None):
             print(json.dumps({"sessions": len(data["sessions"]),
                               "pending_sessions": sum(s["status"] == "pending" for s in data["sessions"].values()),
                               "failed_sessions": sum(s["status"] == "failed" for s in data["sessions"].values()),
+                              "failed_session_ids": [sid for sid, session in data["sessions"].items()
+                                                     if session["status"] == "failed"],
                               "failed_actions": sum(n >= 3 for n in data["action_attempts"].values()),
                               "proposals": len(ledger.list())}, ensure_ascii=False))
         return 0

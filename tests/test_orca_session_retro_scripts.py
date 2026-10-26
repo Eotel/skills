@@ -2,6 +2,7 @@
 
 import json
 import io
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -214,6 +215,26 @@ class RetroTests(unittest.TestCase):
                     self.assertIn("deferred", retro.process_once(self.state, self.root, ledger=FakeLedger()))
                     model.assert_not_called()
         self.assertEqual(retro.load(self.state)["sessions"][self.sid]["status"], "pending")
+
+    def test_failed_session_is_visible_and_can_be_retried(self):
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+            data = retro.load(self.state)
+            retro.ingest(data, self.state)
+            data["sessions"][self.sid].update({"status": "failed", "attempts": 3,
+                                                 "error": "claude was unavailable"})
+            retro.save(data, self.state)
+            output = io.StringIO()
+            with mock.patch.object(retro, "LedgerClient", return_value=FakeLedger()):
+                with redirect_stdout(output):
+                    self.assertEqual(retro.main(["status", "--state", str(self.state)]), 0)
+                self.assertEqual(json.loads(output.getvalue())["failed_session_ids"], [self.sid])
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(retro.main(["retry", "--state", str(self.state),
+                                                 "--session-id", self.sid]), 0)
+        session = retro.load(self.state)["sessions"][self.sid]
+        self.assertEqual((session["status"], session["attempts"]), ("pending", 0))
+        self.assertNotIn("error", session)
 
 
 
