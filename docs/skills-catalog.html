@@ -107,11 +107,9 @@
   <footer>
     <p><b>運用メモ</b>: 真実の source は <code>chezmoi-dotfiles/dot_apm/apm.yml</code>(<code>~/.apm/apm.yml</code> は apply で上書きされるコピー)。
     canonical な実体は <code>~/.agents/skills/&lt;name&gt;</code> で、<code>~/.claude/skills</code> / <code>~/.codex/skills</code> へ symlink bridge。
-    install は <code>apm install --global --target agent-skills</code>。</p>
-    <p><b>更新</b>: branch 追従の dependency は <code>apm update --global</code> で更新し、
-    Eotel の <code>devenv-init</code> は tag(<code>v0.2.0</code>)、mattpocock は SHA(<code>8b78b531</code>)で固定。
-    APM が live manifest の SHA pin を release tag に書き換えた場合は、chezmoi source から manifest を復元して <code>apm install</code> する。
-    上流がディレクトリ再編した場合は apm.yml の subdir パス書き換えが必要(cloudflare-deploy は <code>alias</code> で dir 名を維持)。</p>
+    反映と更新は <a href="https://github.com/Eotel/chezmoi-dotfiles/blob/main/docs/skills-pipeline.md">skills-pipeline の手順</a>に従い、
+    <code>~/.agents/hooks/apm-prune-guard.py recover</code> で既存スキルと配布記録をバックアップしてから全件を復旧する。
+    前後の skill 件数と切れた bridge symlink を確認する。</p>
   </footer>
   </div>
 </main>
