@@ -173,6 +173,7 @@ def compose_in(worktree, compose_projects):
 
 def processes_in(worktree):
     """Processes whose command contains the worktree path, excluding this check's ancestors."""
+    path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
     try:
         output = subprocess.run(
             ["ps", "-axww", "-o", "pid=,ppid=,command="],
@@ -198,7 +199,7 @@ def processes_in(worktree):
         pid = processes[pid][0]
     return [{"pid": pid, "command": command[:160]}
             for pid, (_, command) in processes.items()
-            if pid not in ancestors and worktree in command]
+            if pid not in ancestors and path.search(command)]
 
 
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):

@@ -1422,6 +1422,24 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["processes"], [])
 
+    def test_process_in_a_sibling_with_the_same_name_prefix_does_not_block(self):
+        sibling = self.wt.with_name(self.wt.name + "-other")
+        sibling.mkdir()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
+             str(sibling.resolve() / "server.js")],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            code, result = self.run_main()
+
+            self.assertEqual((code, result["processes"]), (0, []))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+
     def test_the_main_checkout_is_never_removable(self):
         result = rmcheck.check(self.main, self.main, base="main", compose_projects=[])
 
