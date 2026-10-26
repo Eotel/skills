@@ -2166,8 +2166,9 @@ class HourlyTabCleanupTests(unittest.TestCase):
         from datetime import timezone
         with tempfile.TemporaryDirectory() as root:
             transcript = Path(root) / "session.jsonl"
-            transcript.write_text(json.dumps({"type": "assistant", "timestamp":
-                                              "2026-10-26T08:00:00Z"}) + "\n")
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "作業を終えました。"}]},
+                "timestamp": "2026-10-26T08:00:00Z"}) + "\n")
             now = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
             term = {"title": "Claude Code"}
             for source, tail, draft, expected in (("screen", ["finished", "❯"], None, False),
@@ -2182,6 +2183,22 @@ class HourlyTabCleanupTests(unittest.TestCase):
             self.assertIn("recent or unknown transcript activity", cleanup_hourly.close_blockers(
                 term, transcript, {"source": "screen", "tail": ["❯"]}, 5,
                 datetime(2026, 10, 26, 8, 3, tzinfo=timezone.utc)))
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type": "user", "message": {"content": "前の話の続きです"},
+                                         "timestamp": "2026-10-26T08:01:00Z"}) + "\n")
+                stream.write(json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "どちらの案にしますか"}]},
+                    "timestamp": "2026-10-26T08:02:00Z"}) + "\n")
+            self.assertIn("unanswered conversation question", cleanup_hourly.close_blockers(
+                term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now))
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type": "user", "message": {"content": "Aでお願いします"},
+                                         "timestamp": "2026-10-26T08:03:00Z"}) + "\n")
+                stream.write(json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "Aを適用し、作業を終えました。"}]},
+                    "timestamp": "2026-10-26T08:04:00Z"}) + "\n")
+            self.assertEqual(cleanup_hourly.close_blockers(
+                term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now), [])
 
 
 def triage_automation(automation_id, workspace, prompt="/orca-session-triage hourly"):

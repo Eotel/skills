@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -17,6 +18,9 @@ import hourly_runtime
 
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
 BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", "Esc to cancel")
+QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回答|選んで|教えて|"
+                      r"(?:です|ます|でしょう|よろしい|します)か[。.!]?\s*$|"
+                      r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)
 
 
 def prior_tabs(runs, terminals, agents, workspace, current_pane):
@@ -64,11 +68,45 @@ def newest_activity(transcript):
     return newest
 
 
+def unanswered_conversation(transcript):
+    """Keep a tab if its latest exchange may still need the user."""
+    final_text = None
+    pending_tools = set()
+    with transcript.open(encoding="utf-8", errors="replace") as stream:
+        for raw in stream:
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            message = entry.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else None
+            blocks = content if isinstance(content, list) else []
+            if entry.get("type") == "user" and not entry.get("isMeta") and not entry.get("isCompactSummary"):
+                spoken = content if isinstance(content, str) else " ".join(
+                    block.get("text", "") for block in blocks if isinstance(block, dict)
+                    and block.get("type") == "text")
+                if spoken.strip() and not spoken.lstrip().startswith("<"):
+                    final_text, pending_tools = None, set()
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if entry.get("type") == "assistant":
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        final_text = block["text"]
+                    elif block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
+                        pending_tools.add(block.get("id"))
+                elif block.get("type") == "tool_result":
+                    pending_tools.discard(block.get("tool_use_id"))
+    return bool(pending_tools) or not final_text or bool(QUESTION.search(final_text[-500:]))
+
+
 def close_blockers(term, transcript, screen, min_idle_minutes, now):
     problems = []
     newest = newest_activity(transcript)
     if newest is None or (now - newest).total_seconds() < min_idle_minutes * 60:
         problems.append("recent or unknown transcript activity")
+    if unanswered_conversation(transcript):
+        problems.append("unanswered conversation question")
     if (term.get("title") or "")[:1] in SPINNERS:
         problems.append("title is spinning")
     if screen.get("source") != "screen":
