@@ -106,6 +106,28 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNone(item["implemented_at"])
         self.assertIsNone(item["revoked_at"])
 
+    def test_failed_execution_does_not_describe_a_later_decision(self):
+        proposal_id = self.proposal()
+        adopted = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        failed = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "outcome": "failed", "actor": "worker", "result": "適用に失敗"})
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
+        self.assertEqual(item["current_execution"]["result"], "適用に失敗")
+        revoked = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "revoke", "actor": "Eotel"})
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
+        self.assertEqual(item["status"], "revoked")
+        self.assertIsNone(item["current_execution"])
+        reversal_failed = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "outcome": "failed", "actor": "worker", "result": "取り消しに失敗"})
+        self.assertEqual(reversal_failed.returncode, 0, reversal_failed.stderr)
+        item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
+        self.assertEqual(item["current_execution"]["result"], "取り消しに失敗")
+
     def test_clock_ahead_decision_precedes_remote_execution(self):
         proposal_id = self.proposal()
         decision = self.run_ledger(["decide"], {"proposal_id": proposal_id,
@@ -198,9 +220,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         remote_config = remote / "hosts.json"
         writer_config.write_text(json.dumps({"decision_writer": True, "name": "board", "hosts": [{
             "name": "remote", "ssh_target": "remote", "remote_path": "/remote/events.jsonl"}]}))
-        remote_config.write_text(json.dumps({"hosts": [{
-            "name": "board", "ssh_target": "writer", "remote_path": "/writer/events.jsonl",
-            "decision_writer": True}]}))
+        remote_config.write_text(json.dumps({"trusted_writer": "board", "hosts": []}))
         bin_dir = root / "bin"
         bin_dir.mkdir()
         scp = bin_dir / "scp"
@@ -263,8 +283,7 @@ class AdoptionLedgerTests(unittest.TestCase):
 
     def test_writer_snapshot_may_reorder_but_cannot_drop_history(self):
         config = Path(self.temp.name) / "remote-hosts.json"
-        config.write_text(json.dumps({"hosts": [{"name": "board", "ssh_target": "writer",
-            "remote_path": "/writer/events.jsonl", "decision_writer": True}]}))
+        config.write_text(json.dumps({"trusted_writer": "board", "hosts": []}))
         rows = [{"id": str(uuid.uuid4()), "ts": "2026-10-26T19:00:00+09:00", "host": "writer",
                  "type": "proposal", "proposal_id": str(uuid.uuid4()),
                  "source": {"session": "writer", "worktree": "writer"}, "fact": "再発",

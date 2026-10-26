@@ -112,7 +112,7 @@ def project(rows):
                                       "implemented_at": None, "reverted_at": None,
                                       "evidence": list(row.get("evidence", [])),
                                       "supporting_events": [], "decisions": [], "executions": [],
-                                      "latest_event_id": row["id"]}
+                                      "latest_event_id": row["id"], "current_execution": None}
     for row in rows:
         proposal_id = row["proposal_id"]
         if row["type"] == "proposal":
@@ -147,6 +147,7 @@ def project(rows):
                   "revoke": "revoked_at"}[decision]] = row["ts"]
             item["decisions"].append(row)
             item["latest_event_id"] = row["id"]
+            item["current_execution"] = None
         elif row["type"] == "execution":
             if proposal_id not in proposals:
                 raise ValueError(f"execution without proposal: {proposal_id}")
@@ -164,6 +165,7 @@ def project(rows):
                 item["reverted_at"] = row["ts"]
             item["executions"].append(row)
             item["latest_event_id"] = row["id"]
+            item["current_execution"] = row
         else:
             raise ValueError(f"invalid event type: {row['type']}")
     return sorted(proposals.values(), key=lambda item: (
@@ -325,8 +327,7 @@ def receive(config, imports, name):
         raise ValueError("hosts must be a list")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", name):
         raise ValueError("invalid writer name")
-    if not any(isinstance(host, dict) and host.get("name") == name and
-               host.get("decision_writer") is True for host in settings["hosts"]):
+    if settings.get("decision_writer") is True or settings.get("trusted_writer") != name:
         raise ValueError(f"decision writer is not configured: {name}")
     imports.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.NamedTemporaryFile(dir=imports, prefix=f".{name}-", delete=False) as temporary:
@@ -347,9 +348,6 @@ def collect(config, imports, events):
     hosts = settings["hosts"]
     if not isinstance(hosts, list):
         raise ValueError("hosts must be a list")
-    writer_hosts = sum(isinstance(host, dict) and host.get("decision_writer") is True for host in hosts)
-    if writer_hosts > 1 or (settings.get("decision_writer") is True and writer_hosts):
-        raise ValueError("configure exactly one decision writer")
     writer_name = settings.get("name") if settings.get("decision_writer") is True else None
     if settings.get("decision_writer") is True and writer_name is None:
         raise ValueError("local decision writer needs a stable name")
@@ -360,11 +358,8 @@ def collect(config, imports, events):
     errors = []
     targets = []
     for host in hosts:
-        required = {"name", "ssh_target", "remote_path"}
-        if (not isinstance(host, dict) or not required <= set(host)
-                or set(host) - required - {"decision_writer"}
-                or not isinstance(host.get("decision_writer", False), bool)):
-            raise ValueError("each host needs name, ssh_target, remote_path and optional decision_writer")
+        if not isinstance(host, dict) or set(host) != {"name", "ssh_target", "remote_path"}:
+            raise ValueError("each host needs name, ssh_target, remote_path")
         name, target, remote = (host[key] for key in ("name", "ssh_target", "remote_path"))
         if (not isinstance(name, str) or not isinstance(target, str) or not isinstance(remote, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", name)
@@ -386,7 +381,7 @@ def collect(config, imports, events):
                 else:
                     raise OSError(result.stderr.decode(errors="replace").strip())
             rows = read_rows(temporary_path)
-            if not host.get("decision_writer", False) and any(row["type"] == "decision" for row in rows):
+            if any(row["type"] == "decision" for row in rows):
                 raise ValueError(f"remote decision is not allowed: {name}")
             replace_import(imports, name, temporary_path)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
