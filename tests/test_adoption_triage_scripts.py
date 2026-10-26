@@ -280,6 +280,46 @@ class AdoptionLedgerTests(unittest.TestCase):
         item = json.loads(view.stdout)["items"][0]
         self.assertEqual(item["status"], "adopted")
         self.assertEqual(item["executions"][0]["result"], "commit abc")
+        revoked = run(writer, writer_config, ["decide"], {"proposal_id": proposal_id,
+            "decision": "revoke", "actor": "Eotel"})
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        late_result = run(remote, remote_config, ["record"], {"proposal_id": proposal_id,
+            "outcome": "applied", "actor": "remote worker", "result": "late commit"})
+        self.assertEqual(late_result.returncode, 0, late_result.stderr)
+        collected = run(writer, writer_config, ["collect", "--config", str(writer_config)])
+        self.assertEqual(collected.returncode, 0, collected.stderr)
+        view = run(writer, writer_config, ["list", "--json"])
+        self.assertEqual(view.returncode, 0, view.stderr)
+        item = json.loads(view.stdout)["items"][0]
+        self.assertEqual(item["status"], "revoked")
+        self.assertIsNone(item["current_execution"])
+        self.assertEqual(item["executions"][-1]["result"], "late commit")
+        self.assertEqual(item["executions"][-1]["decision_id"], json.loads(adopted.stdout)["id"])
+
+    def test_collect_does_not_treat_read_failure_as_missing(self):
+        root = Path(self.temp.name)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name, code in (("scp", 7), ("ssh", 1)):
+            command = bin_dir / name
+            command.write_text(f"#!{sys.executable}\nimport sys\nsys.exit({code})\n")
+            command.chmod(0o755)
+        config = root / "hosts.json"
+        config.write_text(json.dumps({"hosts": [{"name": "remote", "ssh_target": "remote",
+            "remote_path": "/remote/events.jsonl"}]}))
+        env = {**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+        command = [sys.executable, str(SCRIPT), "--events", str(self.events),
+            "--imports", str(self.imports), "collect", "--config", str(config)]
+        failed = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("scp exit 7", failed.stderr)
+        self.assertIn("remote check exit 1", failed.stderr)
+        self.assertFalse((self.imports / "remote.jsonl").exists())
+        missing = bin_dir / "ssh"
+        missing.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(42)\n")
+        empty = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual((self.imports / "remote.jsonl").read_bytes(), b"")
 
     def test_writer_snapshot_may_reorder_but_cannot_drop_history(self):
         config = Path(self.temp.name) / "remote-hosts.json"

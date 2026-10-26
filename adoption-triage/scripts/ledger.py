@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -153,19 +154,24 @@ def project(rows):
                 raise ValueError(f"execution without proposal: {proposal_id}")
             item = proposals[proposal_id]
             outcome = row["outcome"]
-            if outcome == "applied" and item["status"] != "adopted":
-                raise ValueError(f"adoption was not decided: {proposal_id}")
-            if outcome == "reverted" and item["status"] != "revoked":
-                raise ValueError(f"reversal was not decided: {proposal_id}")
             if outcome not in {"applied", "reverted", "failed"}:
                 raise ValueError(f"invalid execution outcome: {outcome}")
-            if outcome == "applied":
-                item["implemented_at"] = row["ts"]
-            if outcome == "reverted":
-                item["reverted_at"] = row["ts"]
+            decision = next((decision for decision in item["decisions"]
+                             if decision["id"] == row.get("decision_id")), None)
+            if decision is None or decision["decision"] not in {"adopt", "revoke"}:
+                raise ValueError(f"execution without an adoption or revocation: {proposal_id}")
+            if outcome == "applied" and decision["decision"] != "adopt":
+                raise ValueError(f"application without adoption: {proposal_id}")
+            if outcome == "reverted" and decision["decision"] != "revoke":
+                raise ValueError(f"reversal without revocation: {proposal_id}")
             item["executions"].append(row)
             item["latest_event_id"] = row["id"]
-            item["current_execution"] = row
+            if item["decisions"][-1]["id"] == decision["id"]:
+                if outcome == "applied":
+                    item["implemented_at"] = row["ts"]
+                if outcome == "reverted":
+                    item["reverted_at"] = row["ts"]
+                item["current_execution"] = row
         else:
             raise ValueError(f"invalid event type: {row['type']}")
     return sorted(proposals.values(), key=lambda item: (
@@ -284,10 +290,14 @@ def append(events, imports, row):
             item = known.get(proposal_id)
             if item is None:
                 raise ValueError(f"proposal not found: {proposal_id}")
-            if row["outcome"] == "applied" and item["status"] != "adopted":
+            if not item["decisions"] or item["decisions"][-1]["decision"] not in {"adopt", "revoke"}:
+                raise ValueError("execution needs an adoption or revocation")
+            decision = item["decisions"][-1]
+            if row["outcome"] == "applied" and decision["decision"] != "adopt":
                 raise ValueError("adoption was not decided")
-            if row["outcome"] == "reverted" and item["status"] != "revoked":
+            if row["outcome"] == "reverted" and decision["decision"] != "revoke":
                 raise ValueError("reversal was not decided")
+            row["decision_id"] = decision["id"]
         else:
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
@@ -374,12 +384,18 @@ def collect(config, imports, events):
             result = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                                      f"{target}:{remote}", str(temporary_path)], capture_output=True, timeout=20)
             if result.returncode:
+                check_script = ("import sys\ntry:\n    open(sys.argv[1], 'rb').close()\n"
+                                "except FileNotFoundError:\n    sys.exit(42)\n")
+                check_command = f"python3 -c {shlex.quote(check_script)} {shlex.quote(remote)}"
                 missing = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                                          target, "test", "-e", remote], capture_output=True, timeout=10)
-                if missing.returncode == 1 and (not path.exists() or not path.read_bytes()):
+                                          target, check_command], capture_output=True, timeout=10)
+                if missing.returncode == 42 and (not path.exists() or not path.read_bytes()):
                     temporary_path.write_bytes(b"")
                 else:
-                    raise OSError(result.stderr.decode(errors="replace").strip())
+                    raise OSError(f"scp exit {result.returncode}: "
+                                  f"{result.stderr.decode(errors='replace').strip()}; "
+                                  f"remote check exit {missing.returncode}: "
+                                  f"{missing.stderr.decode(errors='replace').strip()}")
             rows = read_rows(temporary_path)
             if any(row["type"] == "decision" for row in rows):
                 raise ValueError(f"remote decision is not allowed: {name}")
