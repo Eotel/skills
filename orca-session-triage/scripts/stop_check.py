@@ -10,7 +10,8 @@ blocks once while an artifact this session published is still watched live:
 Orca counts the tab as working while the watch runs. A missing external inbox service
 is named when the triage automation is installed. A repeated stop
 (`stop_hook_active`) goes through for those checks, so a broken classifier cannot
-trap the session. An unread ask keeps blocking until the inbox cursor is acked.
+trap the session. An unread ask blocks only the latest scheduled tab until its
+inbox cursor is acked.
 """
 
 import json
@@ -21,6 +22,7 @@ import subprocess
 import sys
 
 import inbox_read
+import hourly_runtime
 
 STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
@@ -67,7 +69,7 @@ def unread_ask_reason(workspace, orca):
     if not workspace:
         return None
     try:
-        if not triage_automations(orca, workspace):
+        if not hourly_runtime.current_pane(orca):
             return None
         asks = inbox_read.unread_asks(*inbox_read.paths())
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
