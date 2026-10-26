@@ -658,6 +658,7 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
         proposal_id = item["proposal_id"]
         if status not in ("adopted", "revoked"):
             continue
+        decision_id = item["decisions"][-1]["id"]
         if ((status == "adopted" and item.get("implemented_at"))
                 or (status == "revoked" and item.get("reverted_at"))):
             data["applied_actions"].pop(proposal_id, None)
@@ -700,7 +701,8 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
                 writing_completed = True
                 if state is not None:
                     save(data, state)
-                ledger.record({"proposal_id": proposal_id, "outcome": "applied",
+                ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
+                               "outcome": "applied",
                                "actor": "triage-retro", "result": f"appended to {path}",
                                "undo": json.dumps(expected, ensure_ascii=False)})
             else:
@@ -727,7 +729,8 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
                 writing_completed = True
                 if state is not None:
                     save(data, state)
-                ledger.record({"proposal_id": proposal_id, "outcome": "reverted",
+                ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
+                               "outcome": "reverted",
                                "actor": "triage-retro", "result": result})
             data["applied_actions"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
@@ -739,7 +742,8 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
                                                    data["action_attempts"].get(action_key, 0) + 1)
             if state is not None:
                 save(data, state)
-            ledger.record({"proposal_id": proposal_id, "outcome": "failed",
+            ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
+                           "outcome": "failed",
                            "actor": "triage-retro", "result": str(exc)[:500]})
     return changed
 

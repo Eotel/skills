@@ -57,12 +57,19 @@ class FakeLedger:
 
     def decide(self, body):
         item = self.items[body["proposal_id"]]
-        item["decisions"].append({**body, "ts": retro.now()})
+        item["decisions"].append({**body, "id": str(uuid.uuid4()), "ts": retro.now()})
         item["status"] = {"adopt": "adopted", "revoke": "revoked"}[body["decision"]]
         item["adopted_at" if body["decision"] == "adopt" else "revoked_at"] = retro.now()
 
     def record(self, body):
         item = self.items[body["proposal_id"]]
+        decision = next((row for row in item["decisions"] if row["id"] == body["decision_id"]), None)
+        if decision is None:
+            raise ValueError("execution needs its decision ID")
+        if body["outcome"] == "applied" and decision["decision"] != "adopt":
+            raise ValueError("application needs adoption")
+        if body["outcome"] == "reverted" and decision["decision"] != "revoke":
+            raise ValueError("reversal needs revocation")
         item["executions"].append(body)
         if body["outcome"] == "applied":
             item["implemented_at"] = retro.now()
@@ -147,6 +154,7 @@ class RetroTests(unittest.TestCase):
         proposal = ledger.list()[0]
         self.assertEqual(proposal["status"], "adopted")
         self.assertTrue(proposal["implemented_at"])
+        self.assertEqual(proposal["executions"][0]["decision_id"], proposal["decisions"][0]["id"])
         self.assertEqual(len(proposal["evidence"]), 4)
         facts = retro.facts_path(self.target)
         self.assertEqual(facts.read_text().count(retro.MARKER), 1)
@@ -159,6 +167,8 @@ class RetroTests(unittest.TestCase):
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
         self.assertFalse(facts.exists())
         self.assertTrue(ledger.list()[0]["reverted_at"])
+        self.assertEqual(ledger.list()[0]["executions"][-1]["decision_id"],
+                         ledger.list()[0]["decisions"][-1]["id"])
         self.assertEqual(data["sessions"][self.sid]["status"], "done")
 
     def test_policy_change_waits_for_a_button(self):
