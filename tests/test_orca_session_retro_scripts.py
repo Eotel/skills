@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -45,6 +46,9 @@ class FakeLedger:
 
     def list(self):
         return list(self.items.values())
+
+    def writer_enabled(self):
+        return True
 
     def propose(self, body):
         self.items[body["proposal_id"]] = {**body, "status": "pending", "decisions": [],
@@ -144,13 +148,16 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(proposal["status"], "adopted")
         self.assertTrue(proposal["implemented_at"])
         self.assertEqual(len(proposal["evidence"]), 4)
-        self.assertEqual(self.target.read_text().count(retro.MARKER), 1)
+        facts = retro.facts_path(self.target)
+        self.assertEqual(facts.read_text().count(retro.MARKER), 1)
+        self.assertIn(retro.ROUTER_SECTION, self.target.read_text())
         self.target.write_text(self.target.read_text() + "\nOther author's line\n")
         ledger.decide({"proposal_id": proposal["proposal_id"], "decision": "revoke", "actor": "human"})
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
         self.assertIn("Other author's line", self.target.read_text())
-        self.assertNotIn(retro.MARKER, self.target.read_text())
+        self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
+        self.assertFalse(facts.exists())
         self.assertTrue(ledger.list()[0]["reverted_at"])
         self.assertEqual(data["sessions"][self.sid]["status"], "done")
 
@@ -162,6 +169,24 @@ class RetroTests(unittest.TestCase):
         eligible, reason = retro.eligible_auto(proposal, {"target_versions": {}}, [], self.root)
         self.assertFalse(eligible)
         self.assertEqual(reason, "要確認")
+
+    def test_multiple_adoptions_share_one_reference_and_restore_router(self):
+        ledger = FakeLedger()
+        ids = [str(uuid.uuid4()) for _ in range(3)]
+        for index, proposal_id in enumerate(ids):
+            ledger.propose({"proposal_id": proposal_id, "proposal": f"Tool {index}.py returns JSON.",
+                            "target": "triage-retro:skill:orca-session-triage:fact"})
+            ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
+        data = retro.load(self.state)
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root), 3)
+        facts = retro.facts_path(self.target)
+        self.assertEqual(facts.read_text().count(retro.MARKER), 3)
+        self.assertEqual(self.target.read_text().count(retro.ROUTER_SECTION), 1)
+        for proposal_id in ids:
+            ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root), 3)
+        self.assertFalse(facts.exists())
+        self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
     def test_repository_local_skill_is_an_adoption_candidate(self):
         project_skill = self.home / "ghq/github.com/example/project/.claude/skills/project-triage/SKILL.md"
@@ -198,6 +223,22 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertIn("Git repository", reason)
 
+    def test_deleted_reference_is_not_recreated_automatically(self):
+        facts = retro.facts_path(self.target)
+        facts.parent.mkdir(parents=True)
+        facts.write_text(retro.FACTS_HEADER)
+        subprocess.run(["git", "-C", str(self.root), "add", str(facts.relative_to(self.root))], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null",
+                        "commit", "-qm", "tracked reference"], check=True)
+        facts.unlink()
+        proposal = sample_candidate()
+        proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            eligible, reason = retro.eligible_auto(proposal, {"target_versions": {}}, [], self.root)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "書き込み先に別の変更がある")
+
     def test_verified_json_shape_fact_can_be_adopted(self):
         proposal = sample_candidate()
         proposal["note"] = "scan_sessions.py の標準出力は JSON 配列。行ごとに読む。"
@@ -215,6 +256,16 @@ class RetroTests(unittest.TestCase):
                     self.assertIn("deferred", retro.process_once(self.state, self.root, ledger=FakeLedger()))
                     model.assert_not_called()
         self.assertEqual(retro.load(self.state)["sessions"][self.sid]["status"], "pending")
+
+    def test_disabled_decision_writer_defers_before_model_call(self):
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+        ledger = FakeLedger()
+        ledger.writer_enabled = lambda: False
+        with mock.patch.object(retro, "build_proposals") as model:
+            self.assertIn("deferred: adoption ledger", retro.process_once(
+                self.state, self.root, ignore_load=True, ledger=ledger))
+            model.assert_not_called()
 
     def test_failed_session_is_visible_and_can_be_retried(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):

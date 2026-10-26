@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+from retro_ledger import LedgerClient
+
 
 LABEL = "com.eotel.orca-session-triage.retro"
 
@@ -55,6 +57,9 @@ def status():
 
 def activate():
     plist, log = paths()
+    ledger = LedgerClient()
+    if not ledger.script.is_file() or not ledger.writer_enabled():
+        raise RuntimeError("adoption-triage must be installed and this Mac must be its decision writer")
     running, message = status()
     if running:
         raise RuntimeError(message)

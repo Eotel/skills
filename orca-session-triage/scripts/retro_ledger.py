@@ -8,13 +8,15 @@ import sys
 
 
 DEFAULT_SCRIPT = Path(__file__).resolve().parents[2] / "adoption-triage/scripts/ledger.py"
+DEFAULT_DECISION_CONFIG = Path("~/.config/adoption-triage/hosts.json").expanduser()
 
 
 class LedgerClient:
-    def __init__(self, script=DEFAULT_SCRIPT, events=None, imports=None):
+    def __init__(self, script=DEFAULT_SCRIPT, events=None, imports=None, decision_config=None):
         self.script = Path(script)
         self.events = Path(events) if events else None
         self.imports = Path(imports) if imports else None
+        self.decision_config = Path(decision_config) if decision_config else None
 
     def call(self, action, body=None, *args):
         if not self.script.is_file():
@@ -24,6 +26,8 @@ class LedgerClient:
             command.extend(("--events", str(self.events)))
         if self.imports:
             command.extend(("--imports", str(self.imports)))
+        if self.decision_config:
+            command.extend(("--decision-config", str(self.decision_config)))
         command.extend((action, *args))
         result = subprocess.run(command, input=json.dumps(body, ensure_ascii=False) if body else None,
                                 capture_output=True, text=True, timeout=30)
@@ -45,3 +49,10 @@ class LedgerClient:
 
     def add_evidence(self, body):
         return self.call("support", body)
+
+    def writer_enabled(self):
+        config = self.decision_config or DEFAULT_DECISION_CONFIG
+        try:
+            return json.loads(config.read_text(encoding="utf-8")).get("decision_writer") is True
+        except (OSError, ValueError, AttributeError):
+            return False

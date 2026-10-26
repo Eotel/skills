@@ -11,10 +11,11 @@ checks the relevant skills and memory for overlap, and asks a separate
 `claude -p` context to review the evidence and risk. It records candidate
 lessons and source times through the adoption-policy ledger.
 Only short, supported facts about commands, paths, and errors are appended
-automatically to a skill. The limit is three adoptions per local date and
-three automatic notes per skill. A full skill gets a rewrite proposal for
-morning review. Rules about human decisions, destructive actions, permissions,
-procedures, and scripts wait for a person.
+automatically to `references/observed-triage-facts.md` in the selected skill;
+its root `SKILL.md` gets one short pointer. The limit is three adoptions per
+local night and three automatic notes per skill. A full skill gets a rewrite
+proposal for morning review. Rules about human decisions, destructive actions,
+permissions, procedures, and scripts wait for a person.
 
 ## Service and morning review
 
@@ -25,6 +26,8 @@ to inspect the user service and `activate` to start it outside Orca tabs.
 `status` confirms launchd. The service log is
 `~/.cache/orca-session-triage/retro/service.log`. A busy Mac leaves the
 session pending for the next five-minute check.
+This Mac must be the adoption ledger's configured `decision_writer`; only that
+Mac can record automatic adoptions and morning decisions.
 If the skill source checkout has a different path, set
 `TRIAGE_RETRO_SKILLS_REPO` when rendering and activating the service.
 

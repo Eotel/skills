@@ -31,6 +31,11 @@ MAX_NOTES_PER_SKILL = 3
 MAX_NOTE_CHARS = 190
 SESSION_ID = re.compile(r"^[a-f0-9-]{36}$")
 MARKER = "<!-- triage-retro:"
+FACTS_NAME = "observed-triage-facts.md"
+FACTS_HEADER = "# Observed triage facts\n\n<!-- triage-retro-managed -->\n\n"
+ROUTER_SECTION = ("\n## Observed triage facts\n\n"
+                  "Read [references/observed-triage-facts.md](references/observed-triage-facts.md) "
+                  "when troubleshooting a tool used in hourly triage.\n")
 SCHEMA = {"type": "object", "required": ["proposals"], "properties": {
     "proposals": {"type": "array", "maxItems": 5, "items": {"type": "object", "required": [
         "title", "first_failure", "final_success", "note", "target_skill", "evidence_ids", "category"],
@@ -416,6 +421,10 @@ def proposal_id(session_id, candidate):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "triage-retro:" + candidate["target_skill"] + ":" + normalized))
 
 
+def facts_path(target):
+    return target.parent / "references" / FACTS_NAME
+
+
 def source_checkout_ready(target, data):
     checkout = subprocess.run(["git", "-C", str(target.parent), "rev-parse", "--show-toplevel"],
                               capture_output=True, text=True, timeout=10)
@@ -426,14 +435,21 @@ def source_checkout_ready(target, data):
                             capture_output=True, text=True, timeout=10).stdout.strip()
     if branch not in ("main", "master"):
         return "書き込み先が main 以外"
-    relative = str(target.resolve().relative_to(repo.resolve()))
-    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", relative],
-                            capture_output=True, text=True, timeout=10)
-    if status.returncode:
-        return "書き込み先の Git 状態を確認できない"
-    digest = hashlib.sha256(target.read_bytes()).hexdigest()
-    if status.stdout.strip() and data.get("target_versions", {}).get(str(target.resolve())) != digest:
-        return "書き込み先に別の変更がある"
+    for path in (target, facts_path(target)):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(repo.resolve()):
+            return "書き込み先が Git repository の外"
+        relative = str(resolved.relative_to(repo.resolve()))
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--", relative],
+                                capture_output=True, text=True, timeout=10)
+        if status.returncode:
+            return "書き込み先の Git 状態を確認できない"
+        if path.exists() and not path.is_file():
+            return "書き込み先がファイルではない"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+        if status.stdout.strip() and (digest is None
+                                      or data.get("target_versions", {}).get(str(resolved)) != digest):
+            return "書き込み先に別の変更がある"
     return None
 
 
@@ -451,16 +467,21 @@ def eligible_auto(proposal, data, ledger_items=(), root=SOURCE):
         return False, "追記文の形式を確認"
     if re.search(r"権限|許可|削除|merge|マージ|投稿|承認|無視|skip|ignore|force", note, re.I):
         return False, "人の判断が必要な条件"
-    body = target.read_text(encoding="utf-8")
-    heading = "" if "\n## Observed triage facts\n" in body else "\n## Observed triage facts\n"
-    new_line = note_line({"id": proposal.get("id", "0" * 36), "note": note})
-    growth = ("" if body.endswith("\n") else "\n") + heading + "\n" + new_line
-    if (len(body.encode()) + len(growth.encode()) > MAX_SKILL_BYTES
-            or body.count(MARKER) >= MAX_NOTES_PER_SKILL):
-        return False, "skill を短く書き直す提案が必要"
     source_reason = source_checkout_ready(target, data)
     if source_reason:
         return False, source_reason
+    router_body = target.read_text(encoding="utf-8")
+    facts = facts_path(target)
+    body = facts.read_text(encoding="utf-8") if facts.exists() else FACTS_HEADER
+    if note in router_body or note in body:
+        return False, "skill に同じ事実がある"
+    new_line = note_line({"id": proposal.get("id", "0" * 36), "note": note})
+    growth = ("" if body.endswith("\n") else "\n") + new_line
+    router_growth = ("" if router_body.endswith("\n") else "\n") + ROUTER_SECTION
+    if (len(router_body.encode()) + (0 if ROUTER_SECTION in router_body else len(router_growth.encode()))
+            > MAX_SKILL_BYTES or len(body.encode()) + len(growth.encode()) > MAX_SKILL_BYTES
+            or body.count(MARKER) >= MAX_NOTES_PER_SKILL):
+        return False, "skill を短く書き直す提案が必要"
     tonight = night_key(datetime.now().astimezone())
     count = sum(1 for p in ledger_items for decision in p.get("decisions", [])
                 if decision.get("actor") == "triage-retro" and decision.get("decision") == "adopt"
@@ -475,10 +496,35 @@ def note_line(proposal):
 
 
 def adopt(proposal, root=SOURCE, auto=False):
-    target = skill_target(proposal["target_skill"], root)
-    if target is None or not target.is_file():
+    router = skill_target(proposal["target_skill"], root)
+    if router is None or not router.is_file():
         raise ValueError("target skill is not in the configured source repository")
+    target = facts_path(router)
+    if not target.resolve().is_relative_to(router.parent.resolve()):
+        raise ValueError("facts reference is outside the skill directory")
     line = note_line(proposal)
+    if target.is_file():
+        existing = target.read_text(encoding="utf-8")
+        if proposal["note"] in existing and existing.count(line) != 1:
+            raise ValueError("note is already present in target skill")
+    else:
+        existing = ""
+    initial = FACTS_HEADER if not existing else existing
+    addition = ("" if initial.endswith("\n") else "\n") + line
+    if auto and (len(initial.encode()) + len(addition.encode()) > MAX_SKILL_BYTES
+                 or existing.count(MARKER) >= MAX_NOTES_PER_SKILL):
+        raise ValueError("skill size cap reached")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with router.open("a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        body = stream.read().decode("utf-8")
+        if proposal["note"] in body:
+            raise ValueError("note is already present in target skill")
+        if ROUTER_SECTION not in body:
+            stream.write((("" if body.endswith("\n") else "\n") + ROUTER_SECTION).encode())
+            stream.flush()
+            os.fsync(stream.fileno())
     with target.open("a+b") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         stream.seek(0)
@@ -489,14 +535,12 @@ def adopt(proposal, root=SOURCE, auto=False):
             raise ValueError("adopted line changed; review target before retry")
         if proposal["note"] in body:
             raise ValueError("note is already present in target skill")
-        if auto and (len(body.encode()) + len(line.encode()) > MAX_SKILL_BYTES
+        initial = FACTS_HEADER if not body else body
+        addition = ("" if initial.endswith("\n") else "\n") + line
+        if auto and (len(initial.encode()) + len(addition.encode()) > MAX_SKILL_BYTES
                      or body.count(MARKER) >= MAX_NOTES_PER_SKILL):
             raise ValueError("skill size cap reached")
-        addition = "" if body.endswith("\n") else "\n"
-        if "\n## Observed triage facts\n" not in body:
-            addition += "\n## Observed triage facts\n"
-        addition += "\n" + line
-        stream.write(addition.encode())
+        stream.write(((FACTS_HEADER if not body else "") + addition).encode())
         stream.flush()
         os.fsync(stream.fileno())
     return target.resolve()
@@ -504,25 +548,39 @@ def adopt(proposal, root=SOURCE, auto=False):
 
 def undo(proposal):
     target = Path(proposal.get("target_path") or "")
-    if not target.is_file():
-        raise ValueError("adopted target is missing")
-    with target.open("r+b") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        body = stream.read().decode("utf-8")
-        line = note_line(proposal)
-        if line not in body and MARKER + proposal["id"] not in body:
-            return False  # Already removed after an interrupted execution record.
-        if body.count(line) != 1:
-            raise ValueError("adopted line changed; review target before undo")
-        body = body.replace(line, "", 1)
-        if body.endswith("\n## Observed triage facts\n\n"):
-            body = body[: -len("\n## Observed triage facts\n\n")]
-        stream.seek(0)
-        stream.write(body.encode())
-        stream.truncate()
-        stream.flush()
-        os.fsync(stream.fileno())
-    return True
+    router = Path(proposal.get("router_path") or "")
+    changed = False
+    if target.is_file():
+        with target.open("r+b") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            body = stream.read().decode("utf-8")
+            line = note_line(proposal)
+            if line not in body and MARKER + proposal["id"] in body:
+                raise ValueError("adopted line changed; review target before undo")
+            if line in body:
+                if body.count(line) != 1:
+                    raise ValueError("adopted line changed; review target before undo")
+                body = body.replace(line, "", 1)
+                stream.seek(0)
+                stream.write(body.encode())
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+                changed = True
+            if body == FACTS_HEADER:
+                target.unlink()
+    if not target.exists() and router.is_file():
+        with router.open("r+b") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            body = stream.read().decode("utf-8")
+            if ROUTER_SECTION in body:
+                stream.seek(0)
+                stream.write(body.replace(ROUTER_SECTION, "", 1).encode())
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+                changed = True
+    return changed
 
 
 def transcript_worktree(transcript):
@@ -605,7 +663,8 @@ def sync_decisions(ledger, data, root=SOURCE):
                 if source_reason:
                     raise ValueError(source_reason)
                 path = adopt(proposal, root, auto=auto)
-                token = json.dumps({"target": str(path), "line": note_line(proposal)}, ensure_ascii=False)
+                token = json.dumps({"target": str(path), "router": str(current_target.resolve()),
+                                    "line": note_line(proposal)}, ensure_ascii=False)
                 result = f"appended to {path}"
                 outcome = "applied"
             else:
@@ -614,8 +673,13 @@ def sync_decisions(ledger, data, root=SOURCE):
                 if applied:
                     token_data = json.loads(applied["undo"])
                     proposal["target_path"] = token_data["target"]
+                    proposal["router_path"] = token_data["router"]
                     if token_data["line"] != note_line(proposal):
                         raise ValueError("undo token does not match the adopted line")
+                    current_target = skill_target(skill, root)
+                    if (current_target is None or Path(token_data["router"]).resolve() != current_target.resolve()
+                            or Path(token_data["target"]).resolve() != facts_path(current_target).resolve()):
+                        raise ValueError("undo target does not match the skill")
                     undo(proposal)
                     path = Path(proposal["target_path"])
                     result = f"removed adopted line from {path}"
@@ -625,7 +689,13 @@ def sync_decisions(ledger, data, root=SOURCE):
                 token = None
                 outcome = "reverted"
             if path:
-                data["target_versions"][str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+                router = skill_target(skill, root)
+                for changed_path in (router, path):
+                    if changed_path.exists():
+                        data["target_versions"][str(changed_path.resolve())] = hashlib.sha256(
+                            changed_path.read_bytes()).hexdigest()
+                    else:
+                        data["target_versions"].pop(str(changed_path.resolve()), None)
             receipt = {"proposal_id": item["proposal_id"], "outcome": outcome,
                        "actor": "triage-retro", "result": result}
             if token:
@@ -644,6 +714,8 @@ def sync_decisions(ledger, data, root=SOURCE):
 def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, ledger=None):
     """Reconcile decisions and process at most one hourly transcript outside Orca tabs."""
     ledger = ledger or LedgerClient()
+    if not ledger.writer_enabled():
+        return "deferred: adoption ledger decision writer is not enabled"
     with locked(state / "worker.lock"):
         with locked(paths(state)[2]):
             data = load(state)
@@ -739,10 +811,12 @@ def main(argv=None):
                         help=f"adoption-triage ledger CLI (default: {DEFAULT_SCRIPT})")
     parser.add_argument("--events", type=Path, help="adoption ledger events path for an isolated test")
     parser.add_argument("--imports", type=Path, help="adoption ledger imports path for an isolated test")
+    parser.add_argument("--decision-config", type=Path,
+                        help="adoption ledger decision-writer configuration")
     parser.add_argument("--ignore-load", action="store_true", help="manual processing only")
     parser.add_argument("--session-id", help="failed hourly session to retry")
     args = parser.parse_args(argv)
-    ledger = LedgerClient(args.ledger_script, args.events, args.imports)
+    ledger = LedgerClient(args.ledger_script, args.events, args.imports, args.decision_config)
     try:
         if args.action == "enqueue":
             print("queued" if enqueue(json.load(sys.stdin), args.state) else "skipped")
