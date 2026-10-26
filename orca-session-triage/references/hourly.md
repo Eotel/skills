@@ -39,6 +39,10 @@ keep their own cursor. The watch's output is in
 The Stop hook keeps the current scheduled run open while an `ask` is past the acknowledged
 cursor, including on a repeated stop. Read it, handle it or hand it to the
 appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
+After these checks permit the turn to end, the same hook queues this hourly
+session's transcript for the external retrospective service. It does not run
+the retrospective in the tab. See `references/retro.md` when checking that
+service or reviewing its proposals.
 
 ## In the run
 
