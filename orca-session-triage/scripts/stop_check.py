@@ -9,7 +9,8 @@ for that same queue, the hook blocks the stop once and names the rows. It also
 blocks once while an artifact this session published is still watched live:
 Orca counts the tab as working while the watch runs. A missing external inbox service
 is named when the triage automation is installed. A repeated stop
-(`stop_hook_active`) goes through, so a broken classifier cannot trap the session.
+(`stop_hook_active`) goes through for those checks, so a broken classifier cannot
+trap the session. An unread ask keeps blocking until the inbox cursor is acked.
 """
 
 import json
@@ -18,6 +19,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+
+import inbox_read
 
 STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
@@ -45,16 +48,35 @@ def decide(hook_input, state_dir, orca="orca"):
     Damaged or unexpected files, or an Orca CLI that fails, let the turn end: the hook must
     never trap the session.
     """
-    if hook_input.get("stop_hook_active") or not hook_input.get("session_id"):
+    if not hook_input.get("session_id"):
         return None
+    pending_asks = unread_ask_reason(hook_input.get("cwd"), orca)
+    if hook_input.get("stop_hook_active"):
+        return {"decision": "block", "reason": pending_asks} if pending_asks else None
     session = Path(state_dir) / hook_input["session_id"]
-    # Every reason goes in the one block: the repeated stop goes through and checks nothing.
-    reasons = [watched(session, hook_input.get("transcript_path"))]
+    # Review and live-watch notices block once; unread asks remain a gate until acked.
+    reasons = [pending_asks, watched(session, hook_input.get("transcript_path"))]
     queue = read_json(session / "review-queue.json")
     if isinstance(queue, dict):
         reasons += [unclassed(session, queue), missing_inbox_watch(hook_input.get("cwd"), orca)]
     reasons = [r for r in reasons if r]
     return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
+
+
+def unread_ask_reason(workspace, orca):
+    if not workspace:
+        return None
+    try:
+        if not triage_automations(orca, workspace):
+            return None
+        asks = inbox_read.unread_asks(*inbox_read.paths())
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
+    if not asks:
+        return None
+    lanes = ", ".join(dict.fromkeys(asks))
+    return (f"orca-session-triage: unread ask from {lanes}. Run inbox_read.py read, "
+            "handle the question, then ack its NEXT_OFFSET before ending this turn.")
 
 
 def watched(session, transcript):

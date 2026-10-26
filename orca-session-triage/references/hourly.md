@@ -13,6 +13,9 @@ entries in append order. After handling them, pass its `NEXT_OFFSET` to
 does not touch the watch's offset. A report pulled late from another Mac is
 still shown even if its original timestamp is old. The service's output is in
 `~/.cache/orca-briefs/triage-watch.log` for diagnosis.
+The Stop hook keeps a scheduled run open while an `ask` is past the acknowledged
+cursor, including on a repeated stop. Read and handle that report, then ack the
+reader's `NEXT_OFFSET` before ending the turn.
 
 ## In the run
 
@@ -86,10 +89,15 @@ cutover before changing the live watch:
    `inbox_read.py read` to check delivery. The lead tab remains free of
    Monitors. Check the next scheduled run's new tab before claiming delivery works.
 
-An immediate alert for `kind=ask` could be added to this service later, with
-a macOS notification containing the worktree and a prompt to read the inbox.
-That would alert the person promptly; it would not wake or type into the lead
-tab. Design and implementation need separate approval.
+The ask alert service has its own cursor and shows a Mac notification with the
+lane name and first line of each new `ask`. It alerts even while the lead tab is
+active: tab-state checks can race with a new report, and the notification does
+not acknowledge or answer it. The main watch and hourly reader keep their own
+cursors. After this change is merged and installed, run
+`python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate-alerts`
+once, then `status-alerts` and inspect `~/.cache/orca-briefs/triage-alert.log`.
+Activation starts at the current complete inbox line; later arrivals are
+notified. Existing reports remain available to the hourly reader.
 
 ## The automation
 

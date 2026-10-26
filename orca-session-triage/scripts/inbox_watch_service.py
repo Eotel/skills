@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Manage the macOS user service that watches the triage inbox outside Orca tabs.
+"""Manage the macOS user services that watch the triage inbox outside Orca tabs.
 
 Use `render` to review its launchd plist, `status` to check the live watcher,
 and `activate` only after the tab's Monitor has stopped. Activation refuses a
 second reader of the existing triage offset.
+`activate-alerts` adds an independent reader for Mac notifications on new asks.
 """
 
 import argparse
@@ -17,8 +18,11 @@ import subprocess
 import sys
 import time
 
+from inbox_read import complete_end
+
 
 LABEL = "com.eotel.orca-session-triage.inbox"
+ALERT_LABEL = "com.eotel.orca-session-triage.alert"
 
 
 def paths(home=None):
@@ -50,8 +54,32 @@ def plist_bytes(home=None, python=None, orca=None):
     })
 
 
-def launchd_pid():
-    target = f"gui/{os.getuid()}/{LABEL}"
+def alert_paths(home=None):
+    home = Path(home or Path.home())
+    return (home / "Library/LaunchAgents" / f"{ALERT_LABEL}.plist",
+            home / ".cache/orca-briefs/triage-inbox.jsonl",
+            home / ".cache/orca-session-triage/inbox-alert.offset",
+            home / ".cache/orca-briefs/triage-alert.log")
+
+
+def alert_plist_bytes(home=None, python=None):
+    _, _, _, log = alert_paths(home)
+    python = python or shutil.which("python3")
+    if not python:
+        raise RuntimeError("python3 must be on PATH when rendering the alert service")
+    return plistlib.dumps({
+        "Label": ALERT_LABEL,
+        "ProgramArguments": [python, str(Path(__file__).with_name("inbox_alert.py"))],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    })
+
+
+def launchd_pid(label=LABEL):
+    target = f"gui/{os.getuid()}/{label}"
     result = subprocess.run(["launchctl", "print", target], capture_output=True,
                             text=True, timeout=10)
     if result.returncode or not re.search(r"^\s*state = running\s*$", result.stdout, re.MULTILINE):
@@ -93,6 +121,11 @@ def status(home=None):
     return True, f"watch-inbox running outside Orca tabs (PID {pid})"
 
 
+def alert_status():
+    pid = launchd_pid(ALERT_LABEL)
+    return (True, f"ask alerts running (PID {pid})") if pid else (False, "ask alert service is not running")
+
+
 def activate(home=None):
     plist_path, watch, offset, log = paths(home)
     if not watch.is_file() or not os.access(watch, os.X_OK):
@@ -121,17 +154,50 @@ def activate(home=None):
     raise RuntimeError("launchd accepted the service but watch-inbox did not start; inspect the log")
 
 
+def activate_alerts(home=None):
+    plist_path, inbox, cursor, log = alert_paths(home)
+    if alert_status()[0]:
+        raise RuntimeError("ask alert service is already active")
+    expected = alert_plist_bytes(home)
+    if plist_path.exists() and plist_path.read_bytes() != expected:
+        raise RuntimeError(f"different plist already exists: {plist_path}")
+    cursor.parent.mkdir(parents=True, exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cursor.exists():
+        with inbox.open("rb") as stream:
+            data = stream.read()
+        with cursor.open("x") as output:
+            output.write(str(complete_end(data)))
+    if not plist_path.exists():
+        with plist_path.open("xb") as output:
+            output.write(expected)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+                   check=True, timeout=20)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if alert_status()[0]:
+            return
+        time.sleep(0.2)
+    raise RuntimeError("launchd accepted the alert service but it did not start; inspect the log")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("render", "status", "activate"))
+    parser.add_argument("action", choices=("render", "status", "activate", "render-alerts", "status-alerts", "activate-alerts"))
     args = parser.parse_args(argv)
     try:
         if args.action == "render":
             sys.stdout.buffer.write(plist_bytes())
             return 0
+        if args.action == "render-alerts":
+            sys.stdout.buffer.write(alert_plist_bytes())
+            return 0
         if args.action == "activate":
             activate()
-        running, message = status()
+        if args.action == "activate-alerts":
+            activate_alerts()
+        running, message = alert_status() if args.action.endswith("alerts") else status()
         print(message)
         return 0 if running else 1
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:

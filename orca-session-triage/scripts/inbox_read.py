@@ -23,7 +23,7 @@ def complete_end(data):
     return data.rfind(b"\n") + 1
 
 
-def read(inbox, cursor):
+def pending_bytes(inbox, cursor):
     start = int(cursor.read_text().strip()) if cursor.exists() else 0
     with inbox.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
@@ -32,7 +32,12 @@ def read(inbox, cursor):
             raise ValueError("inbox is shorter than the saved read position")
         stream.seek(start)
         data = stream.read()
-    end = start + complete_end(data)
+    return start, data, complete_end(data)
+
+
+def read(inbox, cursor):
+    start, data, complete = pending_bytes(inbox, cursor)
+    end = start + complete
     for raw in data[:end - start].splitlines():
         try:
             item = json.loads(raw)
@@ -41,6 +46,20 @@ def read(inbox, cursor):
         except (ValueError, TypeError, AttributeError):
             print(raw.decode("utf-8", "replace"))
     print(f"NEXT_OFFSET={end}")
+
+
+def unread_asks(inbox, cursor):
+    """Return lane names for complete ask records after the acknowledged position."""
+    _, data, complete = pending_bytes(inbox, cursor)
+    asks = []
+    for raw in data[:complete].splitlines():
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("kind") == "ask":
+            asks.append(str(item.get("worktree") or item.get("handle") or "unknown"))
+    return asks
 
 
 def save(cursor, position, exclusive=False):

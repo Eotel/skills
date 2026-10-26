@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from threading import Event
 import time
@@ -19,6 +20,7 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "orca-session-triage" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 
 
 def load_script(name):
@@ -35,6 +37,7 @@ hourly_state = load_script("hourly_state")
 stopcheck = load_script("stop_check")
 inbox_service = load_script("inbox_watch_service")
 inbox_read = load_script("inbox_read")
+inbox_alert = load_script("inbox_alert")
 
 
 def write_jsonl(path, rows):
@@ -1980,6 +1983,25 @@ class InboxWatchServiceTests(unittest.TestCase):
                     patch.object(inbox_service, "offset_readers", return_value=[42]):
                 self.assertTrue(inbox_service.status(root)[0])
 
+    def test_alert_service_uses_a_separate_cursor_and_notifier(self):
+        with tempfile.TemporaryDirectory() as root:
+            payload = inbox_service.plistlib.loads(inbox_service.alert_plist_bytes(
+                root, python="/test/bin/python3"))
+            self.assertEqual(payload["Label"], inbox_service.ALERT_LABEL)
+            self.assertEqual(payload["ProgramArguments"], [
+                "/test/bin/python3", str(SCRIPTS / "inbox_alert.py")])
+            self.assertNotIn("close-done-triage.offset", str(payload))
+
+    def test_alert_activation_starts_after_existing_inbox_records(self):
+        with tempfile.TemporaryDirectory() as root:
+            _, inbox, cursor, _ = inbox_service.alert_paths(root)
+            write_jsonl(inbox, [{"kind": "ask", "worktree": "old", "text": "already handled"}])
+            with patch.object(inbox_service, "alert_status", side_effect=[(False, "stopped"), (True, "running")]), \
+                    patch.object(inbox_service.subprocess, "run") as launchctl:
+                inbox_service.activate_alerts(root)
+            self.assertEqual(int(cursor.read_text()), inbox.stat().st_size)
+            self.assertEqual(launchctl.call_args.args[0][:2], ["launchctl", "bootstrap"])
+
 
 class InboxReadTests(unittest.TestCase):
     def test_late_remote_report_is_read_even_with_an_old_timestamp(self):
@@ -2005,6 +2027,34 @@ class InboxReadTests(unittest.TestCase):
                 with redirect_stdout(output):
                     self.assertEqual(inbox_read.main(["read"]), 0)
                 self.assertEqual(output.getvalue(), f"NEXT_OFFSET={position}\n")
+
+
+class InboxAlertTests(unittest.TestCase):
+    def test_alerts_only_new_complete_asks_and_advances_its_own_cursor(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "alert.offset"
+            write_jsonl(inbox, [{"kind": "ask", "worktree": "old", "text": "old"}])
+            cursor.write_text(str(inbox.stat().st_size))
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"kind": "info", "worktree": "info"}) + "\n")
+                stream.write(json.dumps({"kind": "ask", "worktree": "sample-lane", "text": "first\nsecret"}) + "\n")
+                stream.write('{"kind":"ask","worktree":"partial"')
+            seen = []
+            inbox_alert.process(inbox, cursor, seen.append)
+            self.assertEqual([x["worktree"] for x in seen], ["sample-lane"])
+            self.assertEqual(inbox_alert.process(inbox, cursor, seen.append), int(cursor.read_text()))
+            self.assertEqual(len(seen), 1)
+
+    def test_notification_uses_the_first_line_as_arguments(self):
+        item = {"kind": "ask", "worktree": "sample-lane", "text": "first line\nprivate second line"}
+        with patch.object(inbox_alert.subprocess, "run") as run, redirect_stdout(io.StringIO()):
+            inbox_alert.notify(item)
+        args = run.call_args.args[0]
+        self.assertEqual(args[0], "/usr/bin/osascript")
+        self.assertIn("sample-lane", args[-2])
+        self.assertEqual(args[-1], "first line")
+        self.assertTrue(run.call_args.kwargs["check"])
 
 
 def published(url, live="arming"):
@@ -2033,6 +2083,8 @@ class StopCheckTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.dir = self.root / "s1"
         self.dir.mkdir()
+        (self.root / "inbox.jsonl").write_text("")
+        (self.root / "read.offset").write_text("0")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -2051,7 +2103,9 @@ class StopCheckTests(unittest.TestCase):
             hook["cwd"] = cwd
         if transcript:
             hook["transcript_path"] = str(transcript)
-        with patch.object(stopcheck, "inbox_service_running", return_value=watch_running):
+        paths = {"TRIAGE_INBOX": os.environ.get("TRIAGE_INBOX", str(self.root / "inbox.jsonl")),
+                 "TRIAGE_READ_OFFSET": os.environ.get("TRIAGE_READ_OFFSET", str(self.root / "read.offset"))}
+        with patch.dict(os.environ, paths), patch.object(stopcheck, "inbox_service_running", return_value=watch_running):
             return stopcheck.decide(hook, self.root, orca=orca)
 
     def fake_orca(self, automations, runs):
@@ -2094,6 +2148,25 @@ class StopCheckTests(unittest.TestCase):
         self.queue("/w/a", "/w/b")
         self.result("/w/a", "/w/b")
         self.assertIsNone(self.check())
+
+    def test_unread_ask_blocks_even_on_repeated_stop_until_ack(self):
+        inbox = self.root / "inbox.jsonl"
+        cursor = self.root / "read.offset"
+        first = {"kind": "info", "worktree": "earlier", "text": "progress"}
+        write_jsonl(inbox, [first])
+        cursor.write_text(str(inbox.stat().st_size))
+        with inbox.open("a") as stream:
+            stream.write(json.dumps({"kind": "ask", "worktree": "sample-lane", "text": "question"}) + "\n")
+            stream.write('{"kind":"ask","worktree":"partial"')
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {})
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+            for active in (False, True):
+                result = self.check(active=active, cwd="/w/triage", orca=orca)
+                self.assertEqual(result["decision"], "block")
+                self.assertIn("sample-lane", result["reason"])
+                self.assertNotIn("partial", result["reason"])
+            cursor.write_text(str(inbox.stat().st_size - len('{"kind":"ask","worktree":"partial"')))
+            self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
     def test_blocks_once_then_lets_a_repeated_stop_through(self):
         self.queue("/w/a")
