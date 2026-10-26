@@ -31,6 +31,7 @@ def load_script(name):
 scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
 precheck = load_script("precheck")
+hourly_state = load_script("hourly_state")
 stopcheck = load_script("stop_check")
 inbox_service = load_script("inbox_watch_service")
 inbox_read = load_script("inbox_read")
@@ -1791,228 +1792,142 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["blockers"], ["not a git worktree"])
 
 
+class HourlyStateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "hourly.json"
+
+    def source(self, name, content):
+        path = self.root / name
+        path.write_text(content)
+        return str(path)
+
+    def call(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = hourly_state.main(["--state-file", str(self.state), *args])
+        return code, json.loads(out.getvalue())
+
+    def test_left_row_only_stays_left_for_the_saved_final_message(self):
+        old = self.source("old.txt", "Work complete; leave it.\n")
+        new = self.source("new.txt", "New work needed.\n")
+        self.assertEqual(self.call("leave", "--row", "/w/a", "--final-message-file", old)[0], 0)
+        self.assertEqual(self.call("left-now", "--row", "/w/a", "--final-message-file", old),
+                         (0, {"left": True}))
+        self.assertEqual(self.call("left-now", "--row", "/w/a", "--final-message-file", new),
+                         (1, {"left": False}))
+
+    def test_question_and_handoff_survive_a_new_session(self):
+        message = self.source("message.txt", "Should B start?\n")
+        question = self.source("question.txt", "Send B the task?\n")
+        answer = self.source("answer.txt", "Yes, when A finishes.\n")
+        code, asked = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                "--final-message-file", message,
+                                "--question-file", question, "--asked-at", "2026-10-25T12:30:00+09:00")
+        self.assertEqual(code, 0)
+        self.assertEqual(asked["answer"], None)
+        self.assertEqual(asked["asked_at"], "2026-10-25T12:30:00+09:00")
+        self.assertEqual(self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                   "--final-message-file", message,
+                                   "--question-file", question)[1], asked)
+        changed_message = self.source("changed-message.txt", "Still waiting.\n")
+        self.assertEqual(self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                   "--final-message-file", changed_message,
+                                   "--question-file", question)[1], asked)
+        self.call("answered", "--id", asked["id"], "--answer-file", answer,
+                  "--answered-at", "2026-10-25T13:00:00+09:00")
+        code, promise = self.call("promise", "--from-row", "/w/a", "--to-row", "/w/b",
+                                  "--condition", "A finishes", "--task", "Start B")
+        self.assertEqual(code, 0)
+        self.assertIsNone(promise["delivered_at"])
+        self.call("delivered", "--id", promise["id"], "--delivery", "turn_started")
+        _, state = self.call("show")
+        self.assertEqual(state["questions"][asked["id"]]["answer"], "Yes, when A finishes.")
+        self.assertEqual(state["questions"][asked["id"]]["answered_at"], "2026-10-25T13:00:00+09:00")
+        self.assertEqual(state["handoffs"][promise["id"]]["delivery"], "turn_started")
+
+    def test_same_question_for_a_later_pr_is_a_new_decision(self):
+        message = self.source("message.txt", "Ready to merge.\n")
+        question = self.source("question.txt", "Merge this PR?\n")
+        no = self.source("no.txt", "No\n")
+        yes = self.source("yes.txt", "Yes\n")
+        _, earlier = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                               "--final-message-file", message, "--question-file", question)
+        self.call("answered", "--id", earlier["id"], "--answer-file", no)
+        _, later = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#11",
+                             "--final-message-file", message, "--question-file", question)
+        self.assertNotEqual(later["id"], earlier["id"])
+        self.assertIsNone(later["answer"])
+        self.call("answered", "--id", later["id"], "--answer-file", yes)
+        _, state = self.call("show")
+        self.assertEqual(state["questions"][earlier["id"]]["answer"], "No")
+        self.assertEqual(state["questions"][later["id"]]["answer"], "Yes")
+
+    def test_malformed_state_is_not_overwritten(self):
+        self.state.write_text("broken")
+        message = self.source("message.txt", "hello")
+        with redirect_stderr(io.StringIO()):
+            code = hourly_state.main(["--state-file", str(self.state), "leave", "--row", "/w/a",
+                                      "--final-message-file", message])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.state.read_text(), "broken")
+
+
 class PrecheckTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ps = Path(self.tmp.name) / "ps.json"
 
-    def run_precheck(self, worktrees, workspace="/w/triage"):
-        worktree_id = "repo::" + workspace
-        pane = "tab:leaf"
-        pty = worktree_id + "@@pty"
-        for row in worktrees:
-            if row["path"] == workspace:
-                for agent in row["agents"]:
-                    agent["paneKey"] = pane
-        self.ps.write_text(json.dumps({"result": {"worktrees": worktrees}}))
-        answers = {
-            ("automations", "list", "--json"): {"automations": [{
-                "id": "triage", "agentId": "claude", "workspaceId": worktree_id,
-                "reuseSession": True,
-                "precheck": {"command": "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py"},
-            }]},
-            ("automations", "runs", "--id", "triage", "--json"): {"runs": [{
-                "automationId": "triage", "runNumber": 2, "status": "completed",
-                "workspaceId": worktree_id, "terminalPaneKey": pane, "terminalPtyId": pty,
-                "dispatchedAt": 100,
-            }]},
-            ("terminal", "list", "--worktree", "id:" + worktree_id, "--json"): {
-                "terminals": [{"handle": "term_1", "tabId": "tab", "leafId": "leaf", "ptyId": pty,
-                               "connected": True, "writable": True, "agentIdentity": "claude"}]},
-            ("terminal", "wait", "--terminal", "term_1", "--for", "tui-idle", "--timeout-ms", "1000", "--json"):
-                {"wait": {"satisfied": True}},
-        }
-
-        def fake_run(command, **kwargs):
-            key = tuple(command[1:])
-            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"result": answers[key]}), stderr="")
-
+    def run_precheck(self, worktrees, workspace="/w/triage", truncated=False):
+        self.ps.write_text(json.dumps({"result": {"worktrees": worktrees, "truncated": truncated}}))
         out = io.StringIO()
-        with patch.object(precheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
+        with redirect_stdout(out):
             code = precheck.main(["--ps-json", str(self.ps), "--workspace", workspace])
         return code, out.getvalue()
 
-    def run_reuse_case(self, runs, terminals, agents=None, idle=True):
-        workspace = "/w/triage"
-        worktree_id = "repo::" + workspace
-        row = worktree(workspace)
-        row["agents"] = agents if agents is not None else [done_agent("claude", "tab:leaf")]
-        for terminal in terminals:
-            terminal.setdefault("handle", "term_1")
-        answers = {
-            ("worktree", "ps", "--json"): {"worktrees": [row]},
-            ("automations", "list", "--json"): {"automations": [{
-                "id": "triage", "agentId": "claude", "workspaceId": worktree_id,
-                "reuseSession": True,
-                "precheck": {"command": "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py"},
-            }]},
-            ("automations", "runs", "--id", "triage", "--json"): {"runs": runs},
-            ("terminal", "list", "--worktree", "id:" + worktree_id, "--json"): {
-                "terminals": terminals},
-            ("terminal", "wait", "--terminal", "term_1", "--for", "tui-idle", "--timeout-ms", "1000", "--json"):
-                {"wait": {"satisfied": idle}},
-        }
-
-        def fake_run(command, **kwargs):
-            key = tuple(command[1:])
-            code = 1 if key[:2] == ("terminal", "wait") and not idle else 0
-            return subprocess.CompletedProcess(command, code,
-                                               stdout=json.dumps({"result": answers[key]}), stderr="")
-
-        out = io.StringIO()
-        with patch.object(precheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
-            code = precheck.main(["--workspace", workspace])
-        return code, out.getvalue()
-
-    def test_skips_when_previous_run_has_no_live_matching_pty(self):
-        run = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
-               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@old", "dispatchedAt": 100}
-        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@new",
-                    "connected": True, "writable": True, "agentIdentity": "claude"}
-
-        code, out = self.run_reuse_case([run], [terminal])
-
-        self.assertEqual(code, 1)
-        self.assertIn("skip: no prior automation tab can be reused", out)
-
-    def test_reuses_older_lead_tab_after_newer_tab_closed(self):
-        newer = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
-                 "terminalPaneKey": "closed:leaf", "terminalPtyId": "repo::/w/triage@@closed", "dispatchedAt": 200}
-        older = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
-                 "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
-        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
-                    "connected": True, "writable": True, "agentIdentity": "claude"}
-
-        code, out = self.run_reuse_case([newer, older], [terminal])
-
-        self.assertEqual(code, 0)
-        self.assertIn("run: prior automation tab tab:leaf can be reused", out)
-
-    def test_a_newer_run_owns_its_pane_even_when_it_failed(self):
-        old = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
-               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
-        newer = {**old, "status": "failed", "dispatchedAt": 200}
-        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
-                    "connected": True, "writable": True, "agentIdentity": "claude"}
-
-        code, out = self.run_reuse_case([old, newer], [terminal])
-
-        self.assertEqual(code, 1)
-        self.assertIn("skip: no prior automation tab can be reused", out)
-
-    def test_skips_when_the_live_tab_does_not_reach_an_idle_composer(self):
-        run = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
-               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
-        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
-                    "connected": True, "writable": True, "agentIdentity": "claude"}
-
-        code, out = self.run_reuse_case([run], [terminal], idle=False)
-
-        self.assertEqual(code, 1)
-        self.assertIn("skip: no prior automation tab can be reused", out)
-
-    def test_allows_first_run_after_earlier_busy_precheck_skips(self):
-        skipped = {"automationId": "triage", "status": "skipped_precheck", "runNumber": 1,
-                   "workspaceId": "repo::/w/triage"}
-
-        code, out = self.run_reuse_case([skipped], [], agents=[])
-
-        self.assertEqual(code, 0)
-        self.assertIn("run: no prior automation tab; start the first run", out)
-
-    def test_skips_while_an_agent_in_the_workspace_works_is_blocked_or_waits(self):
-        for state in ("working", "blocked", "waiting"):
-            with self.subTest(state=state):
-                code, out = self.run_precheck([worktree("/w/triage", state)])
-
+    def test_a_working_turn_holds_the_next_run(self):
+        for turn in ("working", "done"):
+            with self.subTest(turn=turn):
+                code, out = self.run_precheck([worktree("/w/triage", "working", turn=turn)])
                 self.assertEqual(code, 1)
-                self.assertIn(f"skip: an agent in /w/triage is {state}", out)
+                self.assertIn("skip: an agent in /w/triage is working", out)
 
-    def test_skip_reason_names_a_background_job_left_after_the_agents_turn(self):
-        code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
+    def test_waiting_blocked_and_done_turns_allow_a_fresh_session(self):
+        for state in ("waiting", "blocked", "done"):
+            with self.subTest(state=state):
+                code, out = self.run_precheck([worktree("/w/triage", state),
+                                               worktree("/w/lane", "working")])
+                self.assertEqual(code, 0)
+                self.assertIn("run: start a fresh session", out)
 
-        self.assertEqual(code, 1)
-        self.assertIn("skip: an agent in /w/triage is working (a background job after its turn)", out)
-
-    def test_background_watch_still_blocks_reuse(self):
-        code, out = self.run_precheck([worktree("/w/triage", "working", turn="done")])
-        self.assertEqual(code, 1)
-        self.assertIn("background job", out)
-
-    def test_runs_when_the_workspace_agents_are_done_whatever_other_worktrees_do(self):
-        code, out = self.run_precheck([worktree("/w/triage", "done"), worktree("/w/lane", "waiting")])
-
-        self.assertEqual(code, 0)
-        self.assertIn("run: prior automation tab tab:leaf can be reused", out)
-
-    def test_matches_the_workspace_through_a_symlink(self):
+    def test_matches_a_symlinked_workspace(self):
         real = Path(self.tmp.name) / "real"
         real.mkdir()
         link = Path(self.tmp.name) / "link"
         link.symlink_to(real)
+        code, _ = self.run_precheck([worktree(str(link), "waiting")], workspace=str(real))
+        self.assertEqual(code, 0)
 
-        code, out = self.run_precheck([worktree(str(link), "waiting")], workspace=str(real))
-
-        self.assertEqual(code, 1)
-
-    def test_requires_the_workspace_since_orca_runs_a_precheck_in_the_main_checkout(self):
-        self.ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/triage", "waiting")]}}))
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
-            precheck.main(["--ps-json", str(self.ps)])
-
-        self.assertEqual(exit.exception.code, 2)
-
-    def test_skips_when_orca_does_not_know_the_workspace(self):
+    def test_requires_a_known_workspace(self):
         code, out = self.run_precheck([worktree("/w/lane", "done")])
-
         self.assertEqual(code, 2)
-        self.assertIn("/w/triage is not an Orca worktree", out)
+        self.assertIn("not an Orca worktree", out)
+        code, out = self.run_precheck([worktree("/w/lane", "done")], truncated=True)
+        self.assertEqual(code, 2)
+        self.assertIn("before cutting the list short", out)
 
-    def test_skip_reason_carries_what_orca_said_on_stderr(self):
+    def test_failure_to_read_orca_skips_the_run(self):
         refusing = Path(self.tmp.name) / "refusing-orca"
         refusing.write_text("#!/bin/sh\necho 'runtime not reachable' >&2\nexit 3\n")
         refusing.chmod(0o755)
         out = io.StringIO()
         with redirect_stdout(out):
             code = precheck.main(["--orca", str(refusing), "--workspace", "/w/triage"])
-
         self.assertEqual(code, 2)
-        self.assertIn("skip: could not read Orca worktrees: runtime not reachable", out.getvalue())
-
-    def test_says_when_orca_cut_its_list_before_the_workspace(self):
-        self.ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/lane", "done")], "truncated": True}}))
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = precheck.main(["--ps-json", str(self.ps), "--workspace", "/w/triage"])
-
-        self.assertEqual(code, 2)
-        self.assertIn("skip: /w/triage is not among the 1 worktrees Orca listed before cutting the list short",
-                      out.getvalue())
-
-    def test_skips_with_the_reason_when_orca_answers_in_another_shape(self):
-        for answer in ({"result": {"worktrees": None}}, {"result": {"worktrees": [{"agents": []}]}}, ["x"]):
-            with self.subTest(answer=answer):
-                self.ps.write_text(json.dumps(answer))
-                out = io.StringIO()
-                with redirect_stdout(out):
-                    code = precheck.main(["--ps-json", str(self.ps), "--workspace", "/w/triage"])
-
-                self.assertEqual(code, 2)
-                self.assertIn("skip: could not read Orca worktrees", out.getvalue())
-
-    def test_skips_with_the_reason_when_the_orca_cli_fails(self):
-        garbled = Path(self.tmp.name) / "garbled-orca"
-        garbled.write_text("#!/bin/sh\necho not json\n")
-        garbled.chmod(0o755)
-        for orca in (str(Path(self.tmp.name) / "missing-orca"), "false", str(garbled)):
-            with self.subTest(orca=orca):
-                out = io.StringIO()
-                with redirect_stdout(out):
-                    code = precheck.main(["--orca", orca, "--workspace", "/w/triage"])
-
-                self.assertEqual(code, 2)
-                self.assertIn("skip: could not read Orca worktrees", out.getvalue())
+        self.assertIn("runtime not reachable", out.getvalue())
 
 
 def triage_automation(automation_id, workspace, prompt="/orca-session-triage hourly"):
@@ -2191,19 +2106,6 @@ class StopCheckTests(unittest.TestCase):
             {"queue_generated_at": "2026-10-07T10:00:00+00:00", "rows": [{"path": "/w/a", "class": "maybe"}]}))
         self.assertEqual(self.check()["decision"], "block")
 
-    def test_blocks_once_when_the_hourly_run_skipped_a_run_after_the_last_scan(self):
-        self.queue(at="2026-10-13T02:00:00+00:00")
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
-            automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00"),
-            automation_run("completed", "2026-10-13T02:00:40+00:00")]})
-
-        blocked = self.check(cwd="/w/triage", orca=orca)
-
-        self.assertEqual(blocked["decision"], "block")
-        self.assertIn("skipped", blocked["reason"])
-        self.assertIn("references/hourly.md", blocked["reason"])
-        self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
-
     def test_warns_when_the_external_inbox_service_is_stopped(self):
         self.queue()
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": []})
@@ -2226,70 +2128,6 @@ class StopCheckTests(unittest.TestCase):
         with patch.object(stopcheck.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 1, "stopped")):
             self.assertFalse(stopcheck.inbox_service_running())
-
-    def test_asks_for_the_whole_triage_when_several_runs_in_a_row_were_skipped(self):
-        self.queue(at="2026-10-13T02:30:00+00:00")
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
-            automation_run("skipped_precheck", "2026-10-13T04:00:40+00:00"),
-            automation_run("skipped_precheck", "2026-10-13T05:00:40+00:00"),
-            automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00"),
-            automation_run("completed", "2026-10-13T02:00:40+00:00"),
-            automation_run("skipped_precheck", "2026-10-13T01:00:40+00:00")]})
-
-        reason = self.check(cwd="/w/triage", orca=orca)["reason"]
-
-        self.assertIn("3 runs in a row", reason)
-        self.assertIn("cleanup included", reason)
-
-    def test_the_first_block_names_an_unclassed_queue_and_a_skipped_run_together(self):
-        self.queue("/w/a", at="2026-10-13T02:00:00+00:00")
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
-                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
-
-        reason = self.check(cwd="/w/triage", orca=orca)["reason"]
-
-        self.assertIn("orca-row-classify", reason)
-        self.assertIn("references/hourly.md", reason)
-
-    def test_a_session_in_a_subdirectory_of_the_workspace_is_swept_too(self):
-        self.queue(at="2026-10-13T02:00:00+00:00")
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
-                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
-
-        self.assertEqual(self.check(cwd="/w/triage/review-response", orca=orca)["decision"], "block")
-        self.assertIsNone(self.check(cwd="/w/triage-other", orca=orca))
-
-    def test_an_absurd_start_time_lets_the_turn_end(self):
-        self.queue(at="2026-10-13T02:00:00+00:00")
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
-                              {"a1": [{"status": "skipped_precheck", "startedAt": 10 ** 20}]})
-
-        self.assertIsNone(self.check(cwd="/w/triage", orca=orca))
-
-    def test_lets_the_turn_end_unless_this_workspaces_triage_skipped_a_run_after_the_last_scan(self):
-        self.queue(at="2026-10-13T02:00:00+00:00")
-        later = automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")
-        cases = {
-            "skipped before the scan": ([triage_automation("a1", "/w/triage")],
-                                        {"a1": [automation_run("skipped_precheck", "2026-10-13T01:00:40+00:00")]}),
-            "ran after the scan": ([triage_automation("a1", "/w/triage")],
-                                   {"a1": [automation_run("completed", "2026-10-13T03:00:40+00:00")]}),
-            "another workspace": ([triage_automation("a1", "/w/other")], {"a1": [later]}),
-            "another automation": ([triage_automation("a1", "/w/triage", prompt="/daily-report")], {"a1": [later]}),
-        }
-        for name, (automations, runs) in cases.items():
-            with self.subTest(name):
-                self.assertIsNone(self.check(cwd="/w/triage", orca=self.fake_orca(automations, runs)))
-
-    def test_a_session_that_never_scanned_or_a_failing_orca_lets_the_turn_end(self):
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")],
-                              {"a1": [automation_run("skipped_precheck", "2026-10-13T03:00:40+00:00")]})
-        self.assertIsNone(self.check(cwd="/w/triage", orca=orca))
-
-        self.queue(at="2026-10-13T02:00:00+00:00")
-        for failing in (str(self.root / "missing-orca"), "false"):
-            with self.subTest(orca=failing):
-                self.assertIsNone(self.check(cwd="/w/triage", orca=failing))
 
     def test_blocks_while_an_artifact_this_session_published_is_still_watched(self):
         transcript = self.root / "session.jsonl"
