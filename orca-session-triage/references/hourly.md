@@ -14,7 +14,10 @@ shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
-`~/.cache/orca-session-triage/inbox-read.offset` cursor. The separately
+`~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
+scheduled triage tab may read or acknowledge that cursor. An older tab must
+leave new inbox entries for the current run; it can finish without handling
+them. The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local
 Mac) reads with
 `TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-inbox-read.offset"`
@@ -33,11 +36,22 @@ to the hourly run. A report pulled late from another Mac is still shown even
 if its original timestamp is old. The watch and notification services each
 keep their own cursor. The watch's output is in
 `~/.cache/orca-briefs/triage-watch.log` for diagnosis.
-The Stop hook keeps a scheduled run open while an `ask` is past the acknowledged
+The Stop hook keeps the current scheduled run open while an `ask` is past the acknowledged
 cursor, including on a repeated stop. Read it, handle it or hand it to the
 appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
 
 ## In the run
+
+At the start, run
+`python3 ~/.claude/skills/orca-session-triage/scripts/cleanup_hourly_tabs.py`.
+This checks Orca's run, terminal and agent records before closing previous
+scheduled tabs. It keeps a tab if its turn or background work is active, a
+question from that tab (or one without a recorded owner) is unanswered, its
+latest conversation may still ask the user, its transcript is missing or active
+within five minutes, or its rendered screen shows a draft or a nonempty input
+field. When Orca has no provider session ID, the script requires one transcript
+whose scheduled prompt matches the run's start time. Inspect
+`keep:` output and retry on a later hourly run; leave the workspace open.
 
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
@@ -60,10 +74,6 @@ check promised handoffs and open requests. After the scan, run
 raise the needed decision. Keep every request open until the lead observes
 that its recorded symptom is gone. Then:
 
-- Close previous scheduled-run tabs whose agents are done and whose questions
-  have answers or no question. Check Orca's run history and terminal ownership
-  before closing a tab; leave tabs with unanswered questions open. Apply
-  `cleanup.md` to any done cards in them.
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
@@ -139,9 +149,9 @@ orca automations create --name "session triage" --trigger hourly \
 
 - An existing workspace with `--fresh-session` gets a new tab and session on
   each allowed run, without making a new worktree.
-- `scripts/precheck.py` skips only while an agent in the triage workspace is
-  working, including a background job. A waiting question can stay open while
-  the next run starts. A skipped run is visible in
+- `scripts/precheck.py` skips while a scheduled turn is still dispatched and
+  working, or its completed turn still owns a background job. A later human
+  turn in that tab does not hold the next run. A skipped run is visible in
   `orca automations runs --id <id> --json`. A manual `orca automations run`
   does not run the precheck.
 - Orca runs the precheck through `/bin/sh` with the login `PATH`, but in the

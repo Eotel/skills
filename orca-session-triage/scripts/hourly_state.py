@@ -115,6 +115,7 @@ def change(data, args):
         data["questions"].setdefault(key, {"row": args.row, "decision": decision,
                                            "final_message": message,
                                            "question": question, "asked_at": recorded_at(args.asked_at),
+                                           "owner_pane": os.environ.get("ORCA_PANE_KEY"),
                                            "answer": None})
         return {"id": key, **data["questions"][key]}
     if args.action == "answered":
