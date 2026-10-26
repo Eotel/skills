@@ -8,8 +8,11 @@ longer appoints a lead. A `--only` watch receives selected lanes' reports.
 The triage workspace holds scheduled-run tabs only. Start requests outside the
 hourly sweep in a different workspace, so they cannot hold the next run.
 Read `references/hourly-state.md` for decisions shared across fresh sessions.
-At the start of each run, use `scripts/inbox_read.py read` to see new inbox
-entries in append order. After handling them, pass its `NEXT_OFFSET` to
+At the start of each run, use `scripts/inbox_read.py read --brief` to see new
+inbox entries in append order. `--brief` keeps `ask` and `done` in full and
+shows the first 160 characters of each `info`; use `read` without it when the
+full context of an `info` is needed. Both modes leave the cursor unchanged.
+After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local
@@ -36,8 +39,12 @@ appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
 
 ## In the run
 
-When another tab has explicitly been appointed lead, scan and review the rows,
-then do only the
+When another tab has explicitly been appointed lead, read the open requests in
+the shared hourly state, then scan and review the rows. Run
+`requests-needing-owner` as described in `references/hourly-state.md` and
+include every returned request in the handoff to the lead on every run. A
+lane's `done` leaves the user's request open until the lead verifies the
+original symptom is gone. Then do only the
 cleanup allowed before a user choice by the Boundary and `cleanup.md`. Send questions
 and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
@@ -48,7 +55,10 @@ rows from the reachable Macs in the same run.
 
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and
-check promised handoffs. Then:
+check promised handoffs and open requests. After the scan, run
+`requests-needing-owner` and assign a live lane to each returned request or
+raise the needed decision. Keep every request open until the lead observes
+that its recorded symptom is gone. Then:
 
 - Close previous scheduled-run tabs whose agents are done and whose questions
   have answers or no question. Check Orca's run history and terminal ownership

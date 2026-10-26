@@ -14,17 +14,20 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import uuid
 
 DEFAULT_STATE = "~/.cache/orca-session-triage/hourly-state.json"
 
 
 def read(path):
     if not path.exists():
-        return {"version": 1, "left": {}, "questions": {}, "handoffs": {}}
+        return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1 or any(
-            not isinstance(data.get(key), dict) for key in ("left", "questions", "handoffs")):
+            not isinstance(data.get(key), dict) for key in ("left", "questions", "handoffs")) or not isinstance(
+                data.get("requests", {}), dict):
         raise ValueError(f"invalid hourly state: {path}")
+    data.setdefault("requests", {})
     return data
 
 
@@ -67,7 +70,37 @@ def file_text(path):
     return value
 
 
+def owner_name(value):
+    owner = value.strip()
+    if not owner:
+        raise ValueError("owner is empty")
+    return owner
+
+
 def change(data, args):
+    if args.action == "request-open":
+        key = uuid.uuid4().hex[:16]
+        data["requests"][key] = {"original": file_text(args.original_file),
+                                 "symptom": file_text(args.symptom_file),
+                                 "owner": owner_name(args.owner) if args.owner is not None else None,
+                                 "opened_at": recorded_at(args.opened_at),
+                                 "closed_at": None, "closure_evidence": None}
+        return {"id": key, **data["requests"][key]}
+    if args.action == "request-assign":
+        request = data["requests"][args.id]
+        if request["closed_at"] is not None:
+            raise ValueError("request is already closed")
+        request["owner"] = owner_name(args.owner)
+        return {"id": args.id, **request}
+    if args.action == "request-close":
+        request = data["requests"][args.id]
+        evidence = file_text(args.evidence_file)
+        if request["closed_at"] is not None and request["closure_evidence"] != evidence:
+            raise ValueError("request already closed; inspect the state before changing it")
+        if request["closed_at"] is None:
+            request["closed_at"] = recorded_at(args.closed_at)
+            request["closure_evidence"] = evidence
+        return {"id": args.id, **request}
     if args.action == "leave":
         data["left"][args.row] = {"final_message": file_text(args.final_message_file), "left_at": stamp()}
         return data["left"][args.row]
@@ -112,7 +145,21 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-file", default=DEFAULT_STATE, help="shared hourly state JSON path")
     commands = parser.add_subparsers(dest="action", required=True)
-    commands.add_parser("show", help="read all saved decisions, questions, and handoffs")
+    commands.add_parser("show", help="read all saved decisions, questions, handoffs, and requests")
+    needs_owner = commands.add_parser("requests-needing-owner", help="list open requests without a live owner")
+    needs_owner.add_argument("--live-owner", action="append", default=[], help="live repo/worktree; repeat per owner")
+    request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
+    request_open.add_argument("--original-file", required=True)
+    request_open.add_argument("--symptom-file", required=True)
+    request_open.add_argument("--owner", help="assigned repo/worktree, if known")
+    request_open.add_argument("--opened-at", help="original ISO 8601 time when importing a request")
+    request_assign = commands.add_parser("request-assign", help="replace the lane responsible for an open request")
+    request_assign.add_argument("--id", required=True)
+    request_assign.add_argument("--owner", required=True, help="assigned repo/worktree")
+    request_close = commands.add_parser("request-close", help="close after the lead verifies the symptom is gone")
+    request_close.add_argument("--id", required=True)
+    request_close.add_argument("--evidence-file", required=True)
+    request_close.add_argument("--closed-at", help="original ISO 8601 time when importing a closure")
     left_now = commands.add_parser("left-now", help="check if a left row still has the saved final message")
     left_now.add_argument("--row", required=True)
     left_now.add_argument("--final-message-file", required=True)
@@ -142,14 +189,19 @@ def main(argv=None):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX if args.action not in ("show", "left-now") else fcntl.LOCK_SH)
+            read_only = ("show", "left-now", "requests-needing-owner")
+            fcntl.flock(lock, fcntl.LOCK_EX if args.action not in read_only else fcntl.LOCK_SH)
             data = read(path)
             if args.action == "left-now":
                 same = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": same}
+            elif args.action == "requests-needing-owner":
+                live = set(args.live_owner)
+                result = [{"id": key, **request} for key, request in data["requests"].items()
+                          if request["closed_at"] is None and request["owner"] not in live]
             else:
                 result = data if args.action == "show" else change(data, args)
-            if args.action not in ("show", "left-now"):
+            if args.action not in read_only:
                 save(path, data)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
