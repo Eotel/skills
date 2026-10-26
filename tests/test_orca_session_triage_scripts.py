@@ -375,6 +375,17 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["terminals"], r["closable"]) for r in result],
                          [("stalled", [], [])])
 
+    def test_unreadable_orphaned_shell_is_not_a_meaningful_tab(self):
+        stale = {**terminal("/w/s", None, "term_stale", title=None, orphaned=True),
+                 "connected": True, "lastOutputAt": None}
+        visible = {**terminal("/w/s", None, "term_visible", title=None, preview="server ready", orphaned=True),
+                   "connected": True, "lastOutputAt": None}
+        agent = {**terminal("/w/s", "codex", "term_agent", title=None, orphaned=True),
+                 "connected": True, "lastOutputAt": None}
+        rows = self.inventory([worktree("/w/s", None)], [stale, visible, agent])
+
+        self.assertEqual(rows[0]["meaningful_tabs"], ["term_visible", "term_agent"])
+
     def test_each_agent_orca_marks_done_is_a_done_card_with_the_tab_that_closes_it(self):
         rows = self.inventory(
             [{**worktree("/w/d"), "agents": [
@@ -1005,7 +1016,71 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/done"][0], "stalled")
         self.assertEqual(result["/w/continues"][0], "stalled")
         self.assertEqual(result["/w/no-session-other-head"][0], "stalled")
-        self.assertEqual(result["/w/no-session-open"][0], "stalled")
+        self.assertEqual(result["/w/no-session-open"], ("finished", ["no local work beyond open PR head"]))
+
+    def test_open_pr_cleanup_uses_published_head_not_upstream(self):
+        names = ("clean", "human-replied", "dirty", "unpushed", "other-head", "unknown-unpushed")
+        rows = [{"path": "/w/" + name, "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+                 "linked_pr": None, "claude": None, "codex": []} for name in names]
+
+        def git_lookup(path):
+            name = path.rsplit("/", 1)[-1]
+            return {"branch": name, "head": "aaa", "dirty": int(name == "dirty"),
+                    "unpushed": None if name == "unknown-unpushed" else int(name == "unpushed"),
+                    "github": "acme/app"}
+
+        def pr_lookup(slug, ref):
+            return {"number": 7, "state": "OPEN", "head_oid": "bbb" if ref == "other-head" else "aaa",
+                    "reply_after_last_commit": ref == "human-replied"}
+
+        result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
+            rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+
+        self.assertEqual({name: (row["class"], row.get("open_pr_cleanup", False)) for name, row in result.items()},
+                         {"clean": ("finished", True), "human-replied": ("finished", True),
+                          "dirty": ("stalled", False), "unpushed": ("finished", True),
+                          "other-head": ("stalled", False), "unknown-unpushed": ("finished", True)})
+
+    def test_open_pr_cleanup_preserves_a_historical_transcript_question(self):
+        rows = [
+            {"path": "/w/history", "class": "waiting", "reasons": ["final message asks"],
+             "agents": [], "terminals": [], "linked_pr": None, "claude": {"final_text": "merge?"}},
+            {"path": "/w/agent", "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+             "agents": [{"type": "codex"}], "terminals": [], "linked_pr": None},
+            {"path": "/w/agent-tab", "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+             "agents": [], "terminals": [{"agent": "codex"}], "linked_pr": None},
+        ]
+
+        def git_lookup(path):
+            return {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
+                    "unpushed": 1, "github": "acme/app"}
+
+        def pr_lookup(slug, ref):
+            return {"number": 7, "state": "OPEN", "head_oid": "aaa"}
+
+        result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
+            rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+
+        self.assertEqual(result["history"]["class"], "waiting")
+        self.assertTrue(result["history"]["open_pr_cleanup"])
+        self.assertNotIn("open_pr_cleanup", result["agent"])
+        self.assertNotIn("open_pr_cleanup", result["agent-tab"])
+
+    def test_completed_board_without_agent_still_checks_open_pr_for_cleanup(self):
+        row = {"path": "/w/completed", "class": "finished", "reasons": ["board status completed"],
+               "agents": [], "terminals": [{"agent": None, "handle": "shell1"}],
+               "meaningful_tabs": ["shell1"], "linked_pr": None}
+
+        result = scan.add_next_step_facts(
+            [row],
+            git_lookup=lambda path: {"branch": "completed", "head": "aaa", "dirty": 0,
+                                     "unpushed": 1, "github": "acme/app"},
+            pr_lookup=lambda slug, ref: {"number": 7, "state": "OPEN", "head_oid": "aaa"})[0]
+
+        self.assertEqual(result["class"], "finished")
+        self.assertEqual(result["meaningful_tabs"], ["shell1"])
+        self.assertTrue(result["open_pr_cleanup"])
+        self.assertTrue(result["pr"]["head_matches"])
 
     def test_the_review_queue_holds_every_row_a_reader_must_class(self):
         # Jev reads fast and shallow: every row it judged from a final message gets
@@ -1414,6 +1489,23 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main()
         self.assertEqual((code, result["processes"]), (0, []))
 
+    def test_process_running_from_worktree_blocks_without_path_in_command(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)"],
+            cwd=self.wt, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            code, result = self.run_main()
+
+            self.assertEqual(code, 1)
+            self.assertEqual([item["pid"] for item in result["processes"]], [process.pid])
+            self.assertEqual(result["processes"][0]["cwd"], str(self.wt.resolve()))
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            process.stdout.close()
+
     def test_check_does_not_count_itself_or_its_shell(self):
         command = (f'{sys.executable} {rmcheck.__file__} --worktree {self.wt} '
                    '--base main --no-docker; :')
@@ -1430,7 +1522,7 @@ class RmCheckTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
              str(sibling.resolve() / "server.js")],
-            stdout=subprocess.PIPE, text=True,
+            cwd=sibling, stdout=subprocess.PIPE, text=True,
         )
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
@@ -1517,7 +1609,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/web/src/api/__generated__/", "e2e/.auth/",
                                                         "e2e/.state/", "e2e/screenshots/", "src/paraglide/"])
 
-    def test_unmerged_commit_blocks_unless_it_is_the_merged_pr_head(self):
+    def test_unmerged_commit_blocks_unless_it_is_the_pr_head(self):
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
         head = git(self.wt, "rev-parse", "HEAD")
@@ -1528,7 +1620,22 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(blocked["blockers"], ["HEAD %s is not in main" % head[:8]])
         self.assertTrue(squashed["ok"])
-        self.assertEqual(reopened["blockers"], ["HEAD %s is not in main and PR #7 is OPEN" % head[:8]])
+        self.assertTrue(reopened["ok"])
+
+    def test_open_pr_at_clean_checkout_head_is_removable(self):
+        (self.wt / "app.txt").write_text("pushed change\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        head = git(self.wt, "rev-parse", "HEAD")
+        pr = {"number": 7, "state": "OPEN", "headRefOid": head}
+
+        code, result = self.run_main_without_base("--pr", "7", pr=pr)
+        (self.wt / "app.txt").write_text("unsaved work\n")
+        dirty = self.check(pr=pr)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(dirty["blockers"], ["1 uncommitted changes"])
 
     def test_an_ignored_path_that_holds_nothing_needs_no_review(self):
         (self.main / "uploads").write_text("rows from the main checkout\n")
@@ -1779,7 +1886,7 @@ class RmCheckTests(unittest.TestCase):
 
         code, result = self.run_main_without_base("--pr", "7", pr=pr)
 
-        self.assertEqual((code, result["base"]), (1, "origin/HEAD"))
+        self.assertEqual((code, result["base"]), (0, "origin/HEAD"))
         self.assertEqual(result["notes"], ["PR #7 base origin/release is not fetched: fetch it or pass --base"])
 
     def test_command_checks_against_the_remote_branch_the_worktree_started_from(self):

@@ -27,9 +27,14 @@ judge each row from its own facts.
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
   CLOSED, `review`, `latest_human_activity` from a person other than the PR author,
   `requested` reviewers, `checks`), or null.
-- `git`: `dirty` (uncommitted paths) and `unpushed` (commits not pushed). Both
-  are unknown on a remote Mac until its checkout is inspected there.
+- `git`: `dirty` (uncommitted paths) and `unpushed` (commits ahead of the
+  branch's upstream). Both are unknown on a remote Mac until its checkout is
+  inspected there. An open PR whose head matches HEAD has that commit even if
+  `unpushed` is positive because the branch tracks the PR's base.
 - `reasons`, `jev`: why the scan could not settle the row.
+- `open_pr_cleanup: true`: the checkout may be removed without asking after
+  `rm_check.py` clears it. This does not settle a historical transcript's
+  question or the PR's review.
 
 ## Rules
 
@@ -66,7 +71,9 @@ judge each row from its own facts.
    - `done_unmerged`: the work is done and the PR is open with no reviewer
      requested and no review: someone must request a review or merge.
    - `finished`: the PR merged (or the task needed none) **and** no leftover
-     of kind (c) below is left.
+     of kind (c) below is left. An `open_pr_cleanup` row without a historical
+     message is also `finished`; when it has a message, classify its remaining
+     question or task as usual. The cleanup flag decides removal independently.
 3. **Leftovers: keep each one and say whose it is.** List every open item from
    the message and the comment ("残り", "残っていること", "未確認", "needs its own
    issue") in `remaining`, one short line each. Then sort each into the first

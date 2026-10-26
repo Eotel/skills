@@ -62,8 +62,8 @@ check promised handoffs. Then:
   Keep the tab with that unanswered question open. A later run works through
   other rows and never repeats the recorded question. Once answered, record
   the answer before directing a lane. Other rows' verdicts are acted on in
-  every run, changed or not, so a finished or stalled row is offered again
-  until it is closed.
+  every run, changed or not, so a finished or stalled row is handled again
+  until it is closed; `cleanup.md` decides which removals need no question.
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.

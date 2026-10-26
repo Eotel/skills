@@ -492,8 +492,14 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
     now = time.time() if now is None else now
     by_worktree = {}
     for term in terminals:
+        # An orphaned shell with no agent, title, screen, or output time cannot
+        # be read through its stale handle. Keep agent tabs and tabs with output.
+        if (term.get("orphaned") and not term.get("agentIdentity")
+                and not term.get("title") and not term.get("preview")
+                and term.get("lastOutputAt") is None):
+            continue
         # Orphaned and disconnected is the stale record of a closed tab; a tab
-        # Orca detached from the window stays connected and still runs.
+        # Orca detached from the window can stay connected and still run.
         if term.get("connected") or not term.get("orphaned"):
             by_worktree.setdefault((term.get("_environment"), term.get("worktreeId")), []).append(term)
     rows = []
@@ -752,19 +758,35 @@ def merged_with_nothing_left(row, pr):
             and pr.get("state") == "MERGED" and bool(pr.get("head_matches")))
 
 
+def open_pr_with_no_local_work(row, pr, git):
+    """No current agent or local work remains beyond the published PR head.
+
+    `git.unpushed` is relative to the branch's upstream, which can be the PR's
+    base. An exact PR head match proves this HEAD was pushed to the PR.
+    """
+    return (not row.get("agents")
+            and not any(term.get("agent") for term in row.get("terminals", []))
+            and pr.get("state") == "OPEN" and pr.get("head_matches") is True
+            and git.get("dirty") == 0)
+
+
 def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
-    """Return rows where each row a reader classes (stalled, unsure, waiting) also carries its git and PR state.
+    """Add git and PR facts to rows needing review or completed rows with no current agent.
 
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
     """
+    fact_rows = [row for row in rows if row["class"] in READ_CLASSES or
+                 (row["class"] == "finished" and not row.get("agents") and
+                  not any(term.get("agent") for term in row.get("terminals", [])))]
+    fact_row_ids = {id(row) for row in fact_rows}
     git_by_row = {id(row): (remote_git_hint(row) if row.get("environment") else git_lookup(row["path"]))
-                   for row in rows if row["class"] in READ_CLASSES}
+                   for row in fact_rows}
     keys = []
     seen = set()
     for row in rows:
-        if row["class"] not in READ_CLASSES:
+        if id(row) not in fact_row_ids:
             continue
         git = git_by_row.get(id(row))
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
@@ -787,7 +809,7 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
 
     result = []
     for row in rows:
-        if row["class"] not in READ_CLASSES:
+        if id(row) not in fact_row_ids:
             result.append(row)
             continue
         git = git_by_row[id(row)]
@@ -796,13 +818,18 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         if pr is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
         row = {**row, "git": git, "pr": pr}
-        if pr is not None and pr.get("state") == "OPEN" and pr.get("reply_after_last_commit"):
-            row = {**row, "waits_on": "self",
-                   "reasons": [*row.get("reasons", []), "human PR response after the latest commit"]}
+        open_pr_cleanup = pr is not None and git is not None and open_pr_with_no_local_work(row, pr, git)
+        if open_pr_cleanup:
+            row = {**row, "open_pr_cleanup": True}
         if pr is not None and merged_after_final_message(row, pr):
             row = {**row, "class": "finished", "reasons": ["PR merged after the final message"]}
         elif pr is not None and merged_with_nothing_left(row, pr):
             row = {**row, "class": "finished", "reasons": ["PR merged"]}
+        elif open_pr_cleanup and row.get("reasons") == [NO_SESSION_REASON]:
+            row = {**row, "class": "finished", "reasons": ["no local work beyond open PR head"]}
+        elif pr is not None and pr.get("state") == "OPEN" and pr.get("reply_after_last_commit"):
+            row = {**row, "waits_on": "self",
+                   "reasons": [*row.get("reasons", []), "human PR response after the latest commit"]}
         result.append(row)
     return result
 
@@ -867,6 +894,7 @@ def review_queue(rows, verdicts=None):
         return current_verdict(row, verdicts) is None
 
     return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             **({"open_pr_cleanup": True} if row.get("open_pr_cleanup") else {}),
              **({"identity": row_identity(row)} if row.get("environment") else {}),
              "codex": row["codex"][-1] if row.get("codex") else None,
              "final_at": row_final_at(row), "read": read_key(row)}
@@ -1152,6 +1180,10 @@ def print_summary(rows, verdicts):
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
+    open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
+    print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
+    for row in open_pr_cleanup:
+        print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
 
 
 def main(argv=None):

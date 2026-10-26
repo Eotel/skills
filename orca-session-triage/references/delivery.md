@@ -16,8 +16,12 @@
   user (a decision, an approval, a login or check only they can do, a request
   they cut short) is a question in this pass, quoting what is left. A card with
   nothing left for them closes without a question (`cleanup.md`).
-- Offer `finished` and `unstarted` worktrees in the same pass as close/keep
-  choices, each `stalled` row's next step (`next-step.md`), and each kept
+- An `open_pr_cleanup` row can still carry a historical transcript question.
+  Relay that question as usual; `cleanup.md` removes the checkout without a
+  separate close/keep question once its safety check clears.
+- Offer `finished` worktrees that `cleanup.md` does not remove without asking,
+  and `unstarted` worktrees, in the same pass as close/keep choices. Include
+  each `stalled` row's next step (`next-step.md`) and each kept
   worktree's `closable` shells as one close/keep choice per worktree. An
   `unstarted` agent's task reuses its repository's established request form,
   found in that repository's earlier transcripts (for example
