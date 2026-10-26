@@ -25,6 +25,8 @@ rows from the reachable Macs in the same run.
 When this run leads:
 
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
+- When this run includes a periodic audit, process its "次の一手" rows on every run
+  using the audit's owning skill, even when its value differences were already judged.
 - Ask with AskUserQuestion and set the triage workspace's Orca comment to
   「要判断: …」. The open question holds the session, and later runs skip until
   the user answers, so each question is asked once.
