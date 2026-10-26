@@ -300,21 +300,78 @@ def append(events, imports, row):
     return row
 
 
-def collect(config, imports):
-    hosts = json.loads(config.read_text(encoding="utf-8"))["hosts"]
+def replace_import(imports, name, temporary_path, allow_reorder=False):
+    rows = read_rows(temporary_path)
+    path = imports / f"{name}.jsonl"
+    lock_fd = os.open(imports / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        previous = read_rows(path)
+        if allow_reorder:
+            current = {row["id"]: row for row in rows}
+            if len(current) != len(rows) or any(current.get(row["id"]) != row for row in previous):
+                raise ValueError(f"remote ledger is not append-only: {name}")
+        elif rows[:len(previous)] != previous:
+            raise ValueError(f"remote ledger is not append-only: {name}")
+        os.replace(temporary_path, path)
+    finally:
+        os.close(lock_fd)
+    return rows
+
+
+def receive(config, imports, name):
+    settings = json.loads(config.read_text(encoding="utf-8"))
+    if not isinstance(settings, dict) or not isinstance(settings.get("hosts"), list):
+        raise ValueError("hosts must be a list")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", name):
+        raise ValueError("invalid writer name")
+    if not any(isinstance(host, dict) and host.get("name") == name and
+               host.get("decision_writer") is True for host in settings["hosts"]):
+        raise ValueError(f"decision writer is not configured: {name}")
+    imports.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(dir=imports, prefix=f".{name}-", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+        temporary.write(sys.stdin.buffer.read())
+        temporary.flush()
+        os.fsync(temporary.fileno())
+    try:
+        return len(replace_import(imports, name, temporary_path, allow_reorder=True))
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def collect(config, imports, events):
+    settings = json.loads(config.read_text(encoding="utf-8"))
+    if not isinstance(settings, dict):
+        raise ValueError("host configuration must be an object")
+    hosts = settings["hosts"]
     if not isinstance(hosts, list):
         raise ValueError("hosts must be a list")
+    writer_hosts = sum(isinstance(host, dict) and host.get("decision_writer") is True for host in hosts)
+    if writer_hosts > 1 or (settings.get("decision_writer") is True and writer_hosts):
+        raise ValueError("configure exactly one decision writer")
+    writer_name = settings.get("name") if settings.get("decision_writer") is True else None
+    if settings.get("decision_writer") is True and writer_name is None:
+        raise ValueError("local decision writer needs a stable name")
+    if writer_name is not None and (not isinstance(writer_name, str) or
+                                    not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", writer_name)):
+        raise ValueError("invalid local decision writer name")
     imports.mkdir(parents=True, exist_ok=True, mode=0o700)
     errors = []
+    targets = []
     for host in hosts:
-        if not isinstance(host, dict) or set(host) != {"name", "ssh_target", "remote_path"}:
-            raise ValueError("each host needs name, ssh_target, remote_path")
+        required = {"name", "ssh_target", "remote_path"}
+        if (not isinstance(host, dict) or not required <= set(host)
+                or set(host) - required - {"decision_writer"}
+                or not isinstance(host.get("decision_writer", False), bool)):
+            raise ValueError("each host needs name, ssh_target, remote_path and optional decision_writer")
         name, target, remote = (host[key] for key in ("name", "ssh_target", "remote_path"))
         if (not isinstance(name, str) or not isinstance(target, str) or not isinstance(remote, str)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", name)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,119}", target)
                 or not re.fullmatch(r"/[A-Za-z0-9_./-]{1,300}", remote)):
             raise ValueError(f"invalid host configuration: {name}")
+        targets.append((name, target))
         path = imports / f"{name}.jsonl"
         with tempfile.NamedTemporaryFile(dir=imports, prefix=f".{name}-", delete=False) as temporary:
             temporary_path = Path(temporary.name)
@@ -329,21 +386,29 @@ def collect(config, imports):
                 else:
                     raise OSError(result.stderr.decode(errors="replace").strip())
             rows = read_rows(temporary_path)
-            if any(row["type"] == "decision" for row in rows):
+            if not host.get("decision_writer", False) and any(row["type"] == "decision" for row in rows):
                 raise ValueError(f"remote decision is not allowed: {name}")
-            lock_fd = os.open(imports / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                previous = read_rows(path)
-                if rows[:len(previous)] != previous:
-                    raise ValueError(f"remote ledger is not append-only: {name}")
-                os.replace(temporary_path, path)
-            finally:
-                os.close(lock_fd)
+            replace_import(imports, name, temporary_path)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             errors.append(f"{name}: {exc}")
         finally:
             temporary_path.unlink(missing_ok=True)
+    if writer_name:
+        try:
+            data = b"".join((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+                            for row in all_rows(events, imports))
+        except (OSError, ValueError) as exc:
+            errors.append(f"distribution: {exc}")
+        else:
+            for name, target in targets:
+                try:
+                    result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target,
+                                             f"python3 ~/.agents/skills/adoption-triage/scripts/ledger.py receive --name {writer_name}"],
+                                            input=data, capture_output=True, timeout=20)
+                    if result.returncode:
+                        raise OSError(result.stderr.decode(errors="replace").strip())
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    errors.append(f"{name} distribution: {exc}")
     if errors:
         raise RuntimeError("; ".join(errors))
     return len(hosts)
@@ -356,6 +421,9 @@ def require_decision_writer(config):
         raise ValueError(f"decision writer is not configured: {config}") from exc
     if not isinstance(configured, dict) or configured.get("decision_writer") is not True:
         raise ValueError(f"decision writer is not enabled: {config}")
+    if not isinstance(configured.get("name"), str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9.-]{0,39}", configured["name"]):
+        raise ValueError(f"decision writer needs a stable name: {config}")
 
 
 def main():
@@ -372,6 +440,9 @@ def main():
     listing.add_argument("--json", action="store_true")
     pulling = commands.add_parser("collect", help="copy remote Mac ledgers")
     pulling.add_argument("--config", type=Path, default=DEFAULT_HOSTS)
+    incoming = commands.add_parser("receive", help="accept the configured decision writer's append-only ledger")
+    incoming.add_argument("--name", required=True)
+    incoming.add_argument("--config", type=Path, default=DEFAULT_HOSTS)
     args = parser.parse_args()
     try:
         if args.command == "propose":
@@ -390,8 +461,10 @@ def main():
             else:
                 for item in items:
                     print(f"{item['proposal_id']}\t{item['status']}\t{item['priority']}\t{item['proposal']}")
+        elif args.command == "collect":
+            print(json.dumps({"collected": collect(args.config, args.imports, args.events)}))
         else:
-            print(json.dumps({"collected": collect(args.config, args.imports)}))
+            print(json.dumps({"received": receive(args.config, args.imports, args.name)}))
     except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"adoption-triage: {exc}", file=sys.stderr)
         return 1
