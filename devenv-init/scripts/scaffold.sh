@@ -25,7 +25,7 @@ Required:
 
 Common:
   --framework {django|fastapi|flask}    Framework variant (Python only for now)
-  --python {3.10|3.11|3.12|3.13}        (default: 3.12)
+  --python {3.11|3.12|3.13}             (default: 3.12)
   --name <name>                         Project name (default: dirname)
 
 Toggles (omit = template default):
@@ -53,8 +53,8 @@ die() {
 
 validate_python_version() {
   case "$1" in
-    3.10|3.11|3.12|3.13) ;;
-    *) die "--python must be one of: 3.10, 3.11, 3.12, 3.13" ;;
+    3.11|3.12|3.13) ;;
+    *) die "--python must be one of: 3.11, 3.12, 3.13" ;;
   esac
 }
 
@@ -150,7 +150,7 @@ patch_feature "services\\.sqlite" "$WITH_SQLITE"
 if [ "$LANG_ARG" = "python" ]; then
   PY_NUM="${PYTHON_VERSION//./}"
   if [ -f devenv.nix ]; then
-    sed -i.bak -E "s#(languages\\.python\\.version[[:space:]]*=[[:space:]]*)\"[0-9.]+\"#\\1\"${ESCAPED_PYTHON_VERSION}\"#" devenv.nix
+    sed -i.bak -E "s#(package[[:space:]]*=[[:space:]]*pkgs\\.)python3[0-9]+;#\\1python${PY_NUM};#" devenv.nix
   fi
   if [ -f pyproject.toml ]; then
     sed -i.bak -E "s#(requires-python[[:space:]]*=[[:space:]]*\")>=[0-9.]+(\")#\\1>=${ESCAPED_PYTHON_VERSION}\\2#" pyproject.toml
