@@ -12,7 +12,7 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 | Reason "N orchestration messages unread since its last turn began" | wake it now: send the lead one line naming the unread reports and `orca orchestration check --run <run>`; report it after. On a `waiting` row, ask the question as usual and send the wake line too |
 | Reason "final message says work continues, yet no agent runs" | read its screen: a helper, background job, or CI still running means it is working, so leave it; otherwise the lane continues or says where it stopped |
 | Reason "final message waits on someone else" | blocker: name who it waits on, no question |
-| Reason "no agent session in this worktree" | another agent or the user made the checkout and works elsewhere: report its PR state; ask before removing it |
+| Reason "no agent session in this worktree" | 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」 Check `pr.state: OPEN`, `pr.head_matches: true`, and `git.dirty` / `git.unpushed: 0`, then use `cleanup.md` without asking; otherwise report its PR state and ask before removal |
 | Reason "final message says done" | the work is done but not merged or closed: the rows below pick the step |
 | `git` is null | the checkout is missing or unreadable: look at the path first |
 | `pr.head_matches` is false | the PR found is not this checkout's HEAD (a reused branch name): confirm the PR before using its state |

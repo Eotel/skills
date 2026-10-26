@@ -212,7 +212,8 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
     merged_by_patch = []
-    if base is None or git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0:
+    open_pr_at_head = (pr or {}).get("state") == "OPEN" and (pr or {}).get("headRefOid") == head
+    if not open_pr_at_head and (base is None or git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0):
         merged_head = pr_head or ((pr or {}).get("headRefOid") if (pr or {}).get("state") == "MERGED" else None)
         relation = pr_head_relation(worktree, head, merged_head, head_ahead_of_pr) if merged_head else None
         # Do not let an equivalent patch hide work committed after the PR head.
@@ -369,7 +370,7 @@ def main(argv=None):
     parser.add_argument("--worktree", required=True, help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
     parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD)")
-    parser.add_argument("--pr", type=int, help="PR number; a MERGED PR whose head is HEAD counts as merged (squash merges)")
+    parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit check")
     parser.add_argument("--pr-head", help="full SHA of a PR head confirmed MERGED on a host with gh; HEAD may be its ancestor")
     parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")

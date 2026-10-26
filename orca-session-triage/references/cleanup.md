@@ -2,15 +2,20 @@
 
 A `finished` worktree whose `meaningful_tabs` is empty is done and left behind:
 remove it without asking when `rm_check.py` reports `ok` with no `containers`,
-and report it afterwards. Every other worktree waits for the user's choice. A
-row with `main: true` is a repository's own checkout: its tabs close and the
-checkout stays (`rm_check.py` blocks its removal).
+and report it afterwards.
+
+「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
+This also applies when a readable shell tab remains; the process check below
+still protects work running there. Every other worktree waits for the user's
+choice. A row with `main: true` is a repository's own checkout: its tabs close
+and the checkout stays (`rm_check.py` blocks its removal).
 
 Run these per worktree, in order.
 
 1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the worktree
    has a PR: a MERGED PR whose head equals HEAD counts as merged (squash merges),
-   and the PR's fetched base branch becomes the base. Without it the base is the
+   an OPEN PR whose head equals HEAD clears the unmerged-commit check, and the
+   PR's fetched base branch becomes the base. Without it the base is the
    remote branch the worktree started from, else the remote's default branch.
    Pass `--base` when the output's `base` is not where the work merges.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
@@ -34,6 +39,19 @@ Run these per worktree, in order.
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild.
    - `containers` lists docker compose projects defined inside the worktree.
+   - `processes` lists commands using the path. `orca worktree rm` stops its
+     PTYs before Git removal, but this preflight runs first. If the only process
+     blocker is an Orca-owned login shell and its `direnv export zsh`,
+     `setup-runner.sh`, or `direnv exec` children waiting on setup, inspect all
+     tabs and their process trees with `orca terminal list --worktree
+     path:<path> --json` and `ps -axww -o pid=,ppid=,command=`. When every
+     running PTY tree in that worktree consists only of those setup processes,
+     close them with `orca terminal close --worktree path:<path> --all --json`,
+     then run `rm_check.py` again. Do not signal the login shell separately:
+     its prompt hook can start `direnv` again. A `node` server or another job
+     in any PTY tree is still a blocker; leave it running and report it. Run
+     the inspection and preflight sequentially so their CLI processes do not
+     appear in each other's process list.
 2. Stop those projects with `docker compose -p <project> down` from the worktree.
    Keep named volumes unless the user approved deleting them, and say which
    volumes remain.

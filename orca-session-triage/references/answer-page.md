@@ -15,8 +15,9 @@ capabilities guidance for the `db` part).
 - A next-step section: one row per `stalled` worktree with its PR, review,
   and checks, the proposed step first, and what it waits on when nothing is
   the user's to decide.
-- A cleanup section: one close/keep row per `finished` or `unstarted` worktree,
-  with what `rm_check.py` found and anything the row's choice also removes, and
+- A cleanup section: one close/keep row per `finished` worktree that needs a
+  choice under `cleanup.md`, or `unstarted` worktree, with what `rm_check.py`
+  found and anything the row's choice also removes, and
   one row per kept worktree with `closable` tabs, naming each tab.
 - Answers: declare `db` with an owner-only root rule, write one document
   (`answers/latest`) on submit, and also offer "copy as text" for pasting into

@@ -66,7 +66,11 @@ judge each row from its own facts.
    - `done_unmerged`: the work is done and the PR is open with no reviewer
      requested and no review: someone must request a review or merge.
    - `finished`: the PR merged (or the task needed none) **and** no leftover
-     of kind (c) below is left.
+     of kind (c) below is left. Also classify a row with `no agent session in this
+     worktree` as `finished` when its open PR head matches the checkout and
+     `git.dirty` and `git.unpushed` are both 0: the checkout has no local work
+     beyond the PR, so `orca-session-triage/references/cleanup.md` removes it
+     without asking.
 3. **Leftovers: keep each one and say whose it is.** List every open item from
    the message and the comment ("残り", "残っていること", "未確認", "needs its own
    issue") in `remaining`, one short line each. Then sort each into the first

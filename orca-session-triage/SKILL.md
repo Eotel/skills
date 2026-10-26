@@ -98,13 +98,14 @@ permitted cleanup, and any handoff in `references/hourly.md`.
   nothing.
 - Removing worktrees, branches, containers, or volumes, closing tabs, merging
   or requesting review, and giving an unstarted agent a task need the user's
-  choice per item. Four exceptions act first and report after: a finished
-  worktree with no meaningful tab that `rm_check.py` clears is removed, a
-  done card that leaves the user nothing to do has its tab closed, a row
-  stalled by an API error or by unread worker mail gets one line that wakes it
-  to continue its own work, and a task the user approved as the follow-up of
-  another lane's result ("when A settles it, give B the task") goes to B once
-  A reports it.
+  choice per item. Five exceptions act first and report after:
+  - A finished worktree with no meaningful tab that `rm_check.py` clears is removed.
+  - 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
+  - A done card that leaves the user nothing to do has its tab closed.
+  - A row stalled by an API error or by unread worker mail gets one line that
+    wakes it to continue its own work.
+  - A task the user approved as the follow-up of another lane's result ("when
+    A settles it, give B the task") goes to B once A reports it.
 - Relay answers verbatim; the session answers the user's follow-up questions.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other
