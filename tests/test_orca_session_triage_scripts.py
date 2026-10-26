@@ -33,10 +33,12 @@ def load_script(name):
 scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
 precheck = load_script("precheck")
+hourly_runtime = sys.modules["hourly_runtime"]
 hourly_state = load_script("hourly_state")
 stopcheck = load_script("stop_check")
 inbox_service = load_script("inbox_watch_service")
 inbox_read = load_script("inbox_read")
+cleanup_hourly = load_script("cleanup_hourly_tabs")
 inbox_alert = load_script("inbox_alert")
 
 
@@ -2010,6 +2012,14 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(state["questions"][asked["id"]]["answered_at"], "2026-10-25T13:00:00+09:00")
         self.assertEqual(state["handoffs"][promise["id"]]["delivery"], "turn_started")
 
+    def test_question_records_its_tab_for_later_cleanup(self):
+        message = self.source("message.txt", "Ready.\n")
+        question = self.source("question.txt", "Proceed?\n")
+        with patch.dict(os.environ, {"ORCA_PANE_KEY": "tab:leaf"}):
+            _, asked = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                 "--final-message-file", message, "--question-file", question)
+        self.assertEqual(asked["owner_pane"], "tab:leaf")
+
     def test_same_question_for_a_later_pr_is_a_new_decision(self):
         message = self.source("message.txt", "Ready to merge.\n")
         question = self.source("question.txt", "Merge this PR?\n")
@@ -2042,20 +2052,52 @@ class PrecheckTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ps = Path(self.tmp.name) / "ps.json"
+        self.runs = Path(self.tmp.name) / "runs.json"
 
-    def run_precheck(self, worktrees, workspace="/w/triage", truncated=False):
+    def run_precheck(self, worktrees, runs=(), workspace="/w/triage", truncated=False):
         self.ps.write_text(json.dumps({"result": {"worktrees": worktrees, "truncated": truncated}}))
+        self.runs.write_text(json.dumps({"result": {"runs": runs}}))
         out = io.StringIO()
         with redirect_stdout(out):
-            code = precheck.main(["--ps-json", str(self.ps), "--workspace", workspace])
+            code = precheck.main(["--ps-json", str(self.ps), "--runs-json", str(self.runs),
+                                  "--workspace", workspace])
         return code, out.getvalue()
 
     def test_a_working_turn_holds_the_next_run(self):
         for turn in ("working", "done"):
             with self.subTest(turn=turn):
-                code, out = self.run_precheck([worktree("/w/triage", "working", turn=turn)])
+                row = worktree("/w/triage", "working", turn=turn)
+                row["agents"][0]["paneKey"] = "scheduled-pane"
+                code, out = self.run_precheck([row], [{"status": "dispatched", "trigger": "scheduled",
+                                                      "terminalPaneKey": "scheduled-pane",
+                                                      "workspaceId": "repo::/w/triage"}])
                 self.assertEqual(code, 1)
-                self.assertIn("skip: an agent in /w/triage is working", out)
+                self.assertIn("skip: a scheduled turn in /w/triage is working", out)
+
+    def test_completed_scheduled_run_with_working_human_followup_allows_next_run(self):
+        row = worktree("/w/triage", "working")
+        row["agents"][0]["paneKey"] = "old-pane"
+        row["agents"][0]["mainAgent"] = {"state": "working"}
+        runs = [{"status": "completed", "trigger": "scheduled", "terminalPaneKey": "old-pane",
+                 "workspaceId": "repo::/w/triage"}]
+        code, out = self.run_precheck([row], runs)
+        self.assertEqual(code, 0)
+        self.assertIn("run: start a fresh session", out)
+
+    def test_background_job_from_completed_run_still_blocks(self):
+        row = worktree("/w/triage", "working", turn="done")
+        row["agents"][0]["paneKey"] = "old-pane"
+        runs = [{"status": "completed", "trigger": "scheduled", "terminalPaneKey": "old-pane",
+                 "workspaceId": "repo::/w/triage"}]
+        self.assertEqual(self.run_precheck([row], runs)[0], 1)
+
+    def test_working_agent_without_pane_identity_is_unverifiable(self):
+        row = worktree("/w/triage", "working")
+        code, out = self.run_precheck([row], [{"status": "completed", "trigger": "scheduled",
+                                              "terminalPaneKey": "old-pane",
+                                              "workspaceId": "repo::/w/triage"}])
+        self.assertEqual(code, 2)
+        self.assertIn("could not identify", out)
 
     def test_waiting_blocked_and_done_turns_allow_a_fresh_session(self):
         for state in ("waiting", "blocked", "done"):
@@ -2090,6 +2132,56 @@ class PrecheckTests(unittest.TestCase):
             code = precheck.main(["--orca", str(refusing), "--workspace", "/w/triage"])
         self.assertEqual(code, 2)
         self.assertIn("runtime not reachable", out.getvalue())
+
+
+class HourlyTabCleanupTests(unittest.TestCase):
+    def test_only_completed_idle_older_scheduled_tab_is_a_candidate(self):
+        runs = [{"status": "dispatched", "terminalPaneKey": "current"},
+                {"status": "completed", "terminalPaneKey": "old"}]
+        terms = [{"worktreeId": "repo::/w/triage", "tabId": "old", "leafId": "leaf",
+                  "handle": "old-handle", "connected": True, "orphaned": False}]
+        runs[1]["terminalPaneKey"] = "old:leaf"
+        agents = [{"paneKey": "old:leaf", "state": "done", "mainAgent": {"state": "done"}}]
+        self.assertEqual([term["handle"] for _, term in cleanup_hourly.prior_tabs(
+            runs, terms, agents, "/w/triage", "current")], ["old-handle"])
+        agents[0]["state"] = "working"  # a background job still owns the old tab
+        self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
+        agents[0]["state"] = "done"
+        runs[1]["status"] = "dispatched"
+        self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
+
+    def test_pending_shared_question_keeps_previous_tabs(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "hourly-state.json"
+            state.write_text(json.dumps({"questions": {"q1": {"answer": None,
+                                                            "owner_pane": "old-pane"}}}))
+            self.assertFalse(cleanup_hourly.no_pending_questions(state, "old-pane"))
+            self.assertTrue(cleanup_hourly.no_pending_questions(state, "another-pane"))
+            state.write_text(json.dumps({"questions": {"q1": {"answer": None}}}))
+            self.assertFalse(cleanup_hourly.no_pending_questions(state, "another-pane"))
+            state.write_text(json.dumps({"questions": {"q1": {"answer": "yes"}}}))
+            self.assertTrue(cleanup_hourly.no_pending_questions(state, "old-pane"))
+
+    def test_rendered_screen_and_draft_must_be_safe_to_close(self):
+        from datetime import timezone
+        with tempfile.TemporaryDirectory() as root:
+            transcript = Path(root) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "timestamp":
+                                              "2026-10-26T08:00:00Z"}) + "\n")
+            now = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
+            term = {"title": "Claude Code"}
+            for source, tail, draft, expected in (("screen", ["finished", "❯"], None, False),
+                                                  ("screen", ["finished", "❯"], "unsent reply", True),
+                                                  ("stream", ["finished", "❯"], None, True),
+                                                  ("screen", ["finished", "❯ draft reply"], None, True),
+                                                  ("screen", ["finished"], None, True)):
+                with self.subTest(source=source, tail=tail, draft=draft):
+                    blockers = cleanup_hourly.close_blockers(term, transcript,
+                        {"source": source, "tail": tail, "draft": draft}, 5, now)
+                    self.assertEqual(bool(blockers), expected)
+            self.assertIn("recent or unknown transcript activity", cleanup_hourly.close_blockers(
+                term, transcript, {"source": "screen", "tail": ["❯"]}, 5,
+                datetime(2026, 10, 26, 8, 3, tzinfo=timezone.utc)))
 
 
 def triage_automation(automation_id, workspace, prompt="/orca-session-triage hourly"):
@@ -2163,6 +2255,32 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self):
+        runs = [{"status": "completed", "terminalPaneKey": None},
+                {"status": "completed", "terminalPaneKey": "old-pane"}]
+        self.assertIsNone(hourly_runtime.latest_pane(runs))
+
+    def test_only_latest_scheduled_pane_advances_default_cursor(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "default.offset"
+            write_jsonl(inbox, [{"kind": "ask", "text": "new question"}])
+            cursor.write_text("0")
+            env = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": "",
+                   "ORCA_WORKTREE_ID": "repo::/w/triage", "ORCA_PANE_KEY": "old-pane"}
+            with patch.dict(os.environ, env), patch.object(inbox_read, "paths", return_value=(inbox, cursor)), \
+                    patch.object(hourly_runtime, "scheduled_runs", return_value=[
+                        {"status": "completed", "terminalPaneKey": "new-pane"},
+                        {"status": "completed", "terminalPaneKey": "old-pane"}]):
+                with redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 1)
+                self.assertIn("latest scheduled", error.getvalue())
+                self.assertEqual(cursor.read_text(), "0")
+                os.environ["ORCA_PANE_KEY"] = "new-pane"
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 0)
+                self.assertEqual(int(cursor.read_text()), inbox.stat().st_size)
+
     def test_late_remote_report_is_read_even_with_an_old_timestamp(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
@@ -2317,13 +2435,19 @@ class StopCheckTests(unittest.TestCase):
         with inbox.open("a") as stream:
             stream.write(json.dumps({"kind": "ask", "worktree": "sample-lane", "text": "question"}) + "\n")
             stream.write('{"kind":"ask","worktree":"partial"')
-        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {})
-        with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": "new-pane",
+             "workspaceId": "repo1::/w/triage"}]})
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                                  "ORCA_PANE_KEY": "new-pane", "ORCA_WORKTREE_ID": "repo1::/w/triage"}):
             for active in (False, True):
                 result = self.check(active=active, cwd="/w/triage", orca=orca)
                 self.assertEqual(result["decision"], "block")
                 self.assertIn("sample-lane", result["reason"])
                 self.assertNotIn("partial", result["reason"])
+            os.environ["ORCA_PANE_KEY"] = "old-pane"
+            self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
+            os.environ["ORCA_PANE_KEY"] = "new-pane"
             cursor.write_text(str(inbox.stat().st_size - len('{"kind":"ask","worktree":"partial"')))
             self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
