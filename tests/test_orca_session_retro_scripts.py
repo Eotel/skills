@@ -322,6 +322,32 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "書き込み先に別の変更がある")
 
+    def test_worker_deleted_tracked_reference_allows_a_later_adoption(self):
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "First_tool.py returns JSON.",
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
+        data = retro.load(self.state)
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root), 1)
+        facts = retro.facts_path(self.target)
+        subprocess.run(["git", "-C", str(self.root), "add", "orca-session-triage/SKILL.md",
+                        str(facts.relative_to(self.root))], check=True)
+        subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null",
+                        "commit", "-qm", "tracked adoption"], check=True)
+        ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root), 1)
+        self.assertFalse(facts.exists())
+        self.assertIn(str(facts.resolve()), data["target_versions"])
+        self.assertIsNone(data["target_versions"][str(facts.resolve())])
+        proposal = sample_candidate()
+        proposal["note"] = "Second_tool.py returns JSON."
+        proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            eligible, reason = retro.eligible_auto(proposal, data, ledger.list(), self.root)
+        self.assertTrue(eligible, reason)
+
     def test_verified_json_shape_fact_can_be_adopted(self):
         proposal = sample_candidate()
         proposal["note"] = "scan_sessions.py の標準出力は JSON 配列。行ごとに読む。"

@@ -453,8 +453,8 @@ def source_checkout_ready(target, data):
         if path.exists() and not path.is_file():
             return "書き込み先がファイルではない"
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
-        if status.stdout.strip() and (digest is None
-                                      or data.get("target_versions", {}).get(str(resolved)) != digest):
+        versions = data.get("target_versions", {})
+        if status.stdout.strip() and (str(resolved) not in versions or versions[str(resolved)] != digest):
             return "書き込み先に別の変更がある"
     return None
 
@@ -465,7 +465,7 @@ def remember_versions(data, *targets):
         if target.exists():
             data["target_versions"][key] = hashlib.sha256(target.read_bytes()).hexdigest()
         else:
-            data["target_versions"].pop(key, None)
+            data["target_versions"][key] = None
 
 
 def eligible_auto(proposal, data, ledger_items=(), root=SOURCE):
