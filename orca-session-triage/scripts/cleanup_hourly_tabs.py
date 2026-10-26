@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 import hourly_runtime
+import scan_sessions
 
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
 BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", "Esc to cancel")
@@ -45,10 +46,38 @@ def prior_tabs(runs, terminals, agents, workspace, current_pane):
 
 def transcript_for(run, home):
     session_id = (run.get("usage") or {}).get("providerSessionId")
-    if not session_id or "/" in session_id:
+    if session_id and "/" not in session_id:
+        found = list((home / ".claude/projects").glob(f"*/{session_id}.jsonl"))
+        if len(found) == 1:
+            return found[0]
+    started = run.get("startedAt")
+    workspace = hourly_runtime.workspace_path(run.get("workspaceId"))
+    if not isinstance(started, (int, float)) or not workspace:
         return None
-    found = list((home / ".claude/projects").glob(f"*/{session_id}.jsonl"))
-    return found[0] if len(found) == 1 else None
+    directory = scan_sessions.find_claude_dir(home / ".claude/projects", workspace)
+    matches = []
+    for path in directory.glob("*.jsonl"):
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for raw in stream:
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if entry.get("type") != "user" or entry.get("isMeta"):
+                    continue
+                prompt = scan_sessions.user_text(entry) or ""
+                if not prompt:
+                    continue
+                stamp = entry.get("timestamp")
+                scheduled_prompt = (prompt.startswith("/orca-session-triage hourly") or
+                                    "<command-name>/orca-session-triage</command-name>" in prompt and
+                                    "<command-args>hourly" in prompt)
+                if stamp and scheduled_prompt:
+                    begun = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
+                    if -5000 <= begun - started <= 300000:
+                        matches.append(path)
+                break
+    return matches[0] if len(matches) == 1 else None
 
 
 def newest_activity(transcript):

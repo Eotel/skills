@@ -2135,6 +2135,24 @@ class PrecheckTests(unittest.TestCase):
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
+    def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            project = home / ".claude/projects/-w-triage"
+            project.mkdir(parents=True)
+            target = project / "session-1.jsonl"
+            target.write_text(json.dumps({"type": "user", "timestamp": "2026-10-26T09:00:10Z",
+                                          "message": {"content": "<command-name>/orca-session-triage</command-name>"
+                                                  "<command-args>hourly report</command-args>"}}) + "\n")
+            (project / "older.jsonl").write_text(json.dumps({"type": "user",
+                "timestamp": "2026-10-26T08:00:10Z",
+                "message": {"content": "/orca-session-triage hourly"}}) + "\n")
+            run = {"workspaceId": "repo::/w/triage", "startedAt": 1793005200000,
+                   "usage": {"providerSessionId": None}}
+            self.assertEqual(cleanup_hourly.transcript_for(run, home), target)
+            (project / "collision.jsonl").write_text(target.read_text())
+            self.assertIsNone(cleanup_hourly.transcript_for(run, home))
+
     def test_only_completed_idle_older_scheduled_tab_is_a_candidate(self):
         runs = [{"status": "dispatched", "terminalPaneKey": "current"},
                 {"status": "completed", "terminalPaneKey": "old"}]

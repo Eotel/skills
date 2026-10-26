@@ -46,7 +46,8 @@ scheduled tabs. It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
 latest conversation may still ask the user, its transcript is missing or active
 within five minutes, or its rendered screen shows a draft or a nonempty input
-field. Inspect
+field. When Orca has no provider session ID, the script requires one transcript
+whose scheduled prompt matches the run's start time. Inspect
 `keep:` output and retry on a later hourly run; leave the workspace open.
 
 When another tab has explicitly been appointed lead, scan and review the rows,
