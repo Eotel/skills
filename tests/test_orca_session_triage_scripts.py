@@ -1798,11 +1798,128 @@ class PrecheckTests(unittest.TestCase):
         self.ps = Path(self.tmp.name) / "ps.json"
 
     def run_precheck(self, worktrees, workspace="/w/triage"):
+        worktree_id = "repo::" + workspace
+        pane = "tab:leaf"
+        pty = worktree_id + "@@pty"
+        for row in worktrees:
+            if row["path"] == workspace:
+                for agent in row["agents"]:
+                    agent["paneKey"] = pane
         self.ps.write_text(json.dumps({"result": {"worktrees": worktrees}}))
+        answers = {
+            ("automations", "list", "--json"): {"automations": [{
+                "id": "triage", "agentId": "claude", "workspaceId": worktree_id,
+                "reuseSession": True,
+                "precheck": {"command": "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py"},
+            }]},
+            ("automations", "runs", "--id", "triage", "--json"): {"runs": [{
+                "automationId": "triage", "runNumber": 2, "status": "completed",
+                "workspaceId": worktree_id, "terminalPaneKey": pane, "terminalPtyId": pty,
+                "dispatchedAt": 100,
+            }]},
+            ("terminal", "list", "--worktree", "id:" + worktree_id, "--json"): {
+                "terminals": [{"handle": "term_1", "tabId": "tab", "leafId": "leaf", "ptyId": pty,
+                               "connected": True, "writable": True, "agentIdentity": "claude"}]},
+            ("terminal", "wait", "--terminal", "term_1", "--for", "tui-idle", "--timeout-ms", "1000", "--json"):
+                {"wait": {"satisfied": True}},
+        }
+
+        def fake_run(command, **kwargs):
+            key = tuple(command[1:])
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"result": answers[key]}), stderr="")
+
         out = io.StringIO()
-        with redirect_stdout(out):
+        with patch.object(precheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
             code = precheck.main(["--ps-json", str(self.ps), "--workspace", workspace])
         return code, out.getvalue()
+
+    def run_reuse_case(self, runs, terminals, agents=None, idle=True):
+        workspace = "/w/triage"
+        worktree_id = "repo::" + workspace
+        row = worktree(workspace)
+        row["agents"] = agents if agents is not None else [done_agent("claude", "tab:leaf")]
+        for terminal in terminals:
+            terminal.setdefault("handle", "term_1")
+        answers = {
+            ("worktree", "ps", "--json"): {"worktrees": [row]},
+            ("automations", "list", "--json"): {"automations": [{
+                "id": "triage", "agentId": "claude", "workspaceId": worktree_id,
+                "reuseSession": True,
+                "precheck": {"command": "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py"},
+            }]},
+            ("automations", "runs", "--id", "triage", "--json"): {"runs": runs},
+            ("terminal", "list", "--worktree", "id:" + worktree_id, "--json"): {
+                "terminals": terminals},
+            ("terminal", "wait", "--terminal", "term_1", "--for", "tui-idle", "--timeout-ms", "1000", "--json"):
+                {"wait": {"satisfied": idle}},
+        }
+
+        def fake_run(command, **kwargs):
+            key = tuple(command[1:])
+            code = 1 if key[:2] == ("terminal", "wait") and not idle else 0
+            return subprocess.CompletedProcess(command, code,
+                                               stdout=json.dumps({"result": answers[key]}), stderr="")
+
+        out = io.StringIO()
+        with patch.object(precheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
+            code = precheck.main(["--workspace", workspace])
+        return code, out.getvalue()
+
+    def test_skips_when_previous_run_has_no_live_matching_pty(self):
+        run = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
+               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@old", "dispatchedAt": 100}
+        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@new",
+                    "connected": True, "writable": True, "agentIdentity": "claude"}
+
+        code, out = self.run_reuse_case([run], [terminal])
+
+        self.assertEqual(code, 1)
+        self.assertIn("skip: no prior automation tab can be reused", out)
+
+    def test_reuses_older_lead_tab_after_newer_tab_closed(self):
+        newer = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
+                 "terminalPaneKey": "closed:leaf", "terminalPtyId": "repo::/w/triage@@closed", "dispatchedAt": 200}
+        older = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
+                 "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
+        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
+                    "connected": True, "writable": True, "agentIdentity": "claude"}
+
+        code, out = self.run_reuse_case([newer, older], [terminal])
+
+        self.assertEqual(code, 0)
+        self.assertIn("run: prior automation tab tab:leaf can be reused", out)
+
+    def test_a_newer_run_owns_its_pane_even_when_it_failed(self):
+        old = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
+               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
+        newer = {**old, "status": "failed", "dispatchedAt": 200}
+        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
+                    "connected": True, "writable": True, "agentIdentity": "claude"}
+
+        code, out = self.run_reuse_case([old, newer], [terminal])
+
+        self.assertEqual(code, 1)
+        self.assertIn("skip: no prior automation tab can be reused", out)
+
+    def test_skips_when_the_live_tab_does_not_reach_an_idle_composer(self):
+        run = {"automationId": "triage", "status": "completed", "workspaceId": "repo::/w/triage",
+               "terminalPaneKey": "tab:leaf", "terminalPtyId": "repo::/w/triage@@pty", "dispatchedAt": 100}
+        terminal = {"tabId": "tab", "leafId": "leaf", "ptyId": "repo::/w/triage@@pty",
+                    "connected": True, "writable": True, "agentIdentity": "claude"}
+
+        code, out = self.run_reuse_case([run], [terminal], idle=False)
+
+        self.assertEqual(code, 1)
+        self.assertIn("skip: no prior automation tab can be reused", out)
+
+    def test_allows_first_run_after_earlier_busy_precheck_skips(self):
+        skipped = {"automationId": "triage", "status": "skipped_precheck", "runNumber": 1,
+                   "workspaceId": "repo::/w/triage"}
+
+        code, out = self.run_reuse_case([skipped], [], agents=[])
+
+        self.assertEqual(code, 0)
+        self.assertIn("run: no prior automation tab; start the first run", out)
 
     def test_skips_while_an_agent_in_the_workspace_works_is_blocked_or_waits(self):
         for state in ("working", "blocked", "waiting"):
@@ -1827,7 +1944,7 @@ class PrecheckTests(unittest.TestCase):
         code, out = self.run_precheck([worktree("/w/triage", "done"), worktree("/w/lane", "waiting")])
 
         self.assertEqual(code, 0)
-        self.assertIn("run: no agent in /w/triage works or waits", out)
+        self.assertIn("run: prior automation tab tab:leaf can be reused", out)
 
     def test_matches_the_workspace_through_a_symlink(self):
         real = Path(self.tmp.name) / "real"

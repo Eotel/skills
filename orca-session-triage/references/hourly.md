@@ -103,15 +103,20 @@ orca automations create --name "session triage" --trigger hourly \
   --json
 ```
 
-- An existing workspace with `--reuse-session`: a run goes to the previous
-  run's session once that one is done, so one tab holds every run and the
-  session remembers what it asked. A new worktree per run would pile up on the
+- An existing workspace with `--reuse-session`: a run goes to a prior run's
+  live session once that agent is done, so one tab holds the recurring work
+  and remembers what it asked. A new worktree per run would pile up on the
   board it triages.
 - Orca starts a scheduled run even while the previous one waits on the user,
   then in a new tab. `scripts/precheck.py` skips the run while any agent in the
-  workspace works, is blocked, or waits. A skipped run is recorded with the
-  precheck's output (`orca automations runs --id <id> --json`). A manual
-  `orca automations run` does not run the precheck.
+  workspace works, is blocked, or waits. When the workspace is idle, the
+  precheck also compares prior automation runs with the live tab's pane, PTY,
+  agent, `done` state, and idle input prompt. It skips when no prior tab can be reused; an older
+  lead tab still qualifies after a newer tab has closed. The first run may
+  start a new tab. A skipped run is recorded with the precheck's output
+  (`orca automations runs --id <id> --json`). A manual `orca automations run`
+  does not run the precheck. Orca makes its final reuse decision after the
+  precheck, so a tab or agent changing in between can still prevent reuse.
 - Any agent in the triage workspace holds the run, not only the triage
   session. A tab there that leads other lanes for hours skips every run (22 in
   a row, seen 2026-10-13): keep such tabs in another workspace.
