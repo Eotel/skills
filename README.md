@@ -23,6 +23,7 @@ Authoring rules, script and test conventions, and validation commands live in
 
 ## Skills
 
+- `adoption-triage`: classify retrospective improvements, record review items, and read adoption decisions.
 - `agentic-docs`: create or reorganize agent-readable repository documentation.
 - `apm-usage`: operate APM manifests, packages, targets, and lockfiles.
 - `ast-grep-practice`: create structural lint rules and use the shared Node import guard.
