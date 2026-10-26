@@ -45,11 +45,16 @@ class AdoptionLedgerTests(unittest.TestCase):
                                      "decision": decision, "actor": "Eotel"})
             self.assertEqual(result.returncode, 0, result.stderr)
             if decision == "adopt":
+                adopted_id = json.loads(result.stdout)["id"]
                 result = self.run_ledger(["record"], {"proposal_id": proposal_id,
+                    "decision_id": adopted_id,
                     "outcome": "applied", "actor": "night worker", "result": "commit abc",
                     "undo": "revert commit abc"})
                 self.assertEqual(result.returncode, 0, result.stderr)
+            if decision == "revoke":
+                revoked_id = json.loads(result.stdout)["id"]
         result = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "decision_id": revoked_id,
             "outcome": "reverted", "actor": "night worker", "result": "reverted commit abc"})
         self.assertEqual(result.returncode, 0, result.stderr)
         view = self.run_ledger(["list", "--json"])
@@ -99,6 +104,7 @@ class AdoptionLedgerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             if decision == "adopt" and len(self.events.read_text().splitlines()) == 2:
                 applied = self.run_ledger(["record"], {"proposal_id": proposal_id,
+                    "decision_id": json.loads(result.stdout)["id"],
                     "outcome": "applied", "actor": "worker", "result": "commit abc"})
                 self.assertEqual(applied.returncode, 0, applied.stderr)
         item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
@@ -112,6 +118,7 @@ class AdoptionLedgerTests(unittest.TestCase):
             "decision": "adopt", "actor": "Eotel"})
         self.assertEqual(adopted.returncode, 0, adopted.stderr)
         failed = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "decision_id": json.loads(adopted.stdout)["id"],
             "outcome": "failed", "actor": "worker", "result": "適用に失敗"})
         self.assertEqual(failed.returncode, 0, failed.stderr)
         item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
@@ -123,10 +130,36 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(item["status"], "revoked")
         self.assertIsNone(item["current_execution"])
         reversal_failed = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "decision_id": json.loads(revoked.stdout)["id"],
             "outcome": "failed", "actor": "worker", "result": "取り消しに失敗"})
         self.assertEqual(reversal_failed.returncode, 0, reversal_failed.stderr)
         item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
         self.assertEqual(item["current_execution"]["result"], "取り消しに失敗")
+
+    def test_late_reversal_stays_with_its_decision(self):
+        proposal_id = self.proposal()
+        adopted = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        revoked = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "revoke", "actor": "Eotel"})
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        readopted = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(readopted.returncode, 0, readopted.stderr)
+        missing_id = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "outcome": "failed", "actor": "worker", "result": "失敗"})
+        self.assertNotEqual(missing_id.returncode, 0)
+        revoked_id = json.loads(revoked.stdout)["id"]
+        for outcome, result in (("reverted", "旧変更を取り消した"), ("failed", "旧取り消しの報告に失敗")):
+            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id,
+                "decision_id": revoked_id, "outcome": outcome, "actor": "worker", "result": result})
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
+        self.assertEqual(item["status"], "adopted")
+        self.assertIsNone(item["current_execution"])
+        self.assertIsNone(item["reverted_at"])
+        self.assertEqual([event["decision_id"] for event in item["executions"]], [revoked_id, revoked_id])
 
     def test_clock_ahead_decision_precedes_remote_execution(self):
         proposal_id = self.proposal()
@@ -134,6 +167,7 @@ class AdoptionLedgerTests(unittest.TestCase):
             "decision": "adopt", "actor": "Eotel"})
         self.assertEqual(decision.returncode, 0, decision.stderr)
         applied = self.run_ledger(["record"], {"proposal_id": proposal_id,
+            "decision_id": json.loads(decision.stdout)["id"],
             "outcome": "applied", "actor": "worker", "result": "commit abc"})
         self.assertEqual(applied.returncode, 0, applied.stderr)
         rows = [json.loads(line) for line in self.events.read_text().splitlines()]
@@ -265,12 +299,15 @@ class AdoptionLedgerTests(unittest.TestCase):
         adopted = run(writer, writer_config, ["decide"], {"proposal_id": proposal_id,
             "decision": "adopt", "actor": "Eotel"})
         self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        adopted_id = json.loads(adopted.stdout)["id"]
         before_sync = run(remote, remote_config, ["record"], {"proposal_id": proposal_id,
+            "decision_id": adopted_id,
             "outcome": "applied", "actor": "remote worker", "result": "commit abc"})
         self.assertNotEqual(before_sync.returncode, 0)
         synchronized = run(writer, writer_config, ["collect", "--config", str(writer_config)])
         self.assertEqual(synchronized.returncode, 0, synchronized.stderr)
         applied = run(remote, remote_config, ["record"], {"proposal_id": proposal_id,
+            "decision_id": adopted_id,
             "outcome": "applied", "actor": "remote worker", "result": "commit abc"})
         self.assertEqual(applied.returncode, 0, applied.stderr)
         collected = run(writer, writer_config, ["collect", "--config", str(writer_config)])
@@ -284,6 +321,7 @@ class AdoptionLedgerTests(unittest.TestCase):
             "decision": "revoke", "actor": "Eotel"})
         self.assertEqual(revoked.returncode, 0, revoked.stderr)
         late_result = run(remote, remote_config, ["record"], {"proposal_id": proposal_id,
+            "decision_id": adopted_id,
             "outcome": "applied", "actor": "remote worker", "result": "late commit"})
         self.assertEqual(late_result.returncode, 0, late_result.stderr)
         collected = run(writer, writer_config, ["collect", "--config", str(writer_config)])
@@ -294,7 +332,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(item["status"], "revoked")
         self.assertIsNone(item["current_execution"])
         self.assertEqual(item["executions"][-1]["result"], "late commit")
-        self.assertEqual(item["executions"][-1]["decision_id"], json.loads(adopted.stdout)["id"])
+        self.assertEqual(item["executions"][-1]["decision_id"], adopted_id)
 
     def test_collect_does_not_treat_read_failure_as_missing(self):
         root = Path(self.temp.name)

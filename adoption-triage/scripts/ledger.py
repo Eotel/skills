@@ -234,14 +234,16 @@ def validate_decision(body):
 
 
 def validate_execution(body):
-    if not isinstance(body, dict) or set(body) - {"proposal_id", "outcome", "actor", "result", "undo"}:
+    if not isinstance(body, dict) or set(body) - {"proposal_id", "decision_id", "outcome", "actor", "result", "undo"}:
         raise ValueError("invalid execution object")
     proposal_id = required_text(body.get("proposal_id"), "proposal_id", 80)
     uuid.UUID(proposal_id)
+    decision_id = required_text(body.get("decision_id"), "decision_id", 80)
+    uuid.UUID(decision_id)
     outcome = body.get("outcome")
     if outcome not in {"applied", "reverted", "failed"}:
         raise ValueError("outcome must be applied, reverted, or failed")
-    row = {**envelope("execution", proposal_id), "outcome": outcome,
+    row = {**envelope("execution", proposal_id), "decision_id": decision_id, "outcome": outcome,
            "actor": required_text(body.get("actor"), "actor", 120),
            "result": required_text(body.get("result"), "result")}
     undo = optional_text(body.get("undo"), "undo")
@@ -290,14 +292,14 @@ def append(events, imports, row):
             item = known.get(proposal_id)
             if item is None:
                 raise ValueError(f"proposal not found: {proposal_id}")
-            if not item["decisions"] or item["decisions"][-1]["decision"] not in {"adopt", "revoke"}:
+            decision = next((decision for decision in item["decisions"]
+                             if decision["id"] == row["decision_id"]), None)
+            if decision is None or decision["decision"] not in {"adopt", "revoke"}:
                 raise ValueError("execution needs an adoption or revocation")
-            decision = item["decisions"][-1]
             if row["outcome"] == "applied" and decision["decision"] != "adopt":
                 raise ValueError("adoption was not decided")
             if row["outcome"] == "reverted" and decision["decision"] != "revoke":
                 raise ValueError("reversal was not decided")
-            row["decision_id"] = decision["id"]
         else:
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
@@ -417,7 +419,8 @@ def collect(config, imports, events):
                                              f"python3 ~/.agents/skills/adoption-triage/scripts/ledger.py receive --name {writer_name}"],
                                             input=data, capture_output=True, timeout=20)
                     if result.returncode:
-                        raise OSError(result.stderr.decode(errors="replace").strip())
+                        raise OSError(f"ssh exit {result.returncode}: "
+                                      f"{result.stderr.decode(errors='replace').strip()}")
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     errors.append(f"{name} distribution: {exc}")
     if errors:
