@@ -771,18 +771,22 @@ def open_pr_with_no_local_work(row, pr, git):
 
 
 def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
-    """Return rows where each row a reader classes (stalled, unsure, waiting) also carries its git and PR state.
+    """Add git and PR facts to rows needing review or completed rows with no current agent.
 
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
     """
+    fact_rows = [row for row in rows if row["class"] in READ_CLASSES or
+                 (row["class"] == "finished" and not row.get("agents") and
+                  not any(term.get("agent") for term in row.get("terminals", [])))]
+    fact_row_ids = {id(row) for row in fact_rows}
     git_by_row = {id(row): (remote_git_hint(row) if row.get("environment") else git_lookup(row["path"]))
-                   for row in rows if row["class"] in READ_CLASSES}
+                   for row in fact_rows}
     keys = []
     seen = set()
     for row in rows:
-        if row["class"] not in READ_CLASSES:
+        if id(row) not in fact_row_ids:
             continue
         git = git_by_row.get(id(row))
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
@@ -805,7 +809,7 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
 
     result = []
     for row in rows:
-        if row["class"] not in READ_CLASSES:
+        if id(row) not in fact_row_ids:
             result.append(row)
             continue
         git = git_by_row[id(row)]

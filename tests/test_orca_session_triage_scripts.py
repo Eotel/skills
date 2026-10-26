@@ -1066,6 +1066,22 @@ class NextStepFactTests(unittest.TestCase):
         self.assertNotIn("open_pr_cleanup", result["agent"])
         self.assertNotIn("open_pr_cleanup", result["agent-tab"])
 
+    def test_completed_board_without_agent_still_checks_open_pr_for_cleanup(self):
+        row = {"path": "/w/completed", "class": "finished", "reasons": ["board status completed"],
+               "agents": [], "terminals": [{"agent": None, "handle": "shell1"}],
+               "meaningful_tabs": ["shell1"], "linked_pr": None}
+
+        result = scan.add_next_step_facts(
+            [row],
+            git_lookup=lambda path: {"branch": "completed", "head": "aaa", "dirty": 0,
+                                     "unpushed": 1, "github": "acme/app"},
+            pr_lookup=lambda slug, ref: {"number": 7, "state": "OPEN", "head_oid": "aaa"})[0]
+
+        self.assertEqual(result["class"], "finished")
+        self.assertEqual(result["meaningful_tabs"], ["shell1"])
+        self.assertTrue(result["open_pr_cleanup"])
+        self.assertTrue(result["pr"]["head_matches"])
+
     def test_the_review_queue_holds_every_row_a_reader_must_class(self):
         # Jev reads fast and shallow: every row it judged from a final message gets
         # one careful read, and the verdict is kept until that message changes.
