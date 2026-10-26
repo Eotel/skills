@@ -6,16 +6,12 @@ unsure row, and a stalled row whose own PR merged) to
 `<state dir>/<session id>/review-queue.json`; `orca-row-classify` writes its
 verdicts to `review-result.json` beside it. While a queued row has no verdict
 for that same queue, the hook blocks the stop once and names the rows. It also
-blocks once when the hourly triage of this workspace skipped a run (its precheck
-saw this session busy) after this session's last scan, so the skipped sweep is
-done before the turn ends. It blocks once, too, while an artifact this session
-published is still watched live: Orca counts the tab as working while the watch
-runs, so the precheck skips every hourly run. A missing external inbox service
+blocks once while an artifact this session published is still watched live:
+Orca counts the tab as working while the watch runs. A missing external inbox service
 is named when the triage automation is installed. A repeated stop
 (`stop_hook_active`) goes through, so a broken classifier cannot trap the session.
 """
 
-from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -25,8 +21,6 @@ import sys
 
 STATE_DIR = "~/.cache/orca-session-triage"
 TRIAGE_PROMPT = "/orca-session-triage"
-# Skipped runs in a row after which the turn-end sweep does the whole triage: no scheduled run is cleaning up.
-WHOLE_TRIAGE_AFTER = 3
 # Kept in the session's state directory: how far the transcript was read and which artifacts are still watched.
 WATCH_STATE = "artifact-watches.json"
 # `liveSubscription` of an Artifact publish result that leaves a live watch running.
@@ -58,8 +52,7 @@ def decide(hook_input, state_dir, orca="orca"):
     reasons = [watched(session, hook_input.get("transcript_path"))]
     queue = read_json(session / "review-queue.json")
     if isinstance(queue, dict):
-        reasons += [unclassed(session, queue), unswept(hook_input.get("cwd"), queue, orca),
-                    missing_inbox_watch(hook_input.get("cwd"), orca)]
+        reasons += [unclassed(session, queue), missing_inbox_watch(hook_input.get("cwd"), orca)]
     reasons = [r for r in reasons if r]
     return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
 
@@ -178,49 +171,6 @@ def missing_inbox_watch(workspace, orca):
     return ("orca-session-triage: the external triage inbox service is not running. "
             "See references/hourly.md for the watch-inbox service status and cutover steps; "
             "do not start another reader of ~/.cache/orca-briefs/offsets/close-done-triage.offset.")
-
-
-def skipped_runs(orca, workspace, since_ms):
-    """The newest triage run for this workspace its precheck skipped after since_ms, and the skips in a row up to now.
-
-    Returns (start in epoch ms, count), or (None, 0) when no run was skipped since. The session may run in a
-    subdirectory of the workspace the automation names.
-    """
-    newest, in_a_row = None, 0
-    for automation in triage_automations(orca, workspace):
-        runs = sorted(orca_result(orca, "automations", "runs", "--id", automation["id"])["runs"],
-                      key=lambda run: run.get("startedAt") or 0, reverse=True)
-        skips = 0
-        for run in runs:
-            if run.get("status") != "skipped_precheck":
-                break
-            skips += 1
-        started = runs[0].get("startedAt") or 0 if skips else 0
-        if started > max(since_ms, newest or 0):
-            newest, in_a_row = started, skips
-    return newest, in_a_row
-
-
-def unswept(workspace, queue, orca):
-    """Why to stay when the hourly triage of this workspace skipped a run after this session's last scan, or None."""
-    if not workspace:
-        return None
-    try:
-        since_ms = datetime.fromisoformat(queue["generated_at"]).timestamp() * 1000
-        skipped, in_a_row = skipped_runs(orca, workspace, since_ms)
-        if skipped is None:
-            return None
-        at = datetime.fromtimestamp(skipped / 1000).astimezone().strftime("%H:%M")
-    except (OSError, OverflowError, subprocess.SubprocessError, ValueError, LookupError, TypeError,
-            AttributeError):
-        return None
-    where = "as references/hourly.md says under \"While this session works on a request\"."
-    if in_a_row >= WHOLE_TRIAGE_AFTER:
-        return (f"orca-session-triage: the hourly triage skipped {in_a_row} runs in a row (skipped_precheck, the "
-                f"last at {at}), so no scheduled run is cleaning up. Run the whole triage before ending the turn, "
-                f"cleanup included, {where}")
-    return (f"orca-session-triage: the hourly run at {at} was skipped (skipped_precheck) after this session's "
-            f"last scan. Sweep before ending the turn, {where}")
 
 
 def main():

@@ -7,7 +7,8 @@
   `answered_in_chat_later` was usually answered by a later user message: confirm
   before listing it. Put a recommended option first.
 - Before asking a decision that a verdict or final message leaves open, search
-  that lane's user messages and this session's earlier answers for it. A final
+  that lane's user messages and, in an hourly run, the shared questions and
+  answers in `hourly-state.md`. A final
   message that offers to change course ("if you decide otherwise, I will fix
   the PR") reports a decision already made: ask only the step still open, such
   as the merge.

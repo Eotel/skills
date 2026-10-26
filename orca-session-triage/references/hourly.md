@@ -4,6 +4,9 @@ An Orca automation starts `/orca-session-triage hourly` every hour in the
 triage workspace. The automation's session leads triage. The unfiltered
 `watch-inbox` runs as a macOS user service outside Orca tabs; owning a watch no
 longer appoints a lead. A `--only` watch receives selected lanes' reports.
+The triage workspace holds scheduled-run tabs only. Start requests outside the
+hourly sweep in a different workspace, so they cannot hold the next run.
+Read `references/hourly-state.md` for decisions shared across fresh sessions.
 At the start of each run, use `scripts/inbox_read.py read` to see new inbox
 entries in append order. After handling them, pass its `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The reader keeps its own cursor and
@@ -22,24 +25,30 @@ starting a watch or changing the workspace comment.
 Name any Orca environment the scan could not reach in the handoff. Review
 rows from the reachable Macs in the same run.
 
-When this run leads:
+When this run leads, read the shared hourly state before the scan. Match the
+saved left rows to their newest final messages, retain pending questions, and
+check promised handoffs. Then:
 
+- Close previous scheduled-run tabs whose agents are done and whose questions
+  have answers or no question. Check Orca's run history and terminal ownership
+  before closing a tab; leave tabs with unanswered questions open. Apply
+  `cleanup.md` to any done cards in them.
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
-- Ask with AskUserQuestion and set the triage workspace's Orca comment to
-  「要判断: …」. The open question holds the session, and later runs skip until
-  the user answers, so each question is asked once.
-- A row the user chose to leave in an earlier run of this session stays left
-  until its newest final message changes. Only those: every other row's
-  verdict is acted on in every run, changed or not, so a finished or stalled
-  row is offered again until it is closed.
+- Record each new question as `references/hourly-state.md` says, ask with
+  AskUserQuestion, and set the triage workspace's Orca comment to「要判断: …」.
+  Keep the tab with that unanswered question open. A later run works through
+  other rows and never repeats the recorded question. Once answered, record
+  the answer before directing a lane. Other rows' verdicts are acted on in
+  every run, changed or not, so a finished or stalled row is offered again
+  until it is closed.
 - When nothing needs the user, end with one line and no question.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
 - Leave no Monitor or other background job in this tab after the turn. A
-  background job makes Orca report the tab as working and prevents reuse by
-  the next hourly run. Publishing an Artifact starts a live
+  background job makes Orca report the tab as working and delays the next
+  hourly run. Publishing an Artifact starts a live
   watch (its result says `Live subscription: arming`): stop it right after
   publishing with ArtifactComments `action: "watch"`, `on: false`, and the
   artifact's `url`. The Stop hook names a watch still running.
@@ -75,53 +84,30 @@ cutover before changing the live watch:
    reset or copy the offset.
 4. Run the same script with `status`, inspect `triage-watch.log`, and use
    `inbox_read.py read` to check delivery. The lead tab remains free of
-   Monitors. Check the next scheduled run's tab before claiming reuse works.
+   Monitors. Check the next scheduled run's new tab before claiming delivery works.
 
 An immediate alert for `kind=ask` could be added to this service later, with
 a macOS notification containing the worktree and a prompt to read the inbox.
 That would alert the person promptly; it would not wake or type into the lead
 tab. Design and implementation need separate approval.
 
-## While this session works on a request
-
-The precheck skips every run while the lead works, so a long request leaves the
-board unswept. When the Stop hook names a skipped run, the lead sweeps before
-ending the turn: scan, ask every new question from the `waiting` rows, and
-wake the rows `next-step.md` says to wake. Leave the rest to the next
-scheduled run, unless the hook says several runs in a row were skipped: then
-no scheduled run is cleaning up, so run the whole triage, cleanup included.
-When another tab leads, scan and hand off as described above.
-Codex ignores the hook: there, before ending a turn, look for
-`skipped_precheck` runs since your last scan in
-`orca automations runs --id <id> --json`.
-
 ## The automation
 
 ```sh
 orca automations create --name "session triage" --trigger hourly \
   --prompt "/orca-session-triage hourly 報告と質問は日本語で" --provider claude \
-  --workspace "id:<repoId>::<triage workspace path>" --reuse-session \
+  --workspace "id:<repoId>::<triage workspace path>" --fresh-session \
   --precheck "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py --workspace <triage workspace path>" \
   --json
 ```
 
-- An existing workspace with `--reuse-session`: a run goes to a prior run's
-  live session once that agent is done, so one tab holds the recurring work
-  and remembers what it asked. A new worktree per run would pile up on the
-  board it triages.
-- Orca starts a scheduled run even while the previous one waits on the user,
-  then in a new tab. `scripts/precheck.py` skips the run while any agent in the
-  workspace works, is blocked, or waits. When the workspace is idle, the
-  precheck also compares prior automation runs with the live tab's pane, PTY,
-  agent, `done` state, and idle input prompt. It skips when no prior tab can be reused; an older
-  lead tab still qualifies after a newer tab has closed. The first run may
-  start a new tab. A skipped run is recorded with the precheck's output
-  (`orca automations runs --id <id> --json`). A manual `orca automations run`
-  does not run the precheck. Orca makes its final reuse decision after the
-  precheck, so a tab or agent changing in between can still prevent reuse.
-- Any agent in the triage workspace holds the run, not only the triage
-  session. A tab there that leads other lanes for hours skips every run (22 in
-  a row, seen 2026-10-13): keep such tabs in another workspace.
+- An existing workspace with `--fresh-session` gets a new tab and session on
+  each allowed run, without making a new worktree.
+- `scripts/precheck.py` skips only while an agent in the triage workspace is
+  working, including a background job. A waiting question can stay open while
+  the next run starts. A skipped run is visible in
+  `orca automations runs --id <id> --json`. A manual `orca automations run`
+  does not run the precheck.
 - Orca runs the precheck through `/bin/sh` with the login `PATH`, but in the
   repo's main checkout rather than the workspace, so the command names the
   workspace.
