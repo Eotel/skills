@@ -1823,15 +1823,18 @@ class HourlyStateTests(unittest.TestCase):
         message = self.source("message.txt", "Should B start?\n")
         question = self.source("question.txt", "Send B the task?\n")
         answer = self.source("answer.txt", "Yes, when A finishes.\n")
-        code, asked = self.call("asked", "--row", "/w/a", "--final-message-file", message,
+        code, asked = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                "--final-message-file", message,
                                 "--question-file", question, "--asked-at", "2026-10-25T12:30:00+09:00")
         self.assertEqual(code, 0)
         self.assertEqual(asked["answer"], None)
         self.assertEqual(asked["asked_at"], "2026-10-25T12:30:00+09:00")
-        self.assertEqual(self.call("asked", "--row", "/w/a", "--final-message-file", message,
+        self.assertEqual(self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                   "--final-message-file", message,
                                    "--question-file", question)[1], asked)
         changed_message = self.source("changed-message.txt", "Still waiting.\n")
-        self.assertEqual(self.call("asked", "--row", "/w/a", "--final-message-file", changed_message,
+        self.assertEqual(self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                   "--final-message-file", changed_message,
                                    "--question-file", question)[1], asked)
         self.call("answered", "--id", asked["id"], "--answer-file", answer,
                   "--answered-at", "2026-10-25T13:00:00+09:00")
@@ -1844,6 +1847,23 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(state["questions"][asked["id"]]["answer"], "Yes, when A finishes.")
         self.assertEqual(state["questions"][asked["id"]]["answered_at"], "2026-10-25T13:00:00+09:00")
         self.assertEqual(state["handoffs"][promise["id"]]["delivery"], "turn_started")
+
+    def test_same_question_for_a_later_pr_is_a_new_decision(self):
+        message = self.source("message.txt", "Ready to merge.\n")
+        question = self.source("question.txt", "Merge this PR?\n")
+        no = self.source("no.txt", "No\n")
+        yes = self.source("yes.txt", "Yes\n")
+        _, earlier = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                               "--final-message-file", message, "--question-file", question)
+        self.call("answered", "--id", earlier["id"], "--answer-file", no)
+        _, later = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#11",
+                             "--final-message-file", message, "--question-file", question)
+        self.assertNotEqual(later["id"], earlier["id"])
+        self.assertIsNone(later["answer"])
+        self.call("answered", "--id", later["id"], "--answer-file", yes)
+        _, state = self.call("show")
+        self.assertEqual(state["questions"][earlier["id"]]["answer"], "No")
+        self.assertEqual(state["questions"][later["id"]]["answer"], "Yes")
 
     def test_malformed_state_is_not_overwritten(self):
         self.state.write_text("broken")

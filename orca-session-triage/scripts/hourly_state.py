@@ -74,8 +74,12 @@ def change(data, args):
     if args.action == "asked":
         message = file_text(args.final_message_file)
         question = file_text(args.question_file)
-        key = identifier(args.row, question)
-        data["questions"].setdefault(key, {"row": args.row, "final_message": message,
+        decision = args.decision.strip()
+        if not decision:
+            raise ValueError("decision is empty")
+        key = identifier(args.row, decision)
+        data["questions"].setdefault(key, {"row": args.row, "decision": decision,
+                                           "final_message": message,
                                            "question": question, "asked_at": recorded_at(args.asked_at),
                                            "answer": None})
         return {"id": key, **data["questions"][key]}
@@ -117,6 +121,7 @@ def main(argv=None):
     leave.add_argument("--final-message-file", required=True)
     asked = commands.add_parser("asked", help="record the exact question before presenting it")
     asked.add_argument("--row", required=True)
+    asked.add_argument("--decision", required=True, help="stable subject and action, e.g. merge:PR#10")
     asked.add_argument("--final-message-file", required=True)
     asked.add_argument("--question-file", required=True)
     asked.add_argument("--asked-at", help="original ISO 8601 time when importing a question")
