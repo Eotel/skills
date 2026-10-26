@@ -30,16 +30,19 @@ For `asked --decision`, use the same subject and action across runs, such as
 The lead records each new user request with `request-open --original-file FILE
 --symptom-file FILE` when receiving it. Use the user's exact words for the
 original request and a separately observable symptom. Pass `--owner
-REPO/WORKTREE` when a lane is already assigned; otherwise the request remains
+ROW_IDENTITY` when a lane is already assigned; otherwise the request remains
 unassigned and appears in `requests-needing-owner`. The entry records its
 opening time; use `--opened-at ISO_TIME` when importing an older request.
 Check `show` before registering a request so a fresh session does not duplicate
-it. `request-assign --id ID --owner REPO/WORKTREE` assigns or replaces the
-responsible lane when work passes to another lane.
+it. `request-assign --id ID --owner ROW_IDENTITY` assigns or replaces the
+responsible lane when work passes to another lane. Use the scan's
+`row_identity`: the absolute worktree path on the local Mac, or
+`ENVIRONMENT::PATH` for another Mac. A repository and worktree name alone can
+identify more than one lane across Macs.
 
 Every hourly run reads the open requests in `show` and compares each assigned
 lane with the scan. After the scan, run `requests-needing-owner`, passing
-`--live-owner REPO/WORKTREE` once for each lane still actively handling its
+`--live-owner ROW_IDENTITY` once for each lane still actively handling its
 assigned request. Send every returned request to the lead on every run, even
 when that lane reported `done` earlier. The lead assigns a live lane or asks
 for the needed direction. If the hourly run is the lead, it handles these

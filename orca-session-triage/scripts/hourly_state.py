@@ -72,8 +72,9 @@ def file_text(path):
 
 def owner_name(value):
     owner = value.strip()
-    if not owner:
-        raise ValueError("owner is empty")
+    environment, separator, path = owner.partition("::")
+    if not owner or not Path(path if separator else owner).is_absolute() or (separator and not environment):
+        raise ValueError("owner must be a scan row identity: PATH or ENVIRONMENT::PATH")
     return owner
 
 
@@ -147,15 +148,17 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("show", help="read all saved decisions, questions, handoffs, and requests")
     needs_owner = commands.add_parser("requests-needing-owner", help="list open requests without a live owner")
-    needs_owner.add_argument("--live-owner", action="append", default=[], help="live repo/worktree; repeat per owner")
+    needs_owner.add_argument("--live-owner", action="append", default=[],
+                             help="active scan row identity (PATH or ENVIRONMENT::PATH); repeat per owner")
     request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
     request_open.add_argument("--original-file", required=True)
     request_open.add_argument("--symptom-file", required=True)
-    request_open.add_argument("--owner", help="assigned repo/worktree, if known")
+    request_open.add_argument("--owner", help="assigned scan row identity (PATH or ENVIRONMENT::PATH)")
     request_open.add_argument("--opened-at", help="original ISO 8601 time when importing a request")
     request_assign = commands.add_parser("request-assign", help="replace the lane responsible for an open request")
     request_assign.add_argument("--id", required=True)
-    request_assign.add_argument("--owner", required=True, help="assigned repo/worktree")
+    request_assign.add_argument("--owner", required=True,
+                                help="assigned scan row identity (PATH or ENVIRONMENT::PATH)")
     request_close = commands.add_parser("request-close", help="close after the lead verifies the symptom is gone")
     request_close.add_argument("--id", required=True)
     request_close.add_argument("--evidence-file", required=True)
@@ -196,7 +199,7 @@ def main(argv=None):
                 same = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": same}
             elif args.action == "requests-needing-owner":
-                live = set(args.live_owner)
+                live = {owner_name(value) for value in args.live_owner}
                 result = [{"id": key, **request} for key, request in data["requests"].items()
                           if request["closed_at"] is None and request["owner"] not in live]
             else:

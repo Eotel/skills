@@ -2041,17 +2041,17 @@ class HourlyStateTests(unittest.TestCase):
         symptom = self.source("symptom.txt", "各 session の direnv が固まる\n")
         evidence = self.source("evidence.txt", "実 session で direnv が止まらないことを確認\n")
         code, request = self.call("request-open", "--original-file", original,
-                                  "--symptom-file", symptom, "--owner", "repo/slow-lane")
+                                  "--symptom-file", symptom, "--owner", "/w/slow-lane")
         self.assertEqual(code, 0)
         self.assertEqual(request["original"], "direnv が固まって開発に支障がある")
-        self.assertEqual(request["owner"], "repo/slow-lane")
+        self.assertEqual(request["owner"], "/w/slow-lane")
         self.assertIsNone(request["closed_at"])
         self.assertIsNone(request["closure_evidence"])
         self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
-        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "repo/slow-lane"),
+        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane"),
                          (0, []))
-        self.call("request-assign", "--id", request["id"], "--owner", "repo/next-lane")
-        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "repo/slow-lane")[1][0]["id"],
+        self.call("request-assign", "--id", request["id"], "--owner", "/w/next-lane")
+        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane")[1][0]["id"],
                          request["id"])
         self.assertEqual(self.call("request-close", "--id", request["id"],
                                    "--evidence-file", evidence)[1]["closure_evidence"],
@@ -2069,6 +2069,31 @@ class HourlyStateTests(unittest.TestCase):
         _, request = self.call("request-open", "--original-file", original, "--symptom-file", symptom)
         self.assertIsNone(request["owner"])
         self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
+
+    def test_same_path_on_another_mac_does_not_hide_an_unowned_request(self):
+        original = self.source("original.txt", "動作が遅い")
+        symptom = self.source("symptom.txt", "起動が止まる")
+        local_owner = scan.row_identity({"path": "/w/shared", "environment": None})
+        remote_owner = scan.row_identity({"path": "/w/shared", "environment": "macbook-pro-16"})
+        _, local = self.call("request-open", "--original-file", original,
+                             "--symptom-file", symptom, "--owner", local_owner)
+        _, remote = self.call("request-open", "--original-file", original,
+                              "--symptom-file", symptom,
+                              "--owner", remote_owner)
+        code, needs_owner = self.call("requests-needing-owner", "--live-owner", remote_owner)
+        self.assertEqual(code, 0)
+        self.assertEqual([request["id"] for request in needs_owner], [local["id"]])
+        self.assertNotEqual(local["owner"], remote["owner"])
+
+    def test_request_owner_requires_scan_row_identity(self):
+        original = self.source("original.txt", "動作が遅い")
+        symptom = self.source("symptom.txt", "起動が止まる")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = hourly_state.main(["--state-file", str(self.state), "request-open",
+                                      "--original-file", original, "--symptom-file", symptom,
+                                      "--owner", "skills/shared-lane"])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.state.exists())
 
 
 class PrecheckTests(unittest.TestCase):
