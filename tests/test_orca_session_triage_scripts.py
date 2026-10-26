@@ -2205,7 +2205,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
                 stream.write(json.dumps({"type": "user", "message": {"content": "前の話の続きです"},
                                          "timestamp": "2026-10-26T08:01:00Z"}) + "\n")
                 stream.write(json.dumps({"type": "assistant", "message": {"content": [
-                    {"type": "text", "text": "どちらの案にしますか"}]},
+                    {"type": "text", "text": "どちらの案にしますか。\n判断に必要な背景は前段の説明です。"}]},
                     "timestamp": "2026-10-26T08:02:00Z"}) + "\n")
             self.assertIn("unanswered conversation question", cleanup_hourly.close_blockers(
                 term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now))

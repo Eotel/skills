@@ -20,7 +20,7 @@ import scan_sessions
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
 BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", "Esc to cancel")
 QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回答|選んで|教えて|"
-                      r"(?:です|ます|でしょう|よろしい|します)か[。.!]?\s*$|"
+                      r"(?:です|ます|でしょう|よろしい|します)か|"
                       r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)
 
 
@@ -126,7 +126,7 @@ def unanswered_conversation(transcript):
                         pending_tools.add(block.get("id"))
                 elif block.get("type") == "tool_result":
                     pending_tools.discard(block.get("tool_use_id"))
-    return bool(pending_tools) or not final_text or bool(QUESTION.search(final_text[-500:]))
+    return bool(pending_tools) or not final_text or bool(QUESTION.search(final_text))
 
 
 def close_blockers(term, transcript, screen, min_idle_minutes, now):
