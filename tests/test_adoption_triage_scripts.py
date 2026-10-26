@@ -67,6 +67,33 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.events.read_text().splitlines()), 1)
 
+    def test_support_adds_evidence_without_creating_another_proposal(self):
+        proposal_id = self.proposal()
+        result = self.run_ledger(["support"], {"proposal_id": proposal_id,
+            "source": {"session": "next triage", "worktree": "triage"},
+            "evidence": ["2026-10-26 18:10 に再発"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        view = self.run_ledger(["list", "--json"])
+        items = json.loads(view.stdout)["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["evidence"], ["2026-10-26 17:00", "2026-10-26 18:10 に再発"])
+        self.assertEqual(items[0]["supporting_events"][0]["source"]["session"], "next triage")
+
+    def test_readoption_needs_a_new_execution(self):
+        proposal_id = self.proposal()
+        for decision in ("adopt", "revoke", "adopt"):
+            result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+                                     "decision": decision, "actor": "Eotel"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if decision == "adopt" and len(self.events.read_text().splitlines()) == 2:
+                applied = self.run_ledger(["record"], {"proposal_id": proposal_id,
+                    "outcome": "applied", "actor": "worker", "result": "commit abc"})
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+        item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
+        self.assertEqual(item["status"], "adopted")
+        self.assertIsNone(item["implemented_at"])
+        self.assertIsNone(item["revoked_at"])
+
     def test_imports_are_read_without_changing_local_log(self):
         self.imports.mkdir()
         remote = self.imports / "other-mac.jsonl"

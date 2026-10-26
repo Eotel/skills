@@ -79,7 +79,20 @@ def project(rows):
             proposals[proposal_id] = {**row, "status": "pending", "adopted_at": None,
                                       "rejected_at": None, "held_at": None, "revoked_at": None,
                                       "implemented_at": None, "reverted_at": None,
-                                      "decisions": [], "executions": []}
+                                      "evidence": list(row.get("evidence", [])),
+                                      "supporting_events": [], "decisions": [], "executions": []}
+    for row in rows:
+        proposal_id = row["proposal_id"]
+        if row["type"] == "proposal":
+            continue
+        if row["type"] == "evidence":
+            if proposal_id not in proposals:
+                raise ValueError(f"evidence without proposal: {proposal_id}")
+            item = proposals[proposal_id]
+            for value in row["evidence"]:
+                if value not in item["evidence"]:
+                    item["evidence"].append(value)
+            item["supporting_events"].append(row)
         elif row["type"] == "decision":
             if proposal_id not in proposals:
                 raise ValueError(f"decision without proposal: {proposal_id}")
@@ -91,6 +104,10 @@ def project(rows):
                 raise ValueError(f"only adopted proposals can be revoked: {proposal_id}")
             if item["status"] == "adopted" and decision in {"reject", "hold"}:
                 raise ValueError(f"revoke adoption before {decision}: {proposal_id}")
+            if decision == "adopt":
+                item["implemented_at"] = None
+                item["reverted_at"] = None
+                item["revoked_at"] = None
             item["status"] = {"adopt": "adopted", "reject": "rejected", "hold": "held",
                               "revoke": "revoked"}[decision]
             item[{"adopt": "adopted_at", "reject": "rejected_at", "hold": "held_at",
@@ -190,6 +207,22 @@ def validate_execution(body):
     return row
 
 
+def validate_evidence(body):
+    if not isinstance(body, dict) or set(body) != {"proposal_id", "source", "evidence"}:
+        raise ValueError("evidence needs proposal_id, source, and evidence")
+    proposal_id = required_text(body["proposal_id"], "proposal_id", 80)
+    uuid.UUID(proposal_id)
+    source = body["source"]
+    if not isinstance(source, dict) or set(source) != {"session", "worktree"}:
+        raise ValueError("source requires session and worktree")
+    source = {key: required_text(source[key], key, 240) for key in ("session", "worktree")}
+    evidence = body["evidence"]
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= 100 or any(
+            not isinstance(value, str) or not value.strip() or len(value) > 1000 for value in evidence):
+        raise ValueError("evidence must be a nonempty list of short strings")
+    return {**envelope("evidence", proposal_id), "source": source, "evidence": evidence}
+
+
 def append(events, imports, row):
     events.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(events, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
@@ -210,7 +243,7 @@ def append(events, imports, row):
                 raise ValueError("only adopted proposals can be revoked")
             if previous == "adopted" and decision in {"adopt", "reject", "hold"}:
                 raise ValueError("revoke adoption before another decision")
-        else:
+        elif row["type"] == "execution":
             item = known.get(proposal_id)
             if item is None:
                 raise ValueError(f"proposal not found: {proposal_id}")
@@ -218,6 +251,9 @@ def append(events, imports, row):
                 raise ValueError("adoption was not decided")
             if row["outcome"] == "reverted" and item["status"] != "revoked":
                 raise ValueError("reversal was not decided")
+        else:
+            if proposal_id not in known:
+                raise ValueError(f"proposal not found: {proposal_id}")
         data = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         if os.write(fd, data) != len(data):
             raise OSError("partial event write")
@@ -280,6 +316,7 @@ def main():
     commands.add_parser("propose", help="append one proposal from stdin JSON")
     commands.add_parser("decide", help="append one decision from stdin JSON")
     commands.add_parser("record", help="append one execution result from stdin JSON")
+    commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
     listing = commands.add_parser("list", help="read current proposals")
     listing.add_argument("--json", action="store_true")
     pulling = commands.add_parser("collect", help="copy remote Mac ledgers")
@@ -292,6 +329,8 @@ def main():
             print(json.dumps(append(args.events, args.imports, validate_decision(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "record":
             print(json.dumps(append(args.events, args.imports, validate_execution(json.load(sys.stdin))), ensure_ascii=False))
+        elif args.command == "support":
+            print(json.dumps(append(args.events, args.imports, validate_evidence(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "list":
             items = project(all_rows(args.events, args.imports))
             if args.json:
