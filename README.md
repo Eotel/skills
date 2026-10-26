@@ -6,15 +6,13 @@ detail in references or scripts.
 
 ## Install
 
-Check `apm install --help` for the installed APM release. A typical shared install
-is:
-
-```bash
-apm install -g Eotel/skills/agentic-docs --target agent-skills
-```
-
-Install only the skill directories needed by the target workflow. The Codex
-orchestration callers also require `codex-orchestration-core`.
+For Eotel's shared Mac setup, declare the skill directories in
+[`chezmoi-dotfiles/dot_apm/apm.yml`](https://github.com/Eotel/chezmoi-dotfiles/blob/main/dot_apm/apm.yml)
+and follow its [APM recovery and propagation guide](https://github.com/Eotel/chezmoi-dotfiles/blob/main/docs/skills-pipeline.md).
+The guard backs up the installation, then refreshes the shared skills and
+rebuilds the deployment receipt. Install only the directories needed by the target
+workflow. The Codex orchestration callers also require
+`codex-orchestration-core`.
 
 ## Authoring
 
