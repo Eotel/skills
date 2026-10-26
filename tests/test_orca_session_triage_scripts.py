@@ -2046,6 +2046,65 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.state.read_text(), "broken")
 
+    def test_request_stays_open_after_worker_done_until_symptom_is_verified(self):
+        original = self.source("original.txt", "direnv が固まって開発に支障がある\n")
+        symptom = self.source("symptom.txt", "各 session の direnv が固まる\n")
+        evidence = self.source("evidence.txt", "実 session で direnv が止まらないことを確認\n")
+        code, request = self.call("request-open", "--original-file", original,
+                                  "--symptom-file", symptom, "--owner", "/w/slow-lane")
+        self.assertEqual(code, 0)
+        self.assertEqual(request["original"], "direnv が固まって開発に支障がある")
+        self.assertEqual(request["owner"], "/w/slow-lane")
+        self.assertIsNone(request["closed_at"])
+        self.assertIsNone(request["closure_evidence"])
+        self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
+        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane"),
+                         (0, []))
+        self.call("request-assign", "--id", request["id"], "--owner", "/w/next-lane")
+        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane")[1][0]["id"],
+                         request["id"])
+        self.assertEqual(self.call("request-close", "--id", request["id"],
+                                   "--evidence-file", evidence)[1]["closure_evidence"],
+                         "実 session で direnv が止まらないことを確認")
+        self.assertEqual(self.call("requests-needing-owner"), (0, []))
+        self.assertEqual(self.call("show")[1]["requests"][request["id"]]["symptom"],
+                         "各 session の direnv が固まる")
+
+    def test_request_commands_accept_existing_state_without_requests(self):
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {}}))
+        self.assertEqual(self.call("requests-needing-owner"), (0, []))
+        self.assertIn("requests", self.call("show")[1])
+        original = self.source("original.txt", "担当を立てて直してほしい")
+        symptom = self.source("symptom.txt", "direnv が止まる")
+        _, request = self.call("request-open", "--original-file", original, "--symptom-file", symptom)
+        self.assertIsNone(request["owner"])
+        self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
+
+    def test_same_path_on_another_mac_does_not_hide_an_unowned_request(self):
+        original = self.source("original.txt", "動作が遅い")
+        symptom = self.source("symptom.txt", "起動が止まる")
+        local_owner = scan.row_identity({"path": "/w/shared", "environment": None})
+        remote_owner = scan.row_identity({"path": "/w/shared", "environment": "macbook-pro-16"})
+        _, local = self.call("request-open", "--original-file", original,
+                             "--symptom-file", symptom, "--owner", local_owner)
+        _, remote = self.call("request-open", "--original-file", original,
+                              "--symptom-file", symptom,
+                              "--owner", remote_owner)
+        code, needs_owner = self.call("requests-needing-owner", "--live-owner", remote_owner)
+        self.assertEqual(code, 0)
+        self.assertEqual([request["id"] for request in needs_owner], [local["id"]])
+        self.assertNotEqual(local["owner"], remote["owner"])
+
+    def test_request_owner_requires_scan_row_identity(self):
+        original = self.source("original.txt", "動作が遅い")
+        symptom = self.source("symptom.txt", "起動が止まる")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = hourly_state.main(["--state-file", str(self.state), "request-open",
+                                      "--original-file", original, "--symptom-file", symptom,
+                                      "--owner", "skills/shared-lane"])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.state.exists())
+
 
 class PrecheckTests(unittest.TestCase):
     def setUp(self):
@@ -2290,6 +2349,31 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            long_info = "詳" * 161
+            write_jsonl(inbox, [
+                {"ts": "t1", "kind": "ask", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "質問全文\n二行目"},
+                {"ts": "t2", "kind": "info", "host": "host1", "repo": "repo-b",
+                 "worktree": "same", "text": long_info},
+                {"ts": "t3", "kind": "done", "host": "host1", "worktree": "old",
+                 "text": "完了全文\n二行目"},
+            ])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read", "--brief"]), 0)
+                rendered = output.getvalue()
+                self.assertIn("t1 ask host1 repo-a/same\n質問全文\n二行目", rendered)
+                self.assertIn("t2 info host1 repo-b/same\n" + "詳" * 160 + "…", rendered)
+                self.assertNotIn(long_info, rendered)
+                self.assertIn("t3 done host1 old\n完了全文\n二行目", rendered)
+                self.assertEqual(rendered.splitlines()[-1], f"NEXT_OFFSET={inbox.stat().st_size}")
+                self.assertFalse(cursor.exists())
+
     def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self):
         runs = [{"status": "completed", "terminalPaneKey": None},
                 {"status": "completed", "terminalPaneKey": "old-pane"}]
