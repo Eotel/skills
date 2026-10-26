@@ -329,11 +329,17 @@ def collect(config, imports):
                 else:
                     raise OSError(result.stderr.decode(errors="replace").strip())
             rows = read_rows(temporary_path)
-            previous = {row["id"]: row for row in read_rows(path)}
-            current = {row["id"]: row for row in rows}
-            if any(current.get(key) != value for key, value in previous.items()):
-                raise ValueError(f"remote ledger is not append-only: {name}")
-            os.replace(temporary_path, path)
+            if any(row["type"] == "decision" for row in rows):
+                raise ValueError(f"remote decision is not allowed: {name}")
+            lock_fd = os.open(imports / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                previous = read_rows(path)
+                if rows[:len(previous)] != previous:
+                    raise ValueError(f"remote ledger is not append-only: {name}")
+                os.replace(temporary_path, path)
+            finally:
+                os.close(lock_fd)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             errors.append(f"{name}: {exc}")
         finally:
@@ -343,10 +349,20 @@ def collect(config, imports):
     return len(hosts)
 
 
+def require_decision_writer(config):
+    try:
+        configured = json.loads(config.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"decision writer is not configured: {config}") from exc
+    if not isinstance(configured, dict) or configured.get("decision_writer") is not True:
+        raise ValueError(f"decision writer is not enabled: {config}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS)
     parser.add_argument("--imports", type=Path, default=DEFAULT_IMPORTS)
+    parser.add_argument("--decision-config", type=Path, default=DEFAULT_HOSTS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("propose", help="append one proposal from stdin JSON")
     commands.add_parser("decide", help="append one decision from stdin JSON")
@@ -361,6 +377,7 @@ def main():
         if args.command == "propose":
             print(json.dumps(append(args.events, args.imports, validate_proposal(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "decide":
+            require_decision_writer(args.decision_config)
             print(json.dumps(append(args.events, args.imports, validate_decision(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "record":
             print(json.dumps(append(args.events, args.imports, validate_execution(json.load(sys.stdin))), ensure_ascii=False))

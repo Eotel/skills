@@ -19,10 +19,13 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.events = Path(self.temp.name) / "events.jsonl"
         self.imports = Path(self.temp.name) / "imports"
+        self.writer_config = Path(self.temp.name) / "writer.json"
+        self.writer_config.write_text('{"decision_writer": true}')
 
     def run_ledger(self, command, body=None):
         return subprocess.run([sys.executable, str(SCRIPT), "--events", str(self.events),
-                               "--imports", str(self.imports), *command],
+                               "--imports", str(self.imports), "--decision-config", str(self.writer_config),
+                               *command],
                               input=json.dumps(body, ensure_ascii=False) if body is not None else None,
                               text=True, capture_output=True)
 
@@ -67,6 +70,14 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.events.read_text().splitlines()), 1)
 
+    def test_only_configured_writer_can_decide(self):
+        proposal_id = self.proposal()
+        self.writer_config.write_text('{"decision_writer": false}')
+        result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
+            "decision": "adopt", "actor": "other Mac"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.events.read_text().splitlines()), 1)
+
     def test_support_adds_evidence_without_creating_another_proposal(self):
         proposal_id = self.proposal()
         result = self.run_ledger(["support"], {"proposal_id": proposal_id,
@@ -94,19 +105,19 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNone(item["implemented_at"])
         self.assertIsNone(item["revoked_at"])
 
-    def test_remote_clock_ahead_keeps_decision_and_execution_in_order(self):
+    def test_clock_ahead_decision_precedes_remote_execution(self):
         proposal_id = self.proposal()
-        self.imports.mkdir()
-        row = json.loads(self.events.read_text().strip())
-        row["ts"] = "2026-10-26T23:00:00+09:00"
-        (self.imports / "remote.jsonl").write_text(json.dumps(row) + "\n")
-        self.events.unlink()
         decision = self.run_ledger(["decide"], {"proposal_id": proposal_id,
             "decision": "adopt", "actor": "Eotel"})
         self.assertEqual(decision.returncode, 0, decision.stderr)
         applied = self.run_ledger(["record"], {"proposal_id": proposal_id,
             "outcome": "applied", "actor": "worker", "result": "commit abc"})
         self.assertEqual(applied.returncode, 0, applied.stderr)
+        rows = [json.loads(line) for line in self.events.read_text().splitlines()]
+        rows[1]["ts"] = "2026-10-26T23:00:00+09:00"
+        self.events.write_text("".join(json.dumps(row) + "\n" for row in rows[:2]))
+        self.imports.mkdir()
+        (self.imports / "remote.jsonl").write_text(json.dumps(rows[2]) + "\n")
         view = self.run_ledger(["list", "--json"])
         self.assertEqual(view.returncode, 0, view.stderr)
         self.assertEqual(json.loads(view.stdout)["items"][0]["status"], "adopted")
@@ -136,10 +147,15 @@ class AdoptionLedgerTests(unittest.TestCase):
 
     def test_collect_keeps_remote_history_and_rejects_truncation(self):
         proposal_id = self.proposal()
+        supported = self.run_ledger(["support"], {"proposal_id": proposal_id,
+            "source": {"session": "remote", "worktree": "preview"},
+            "evidence": ["別の記録"]})
+        self.assertEqual(supported.returncode, 0, supported.stderr)
         remote = Path(self.temp.name) / "remote.jsonl"
         rows = [json.loads(line) for line in self.events.read_text().splitlines()]
-        rows[0]["host"] = "renamed-os-host"
-        remote.write_text(json.dumps(rows[0], ensure_ascii=False) + "\n")
+        for row in rows:
+            row["host"] = "renamed-os-host"
+        remote.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
         self.events.unlink()
         bin_dir = Path(self.temp.name) / "bin"
         bin_dir.mkdir()
@@ -157,6 +173,15 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         view = self.run_ledger(["list", "--json"])
         self.assertEqual(json.loads(view.stdout)["items"][0]["proposal_id"], proposal_id)
+        remote.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in reversed(rows)))
+        result = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([json.loads(line)["type"] for line in (self.imports / "other-mac.jsonl").read_text().splitlines()],
+                         ["proposal", "evidence"])
+        decision = {**rows[1], "type": "decision", "decision": "adopt", "actor": "other Mac"}
+        remote.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in [rows[0], decision]))
+        result = subprocess.run(command, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
         remote.write_text("")
         result = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
