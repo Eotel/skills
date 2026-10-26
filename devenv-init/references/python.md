@@ -6,7 +6,7 @@ Four templates: `python`, `python+django`, `python+fastapi`, `python+flask`.
 
 | Tool | Source | Purpose |
 |---|---|---|
-| Python 3.12 | `languages.python.uv` | runtime |
+| Python 3.12 | `languages.python.package = pkgs.python312` (prebuilt in cache.nixos.org / devenv.cachix.org) | runtime |
 | `uv` | devenv | package manager (replaces pip/poetry) |
 | `ruff` | `pkgs.ruff` | linter + formatter |
 | `basedpyright` | `pkgs.basedpyright` | type checker / LSP |

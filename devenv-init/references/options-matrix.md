@@ -20,6 +20,6 @@ Per-template default values for `features.*.enable`. Override with `--with-*` / 
 | Flag | Patches |
 |---|---|
 | `--with-*` / `--no-*` | `devenv.nix` `features.<key>.enable` |
-| `--python <ver>` | `devenv.nix` `languages.python.version`; `pyproject.toml` `requires-python` + `target-version`; `pyrightconfig.json` `pythonVersion` |
+| `--python <ver>` | `devenv.nix` `languages.python.package` (`pkgs.python3XX`); `pyproject.toml` `requires-python` + `target-version`; `pyrightconfig.json` `pythonVersion` |
 | `--name <name>` | `pyproject.toml` `name` + `packages` |
 | `--strict-types` | additionally flips `pyrightconfig.json` `typeCheckingMode` to `strict` |
