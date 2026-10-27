@@ -261,6 +261,15 @@ class AdoptionLedgerTests(unittest.TestCase):
         reopened = self.run_ledger(["decide"], {"proposal_id": pending, "decision": "adopt", "actor": "Eotel"})
         self.assertEqual(reopened.returncode, 0, reopened.stderr)
 
+    def test_adopting_a_later_consolidation_closes_the_earlier_ones_targets(self) -> None:
+        original = self.proposal()
+        first = json.loads(self.consolidation("merges", [original]).stdout)["proposal_id"]
+        second = json.loads(self.consolidation("merges", [first]).stdout)["proposal_id"]
+        result = self.run_ledger(["decide"], {"proposal_id": second, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual({row["proposal_id"] for row in json.loads(result.stdout)["closed"]}, {first, original})
+        candidates = json.loads(self.run_ledger(["list", "--json", "--candidates"]).stdout)["items"]
+        self.assertNotIn(original, [item["proposal_id"] for item in candidates])
+
     def test_empty_proposal_id_does_not_append(self):
         result = self.run_ledger(["propose"], {
             "proposal_id": "", "source": {"session": "triage", "worktree": "triage"},

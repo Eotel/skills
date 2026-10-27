@@ -208,9 +208,14 @@ def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
 
 def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
     """Decisions that close the open targets of an adopted consolidation; re-adopting a target reopens it."""
-    rows = []
+    rows, seen = [], {owner["proposal_id"]}
     for relation, label in (("merges", "統合先"), ("retires", "取り下げの提案")):
-        for target_id in owner[relation]:
+        queue = list(owner[relation])
+        while queue:
+            target_id = queue.pop(0)
+            if target_id in seen:
+                continue
+            seen.add(target_id)
             target = known[target_id]
             if target["status"] in {"pending", "held"}:
                 decision = "reject"
@@ -218,6 +223,8 @@ def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[d
                 decision = "revoke"
             else:
                 continue
+            # A consolidation closed here hands its own targets on, or they would return as candidates.
+            queue.extend((*target["merges"], *target["retires"]))
             rows.append({**envelope("decision", target_id), "decision": decision, "actor": actor,
                          "reason": f"{label}「{owner['proposal']}」を採用",
                          "after_id": target["latest_event_id"]})
