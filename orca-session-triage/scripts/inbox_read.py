@@ -79,7 +79,7 @@ def save(cursor, position, exclusive=False):
     else:
         temporary = cursor.with_name(cursor.name + ".tmp")
         temporary.write_text(str(position))
-        os.replace(temporary, cursor)
+        temporary.replace(cursor)
 
 
 def main(argv=None):

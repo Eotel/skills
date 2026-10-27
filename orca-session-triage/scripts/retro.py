@@ -89,10 +89,10 @@ def atomic_text(path, content, mode=0o600):
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(tmp, path)
+        Path(tmp).replace(path)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        if Path(tmp).exists():
+            Path(tmp).unlink()
 
 
 def load(state=STATE):

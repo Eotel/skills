@@ -95,7 +95,7 @@ def uses_offset(command, offset):
         return False
     for i, arg in enumerate(args[:-1]):
         if Path(arg).name == "watch-inbox":
-            return os.path.realpath(os.path.expanduser(args[i + 1])) == os.path.realpath(offset)
+            return os.path.realpath(Path(args[i + 1]).expanduser()) == os.path.realpath(offset)
     return False
 
 

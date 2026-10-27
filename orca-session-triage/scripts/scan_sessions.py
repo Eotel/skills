@@ -4,7 +4,6 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import glob
 import http.client
 import json
 import os
@@ -64,7 +63,7 @@ def find_claude_dir(projects_root, worktree_path):
 
 def load_jsonl(path):
     rows = []
-    with open(path, encoding="utf-8") as handle:
+    with Path(path).open(encoding="utf-8") as handle:
         for line in handle:
             try:
                 row = json.loads(line)
@@ -828,8 +827,10 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         elif open_pr_cleanup and row.get("reasons") == [NO_SESSION_REASON]:
             row = {**row, "class": "finished", "reasons": ["no local work beyond open PR head"]}
         elif pr is not None and pr.get("state") == "OPEN" and pr.get("reply_after_last_commit"):
+            reasons = row.get("reasons")
             row = {**row, "waits_on": "self",
-                   "reasons": [*row.get("reasons", []), "human PR response after the latest commit"]}
+                   "reasons": [*(reasons if isinstance(reasons, list) else []),
+                               "human PR response after the latest commit"]}
         result.append(row)
     return result
 
@@ -912,18 +913,18 @@ def write_json_atomically(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, path)
+    temp.replace(path)
 
 
 def load_verdicts(store_path):
     """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
-    store = Path(os.path.expanduser(str(store_path)))
+    store = Path(store_path).expanduser()
     if not store.exists():
         return {}
     data = read_json_file(store)
     if isinstance(data, dict):
         return {path: v for path, v in data.items() if isinstance(v, dict)}
-    os.replace(store, store.with_name(store.name + ".bad"))
+    store.replace(store.with_name(store.name + ".bad"))
     return {}
 
 
@@ -961,7 +962,7 @@ def newer_verdicts(verdicts, incoming):
 
 def absorb_verdicts(store_path, write=True):
     """Fold every session's classed queue (the store's sibling directories) into the store and return it."""
-    store = Path(os.path.expanduser(str(store_path)))
+    store = Path(store_path).expanduser()
     verdicts = load_verdicts(store)
     for queue in sorted(store.parent.glob("*/review-queue.json"), key=lambda p: p.stat().st_mtime):
         verdicts = newer_verdicts(verdicts, classed_queue(queue.parent))
@@ -1118,7 +1119,10 @@ def read_mail(args):
 def expand_roots(patterns):
     roots = []
     for pattern in patterns:
-        roots.extend(p for p in glob.glob(os.path.expanduser(pattern)) if os.path.isdir(p))
+        expanded = Path(pattern).expanduser()
+        base = Path(expanded.anchor) if expanded.is_absolute() else Path()
+        relative_pattern = str(expanded.relative_to(base)) if expanded.is_absolute() else str(expanded)
+        roots.extend(str(path) for path in base.glob(relative_pattern) if path.is_dir())
     return roots
 
 
@@ -1160,7 +1164,7 @@ def parse_args(argv=None):
 
 def write_review_queue(path, rows, verdicts=None):
     """Write {"generated_at", "rows"} so a later check can tell whether this scan's queue was classed."""
-    target = Path(os.path.expanduser(path))
+    target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "rows": review_queue(rows, verdicts)}
     write_json_atomically(target, payload)
@@ -1196,7 +1200,7 @@ def main(argv=None):
         print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
               "idle final messages come back unsure, so read them", file=sys.stderr)
     judge = jev_judge(key) if key else (lambda message: None)
-    rows = add_next_step_facts(build_inventory(worktrees, terminals, os.path.expanduser(args.claude_projects),
+    rows = add_next_step_facts(build_inventory(worktrees, terminals, str(Path(args.claude_projects).expanduser()),
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args)))

@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 import copy
+from email.message import Message
 import importlib.util
 import io
 import json
@@ -22,6 +23,7 @@ WORKTREE_SETUP = ROOT / "codex-tdd-orchestration" / "scripts" / "worktree-setup.
 
 def load_script(name):
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / (name + ".py"))
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -792,7 +794,8 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(checks.classify_checks(runs), (True, []))
 
     def test_failed_classification(self):
-        runs = [{"name": result, "status": "completed", "conclusion": result} for result in ("failure", "cancelled", "timed_out", "action_required")]
+        runs: list[dict[str, str | None]] = [{"name": result, "status": "completed", "conclusion": result}
+                                            for result in ("failure", "cancelled", "timed_out", "action_required")]
         runs.append({"name": "unknown", "status": "completed", "conclusion": None})
         self.assertEqual(checks.classify_checks(runs), (True, ["failure", "cancelled", "timed_out", "action_required", "unknown"]))
 
@@ -982,7 +985,7 @@ class AsanaTasksTests(unittest.TestCase):
 
     def test_http_error_redacts_pat_and_response_body(self):
         client = asana.Asana("test-token")
-        error = urllib.error.HTTPError("https://app.asana.com/api/1.0/tasks", 401, "test-token", {}, io.BytesIO(b"test-token"))
+        error = urllib.error.HTTPError("https://app.asana.com/api/1.0/tasks", 401, "test-token", Message(), io.BytesIO(b"test-token"))
         with patch.object(asana.urllib.request, "urlopen", side_effect=error):
             with self.assertRaisesRegex(ValueError, r"Asana request failed \(HTTP 401\)") as context:
                 client.call("GET", "/tasks/task-id")

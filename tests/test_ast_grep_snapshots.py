@@ -12,7 +12,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "ast-grep-practice/scripts/check_
 
 
 class SnapshotChecks(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -38,18 +38,18 @@ for name, value in json.loads((preset / 'expected.json').read_text()).items():
 ''')
         self.cli.chmod(0o755)
 
-    def run_check(self):
+    def run_check(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), str(self.preset),
                                "--ast-grep", str(self.cli)],
                               capture_output=True, text=True, check=False)
 
-    def test_current_snapshots_pass_without_rewriting_baseline(self):
+    def test_current_snapshots_pass_without_rewriting_baseline(self) -> None:
         before = self.baseline.read_bytes()
         result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.baseline.read_bytes(), before)
 
-    def test_obsolete_records_fail_and_preserve_baseline(self):
+    def test_obsolete_records_fail_and_preserve_baseline(self) -> None:
         self.baseline.write_text("current output\nobsolete match\n")
         before = self.baseline.read_bytes()
         result = self.run_check()
@@ -57,17 +57,17 @@ for name, value in json.loads((preset / 'expected.json').read_text()).items():
         self.assertIn("Snapshots differ", result.stdout)
         self.assertEqual(self.baseline.read_bytes(), before)
 
-    def test_missing_baseline_fails(self):
+    def test_missing_baseline_fails(self) -> None:
         self.baseline.unlink()
         self.assertEqual(self.run_check().returncode, 1)
 
-    def test_cli_failure_cannot_pass(self):
+    def test_cli_failure_cannot_pass(self) -> None:
         (self.preset / "fail").write_text("")
         result = self.run_check()
         self.assertEqual(result.returncode, 2)
         self.assertIn("fixture CLI failure", result.stdout)
 
-    def test_empty_generation_cannot_pass(self):
+    def test_empty_generation_cannot_pass(self) -> None:
         (self.preset / "expected.json").write_text("{}")
         self.assertEqual(self.run_check().returncode, 2)
 

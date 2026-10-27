@@ -1,0 +1,38 @@
+target-version = "py312"
+
+[lint]
+select = ["ANN", "PTH"]
+
+[lint.per-file-ignores]
+# Existing annotation debt is tracked in https://github.com/Eotel/skills/issues/78.
+# Keep each exception file-specific so new Python files must pass ANN.
+"adoption-triage/scripts/ledger.py" = ["ANN"] # 48 existing annotation diagnostics
+"claude-cloud-dispatch/scripts/cloud_launch.py" = ["ANN"] # 45 existing annotation diagnostics
+"natural-japanese/scripts/check_japanese.py" = ["ANN"] # 15 existing annotation diagnostics
+"orca-session-triage/scripts/cleanup_hourly_tabs.py" = ["ANN"] # 24 existing annotation diagnostics
+"orca-session-triage/scripts/hourly_state.py" = ["ANN"] # 19 existing annotation diagnostics
+"orca-session-triage/scripts/inbox_read.py" = ["ANN"] # 19 existing annotation diagnostics
+"orca-session-triage/scripts/inbox_watch_service.py" = ["ANN"] # 27 existing annotation diagnostics
+"orca-session-triage/scripts/precheck.py" = ["ANN"] # 17 existing annotation diagnostics
+"orca-session-triage/scripts/retro.py" = ["ANN"] # 108 existing annotation diagnostics
+"orca-session-triage/scripts/retro_ledger.py" = ["ANN"] # 19 existing annotation diagnostics
+"orca-session-triage/scripts/rm_check.py" = ["ANN"] # 67 existing annotation diagnostics
+"orca-session-triage/scripts/scan_sessions.py" = ["ANN"] # 210 existing annotation diagnostics
+"orca-session-triage/scripts/stop_check.py" = ["ANN"] # 29 existing annotation diagnostics
+"review-response/scripts/asana_tasks.py" = ["ANN"] # 24 existing annotation diagnostics
+"review-response/scripts/render_status.py" = ["ANN"] # 18 existing annotation diagnostics
+"review-response/scripts/watch_checks.py" = ["ANN"] # 21 existing annotation diagnostics
+"review-response/scripts/watch_prs.py" = ["ANN"] # 21 existing annotation diagnostics
+"tests/test_adoption_triage_scripts.py" = ["ANN"] # 26 existing annotation diagnostics
+"tests/test_claude_cloud_dispatch_scripts.py" = ["ANN"] # 28 existing annotation diagnostics
+"tests/test_natural_japanese_scripts.py" = ["ANN"] # 24 existing annotation diagnostics
+"tests/test_orca_session_retro_scripts.py" = ["ANN"] # 37 existing annotation diagnostics
+"tests/test_orca_session_triage_scripts.py" = ["ANN"] # 420 existing annotation diagnostics
+"tests/test_review_response_scripts.py" = ["ANN"] # 133 existing annotation diagnostics
+# These files are the imported yomiyasu snapshot documented in README.md. Their
+# 252 path diagnostics need an upstream migration before refreshing that snapshot.
+"yomiyasu/scripts/markdown_visibility.py" = ["ANN", "PTH"] # 97 ANN, 17 PTH
+"yomiyasu/scripts/yomiyasu_check.py" = ["ANN", "PTH"] # 713 ANN, 178 PTH
+"yomiyasu/scripts/yomiyasu_diff.py" = ["ANN", "PTH"] # 1495 ANN, 9 PTH
+"yomiyasu/scripts/yomiyasu_hook.py" = ["ANN", "PTH"] # 140 ANN, 43 PTH
+"yomiyasu/scripts/yomiyasu_lint.py" = ["ANN", "PTH"] # 457 ANN, 5 PTH

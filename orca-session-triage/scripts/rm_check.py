@@ -44,7 +44,7 @@ def is_regenerable(relpath):
 
 def same_tree(left, right):
     if left.is_symlink() or right.is_symlink():
-        return left.is_symlink() and right.is_symlink() and os.readlink(left) == os.readlink(right)
+        return left.is_symlink() and right.is_symlink() and left.readlink() == right.readlink()
     if left.is_file():
         return right.is_file() and filecmp.cmp(left, right, shallow=False)
     if not (left.is_dir() and right.is_dir()):
@@ -165,7 +165,7 @@ def compose_in(worktree, compose_projects):
     prefix = str(Path(worktree).resolve()) + "/"
     found = []
     for project in compose_projects:
-        files = [f for f in (project.get("ConfigFiles") or "").split(",") if os.path.isabs(f)]
+        files = [f for f in (project.get("ConfigFiles") or "").split(",") if Path(f).is_absolute()]
         if any(str(Path(f).resolve()).startswith(prefix) for f in files):
             found.append({"project": project.get("Name"), "status": project.get("Status")})
     return found
@@ -177,7 +177,7 @@ def process_cwds(pids):
         found = {}
         for pid in pids:
             try:
-                found[pid] = os.readlink("/proc/%d/cwd" % pid)
+                found[pid] = str(Path("/proc/%d/cwd" % pid).readlink())
             except OSError:
                 continue
         return found
@@ -250,6 +250,7 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
         relation = pr_head_relation(worktree, head, merged_head, head_ahead_of_pr) if merged_head else None
         # Do not let an equivalent patch hide work committed after the PR head.
         if relation == "ahead":
+            assert merged_head is not None
             blockers.append("HEAD %s is ahead of merged PR head %s" % (head[:8], merged_head[:8]))
         elif relation != "contained":
             # A commit rebased before its PR merged has its patch in base under another hash.
@@ -257,8 +258,10 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
             if merged_by_patch:
                 pass
             elif relation == "diverged":
+                assert merged_head is not None
                 blockers.append("HEAD %s diverged from merged PR head %s" % (head[:8], merged_head[:8]))
             elif relation == "unknown":
+                assert merged_head is not None
                 blockers.append("HEAD %s cannot be compared with merged PR head %s" % (head[:8], merged_head[:8]))
             elif base is None:
                 blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
@@ -450,8 +453,9 @@ def main(argv=None):
         notes.append("For a merged PR, confirm its head on a host with gh and pass --pr-head <sha>")
     if any("cannot be compared" in blocker for blocker in result["blockers"]):
         notes.append("PR head object is absent locally; compare <pr-head>...<HEAD> with gh on another host and pass its ahead_by as --head-ahead-of-pr <number>")
-    if not args.base and not by_pr and (pr or {}).get("baseRefName"):
-        notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr["baseRefName"]))
+    pr_base_name = (pr or {}).get("baseRefName")
+    if not args.base and not by_pr and pr_base_name:
+        notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr_base_name))
     if projects is None:
         notes.append("docker compose unavailable: containers not checked")
     if notes:

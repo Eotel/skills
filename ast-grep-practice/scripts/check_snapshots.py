@@ -9,12 +9,12 @@ import subprocess
 import tempfile
 
 
-def files(directory):
+def files(directory: Path) -> dict[str, bytes]:
     return {str(p.relative_to(directory)): p.read_bytes()
             for p in directory.rglob("*.yml") if p.is_file()}
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("presets", nargs="+", type=Path,
                         help="Bundled preset directories containing rules/ and rule-tests/.")

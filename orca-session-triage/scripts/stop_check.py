@@ -97,11 +97,13 @@ def watched(session, transcript):
     state = read_json(state_file)
     if not isinstance(state, dict) or state.get("transcript") != transcript:
         state = {}
-    offset = state.get("offset") if isinstance(state.get("offset"), int) else 0
-    kept = state.get("watched") if isinstance(state.get("watched"), list) else []
+    stored_offset = state.get("offset")
+    offset = stored_offset if isinstance(stored_offset, int) else 0
+    stored_watched = state.get("watched")
+    kept = stored_watched if isinstance(stored_watched, list) else []
     urls = dict.fromkeys(url for url in kept if isinstance(url, str))
     try:
-        with open(transcript, "rb") as lines:
+        with Path(transcript).open("rb") as lines:
             if os.fstat(lines.fileno()).st_size < offset:
                 offset, urls = 0, {}
             lines.seek(offset)
@@ -205,7 +207,7 @@ def main():
         hook_input = json.load(sys.stdin)
     except ValueError:
         return 0
-    decision = decide(hook_input, os.path.expanduser(STATE_DIR), os.environ.get("ORCA_CLI_COMMAND", "orca"))
+    decision = decide(hook_input, str(Path(STATE_DIR).expanduser()), os.environ.get("ORCA_CLI_COMMAND", "orca"))
     if decision:
         json.dump(decision, sys.stdout)
     else:

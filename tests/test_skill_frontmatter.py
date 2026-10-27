@@ -18,7 +18,7 @@ CLAUDE_CODE_KEYS = {"when_to_use", "argument-hint", "arguments", "disable-model-
                     "shell"}
 
 
-def frontmatter_keys(text):
+def frontmatter_keys(text: str) -> list[str] | None:
     """Top-level keys of a SKILL.md's leading `---` block, or None without one."""
     match = re.match(r"---\n(.*?)\n---\n", text, re.S)
     if not match:
@@ -26,17 +26,17 @@ def frontmatter_keys(text):
     return re.findall(r"^([A-Za-z_][\w-]*):", match.group(1), re.M)
 
 
-def unknown_keys(text):
+def unknown_keys(text: str) -> list[str]:
     return [key for key in frontmatter_keys(text) or [] if key not in AGENT_SKILLS_KEYS | CLAUDE_CODE_KEYS]
 
 
 class FrontmatterTests(unittest.TestCase):
-    def test_flags_a_key_nothing_reads(self):
+    def test_flags_a_key_nothing_reads(self) -> None:
         text = "---\nname: x\ndescription: y\ncontext: fork\nmodle: sonnet\nhooks:\n  Stop: []\n---\n\nbody\n"
         self.assertEqual(frontmatter_keys(text), ["name", "description", "context", "modle", "hooks"])
         self.assertEqual(unknown_keys(text), ["modle"])
 
-    def test_every_skill_uses_known_keys(self):
+    def test_every_skill_uses_known_keys(self) -> None:
         skills = sorted(ROOT.glob("*/SKILL.md"))
         self.assertTrue(skills)
         for skill in skills:

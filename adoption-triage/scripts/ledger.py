@@ -327,7 +327,7 @@ def replace_import(imports, name, temporary_path, allow_reorder=False):
                 raise ValueError(f"remote ledger is not append-only: {name}")
         elif rows[:len(previous)] != previous:
             raise ValueError(f"remote ledger is not append-only: {name}")
-        os.replace(temporary_path, path)
+        temporary_path.replace(path)
     finally:
         os.close(lock_fd)
     return rows

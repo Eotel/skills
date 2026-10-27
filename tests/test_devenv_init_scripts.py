@@ -25,7 +25,7 @@ cp "$TEMPLATE_DIR/devenv.nix" devenv.nix
 
 
 class DevenvInitScriptsTests(unittest.TestCase):
-    def run_scaffold(self, *args):
+    def run_scaffold(self, *args: str) -> tuple[subprocess.CompletedProcess[str], str | None]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             bin_dir = tmp / "bin"
@@ -50,13 +50,14 @@ class DevenvInitScriptsTests(unittest.TestCase):
             devenv_nix = project / "devenv.nix"
             return result, devenv_nix.read_text() if devenv_nix.exists() else None
 
-    def test_python_option_selects_the_nixpkgs_interpreter(self):
+    def test_python_option_selects_the_nixpkgs_interpreter(self) -> None:
         result, devenv_nix = self.run_scaffold("--lang", "python", "--python", "3.13")
         self.assertEqual(result.returncode, 0, result.stderr)
+        assert devenv_nix is not None
         self.assertIn("package = pkgs.python313;", devenv_nix)
         self.assertNotIn("python312", devenv_nix)
 
-    def test_rejects_python_missing_from_nixpkgs(self):
+    def test_rejects_python_missing_from_nixpkgs(self) -> None:
         result, devenv_nix = self.run_scaffold("--lang", "python", "--python", "3.10")
         self.assertEqual(result.returncode, 2)
         self.assertIn("--python must be one of", result.stderr)
