@@ -1120,9 +1120,19 @@ def expand_roots(patterns):
     roots = []
     for pattern in patterns:
         expanded = Path(pattern).expanduser()
+        if not any(char in str(expanded) for char in "*?["):
+            if expanded.is_dir():
+                roots.append(str(expanded))
+            continue
         base = Path(expanded.anchor) if expanded.is_absolute() else Path()
         relative_pattern = str(expanded.relative_to(base)) if expanded.is_absolute() else str(expanded)
-        roots.extend(str(path) for path in base.glob(relative_pattern) if path.is_dir())
+        # glob.glob() was non-recursive and skipped hidden names for '*' parts.
+        glob_pattern = re.sub(r"\*+", "*", relative_pattern)
+        pattern_parts = Path(glob_pattern).parts
+        roots.extend(str(path) for path in base.glob(glob_pattern)
+                     if path.is_dir() and all(
+                         not part.startswith(".") or expected.startswith(".")
+                         for part, expected in zip(path.relative_to(base).parts, pattern_parts)))
     return roots
 
 

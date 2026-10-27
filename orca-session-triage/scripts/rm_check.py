@@ -44,7 +44,8 @@ def is_regenerable(relpath):
 
 def same_tree(left, right):
     if left.is_symlink() or right.is_symlink():
-        return left.is_symlink() and right.is_symlink() and left.readlink() == right.readlink()
+        # Path.readlink() normalizes trailing slashes and '/.' in a link target.
+        return left.is_symlink() and right.is_symlink() and os.readlink(left) == os.readlink(right)  # noqa: PTH115
     if left.is_file():
         return right.is_file() and filecmp.cmp(left, right, shallow=False)
     if not (left.is_dir() and right.is_dir()):

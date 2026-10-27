@@ -1191,7 +1191,9 @@ class ScanCommandTests(unittest.TestCase):
     def test_expand_roots_accepts_absolute_patterns_with_spaces(self):
         accounts = self.dir / "Application Support" / "accounts"
         (accounts / "first" / "sessions").mkdir(parents=True)
+        (accounts / "first" / "nested" / "sessions").mkdir(parents=True)
         (accounts / "second" / "sessions").mkdir(parents=True)
+        (accounts / ".hidden" / "sessions").mkdir(parents=True)
         (accounts / "third").mkdir()
         (accounts / "third" / "sessions").write_text("not a directory")
         pattern = str(accounts / "*" / "sessions")
@@ -1200,6 +1202,11 @@ class ScanCommandTests(unittest.TestCase):
             str(accounts / "first" / "sessions"),
             str(accounts / "second" / "sessions"),
         ]))
+        self.assertEqual(sorted(scan.expand_roots([str(accounts / "**" / "sessions")])),
+                         sorted(scan.expand_roots([pattern])))
+
+    def test_expand_roots_accepts_literal_current_and_absolute_roots(self):
+        self.assertEqual(scan.expand_roots([".", "./", "/"]), [".", ".", "/"])
 
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
         local = {"worktrees": [worktree("/local/w", "done")],
@@ -1729,6 +1736,14 @@ class RmCheckTests(unittest.TestCase):
         result = self.check()
 
         self.assertEqual(result["review"], ["uploads (differs from main checkout)"])
+
+    def test_same_tree_compares_raw_symlink_targets(self):
+        left = self.wt / "link"
+        right = self.main / "link"
+        left.symlink_to("file/")
+        right.symlink_to("file")
+
+        self.assertFalse(rmcheck.same_tree(left, right))
 
     def test_compose_placeholder_entries_never_match_the_worktree(self):
         projects = [{"Name": "elsewhere", "Status": "running(1)", "ConfigFiles": "/other/compose.yaml,-"}]
