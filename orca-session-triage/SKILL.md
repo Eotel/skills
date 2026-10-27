@@ -114,6 +114,8 @@ permitted cleanup, and any handoff in `references/hourly.md`.
     wakes it to continue its own work.
   - A task the user approved as the follow-up of another lane's result ("when
     A settles it, give B the task") goes to B once A reports it.
+  - A lane confirmation in the user's standing approvals is answered once it
+    has waited for the lead, as `references/hourly.md` describes.
 - Relay answers verbatim; the session answers the user's follow-up questions.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other
