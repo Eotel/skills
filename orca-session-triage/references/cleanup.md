@@ -46,7 +46,9 @@ Run these per worktree, in order.
      `src/paraglide/`, `e2e/screenshots/`, `e2e/.state/`, `e2e/.auth/`): a setup
      or a test run writes them again, so they do not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
-     example and fresh ports rebuild.
+     example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
+     at the worktree root: its random installation identity binds only that
+     checkout, and the next install writes a new one.
    - `containers` lists docker compose projects defined inside the worktree.
    - `processes` lists commands or current directories using the path. Each
      says whether it runs in an Orca tab (`in_orca_tab`), the tab's `handle`

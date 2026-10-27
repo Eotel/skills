@@ -1727,6 +1727,18 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/web/src/api/__generated__/", "e2e/.auth/",
                                                         "e2e/.state/", "e2e/screenshots/", "src/paraglide/"])
 
+    def test_the_apm_installation_identity_does_not_hold_up_removal(self):
+        # APM 0.35 writes these into each checkout it installs to, ignoring them with their own .gitignore.
+        (self.wt / ".apm-local").mkdir()
+        (self.wt / ".apm-local" / ".gitignore").write_text("*\n")
+        (self.wt / ".apm-local" / "installation").write_text("0123456789abcdef0123456789abcdef\n")
+
+        result = self.check()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["review"], sorted(result["regenerable"])),
+                         ([], [".apm-local/.gitignore", ".apm-local/installation"]))
+
     def test_unmerged_commit_blocks_unless_it_is_the_pr_head(self):
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")

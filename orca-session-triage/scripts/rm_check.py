@@ -20,8 +20,10 @@ CACHE_PARTS = {
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
+# APM 0.35 binds each checkout it installs to with a random .apm-local/installation and
+# writes a new one on the next install, so a removed checkout's identity binds nothing.
 REGENERABLE_PARTS = {"__generated__"}
-REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/")
+REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/")
 # A per-worktree .env may move these away from its .env.example and still be written again.
 ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
 ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
