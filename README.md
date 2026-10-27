@@ -39,6 +39,14 @@ Authoring rules, script and test conventions, and validation commands live in
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
 - `natural-japanese`: review and revise human-facing Japanese word choices;
   flag expressions for contextual review with a Python scanner.
+- `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
+  This is the MIT-licensed `nanaism/yomiyasu` v2.4.0 skill at commit
+  `ae258d7a57b335673e30b88a018ae08d4f72c449`. Its 42 files match that
+  tag byte for byte. The `.codex-plugin/plugin.json` metadata is omitted because
+  APM 0.35.0 treats it as a native Codex plugin and refuses the shared
+  `agent-skills` target. `yomiyasu_check.py` stores copies of the original and
+  final text in `.yomiyasu/` by default, with private file permissions and a
+  local `.gitignore`.
 - `orca-session-triage`: sweep Orca agent sessions for finished or stalled
   worktrees, waiting questions, and agents that never got a task; batch the
   answers and next steps, clear the done cards, and close the finished tabs
