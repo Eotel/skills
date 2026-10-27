@@ -56,3 +56,10 @@
   `orca terminal send --terminal <handle> --text $'\e[B' --json` (↓; `\e[A` is
   ↑), read the screen to confirm the highlighted option, then send a bare
   `--enter`. The transcript then records the chosen answer.
+- Before passing an unnamed screenshot or question to a lane, find where it
+  comes from: search its fixed text in the candidate repositories and read the
+  other triage tabs' latest output. If the source is still unclear, ask the user
+  which system it is.
+- Before writing a brief or an AGENTS.md for a lane, read `codex-prompting`,
+  `agentic-docs`, and `writing-for-agents`; before running several lanes in one
+  repository, read `worker-contract`.
