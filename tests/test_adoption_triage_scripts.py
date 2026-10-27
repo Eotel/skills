@@ -180,6 +180,96 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(json.loads(view.stdout)["items"][0]["status"], "adopted")
         self.assertEqual(len(json.loads(view.stdout)["items"][0]["executions"]), 1)
 
+    def consolidation(self, relation: str, targets: list[str]) -> subprocess.CompletedProcess[str]:
+        return self.run_ledger(["propose"], {
+            "source": {"session": "adoption-consolidate", "worktree": "adoption-consolidate"},
+            "fact": "同じ話題の案が別々に届いた", "proposal": "検査の option にまとめる",
+            "reason": "道具で守らせる", "recommendation": "adopt", "priority": "normal",
+            "evidence": ["ledger.py:1"], relation: targets})
+
+    def test_consolidation_links_merged_and_retired_proposals(self) -> None:
+        first, second, stale = self.proposal(), self.proposal(), self.proposal()
+        merged = self.consolidation("merges", [first, second])
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        retired = self.consolidation("retires", [stale])
+        self.assertEqual(retired.returncode, 0, retired.stderr)
+        items = {item["proposal_id"]: item for item in
+                 json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]}
+        merged_id = json.loads(merged.stdout)["proposal_id"]
+        retired_id = json.loads(retired.stdout)["proposal_id"]
+        self.assertEqual(items[merged_id]["merges"], [first, second])
+        self.assertEqual(items[retired_id]["retires"], [stale])
+        self.assertEqual(items[first]["merged_into"], [merged_id])
+        self.assertEqual(items[second]["merged_into"], [merged_id])
+        self.assertEqual(items[stale]["retired_by"], [retired_id])
+        self.assertEqual(items[stale]["merged_into"], [])
+
+    def test_consolidation_needs_open_targets_not_already_consolidated(self) -> None:
+        target, closed = self.proposal(), self.proposal()
+        self.run_ledger(["decide"], {"proposal_id": closed, "decision": "reject", "actor": "Eotel"})
+        first = self.consolidation("merges", [target])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["proposal_id"]
+        candidates = json.loads(self.run_ledger(["list", "--json", "--candidates"]).stdout)["items"]
+        self.assertEqual([item["proposal_id"] for item in candidates], [first_id])
+        lines = len(self.events.read_text().splitlines())
+        for relation, targets in (("retires", [target]), ("merges", [closed]),
+                                  ("merges", [str(uuid.uuid4())])):
+            with self.subTest(relation=relation, targets=targets):
+                result = self.consolidation(relation, targets)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.events.read_text().splitlines()), lines)
+        self.run_ledger(["decide"], {"proposal_id": first_id, "decision": "reject", "actor": "Eotel"})
+        candidates = json.loads(self.run_ledger(["list", "--json", "--candidates"]).stdout)["items"]
+        self.assertEqual([item["proposal_id"] for item in candidates], [target])
+        again = self.consolidation("retires", [target])
+        self.assertEqual(again.returncode, 0, again.stderr)
+        lines = len(self.events.read_text().splitlines())
+        for decision in ("adopt", "hold"):
+            with self.subTest(reactivated=decision):
+                result = self.run_ledger(["decide"], {"proposal_id": first_id, "decision": decision,
+                                                      "actor": "Eotel"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.events.read_text().splitlines()), lines)
+
+    def test_adopting_a_consolidation_closes_its_open_targets(self) -> None:
+        pending, held, adopted, stale = (self.proposal() for _ in range(4))
+        for target, decision in ((held, "hold"), (adopted, "adopt")):
+            self.run_ledger(["decide"], {"proposal_id": target, "decision": decision, "actor": "Eotel"})
+        merged = json.loads(self.consolidation("merges", [pending, held, adopted]).stdout)["proposal_id"]
+        retired = json.loads(self.consolidation("retires", [stale]).stdout)["proposal_id"]
+
+        def statuses() -> dict[str, str]:
+            return {item["proposal_id"]: item["status"]
+                    for item in json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]}
+
+        for owner, decision in ((merged, "hold"), (retired, "reject")):
+            self.run_ledger(["decide"], {"proposal_id": owner, "decision": decision, "actor": "Eotel"})
+        self.assertEqual([statuses()[key] for key in (pending, held, adopted, stale)],
+                         ["pending", "held", "adopted", "pending"])
+        result = self.run_ledger(["decide"], {"proposal_id": merged, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({row["proposal_id"]: row["decision"] for row in json.loads(result.stdout)["closed"]},
+                         {pending: "reject", held: "reject", adopted: "revoke"})
+        self.run_ledger(["decide"], {"proposal_id": retired, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual([statuses()[key] for key in (pending, held, adopted, stale)],
+                         ["rejected", "rejected", "revoked", "rejected"])
+        items = {item["proposal_id"]: item for item in
+                 json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]}
+        self.assertTrue(items[pending]["decisions"][-1]["reason"].startswith("統合先"))
+        self.assertTrue(items[stale]["decisions"][-1]["reason"].startswith("取り下げの提案"))
+        reopened = self.run_ledger(["decide"], {"proposal_id": pending, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+
+    def test_adopting_a_later_consolidation_closes_the_earlier_ones_targets(self) -> None:
+        original = self.proposal()
+        first = json.loads(self.consolidation("merges", [original]).stdout)["proposal_id"]
+        second = json.loads(self.consolidation("merges", [first]).stdout)["proposal_id"]
+        result = self.run_ledger(["decide"], {"proposal_id": second, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual({row["proposal_id"] for row in json.loads(result.stdout)["closed"]}, {first, original})
+        candidates = json.loads(self.run_ledger(["list", "--json", "--candidates"]).stdout)["items"]
+        self.assertNotIn(original, [item["proposal_id"] for item in candidates])
+
     def test_empty_proposal_id_does_not_append(self):
         result = self.run_ledger(["propose"], {
             "proposal_id": "", "source": {"session": "triage", "worktree": "triage"},
