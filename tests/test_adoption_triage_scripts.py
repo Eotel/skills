@@ -232,6 +232,35 @@ class AdoptionLedgerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(len(self.events.read_text().splitlines()), lines)
 
+    def test_adopting_a_consolidation_closes_its_open_targets(self) -> None:
+        pending, held, adopted, stale = (self.proposal() for _ in range(4))
+        for target, decision in ((held, "hold"), (adopted, "adopt")):
+            self.run_ledger(["decide"], {"proposal_id": target, "decision": decision, "actor": "Eotel"})
+        merged = json.loads(self.consolidation("merges", [pending, held, adopted]).stdout)["proposal_id"]
+        retired = json.loads(self.consolidation("retires", [stale]).stdout)["proposal_id"]
+
+        def statuses() -> dict[str, str]:
+            return {item["proposal_id"]: item["status"]
+                    for item in json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]}
+
+        for owner, decision in ((merged, "hold"), (retired, "reject")):
+            self.run_ledger(["decide"], {"proposal_id": owner, "decision": decision, "actor": "Eotel"})
+        self.assertEqual([statuses()[key] for key in (pending, held, adopted, stale)],
+                         ["pending", "held", "adopted", "pending"])
+        result = self.run_ledger(["decide"], {"proposal_id": merged, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({row["proposal_id"]: row["decision"] for row in json.loads(result.stdout)["closed"]},
+                         {pending: "reject", held: "reject", adopted: "revoke"})
+        self.run_ledger(["decide"], {"proposal_id": retired, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual([statuses()[key] for key in (pending, held, adopted, stale)],
+                         ["rejected", "rejected", "revoked", "rejected"])
+        items = {item["proposal_id"]: item for item in
+                 json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]}
+        self.assertTrue(items[pending]["decisions"][-1]["reason"].startswith("統合先"))
+        self.assertTrue(items[stale]["decisions"][-1]["reason"].startswith("取り下げの提案"))
+        reopened = self.run_ledger(["decide"], {"proposal_id": pending, "decision": "adopt", "actor": "Eotel"})
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+
     def test_empty_proposal_id_does_not_append(self):
         result = self.run_ledger(["propose"], {
             "proposal_id": "", "source": {"session": "triage", "worktree": "triage"},

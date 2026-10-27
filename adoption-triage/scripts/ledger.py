@@ -206,6 +206,24 @@ def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
     return f"is already in open proposal {owner}" if owner else None
 
 
+def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
+    """Decisions that close the open targets of an adopted consolidation; re-adopting a target reopens it."""
+    rows = []
+    for relation, label in (("merges", "統合先"), ("retires", "取り下げの提案")):
+        for target_id in owner[relation]:
+            target = known[target_id]
+            if target["status"] in {"pending", "held"}:
+                decision = "reject"
+            elif target["status"] == "adopted" and not target["implemented_at"]:
+                decision = "revoke"
+            else:
+                continue
+            rows.append({**envelope("decision", target_id), "decision": decision, "actor": actor,
+                         "reason": f"{label}「{owner['proposal']}」を採用",
+                         "after_id": target["latest_event_id"]})
+    return rows
+
+
 def envelope(kind, proposal_id):
     return {"id": str(uuid.uuid4()), "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "host": socket.gethostname(), "type": kind, "proposal_id": proposal_id}
@@ -357,13 +375,17 @@ def append(events, imports, row):
                 raise ValueError(f"proposal not found: {proposal_id}")
         if row["type"] != "proposal":
             row["after_id"] = known[proposal_id]["latest_event_id"]
-        data = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        adopted = row["type"] == "decision" and row["decision"] == "adopt"
+        closed = closing_decisions(known[proposal_id], known, row["actor"]) if adopted else []
+        # One write keeps the adoption and the targets it closes together.
+        data = b"".join((json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+                        for event in (row, *closed))
         if os.write(fd, data) != len(data):
             raise OSError("partial event write")
         os.fsync(fd)
     finally:
         os.close(fd)
-    return row
+    return {**row, "closed": closed} if adopted else row
 
 
 def replace_import(imports, name, temporary_path, allow_reorder=False):

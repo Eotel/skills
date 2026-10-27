@@ -32,6 +32,8 @@
 
 文の案は、[policy.md](policy.md)「案の形」に従い、道具の引数・既定値・検査・出力で守らせる案にまとめ直す。新しい案の `target` はその形に合わせる。Eotel/skills の script を直す案は `triage-retro:skill:<skill>:script`、直せない外の道具は `triage-retro:skill:<skill>:upstream`、skill の外（`~/.cache/orca-briefs/bin`・orca-board など）は repository とファイルを書いた文にする。`priority` は元の案のうち最も高いものにする。
 
+三浦さんがまとめた案・取り下げの案を採用すると、台帳が元の案を同じ操作で閉じる。まとめた案には、元の案から残すべき事実・根拠・対象をすべて入れる。
+
 台帳は、`merges`・`retires` の先が候補でないとき書き込みを断る。断られたら `list --json --candidates` で状態を読み直す。
 
 ## 終わり
