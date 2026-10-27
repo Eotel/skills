@@ -180,14 +180,14 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(json.loads(view.stdout)["items"][0]["status"], "adopted")
         self.assertEqual(len(json.loads(view.stdout)["items"][0]["executions"]), 1)
 
-    def consolidation(self, relation, targets):
+    def consolidation(self, relation: str, targets: list[str]) -> subprocess.CompletedProcess[str]:
         return self.run_ledger(["propose"], {
             "source": {"session": "adoption-consolidate", "worktree": "adoption-consolidate"},
             "fact": "同じ話題の案が別々に届いた", "proposal": "検査の option にまとめる",
             "reason": "道具で守らせる", "recommendation": "adopt", "priority": "normal",
             "evidence": ["ledger.py:1"], relation: targets})
 
-    def test_consolidation_links_merged_and_retired_proposals(self):
+    def test_consolidation_links_merged_and_retired_proposals(self) -> None:
         first, second, stale = self.proposal(), self.proposal(), self.proposal()
         merged = self.consolidation("merges", [first, second])
         self.assertEqual(merged.returncode, 0, merged.stderr)
@@ -204,7 +204,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(items[stale]["retired_by"], [retired_id])
         self.assertEqual(items[stale]["merged_into"], [])
 
-    def test_consolidation_needs_open_targets_not_already_consolidated(self):
+    def test_consolidation_needs_open_targets_not_already_consolidated(self) -> None:
         target, closed = self.proposal(), self.proposal()
         self.run_ledger(["decide"], {"proposal_id": closed, "decision": "reject", "actor": "Eotel"})
         first = self.consolidation("merges", [target])
@@ -224,6 +224,13 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual([item["proposal_id"] for item in candidates], [target])
         again = self.consolidation("retires", [target])
         self.assertEqual(again.returncode, 0, again.stderr)
+        lines = len(self.events.read_text().splitlines())
+        for decision in ("adopt", "hold"):
+            with self.subTest(reactivated=decision):
+                result = self.run_ledger(["decide"], {"proposal_id": first_id, "decision": decision,
+                                                      "actor": "Eotel"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.events.read_text().splitlines()), lines)
 
     def test_empty_proposal_id_does_not_append(self):
         result = self.run_ledger(["propose"], {

@@ -192,12 +192,17 @@ def project(rows):
         -timestamp(item["ts"]).timestamp()))
 
 
-def consolidation_blocker(item, known):
+def active_owner(item: dict, known: dict[str, dict], besides: str | None = None) -> str | None:
+    """The undecided or adopted proposal, other than `besides`, that already merges or retires the item."""
+    return next((owner for owner in (*item["merged_into"], *item["retired_by"])
+                 if owner != besides and known[owner]["status"] in {"pending", "held", "adopted"}), None)
+
+
+def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
     """Why a proposal cannot be merged or retired now; None when it is a consolidation candidate."""
     if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"]:
         return "is not open"
-    owner = next((owner for owner in (*item["merged_into"], *item["retired_by"])
-                  if known[owner]["status"] in {"pending", "held", "adopted"}), None)
+    owner = active_owner(item, known)
     return f"is already in open proposal {owner}" if owner else None
 
 
@@ -328,6 +333,13 @@ def append(events, imports, row):
                 raise ValueError("only adopted proposals can be revoked")
             if previous == "adopted" and decision in {"adopt", "reject", "hold"}:
                 raise ValueError("revoke adoption before another decision")
+            if decision in {"adopt", "hold"}:
+                # A rejected consolidation may come back only while no other one has taken its targets.
+                for relation in RELATIONS:
+                    for target_id in known[proposal_id][relation]:
+                        owner = active_owner(known[target_id], known, besides=proposal_id)
+                        if owner:
+                            raise ValueError(f"{relation} target is already in open proposal {owner}: {target_id}")
         elif row["type"] == "execution":
             item = known.get(proposal_id)
             if item is None:
