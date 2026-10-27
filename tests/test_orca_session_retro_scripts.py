@@ -65,8 +65,9 @@ class FakeLedger:
     def decide(self, body):
         item = self.items[body["proposal_id"]]
         item["decisions"].append({**body, "id": str(uuid.uuid4()), "ts": retro.now()})
-        item["status"] = {"adopt": "adopted", "revoke": "revoked"}[body["decision"]]
-        item["adopted_at" if body["decision"] == "adopt" else "revoked_at"] = retro.now()
+        item["status"] = {"adopt": "adopted", "reject": "rejected", "hold": "held",
+                          "revoke": "revoked"}[body["decision"]]
+        item[item["status"] + "_at"] = retro.now()
 
     def record(self, body):
         item = self.items[body["proposal_id"]]
@@ -546,6 +547,87 @@ class RetroTests(unittest.TestCase):
                 self.assertIn("empty", retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger))
                 fork.assert_not_called()
         self.assertEqual(len(ledger.items), 1)
+
+    def test_adoption_comment_rewrites_the_note_before_it_is_written(self) -> None:
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
+                        "fact": "Tool.py failed, then returned JSON.",
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel",
+                       "reason": "コマンドの形で書いて"})
+        rewritten = "`python3 tool.py --json` は JSON を返す。"
+        data = retro.load(self.state)
+        with mock.patch.object(retro, "run_claude", return_value={"note": rewritten}) as claude:
+            self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        self.assertIn("コマンドの形で書いて", claude.call_args.args[0])
+        facts = retro.facts_path(self.target)
+        self.assertIn(rewritten, facts.read_text())
+        self.assertNotIn("Tool.py returns JSON.", facts.read_text())
+        self.assertIn(rewritten, ledger.items[proposal_id]["executions"][-1]["result"])
+        ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "Eotel"})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        self.assertFalse(facts.exists())
+
+    def test_rejection_comment_reaches_the_next_retrospective(self) -> None:
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "作業場は毎回作り直す。",
+                        "target": "triage-retro:skill:orca-session-triage:procedure"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "reject", "actor": "Eotel",
+                       "reason": "作り直すと担当の履歴が消える"})
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+        prompts = []
+
+        def fork(prompt: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            prompts.append(prompt)
+            return {"proposals": []}
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "fork_target", return_value=retro.ForkTarget(
+                    self.sid, self.home, "claude-opus-5-5", 0.0)):
+                with mock.patch.object(retro, "run_claude", side_effect=fork):
+                    retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
+        self.assertIn("作業場は毎回作り直す。", prompts[0])
+        self.assertIn("作り直すと担当の履歴が消える", prompts[0])
+
+    def test_deployed_skill_copy_is_written_at_its_apm_source(self) -> None:
+        checkouts = self.home / "ghq/github.com"
+        source = checkouts / "team/skills/skills/shared/SKILL.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# Shared\n")
+        copy = checkouts / "example/app/.claude/skills/shared/SKILL.md"
+        copy.parent.mkdir(parents=True)
+        copy.write_text("# Shared\n")
+        lock = ("dependencies:\n- repo_url: team/skills\n  host: github.com\n"
+                "  virtual_path: skills/shared\n  deployed_files:\n  - {path}\n  - {path}/SKILL.md\n"
+                "deployments:\n- kind: project-relative\n  value: {path}\n")
+        (copy.parents[3] / "apm.lock.yaml").write_text(lock.format(path=".claude/skills/shared"))
+        (self.home / ".apm").mkdir()
+        (self.home / ".apm/apm.lock.yaml").write_text(lock.format(path=".agents/skills/shared"))
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            self.assertEqual(retro.skill_target("example/app/shared", self.root), source)
+            self.assertEqual(retro.skill_target("team/skills/shared", self.root), source)
+
+    def test_adoption_the_worker_cannot_write_notifies_once(self) -> None:
+        log = self.home / "notify.log"
+        notifier = self.home / "triage-notify"
+        notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        notifier.chmod(0o755)
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
+                        "target": "triage-retro:skill:example/app/missing:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        data = retro.load(self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "NOTIFY", notifier):
+                for _ in range(4):
+                    retro.sync_decisions(ledger, data, self.root, self.state)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertIn(proposal_id, log.read_text())
+        self.assertIn("example/app/missing", log.read_text())
+        self.assertIn("target skill is missing", log.read_text())
 
     def test_service_does_not_embed_the_claude_profile(self) -> None:
         with mock.patch.dict(retro_service.os.environ, {"CLAUDE_CONFIG_DIR": "/profiles/a/home"}):
