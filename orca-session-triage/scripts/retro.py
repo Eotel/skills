@@ -1065,34 +1065,44 @@ def note_ids(lines: Sequence[str]) -> set[str]:
     return {line[line.index(MARKER):] for line in lines if MARKER in line}
 
 
-def onto_main(repo: Path, name: str, local: bytes | None) -> bytes | None:
-    """Replay the worker's edits to ``name`` on origin/main; None deletes the file.
-
-    The worker only adds or removes marked note lines and the router pointer, so replaying those edits
-    keeps whatever main gained meanwhile, even at the same end of the file.
-    """
+def replay_facts(repo: Path, name: str, local: bytes | None) -> bytes | None:
+    """The worker's added and removed note lines in ``name`` replayed on origin/main; None when no note is left."""
     base = (blob(repo, "HEAD", name) or b"").decode("utf-8").splitlines(keepends=True)
-    upstream_blob = blob(repo, "origin/main", name)
-    upstream = (upstream_blob or b"").decode("utf-8")
+    upstream = (blob(repo, "origin/main", name) or b"").decode("utf-8")
     mine = (local or b"").decode("utf-8").splitlines(keepends=True)
-    if name.endswith(f"references/{FACTS_NAME}"):
-        removed = note_ids(base) - note_ids(mine)
-        kept = [line for line in (upstream or FACTS_HEADER).splitlines(keepends=True)
-                if MARKER not in line or line[line.index(MARKER):] not in removed]
-        added = [line for line in mine if MARKER in line and line not in base
-                 and line[line.index(MARKER):] not in note_ids(kept)]
-        result = "".join(kept) + ("" if not added or "".join(kept).endswith("\n") else "\n") + "".join(added)
-        return None if not note_ids(result.splitlines(keepends=True)) else result.encode("utf-8")
-    if name.endswith("SKILL.md") and upstream_blob is not None:
-        had, has = ROUTER_SECTION in "".join(base), ROUTER_SECTION in "".join(mine)
-        if has and not had and ROUTER_SECTION not in upstream:
-            return (upstream + ("" if upstream.endswith("\n") else "\n") + ROUTER_SECTION).encode("utf-8")
-        if had and not has:
-            return upstream.replace(ROUTER_SECTION, "", 1).encode("utf-8")
-        return upstream_blob
-    if upstream_blob == blob(repo, "HEAD", name):
-        return local
-    raise RuntimeError(f"{name} changed in main and here; a person must merge it")
+    removed = note_ids(base) - note_ids(mine)
+    kept = [line for line in (upstream or FACTS_HEADER).splitlines(keepends=True)
+            if MARKER not in line or line[line.index(MARKER):] not in removed]
+    added = [line for line in mine if MARKER in line and line not in base and line[line.index(MARKER):] not in note_ids(kept)]
+    result = "".join(kept) + ("" if not added or "".join(kept).endswith("\n") else "\n") + "".join(added)
+    return result.encode("utf-8") if note_ids(result.splitlines(keepends=True)) else None
+
+
+def replay(repo: Path, names: Sequence[str]) -> dict[str, bytes | None]:
+    """The worker's edits to ``names`` replayed on origin/main; None deletes a file.
+
+    The worker only adds or removes marked note lines and router pointers, so replaying them keeps whatever
+    main gained meanwhile. A router points to its facts exactly when the replayed facts still hold a note.
+    """
+    local = {name: (repo / name).read_bytes() if (repo / name).is_file() else None for name in names}
+    facts = {name: replay_facts(repo, name, local[name]) for name in names if name.endswith(f"references/{FACTS_NAME}")}
+
+    def router(name: str) -> bytes | None:
+        upstream = blob(repo, "origin/main", name)
+        if not name.endswith("SKILL.md") or upstream is None:
+            if upstream == blob(repo, "HEAD", name):
+                return local[name]
+            raise RuntimeError(f"{name} changed in main and here; a person must merge it")
+        reference = str(Path(name).parent / "references" / FACTS_NAME)
+        notes = facts[reference] if reference in facts else blob(repo, "origin/main", reference)
+        wanted = bool(notes and note_ids(notes.decode("utf-8").splitlines(keepends=True)))
+        text = upstream.decode("utf-8")
+        if wanted and ROUTER_SECTION not in text:
+            return (text + ("" if text.endswith("\n") else "\n") + ROUTER_SECTION).encode("utf-8")
+        if not wanted and ROUTER_SECTION in text:
+            return text.replace(ROUTER_SECTION, "", 1).encode("utf-8")
+        return upstream
+    return facts | {name: router(name) for name in names if name not in facts}
 
 
 class WorkerFiles(NamedTuple):
@@ -1132,26 +1142,39 @@ def settle(repo: Path, changed: Sequence[Path], data: dict[str, Any]) -> str:
     return "publish: settled after the merge"
 
 
+def open_pull_requests(repo: Path) -> list[dict[str, Any]]:
+    listed = subprocess.run(["gh", "pr", "list", "--head", PUBLISH_BRANCH, "--state", "open", "--json", "number"],
+                            capture_output=True, text=True, timeout=60, cwd=repo, check=True)
+    return json.loads(listed.stdout or "[]")
+
+
 def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
     """Put the worker's notes in the source checkout on one PR branch; after the merge, return it to main."""
     repo = root.resolve()
     if git(repo, "remote", "get-url", "origin", check=False).returncode:
         return "publish: the source checkout has no origin"
     files = worker_files(data, repo)
-    held = [name for path in files.edited if (name := str(path.relative_to(repo))) in data.get("published", {})]
+    published = data.get("published") or {}
+    held = [name for path in files.edited if (name := str(path.relative_to(repo))) in published]
     if held:
         raise RuntimeError(f"published files changed after the worker wrote them: {', '.join(held)}")
-    if not files.written:
-        data.pop("published", None)
+    names = sorted({str(path.relative_to(repo)) for path in files.written} | set(published))
+    if not names:
         return "publish: nothing to publish"
     git(repo, "fetch", "--quiet", "origin")
-    names = [str(path.relative_to(repo)) for path in files.written]
-    contents = {name: onto_main(repo, name, path.read_bytes() if path.is_file() else None)
-                for name, path in zip(names, files.written)}
+    contents = replay(repo, names)
     if all(content == blob(repo, "origin/main", name) for name, content in contents.items()):
-        return settle(repo, files.written, data)
-    digests = {name: digest(path) for name, path in zip(names, files.written)}
-    if data.get("published") == digests:
+        # Main already says what the worker wants: the PR merged, or a revocation emptied it.
+        withdrawn = [pull["number"] for pull in open_pull_requests(repo)]
+        for number in withdrawn:
+            subprocess.run(["gh", "pr", "close", str(number), "--delete-branch", "--comment",
+                            "取り消しにより、main と同じ内容になったので閉じます。triage-retro worker"],
+                           capture_output=True, text=True, timeout=60, cwd=repo, check=True)
+        settled = settle(repo, files.written, data)
+        return f"publish: closed PR #{withdrawn[0]}; {settled}" if withdrawn else settled
+    digests = {name: hashlib.sha256(content).hexdigest() if content is not None else None
+               for name, content in contents.items()}
+    if published == digests:
         return "publish: the PR branch is up to date"
     with tempfile.TemporaryDirectory(prefix="triage-retro-publish-") as scratch:
         tree = Path(scratch) / "tree"
@@ -1170,16 +1193,14 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
                 "origin", f"HEAD:refs/heads/{PUBLISH_BRANCH}")
         finally:
             git(repo, "worktree", "remove", "--force", str(tree), check=False)
-    listed = subprocess.run(["gh", "pr", "list", "--head", PUBLISH_BRANCH, "--state", "open", "--json", "number"],
-                            capture_output=True, text=True, timeout=60, cwd=repo, check=True)
-    if not json.loads(listed.stdout or "[]"):
+    if not open_pull_requests(repo):
         body = ("振り返りの worker が、採用された文を skill に書いた分です。branch は worker が作り直します。\n\n"
                 + "\n".join(f"- `{name}`" for name in names) + "\n\ntriage-retro worker")
         subprocess.run(["gh", "pr", "create", "--base", "main", "--head", PUBLISH_BRANCH, "--assignee", "Eotel",
                         "--title", "docs: record adopted retrospective notes", "--body", body],
                        capture_output=True, text=True, timeout=60, cwd=repo, check=True)
     data["published"] = digests
-    return f"publish: pushed {len(files.written)} files to {PUBLISH_BRANCH}"
+    return f"publish: pushed {len(names)} files to {PUBLISH_BRANCH}"
 
 
 def publish_safely(state: Path = STATE, root: Path = SOURCE) -> str:

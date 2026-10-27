@@ -465,13 +465,30 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(retro.facts_path(self.target).exists())
         self.assertFalse((self.home / "notify.log").exists())
 
-    def test_worker_notes_are_published_on_one_branch_and_settled_after_merge(self) -> None:
+    def published_remote(self) -> tuple[Path, list[dict[str, int]], Any]:
+        """A bare origin for the skill checkout, a list of open PRs, and a run() that fakes gh over it."""
         remote = self.home / "remote.git"
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
-        git = ["git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-               "-c", "core.hooksPath=/dev/null"]
-        subprocess.run([*git, "remote", "add", "origin", str(remote)], check=True)
-        subprocess.run([*git, "push", "-q", "origin", "main"], check=True)
+        identity = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null"]
+        subprocess.run(["git", "-C", str(self.root), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "push", "-q", "origin", "main"], check=True)
+        pulls: list[dict[str, int]] = []
+        real_run = subprocess.run
+
+        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git":
+                return real_run([cmd[0], *identity, *cmd[1:]], *args, **kwargs)
+            if cmd[0] != "gh":
+                return real_run(cmd, *args, **kwargs)
+            if cmd[1:3] == ["pr", "create"]:
+                pulls.append({"number": len(pulls) + 1})
+            if cmd[1:3] == ["pr", "close"]:
+                pulls.clear()
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(pulls), "")
+        return remote, pulls, fake_run
+
+    def test_worker_notes_are_published_on_one_branch_and_settled_after_merge(self) -> None:
+        remote, pulls, fake_run = self.published_remote()
         upstream = self.home / "upstream"
         subprocess.run(["git", "clone", "-q", str(remote), str(upstream)], check=True)
         (upstream / "orca-session-triage/SKILL.md").write_text("# Triage\n\nUpstream line.\n")
@@ -483,40 +500,43 @@ class RetroTests(unittest.TestCase):
         facts = retro.adopt(note, self.root)
         retro.remember_versions(data, self.target, facts)
         other = self.root / "orca-session-triage/references/hourly.md"
-        other.parent.mkdir(parents=True, exist_ok=True)
         other.write_text("another lane's edit\n")
-        created = []
-        real_run = subprocess.run
-
-        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            if cmd[0] == "git":
-                return real_run([*cmd[:1], "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                                 "-c", "core.hooksPath=/dev/null", *cmd[1:]], *args, **kwargs)
-            if cmd[0] != "gh":
-                return real_run(cmd, *args, **kwargs)
-            if cmd[1:3] == ["pr", "create"]:
-                created.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, "[]" if cmd[1:3] == ["pr", "list"] and not created else "[{}]", "")
         with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
             self.assertIn("pushed", retro.publish(data, self.root))
             self.assertIn("up to date", retro.publish(data, self.root))
         branch = ["git", "--git-dir", str(remote)]
-        tree = real_run([*branch, "ls-tree", "-r", "--name-only", retro.PUBLISH_BRANCH],
-                        capture_output=True, text=True, check=True).stdout.split()
+        tree = subprocess.run([*branch, "ls-tree", "-r", "--name-only", retro.PUBLISH_BRANCH],
+                              capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("orca-session-triage/references/observed-triage-facts.md", tree)
         self.assertNotIn("orca-session-triage/references/hourly.md", tree)
-        router = real_run([*branch, "show", f"{retro.PUBLISH_BRANCH}:orca-session-triage/SKILL.md"],
-                          capture_output=True, text=True, check=True).stdout
+        router = subprocess.run([*branch, "show", f"{retro.PUBLISH_BRANCH}:orca-session-triage/SKILL.md"],
+                                capture_output=True, text=True, check=True).stdout
         self.assertIn("Upstream line.", router)
         self.assertIn(retro.ROUTER_SECTION, router)
-        self.assertEqual(len(created), 1)
-        real_run([*branch, "update-ref", "refs/heads/main", retro.PUBLISH_BRANCH], check=True)
+        self.assertEqual(len(pulls), 1)
+        subprocess.run([*branch, "update-ref", "refs/heads/main", retro.PUBLISH_BRANCH], check=True)
+        pulls.clear()  # merged
         with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
             self.assertIn("settled", retro.publish(data, self.root))
-        self.assertEqual(real_run(["git", "-C", str(self.root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout,
-                         real_run([*branch, "rev-parse", "main"], capture_output=True, text=True).stdout)
+        self.assertEqual(subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True).stdout,
+                         subprocess.run([*branch, "rev-parse", "main"], capture_output=True, text=True).stdout)
         self.assertIn(note["id"], facts.read_text())
         self.assertEqual(other.read_text(), "another lane's edit\n")
+
+    def test_revocation_before_the_merge_closes_the_published_pr(self) -> None:
+        _, pulls, fake_run = self.published_remote()
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        facts = retro.adopt(note, self.root)
+        retro.remember_versions(data, self.target, facts)
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("pushed", retro.publish(data, self.root))
+            retro.undo({**note, "target_path": str(facts), "router_path": str(self.target)})
+            retro.remember_versions(data, self.target, facts)
+            self.assertIn("closed PR #1", retro.publish(data, self.root))
+        self.assertEqual(pulls, [])
+        self.assertFalse(facts.exists())
 
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):
