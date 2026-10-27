@@ -23,6 +23,8 @@ DEFAULT_HOSTS = Path("~/.config/adoption-triage/hosts.json").expanduser()
 DECISIONS = {"adopt", "reject", "hold", "revoke"}
 # handed_off: the worker left an adopted change to a lane, which records applied when it ships.
 OUTCOMES = {"applied", "reverted", "failed", "handed_off"}
+# merges: this proposal combines the listed ones; retires: it withdraws the listed stale ones.
+RELATIONS = {"merges": "merged_into", "retires": "retired_by"}
 
 
 def required_text(value, name, limit=4000):
@@ -115,7 +117,15 @@ def project(rows):
                                       "implemented_at": None, "reverted_at": None,
                                       "evidence": list(row.get("evidence", [])),
                                       "supporting_events": [], "decisions": [], "executions": [],
-                                      "latest_event_id": row["id"], "current_execution": None}
+                                      "latest_event_id": row["id"], "current_execution": None,
+                                      **{relation: list(row.get(relation, [])) for relation in RELATIONS},
+                                      **{reverse: [] for reverse in RELATIONS.values()}}
+    for item in list(proposals.values()):
+        for relation, reverse in RELATIONS.items():
+            for target in item[relation]:
+                if target not in proposals:
+                    raise ValueError(f"{relation} without proposal: {target}")
+                proposals[target][reverse].append(item["proposal_id"])
     for row in rows:
         proposal_id = row["proposal_id"]
         if row["type"] == "proposal":
@@ -182,6 +192,15 @@ def project(rows):
         -timestamp(item["ts"]).timestamp()))
 
 
+def consolidation_blocker(item, known):
+    """Why a proposal cannot be merged or retired now; None when it is a consolidation candidate."""
+    if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"]:
+        return "is not open"
+    owner = next((owner for owner in (*item["merged_into"], *item["retired_by"])
+                  if known[owner]["status"] in {"pending", "held", "adopted"}), None)
+    return f"is already in open proposal {owner}" if owner else None
+
+
 def envelope(kind, proposal_id):
     return {"id": str(uuid.uuid4()), "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "host": socket.gethostname(), "type": kind, "proposal_id": proposal_id}
@@ -191,7 +210,7 @@ def validate_proposal(body):
     if not isinstance(body, dict):
         raise ValueError("proposal must be a JSON object")
     allowed = {"proposal_id", "source", "fact", "proposal", "reason", "recommendation",
-               "priority", "evidence", "target"}
+               "priority", "evidence", "target", *RELATIONS}
     if set(body) - allowed:
         raise ValueError("unknown proposal field")
     source = body.get("source")
@@ -215,6 +234,18 @@ def validate_proposal(body):
     target = optional_text(body.get("target"), "target", 500)
     row = {**body, **envelope("proposal", proposal_id), "source": source,
            "evidence": evidence, "target": target}
+    for relation in RELATIONS:
+        targets = body.get(relation)
+        if targets is None:
+            continue
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 100 or len(set(targets)) != len(targets):
+            raise ValueError(f"{relation} must be a nonempty list of distinct proposal UUIDs")
+        for value in targets:
+            if not isinstance(value, str) or value == proposal_id:
+                raise ValueError(f"{relation} must list other proposals")
+            uuid.UUID(value)
+    if set(body.get("merges", [])) & set(body.get("retires", [])):
+        raise ValueError("a proposal cannot both merge and retire the same proposal")
     return row
 
 
@@ -281,6 +312,13 @@ def append(events, imports, row):
         if row["type"] == "proposal":
             if proposal_id in known:
                 raise ValueError(f"proposal already exists: {proposal_id}")
+            for relation in RELATIONS:
+                for target_id in row.get(relation, []):
+                    if target_id not in known:
+                        raise ValueError(f"{relation} target not found: {target_id}")
+                    blocker = consolidation_blocker(known[target_id], known)
+                    if blocker:
+                        raise ValueError(f"{relation} target {blocker}: {target_id}")
         elif row["type"] == "decision":
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
@@ -454,6 +492,8 @@ def main():
     commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
     listing = commands.add_parser("list", help="read current proposals")
     listing.add_argument("--json", action="store_true")
+    listing.add_argument("--candidates", action="store_true",
+                         help="only pending, held, and unimplemented adopted proposals not already in an open consolidation")
     pulling = commands.add_parser("collect", help="copy remote Mac ledgers")
     pulling.add_argument("--config", type=Path, default=DEFAULT_HOSTS)
     incoming = commands.add_parser("receive", help="accept the configured decision writer's append-only ledger")
@@ -472,6 +512,9 @@ def main():
             print(json.dumps(append(args.events, args.imports, validate_evidence(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "list":
             items = project(all_rows(args.events, args.imports))
+            if args.candidates:
+                known = {item["proposal_id"]: item for item in items}
+                items = [item for item in items if consolidation_blocker(item, known) is None]
             if args.json:
                 print(json.dumps({"items": items}, ensure_ascii=False))
             else:
