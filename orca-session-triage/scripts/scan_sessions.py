@@ -1165,11 +1165,26 @@ def parse_args(argv=None):
                              "message without a verdict for it yet, and a stalled row whose own PR merged) to this "
                              "JSON file, for orca-row-classify; verdicts already written for any session's queue "
                              "beside the store are kept in --verdicts first")
-    parser.add_argument("--summary", action="store_true",
-                        help="print class counts, review queue rows, and finished worktree/tab counts instead of JSON")
+    views = parser.add_mutually_exclusive_group()
+    views.add_argument("--summary", action="store_true",
+                       help="print class counts, review queue rows, and finished worktree/tab counts instead of JSON")
+    views.add_argument("--rows", action="store_true",
+                       help="print one line per row: name | class (the verdict's, else the scan's) | GitHub "
+                            "repo#PR state | tab count | newest final message time | question, waits_on, "
+                            "next_step, or the final message's start")
+    views.add_argument("--row", metavar="NAME",
+                       help="print one row as JSON with fixed keys: strings are never null, `final` is the newest "
+                            "final message of Claude, Codex, or Orca, and `github` is owner/repo from origin; "
+                            "NAME is the worktree's last path segment (ENVIRONMENT::name on another Mac), "
+                            "its path, or its row identity")
+    parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
+                        help="read the rows a previous scan printed as JSON instead of scanning again")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
                         help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.from_file and args.review_out:
+        parser.error("--review-out needs a live scan; drop --from")
+    return args
 
 
 def write_review_queue(path, rows, verdicts=None):
@@ -1200,8 +1215,103 @@ def print_summary(rows, verdicts):
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
 
 
+def row_name(row: dict) -> str:
+    name = Path(row["path"]).name
+    return f"{row['environment']}::{name}" if row.get("environment") else name
+
+
+def final_message(row: dict) -> dict:
+    """{source, at, text} of the newest final message the row's agents or Orca hold; empty strings without one."""
+    latest = latest_message({"claude": row.get("claude"), "codex": row.get("codex") or [],
+                             "orca_message": row.get("orca_message")})
+    if latest is None:
+        return {"source": "", "at": "", "text": ""}
+    source, text = latest
+    at = {"claude": (row.get("claude") or {}).get("final_at"),
+          "codex": ((row.get("codex") or [{}])[-1]).get("last_assistant_at"),
+          "orca": (row.get("orca_message") or {}).get("at")}[source]
+    return {"source": source, "at": at or "", "text": text or ""}
+
+
+def github_of(row: dict) -> str:
+    """owner/repo of the row's checkout: from the scan's git facts, else from a local checkout's origin."""
+    known = (row.get("git") or {}).get("github")
+    if known or row.get("environment"):
+        return known or ""
+    try:
+        origin = subprocess.run(["git", "-C", row["path"], "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if origin.returncode != 0:
+        return ""
+    return github_slug(origin.stdout.strip()) or ""
+
+
+def row_view(row: dict) -> dict:
+    """One row with fixed keys and no null strings, so a reader never has to know the scan's raw shapes."""
+    verdict = row.get("verdict") or {}
+    final = final_message(row)
+    asked = {"claude": (row.get("claude") or {}).get("last_user"),
+             "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
+    return {
+        "identity": row_identity(row), "name": row_name(row), "path": row["path"],
+        "repo": row.get("repo") or "", "environment": row.get("environment") or "", "github": github_of(row),
+        "class": verdict.get("class") or row["class"], "scan_class": row["class"],
+        "reasons": row.get("reasons") if isinstance(row.get("reasons"), list) else [],
+        "question": verdict.get("question") or "", "waits_on": verdict.get("waits_on") or row.get("waits_on") or "",
+        "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
+        "final": final, "last_user": asked or "",
+        "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
+        "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
+                 for t in row.get("terminals") or []],
+        "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
+        "open_pr_cleanup": bool(row.get("open_pr_cleanup")),
+    }
+
+
+def row_line(view: dict) -> str:
+    klass = view["class"] + (f" (scan: {view['scan_class']})" if view["class"] != view["scan_class"] else "")
+    pr = view["pr"] or {}
+    where = (view["github"] + (f"#{pr['number']} {pr.get('state') or ''}".rstrip() if pr.get("number") else "")
+             if view["github"] else "-")
+    said = " ".join(view["final"]["text"].split())
+    note = " ".join((view["question"] or view["waits_on"] or view["next_step"]).split()) or (
+        said[:80] + ("…" if len(said) > 80 else ""))
+    return f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
+
+
+def saved_rows(path: str) -> list[dict]:
+    rows = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not isinstance(rows, list) or not all(isinstance(row, dict) and "path" in row for row in rows):
+        raise ValueError(f"{path} is not the JSON list a scan prints")
+    return rows
+
+
+def print_row(rows: list[dict], key: str) -> int:
+    # A row identity names one row even when another Mac has a checkout at the same path.
+    found = ([row for row in rows if row_identity(row) == key]
+             or [row for row in rows if key in (row["path"], row_name(row))])
+    if len(found) != 1:
+        names = ", ".join(row_identity(row) for row in found)
+        print(f"--row {key}: " + (f"matches {names}; pass one of them" if found else "no row has this name"),
+              file=sys.stderr)
+        return 1
+    json.dump(row_view(found[0]), sys.stdout, ensure_ascii=False, indent=2)
+    print()
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.from_file:
+        try:
+            rows = saved_rows(args.from_file)
+        except (OSError, ValueError) as error:
+            print(f"--from: {error}", file=sys.stderr)
+            return 1
+        verdicts = absorb_verdicts(args.verdicts, write=False)
+        return print_rows(args, with_verdicts(rows, verdicts), verdicts)
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
@@ -1218,7 +1328,16 @@ def main(argv=None):
     rows = with_verdicts(rows, verdicts)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts)
-    if args.summary:
+    return print_rows(args, rows, verdicts)
+
+
+def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
+    if args.row:
+        return print_row(rows, args.row)
+    if args.rows:
+        for row in rows:
+            print(row_line(row_view(row)))
+    elif args.summary:
         print_summary(rows, verdicts)
     else:
         json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)

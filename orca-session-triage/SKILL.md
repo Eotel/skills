@@ -28,7 +28,14 @@ board's done cards; close what the user approves.
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
   `--summary` prints class counts, review rows, finished worktree/tab counts,
-  and open PR cleanup rows. Jev
+  and open PR cleanup rows. `--rows` prints one line per row (name, the
+  verdict's class over the scan's, GitHub repo and PR, tab count, newest final
+  message time, and its question, `waits_on`, `next_step`, or message start).
+  `--row NAME` prints one row as JSON with fixed keys: no null strings, the
+  newest final message of Claude, Codex, or Orca in `final`, and `github` as
+  owner/repo from origin for `gh -R`. `--from SCAN_JSON` reads a saved scan
+  instead of scanning again. Read rows through these rather than parsing the
+  scan's JSON by hand. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
   reads each idle worktree's newest final message and returns `jev`: `asks`,
   the probability that it waits on the user (0.7 or more is `waiting`), and

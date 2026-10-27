@@ -1208,6 +1208,76 @@ class ScanCommandTests(unittest.TestCase):
     def test_expand_roots_accepts_literal_current_and_absolute_roots(self):
         self.assertEqual(scan.expand_roots([".", "./", "/"]), [".", ".", "/"])
 
+    def saved_scan(self):
+        """Rows in the shapes that were misread by hand: null titles, a codex list, a verdict, an Orca message."""
+        checkout = self.dir / "dotfiles-73"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                        "git@github.com:Eotel/chezmoi-dotfiles.git"], check=True)
+        rows = [
+            {"path": "/w/app/fix-login", "repo": "app", "environment": None, "class": "stalled",
+             "reasons": ["final message"], "comment": None,
+             "terminals": [{"handle": "term_1", "agent": "claude", "title": None}],
+             "claude": {"final_text": "PR #10 を出しました。\nmerge してよいですか", "final_at": "2026-10-27T01:00:00Z",
+                        "last_user": "直して", "pending_questions": []},
+             "codex": [], "git": {"github": "Eotel/app"}, "pr": {"number": 10, "state": "OPEN"},
+             "verdict": {"class": "waiting", "question": "PR #10 を\nmerge するか", "waits_on": None,
+                         "next_step": None}},
+            {"path": str(checkout), "repo": "dotfiles", "environment": None, "class": "unsure",
+             "reasons": [], "comment": "作業中", "terminals": [],
+             "claude": {"final_text": "古い発言", "final_at": "2026-10-27T01:00:00Z", "last_user": "古い依頼"},
+             "codex": [{"last_assistant": "前の回", "last_assistant_at": "2026-10-27T00:00:00Z",
+                        "last_role": "assistant"},
+                       {"last_assistant": "設定を反映しました", "last_assistant_at": "2026-10-27T02:00:00Z",
+                        "last_role": "assistant", "last_user": "設定を反映して"}]},
+            {"path": "/remote/w/app", "repo": "app", "environment": "mbp16", "class": "waiting",
+             "reasons": [], "comment": "", "terminals": [{"handle": None, "agent": None, "title": None}],
+             "claude": None, "codex": [], "orca_message": {"text": "どちらにしますか", "at": "2026-10-27T03:00:00Z"}},
+            {"path": "/w/app/fix-login", "repo": "app", "environment": "mbp16", "class": "working",
+             "reasons": [], "comment": "", "terminals": [], "claude": None, "codex": []},
+        ]
+        path = self.dir / "scan.json"
+        path.write_text(json.dumps(rows, ensure_ascii=False))
+        return path, checkout
+
+    def test_rows_print_one_line_per_saved_row_without_rescanning(self):
+        saved, checkout = self.saved_scan()
+        with patch.object(scan, "collect_worktrees_and_terminals", side_effect=AssertionError("rescanned")), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rows"]), 0)
+
+        self.assertEqual(out.getvalue().splitlines(), [
+            "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T01:00:00Z"
+            " | PR #10 を merge するか",
+            f"dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました",
+            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか",
+            "mbp16::fix-login | working | - | tabs 0 | - | ",
+        ])
+
+    def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self):
+        saved, checkout = self.saved_scan()
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "dotfiles-73"]), 0)
+        row = json.loads(out.getvalue())
+        self.assertEqual((row["path"], row["github"], row["class"], row["comment"]),
+                         (str(checkout), "Eotel/chezmoi-dotfiles", "unsure", "作業中"))
+        self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T02:00:00Z",
+                                        "text": "設定を反映しました"})
+        self.assertEqual(row["last_user"], "設定を反映して")
+
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
+        row = json.loads(out.getvalue())
+        self.assertEqual((row["identity"], row["class"], row["question"], row["comment"], row["tabs"]),
+                         ("/w/app/fix-login", "waiting", "PR #10 を\nmerge するか", "",
+                          [{"handle": "term_1", "agent": "claude", "title": ""}]))
+        self.assertEqual(row["final"]["text"], "PR #10 を出しました。\nmerge してよいですか")
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "nothing"]), 1)
+        self.assertIn("nothing", err.getvalue())
+
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
         local = {"worktrees": [worktree("/local/w", "done")],
                  "hostScope": {"omittedHostSelectors": [
@@ -2001,6 +2071,27 @@ class HourlyStateTests(unittest.TestCase):
         with redirect_stdout(out):
             code = hourly_state.main(["--state-file", str(self.state), *args])
         return code, json.loads(out.getvalue())
+
+    def test_pending_lists_only_open_items_each_with_its_id(self):
+        message = self.source("message.txt", "Should B start?\n")
+        question = self.source("question.txt", "Send B the task?\n")
+        answer = self.source("answer.txt", "Yes.\n")
+        _, open_question = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
+                                     "--final-message-file", message, "--question-file", question)
+        _, answered = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#11",
+                                "--final-message-file", message, "--question-file", question)
+        self.call("answered", "--id", answered["id"], "--answer-file", answer)
+        _, handoff = self.call("promise", "--from-row", "/w/a", "--to-row", "/w/b",
+                               "--condition", "A merged", "--task", "start B")
+        self.call("leave", "--row", "/w/c", "--final-message-file", message)
+
+        code, pending = self.call("pending")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([item["id"] for item in pending["questions"]], [open_question["id"]])
+        self.assertEqual([item["id"] for item in pending["handoffs"]], [handoff["id"]])
+        self.assertEqual(pending["requests"], [])
+        self.assertEqual([item["row"] for item in pending["left"]], ["/w/c"])
 
     def test_left_row_only_stays_left_for_the_saved_final_message(self):
         old = self.source("old.txt", "Work complete; leave it.\n")
