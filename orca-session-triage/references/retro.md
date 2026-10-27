@@ -41,6 +41,15 @@ local night and three automatic notes per skill. A full skill gets a rewrite
 proposal for morning review. Rules about human decisions, destructive actions,
 permissions, procedures, and scripts wait for a person.
 
+A lesson about a hard-to-use tool becomes a fix, as `adoption-triage`'s
+policy asks: a change to a tool this setup maintains (category `script`) or
+an upstream issue for one it cannot change (category `upstream`), with the
+workaround as a separate fact until the fix ships. A fact that names a script
+in Eotel/skills or `~/.cache/orca-briefs/bin` is never adopted automatically.
+An adopted `script` or `upstream` proposal is not written as a note: the
+worker records it as failed and sends the triage lead one `triage-notify
+--kind ask` so that a lane takes it.
+
 The skill list offers Eotel/skills, skills kept in a repository's
 `.claude/skills` or `.agents/skills`, and the sources of skills installed by
 the user's APM. A skill that APM deployed into a repository or home is written
