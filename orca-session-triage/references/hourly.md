@@ -74,6 +74,12 @@ contains the exact `review-pr` command with `--kind` and `--if-needed` when
 the PR's source is known. If the row has no command, confirm who created the
 PR before choosing `cloud` or `colleague`.
 
+In every hourly run on a Mac that has `~/.cache/orca-briefs/bin/topic`, run
+`topic check --all`. Each drift row names the record, what disagrees, and the
+workspace that should fix it (its newest writer that still exists, with live
+agents). The writer fixes its own drift: never route a row to the user. A row
+without a live writer goes to the lead.
+
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
 `requests-needing-owner` as described in `references/hourly-state.md` and
@@ -117,6 +123,9 @@ raise the needed decision. Keep every request open until the lead observes
 that its recorded symptom is gone. Then:
 
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
+- Send each `topic check --all` drift row to a live agent of the workspace it
+  names with `send`, quoting the row and the fix it prints. When another lead
+  is appointed, put the rows in the handoff instead.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
   For 「レビューの番」, run the row's `review-pr ... --if-needed` command in this
