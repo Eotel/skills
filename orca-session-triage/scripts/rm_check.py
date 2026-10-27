@@ -34,7 +34,9 @@ def git(cwd, *args):
 
 def is_cache(relpath):
     parts = Path(relpath.rstrip("/")).parts
-    return bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
+    # pip writes <name>.egg-info beside an editable install's sources again on each install.
+    return (bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
+            or any(part.endswith(".egg-info") for part in parts))
 
 
 def is_regenerable(relpath):

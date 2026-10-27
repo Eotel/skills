@@ -1911,6 +1911,9 @@ class RmCheckTests(unittest.TestCase):
         pushed, local = self.wt / "local-deps" / "pushed", self.wt / "local-deps" / "local"
         git(deps, "worktree", "add", "-q", "--detach", str(pushed), "main")
         git(deps, "worktree", "add", "-q", "-b", "draft", str(local), "main")
+        (deps / ".git" / "info" / "exclude").write_text("*.egg-info/\n")
+        (pushed / "src" / "deps.egg-info").mkdir(parents=True)
+        (pushed / "src" / "deps.egg-info" / "PKG-INFO").write_text("Name: deps\n")
         (local / "lib.txt").write_text("v2\n")
         git(local, "commit", "-q", "-am", "unpushed")
 
