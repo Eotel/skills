@@ -81,8 +81,9 @@ board's done cards; close what the user approves.
 - `references/hourly.md`: a run started as `/orca-session-triage hourly`,
   setting up the Orca automation that starts it, or ending a turn of the
   session the automation runs in.
-- `references/retro.md`: the external retrospective service, its adoption
-  ledger, and recovery when an hourly transcript has not been processed.
+- `references/retro.md`: the end-of-run retrospective in a forked Agent, the
+  external service for finished sessions, its adoption ledger, and recovery
+  when an hourly transcript has not been processed.
 
 ## Done
 
@@ -114,6 +115,8 @@ permitted cleanup, and any handoff in `references/hourly.md`.
     wakes it to continue its own work.
   - A task the user approved as the follow-up of another lane's result ("when
     A settles it, give B the task") goes to B once A reports it.
+  - A lane confirmation in the user's standing approvals is answered once it
+    has waited for the lead, as `references/hourly.md` describes.
 - Relay answers verbatim; the session answers the user's follow-up questions.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other

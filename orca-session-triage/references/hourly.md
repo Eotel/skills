@@ -12,6 +12,13 @@ At the start of each run, use `scripts/inbox_read.py read --brief` to see new
 inbox entries in append order. `--brief` keeps `ask` and `done` in full and
 shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
+For a large inbox, `read --summary` shows each entry on one line with the first
+160 characters of its text. `--kind ask,done` filters by type, and
+`--source skills/triage-request-ledger` filters by the displayed
+`repo/worktree` (older entries without a repo use their worktree). These options
+only filter the display: `NEXT_OFFSET` still covers every complete inbox entry.
+Read an unfiltered summary before acknowledging an offset from a filtered view
+so hidden entries are not skipped.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
@@ -40,9 +47,9 @@ The Stop hook keeps the current scheduled run open while an `ask` is past the ac
 cursor, including on a repeated stop. Read it, handle it or hand it to the
 appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
 After these checks permit the turn to end, the same hook queues this hourly
-session's transcript for the external retrospective service. It does not run
-the retrospective in the tab. See `references/retro.md` when checking that
-service or reviewing its proposals.
+session's transcript. The external retrospective service skips a session the
+run's own forked retrospective already recorded and reviews one it did not.
+See `references/retro.md` for both and for reviewing their proposals.
 
 ## In the run
 
@@ -71,6 +78,18 @@ starting a watch or changing the workspace comment.
 Name any Orca environment the scan could not reach in the handoff. Review
 rows from the reachable Macs in the same run.
 
+The lead does not send terminal input to a scheduled tab, so its answers reach
+later runs through `scripts/lead_decisions.py`. Give each question in the
+handoff a stable key in the form `hourly_state.py asked --decision` uses, such
+as `remove:ENVIRONMENT::PATH`. Before handing off, pass the keys to
+`lead_decisions.py unanswered --decision KEY` (repeat per key) and hand off only
+the keys it prints. `lead_decisions.py show` gives the answers: follow each as
+the lead's direction for its row, and name what you did in the handoff. When a
+row's situation changes so the answer may no longer fit, ask under a new key.
+The lead records an answer with
+`lead_decisions.py record --decision KEY --answer-file FILE`; records are only
+appended, and a later record for a key replaces its earlier answer.
+
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and
 check promised handoffs and open requests. After the scan, run
@@ -89,6 +108,8 @@ that its recorded symptom is gone. Then:
   every run, changed or not, so a finished or stalled row is handled again
   until it is closed; `cleanup.md` decides which removals need no question.
 - When nothing needs the user, end with one line and no question.
+- Before the comment, run the retrospective in a forked Agent as
+  `references/retro.md` describes and wait for its one-line result.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
 - Leave no Monitor or other background job in this tab after the turn. A
@@ -102,6 +123,26 @@ Check the external watch with
 `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py status`.
 The Stop hook names a stopped service. Do not start a replacement Monitor in
 the tab.
+
+## Confirmations approved in advance
+
+Some lane confirmations were approved by the user in advance. They are listed
+in one local file, `~/.cache/orca-briefs/standing-approvals.json`, with the
+limits each entry checks and the user's original words, time, and where they
+were given. Add an entry only with all three. The docstring of
+`~/.cache/orca-briefs/bin/standing_approvals.py` describes what each kind
+compares before answering.
+
+The external watch answers a listed confirmation after it has waited the
+file's `grace_seconds` without the lead's answer, and reports the answer as
+`info`. Before then, a confirmation on a lane whose brief was delivered is
+reported as `ask` once. A confirmation that differs from the list is left
+for the lead. When the scan finds a lane stopped on such a confirmation and
+the watch is not running, run
+`~/.cache/orca-briefs/bin/standing-approve answer HANDLE --worktree PATH`.
+Exit 0 means it answered; 3 means the lead still has time, and it recorded
+when it first saw the prompt; 2 means the lead must answer. Hand anything it
+leaves to the lead as before.
 
 ## External inbox service and cutover
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Render, activate, and inspect the external triage retrospective launchd service."""
 
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path

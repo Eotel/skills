@@ -2377,6 +2377,62 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def test_read_filters_by_kind_and_source_without_advancing_cursor(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            write_jsonl(inbox, [
+                {"ts": "t1", "kind": "ask", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "質問"},
+                {"ts": "t2", "kind": "info", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "経過"},
+                {"ts": "t3", "kind": "done", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "完了"},
+                {"ts": "t4", "kind": "ask", "host": "host1", "repo": "repo-b",
+                 "worktree": "same", "text": "別の送り元"},
+                {"ts": "t5", "kind": "ask", "host": "host1", "worktree": "old",
+                 "text": "旧形式"},
+            ])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main([
+                        "read", "--kind", "ask,done", "--source", "repo-a/same"]), 0)
+                self.assertEqual(output.getvalue(),
+                                 f"t1 ask host1 repo-a/same\n質問\n\n"
+                                 f"t3 done host1 repo-a/same\n完了\n\n"
+                                 f"NEXT_OFFSET={inbox.stat().st_size}\n")
+                self.assertFalse(cursor.exists())
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read", "--source", "old"]), 0)
+                self.assertEqual(output.getvalue(),
+                                 f"t5 ask host1 old\n旧形式\n\n"
+                                 f"NEXT_OFFSET={inbox.stat().st_size}\n")
+
+    def test_summary_prints_one_short_line_per_entry(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            write_jsonl(inbox, [
+                {"ts": "t1", "kind": "ask", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "問" * 161 + "\n続き"},
+                {"ts": "t2", "kind": "info", "host": "host1", "repo": "repo-b",
+                 "worktree": "other", "text": "作業中\n補足"},
+                {"ts": "t3", "kind": "done", "host": "host1", "worktree": "old",
+                 "text": "完了"},
+            ])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read", "--summary"]), 0)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    "t1 ask host1 repo-a/same  " + "問" * 160 + "…",
+                    "t2 info host1 repo-b/other  作業中 補足",
+                    "t3 done host1 old  完了",
+                    f"NEXT_OFFSET={inbox.stat().st_size}",
+                ])
+
     def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
