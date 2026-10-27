@@ -80,10 +80,16 @@ the shared hourly state, then scan and review the rows. Run
 include every returned request in the handoff to the lead on every run. A
 lane's `done` leaves the user's request open until the lead verifies the
 original symptom is gone. Then do only the
-cleanup allowed before a user choice by the Boundary and `cleanup.md`. Send questions
-and instructions for other lanes to the lead in one `triage-notify --kind ask`
-message, including any cleanup done. With nothing to hand off, report cleanup
-with `--kind info`. The lead asks the user and directs the lanes. End without
+cleanup allowed before a user choice by the Boundary and `cleanup.md`. Write the
+questions and instructions for other lanes, including any cleanup done, in one
+file and send it with `python3 ~/.claude/skills/orca-session-triage/scripts/handoff.py
+send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
+--decision KEY (once per question) --lead-worktree <the lead's worktree>`
+(`--kind info` with nothing to hand off but cleanup). At the moment it sends,
+it adds every inbox report that arrived after the scan began and the lead's
+latest message and unanswered questions read again from its transcript, so the
+handoff never rests on the scan's start. Ack the NEXT_OFFSET it prints. The
+lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment.
 Include each 「レビューの番」 PR URL and its command, or the missing source to
 confirm, in this run's handoff to the lead. Do not start its review in the
@@ -94,9 +100,9 @@ rows from the reachable Macs in the same run.
 The lead does not send terminal input to a scheduled tab, so its answers reach
 later runs through `scripts/lead_decisions.py`. Give each question in the
 handoff a stable key in the form `hourly_state.py asked --decision` uses, such
-as `remove:ENVIRONMENT::PATH`. Before handing off, pass the keys to
-`lead_decisions.py unanswered --decision KEY` (repeat per key) and hand off only
-the keys it prints. `lead_decisions.py show` gives the answers: follow each as
+as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
+`--decision` key already has an answer and prints those answers.
+`lead_decisions.py show` gives the answers: follow each as
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
 The lead records an answer with
