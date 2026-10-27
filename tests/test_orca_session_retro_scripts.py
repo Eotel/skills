@@ -428,6 +428,37 @@ class RetroTests(unittest.TestCase):
             eligible, reason = retro.eligible_auto(proposal, {"target_versions": {}}, [], self.root)
         self.assertTrue(eligible, reason)
 
+    def test_fact_about_an_own_tool_waits_for_a_fix_proposal(self) -> None:
+        script = self.root / "orca-session-triage/scripts/inbox_read.py"
+        script.parent.mkdir()
+        script.write_text("")
+        proposal = sample_candidate()
+        proposal["note"] = "inbox_read.py read --brief の出力を tail で切ると前の ask が欠ける。ファイルに保存して読む。"
+        proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            eligible, reason = retro.eligible_auto(proposal, {"target_versions": {}}, [], self.root)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "自分たちの道具は直す案にする")
+
+    def test_adopted_upstream_issue_is_not_written_and_notifies(self) -> None:
+        log = self.home / "notify.log"
+        notifier = self.home / "triage-notify"
+        notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        notifier.chmod(0o755)
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "bee の issue view --json にコメントを入れるよう上流に報告する。",
+                        "target": "triage-retro:skill:orca-session-triage:upstream"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        data = retro.load(self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "NOTIFY", notifier):
+                retro.sync_decisions(ledger, data, self.root, self.state)
+                retro.sync_decisions(ledger, data, self.root, self.state)
+        self.assertFalse(retro.facts_path(self.target).exists())
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertIn(proposal_id, log.read_text())
+
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)

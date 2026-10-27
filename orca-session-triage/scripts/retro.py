@@ -38,6 +38,8 @@ MAX_SKILL_BYTES = 12_000
 MAX_NOTES_PER_SKILL = 3
 MAX_NOTE_CHARS = 190
 MAX_REJECTED = 20
+# Adopted tool fixes and upstream reports need a lane; the worker never writes them as notes.
+SEPARATE_WORK = frozenset(("script", "upstream"))
 SESSION_ID = re.compile(r"^[a-f0-9-]{36}$")
 MARKER = "<!-- triage-retro:"
 FACTS_NAME = "observed-triage-facts.md"
@@ -53,7 +55,7 @@ SCHEMA = {"type": "object", "required": ["proposals"], "properties": {
             "final_success": {"type": "string"}, "note": {"type": "string"},
             "target_skill": {"type": "string"},
             "evidence_quotes": {"type": "array", "items": {"type": "string"}},
-            "category": {"type": "string", "enum": ["fact", "rule", "procedure", "script"]},
+            "category": {"type": "string", "enum": ["fact", "rule", "procedure", "script", "upstream"]},
         }}}
 }}
 REVIEW_SCHEMA = {"type": "object", "required": ["decisions"], "properties": {
@@ -446,7 +448,12 @@ def nearby_knowledge(note, root=SOURCE, target_skill=None):
 RETRO_PROMPT = (
     "ここまでの定時 triage の回を振り返る。あなたはこの会話の文脈を引き継いだ複製で、元の会話の記録は変わらない。"
     "最初の失敗と、後で実際に成功した対を最大5件挙げる。成功が会話で確認できないもの、一度きりで繰り返さないものは挙げない。"
-    "note は既存 skill に追記できる190字以内の一行で、具体的な道具・パス・エラー対処だけを書く。"
+    "note は190字以内の一行にする。fact なら既存 skill に追記できる具体的な道具・パス・エラー対処だけを書き、"
+    "script・upstream なら直す内容を書く。"
+    "道具の使いにくさから出た教訓は、使い方として書かず道具を直す案にする。自分たちの道具"
+    "（下の skill の scripts、~/.cache/orca-briefs/bin、orca-board）なら、引数・option を足すか出力を直す案を"
+    "category script で出す。直せない外の道具（gh・bee など）なら上流への issue の案を category upstream で出し、"
+    "直るまでの使い方は別に category fact で出してよい。"
     "利用者の決まり、権限、削除・merge・投稿の条件、手順やスクリプトの変更は category を fact 以外にする。"
     "target_skill は下の skill 名から選ぶ。repo/project 固有 skill も候補にしてよい。"
     "evidence_quotes には失敗と成功のそれぞれについて、会話中の道具の出力・実行したコマンド・発言から"
@@ -641,13 +648,24 @@ def remember_versions(data, *targets):
             data["target_versions"][key] = None
 
 
-def eligible_auto(proposal, data, ledger_items=(), root=SOURCE):
+def own_tools(root: Path = SOURCE) -> frozenset[str]:
+    """File names of the tools this setup maintains; a lesson about one becomes a fix to it, not a usage note."""
+    tools = (*root.glob("*/scripts/*"), *(Path.home() / ".cache/orca-briefs/bin").glob("*"))
+    return frozenset(path.name for path in tools
+                     if path.is_file() and re.search(r"[._-]", path.name)
+                     and not re.search(r"\.bak|backup", path.name) and path.suffix != ".md")
+
+
+def eligible_auto(proposal: dict[str, Any], data: dict[str, Any], ledger_items: Sequence[dict[str, Any]] = (),
+                  root: Path = SOURCE) -> tuple[bool, str]:
     review = proposal.get("review") or {}
     note = proposal["note"]
     target = skill_target(proposal["target_skill"], root)
     if (proposal.get("category") != "fact" or review.get("supported") is not True
             or review.get("duplicate") is not False or review.get("low_risk") is not True):
         return False, "要確認"
+    if any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", note) for name in own_tools(root)):
+        return False, "自分たちの道具は直す案にする"
     if target is None or not target.is_file():
         return False, "書き込み先が未設定"
     if (len(note) > MAX_NOTE_CHARS or "\n" in note or MARKER in note
@@ -865,8 +883,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         proposal = {"id": proposal_id, "note": item["proposal"], "target_skill": skill}
         writing_completed = False
         try:
-            if category == "script" and status == "adopted":
-                raise ValueError("script change requires a separate implementation")
+            if category in SEPARATE_WORK and status == "adopted":
+                raise ValueError(f"{category} proposal requires separate work, not a skill note")
             router = skill_target(skill, root)
             if router is None:
                 raise ValueError("target skill is missing")
@@ -946,7 +964,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             if writing_completed:
                 raise  # A written note or reversal needs a receipt, not another local edit.
             attempts = data["action_attempts"][action_key] = (
-                3 if category == "script" else data["action_attempts"].get(action_key, 0) + 1)
+                3 if category in SEPARATE_WORK else data["action_attempts"].get(action_key, 0) + 1)
             if state is not None:
                 save(data, state)
             ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
