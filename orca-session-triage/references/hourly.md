@@ -71,6 +71,18 @@ starting a watch or changing the workspace comment.
 Name any Orca environment the scan could not reach in the handoff. Review
 rows from the reachable Macs in the same run.
 
+The lead does not send terminal input to a scheduled tab, so its answers reach
+later runs through `scripts/lead_decisions.py`. Give each question in the
+handoff a stable key in the form `hourly_state.py asked --decision` uses, such
+as `remove:ENVIRONMENT::PATH`. Before handing off, pass the keys to
+`lead_decisions.py unanswered --decision KEY` (repeat per key) and hand off only
+the keys it prints. `lead_decisions.py show` gives the answers: follow each as
+the lead's direction for its row, and name what you did in the handoff. When a
+row's situation changes so the answer may no longer fit, ask under a new key.
+The lead records an answer with
+`lead_decisions.py record --decision KEY --answer-file FILE`; records are only
+appended, and a later record for a key replaces its earlier answer.
+
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and
 check promised handoffs and open requests. After the scan, run
@@ -104,6 +116,26 @@ Check the external watch with
 `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py status`.
 The Stop hook names a stopped service. Do not start a replacement Monitor in
 the tab.
+
+## Confirmations approved in advance
+
+Some lane confirmations were approved by the user in advance. They are listed
+in one local file, `~/.cache/orca-briefs/standing-approvals.json`, with the
+limits each entry checks and the user's original words, time, and where they
+were given. Add an entry only with all three. The docstring of
+`~/.cache/orca-briefs/bin/standing_approvals.py` describes what each kind
+compares before answering.
+
+The external watch answers a listed confirmation after it has waited the
+file's `grace_seconds` without the lead's answer, and reports the answer as
+`info`. Before then, a confirmation on a lane whose brief was delivered is
+reported as `ask` once. A confirmation that differs from the list is left
+for the lead. When the scan finds a lane stopped on such a confirmation and
+the watch is not running, run
+`~/.cache/orca-briefs/bin/standing-approve answer HANDLE --worktree PATH`.
+Exit 0 means it answered; 3 means the lead still has time, and it recorded
+when it first saw the prompt; 2 means the lead must answer. Hand anything it
+leaves to the lead as before.
 
 ## External inbox service and cutover
 
