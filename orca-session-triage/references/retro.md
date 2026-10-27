@@ -41,6 +41,28 @@ local night and three automatic notes per skill. A full skill gets a rewrite
 proposal for morning review. Rules about human decisions, destructive actions,
 permissions, procedures, and scripts wait for a person.
 
+The skill list offers Eotel/skills, skills kept in a repository's
+`.claude/skills` or `.agents/skills`, and the sources of skills installed by
+the user's APM. A skill that APM deployed into a repository or home is written
+at the source checkout its `apm.lock.yaml` names under `~/ghq/github.com`,
+never at the deployed copy. Like Eotel/skills, that checkout must be on `main`
+or `master` with the target files unchanged.
+
+## Comments on decisions
+
+A decision's `reason` from the adoption board is the deciding person's
+comment. The worker's own `triage-retro` reasons are not comments.
+
+- **Adopt with a comment:** a separate `claude -p` rewrites the note as the
+  comment asks, within one line of 190 characters, and the rewrite is
+  written instead of the proposal. The execution's `result` keeps the
+  rewritten line; revoking removes that line.
+- **Reject with a comment:** the twenty newest such proposals and their
+  comments go into the next retrospective's prompt, live or service, so the
+  same lesson is not proposed again.
+- **Hold with a comment:** the worker writes nothing; the board notifies the
+  triage lead.
+
 ## Failures
 
 A failed `claude -p` call records its exit code and the `is_error`,
@@ -49,6 +71,12 @@ A failed `claude -p` call records its exit code and the `is_error`,
 fails twice in a row, the worker sends one `triage-notify --kind ask`.
 `retro.py status` shows `last_failure`. After fixing the cause, run
 `retro.py retry --session-id UUID` for each failed session ID.
+
+An adoption or revocation the worker cannot apply is recorded as a `failed`
+execution and retried at the next checks. When it stops after the third
+failure (a script change stops at once), the worker sends one
+`triage-notify --kind ask` with the proposal ID, the target skill, and the
+reason.
 
 ## Service and morning review
 

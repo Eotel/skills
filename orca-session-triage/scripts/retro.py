@@ -37,6 +37,7 @@ MAX_NIGHTLY_AUTO = 3
 MAX_SKILL_BYTES = 12_000
 MAX_NOTES_PER_SKILL = 3
 MAX_NOTE_CHARS = 190
+MAX_REJECTED = 20
 SESSION_ID = re.compile(r"^[a-f0-9-]{36}$")
 MARKER = "<!-- triage-retro:"
 FACTS_NAME = "observed-triage-facts.md"
@@ -64,6 +65,7 @@ REVIEW_SCHEMA = {"type": "object", "required": ["decisions"], "properties": {
             "reason": {"type": "string"},
         }}}
 }}
+REWRITE_SCHEMA = {"type": "object", "required": ["note"], "properties": {"note": {"type": "string"}}}
 
 
 def now():
@@ -103,17 +105,18 @@ def atomic_text(path, content, mode=0o600):
             Path(tmp).unlink()
 
 
-def load(state=STATE):
+def load(state: Path = STATE) -> dict[str, Any]:
     state_file = paths(state)[1]
     if not state_file.exists():
         return {"offset": 0, "sessions": {}, "target_versions": {},
-                "action_attempts": {}, "applied_actions": {}}
+                "action_attempts": {}, "applied_actions": {}, "rewrites": {}}
     data = json.loads(state_file.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not all(k in data for k in ("offset", "sessions")):
         raise ValueError(f"invalid worker state: {state_file}")
     data.setdefault("target_versions", {})
     data.setdefault("action_attempts", {})
     data.setdefault("applied_actions", {})
+    data.setdefault("rewrites", {})
     return data
 
 
@@ -295,35 +298,59 @@ def quoted_events(quotes: Sequence[object], events: Sequence[Event]) -> list[Eve
     return sorted(found.values(), key=lambda event: event["id"]) if len(found) >= 2 else None
 
 
-def skill_catalog(root=SOURCE):
-    """Source skills in Eotel/skills and repository-local skill directories."""
-    result = {path.parent.name: path for path in sorted(root.glob("*/SKILL.md"))}
-    checkout_base = Path.home() / "ghq/github.com"
-    if checkout_base.is_dir():
-        for owner in checkout_base.iterdir():
-            if not owner.is_dir():
-                continue
-            for repo in owner.iterdir():
-                if not repo.is_dir() or repo.resolve() == root.resolve():
-                    continue
-                for directory in (repo / ".claude/skills", repo / ".agents/skills"):
-                    for path in directory.glob("*/SKILL.md"):
-                        result[f"{owner.name}/{repo.name}/{path.parent.name}"] = path
-    return result
+class Deployment(NamedTuple):
+    """Paths APM copied from one source skill, relative to the directory holding ``apm.lock.yaml``."""
+    repo: Path
+    source: Path
+    copies: frozenset[str]
 
 
-def skill_target(name, root=SOURCE):
+def apm_deployments(base: Path) -> list[Deployment]:
+    """The GitHub dependencies in ``base/apm.lock.yaml``, each with its local ghq source checkout."""
+    lock = base / "apm.lock.yaml"
+    dependencies = lock.read_text(encoding="utf-8").split("\ndeployments:", 1)[0] if lock.is_file() else ""
+    blocks = [(dict(re.findall(r"^ *(repo_url|host|virtual_path): (\S+)$", block, re.M)),
+               frozenset(re.findall(r"^  - (\S+)$", block, re.M)))
+              for block in re.split(r"^- ", dependencies, flags=re.M)[1:]]
+    return [Deployment(repo, repo / fields.get("virtual_path", ""), copies)
+            for fields, copies in blocks
+            if "repo_url" in fields and fields.get("host", "github.com") == "github.com"
+            for repo in [Path.home() / "ghq/github.com" / fields["repo_url"]]]
+
+
+def apm_source(path: Path, deployments: Sequence[Deployment]) -> Path:
+    """The source of a repository-local ``SKILL.md`` that APM deployed; otherwise ``path`` itself."""
+    repo, copy = path.parents[3].resolve(), path.parent.resolve()
+    relative = copy.relative_to(repo).as_posix() if copy.is_relative_to(repo) else None
+    return next((deployment.source / "SKILL.md" for deployment in deployments if relative in deployment.copies), path)
+
+
+def skill_catalog(root: Path = SOURCE) -> dict[str, Path]:
+    """Source skills: Eotel/skills, repository-local skills, and the APM sources of deployed copies.
+
+    A skill APM deployed into a repository maps to its source checkout, so an adoption never edits the copy.
+    """
+    checkouts = Path.home() / "ghq/github.com"
+    local = [path for pattern in ("*/*/.claude/skills/*/SKILL.md", "*/*/.agents/skills/*/SKILL.md")
+             for path in sorted(checkouts.glob(pattern)) if path.parents[3].resolve() != root.resolve()]
+    deployed = {repo: apm_deployments(repo) for repo in {path.parents[3] for path in local}}
+    # The lock may spell a repository in another case; samefile still recognizes Eotel/skills itself.
+    installed = [deployment.source / "SKILL.md" for deployment in apm_deployments(Path.home() / ".apm")
+                 if (deployment.source / "SKILL.md").is_file()
+                 and not (root.is_dir() and deployment.repo.samefile(root))]
+    return ({path.parent.name: path for path in sorted(root.glob("*/SKILL.md"))}
+            | {"/".join((*path.relative_to(checkouts).parts[:2], path.parent.name)): path for path in installed}
+            | {f"{path.parents[4].name}/{path.parents[3].name}/{path.parent.name}":
+               apm_source(path, deployed[path.parents[3]]) for path in local})
+
+
+def skill_target(name: str, root: Path = SOURCE) -> Path | None:
     target = skill_catalog(root).get(name)
     if target is None or not target.is_file():
         return None
-    if "/" in name:
-        owner, repository, _ = name.split("/", 2)
-        expected = Path.home() / "ghq/github.com" / owner / repository
-    else:
-        expected = root
-    if not target.resolve().is_relative_to(expected.resolve()):
-        return None
-    return target
+    checkouts = Path.home() / "ghq/github.com"
+    expected = checkouts.joinpath(*target.relative_to(checkouts).parts[:2]) if "/" in name else root
+    return target if target.resolve().is_relative_to(expected.resolve()) else None
 
 
 def skill_description(path: Path) -> str | None:
@@ -430,8 +457,23 @@ def transcript_text(transcript: Path) -> str:
     return transcript.read_text(encoding="utf-8", errors="replace").casefold()
 
 
-def fork_prompt(transcript: Path, root: Path = SOURCE) -> str:
-    return RETRO_PROMPT + "\n\nSKILLS\n" + skill_index(root, transcript_text(transcript))
+def decision_comment(item: dict[str, Any]) -> str:
+    """The deciding person's comment on the latest decision; the worker's own reasons are not comments."""
+    decision = (item.get("decisions") or [{}])[-1]
+    return "" if decision.get("actor") == "triage-retro" else str(decision.get("reason") or "").strip()
+
+
+def rejected_lessons(items: Sequence[dict[str, Any]]) -> str:
+    """The newest rejected proposals that came with a comment, for the next retrospective to avoid."""
+    rejected = sorted((item for item in items if item.get("status") == "rejected" and decision_comment(item)),
+                      key=lambda item: item["rejected_at"], reverse=True)[:MAX_REJECTED]
+    return "\n".join(f"- 案: {str(item['proposal'])[:300]} / 却下の理由: {decision_comment(item)[:300]}"
+                     for item in rejected)
+
+
+def fork_prompt(transcript: Path, root: Path = SOURCE, rejected: str = "") -> str:
+    return (RETRO_PROMPT + "\n\nSKILLS\n" + skill_index(root, transcript_text(transcript))
+            + (f"\n\n却下された案と理由（同じ案や言い換えた案は出さない）\n{rejected}" if rejected else ""))
 
 
 def fork_target(transcript: Path) -> ForkTarget:
@@ -449,11 +491,11 @@ def fork_target(transcript: Path) -> ForkTarget:
 
 
 def build_proposals(transcript: Path, root: Path = SOURCE, claude: str = "claude",
-                    existing: Sequence[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+                    existing: Sequence[dict[str, Any]] = (), rejected: str = "") -> list[dict[str, Any]]:
     """Ask a forked copy of the finished session for lessons, then review them independently."""
     if not root.is_dir():
         raise FileNotFoundError(f"skill source checkout is missing: {root}")
-    output = run_claude(fork_prompt(transcript, root), SCHEMA, claude, resume=fork_target(transcript))
+    output = run_claude(fork_prompt(transcript, root, rejected), SCHEMA, claude, resume=fork_target(transcript))
     return review_proposals(output.get("proposals") or [], transcript, root, claude, existing)
 
 
@@ -774,7 +816,29 @@ def as_existing(items):
     return result
 
 
-def sync_decisions(ledger, data, root=SOURCE, state=None):
+def rewritten_note(item: dict[str, Any], comment: str, claude: str = "claude") -> str:
+    """The adopted note rewritten as the deciding person's comment asks."""
+    evidence = "\n".join(map(str, item.get("evidence") or []))[:6000]
+    prompt = ("採用された振り返りの追記文を、採用した人のコメントに合わせて書き直す。"
+              "コメントが文の直しを求めていなければ、元の文をそのまま返す。根拠に無い事実を足さない。"
+              f"改行を入れず、{MAX_NOTE_CHARS}字以内の一行にする。\n\n"
+              f"元の文\n{item['proposal']}\n\nコメント\n{comment}\n\n根拠\n{item.get('fact') or ''}\n{evidence}")
+    note = str(run_claude(prompt, REWRITE_SCHEMA, claude).get("note") or "").strip()
+    if not note or "\n" in note or MARKER in note or len(note) > MAX_NOTE_CHARS:
+        raise ValueError(f"rewritten note is not one line of {MAX_NOTE_CHARS} characters or fewer: {note[:200]}")
+    return note
+
+
+def applied_note(item: dict[str, Any], data: dict[str, Any]) -> str:
+    """The note the last application wrote, which a comment may have rewritten from the proposal."""
+    receipts = [json.loads(execution["undo"]) for execution in item.get("executions", [])
+                if execution.get("outcome") == "applied" and execution.get("undo")]
+    token = receipts[-1] if receipts else data["applied_actions"].get(item["proposal_id"]) or {}
+    line, suffix = str(token.get("line") or ""), f" {MARKER}{item['proposal_id']} -->\n"
+    return line[2:-len(suffix)] if line.startswith("- ") and line.endswith(suffix) else item["proposal"]
+
+
+def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, state: Path | None = None) -> int:
     """Reconcile decisions; callers hold the worker and state locks when state is set."""
     changed = 0
     for item in ledger.list():
@@ -793,6 +857,7 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
         if ((status == "adopted" and item.get("implemented_at"))
                 or (status == "revoked" and item.get("reverted_at"))):
             data["applied_actions"].pop(proposal_id, None)
+            data["rewrites"].pop(decision_id, None)
             continue
         action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
         if data["action_attempts"].get(action_key, 0) >= 3 and proposal_id not in data["applied_actions"]:
@@ -806,6 +871,15 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
             if router is None:
                 raise ValueError("target skill is missing")
             reference = facts_path(router)
+            comment = decision_comment(item)
+            if status == "adopted" and comment:
+                # One rewrite per decision, kept so that a retry writes the same line.
+                proposal["note"] = data["rewrites"][decision_id] = (
+                    data["rewrites"].get(decision_id) or rewritten_note(item, comment))
+                if state is not None:
+                    save(data, state)
+            elif status == "revoked":
+                proposal["note"] = applied_note(item, data)
             line = note_line(proposal)
             expected = {"target": str(reference.resolve()), "router": str(router.resolve()), "line": line}
             contents = reference.read_text(encoding="utf-8") if reference.is_file() else ""
@@ -832,9 +906,10 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
                 writing_completed = True
                 if state is not None:
                     save(data, state)
+                rewrite = f"\nコメントで書き直した文: {proposal['note']}" if decision_id in data["rewrites"] else ""
                 ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
                                "outcome": "applied",
-                               "actor": "triage-retro", "result": f"appended to {path}",
+                               "actor": "triage-retro", "result": f"appended to {path}{rewrite}",
                                "undo": json.dumps(expected, ensure_ascii=False)})
             else:
                 applied = next((e for e in reversed(item.get("executions", []))
@@ -865,17 +940,21 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
                                "actor": "triage-retro", "result": result})
             data["applied_actions"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
+            data["rewrites"].pop(decision_id, None)
             changed += 1
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             if writing_completed:
                 raise  # A written note or reversal needs a receipt, not another local edit.
-            data["action_attempts"][action_key] = (3 if category == "script" else
-                                                   data["action_attempts"].get(action_key, 0) + 1)
+            attempts = data["action_attempts"][action_key] = (
+                3 if category == "script" else data["action_attempts"].get(action_key, 0) + 1)
             if state is not None:
                 save(data, state)
             ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
                            "outcome": "failed",
                            "actor": "triage-retro", "result": str(exc)[:500]})
+            if attempts == 3:
+                notify(f"振り返りの{'採用' if status == 'adopted' else '取り消し'}を worker が反映できず、"
+                       f"再試行を止めました。案 {proposal_id}、書き先 {skill}（{category}）、理由: {str(exc)[:300]}")
     return changed
 
 
@@ -973,7 +1052,8 @@ def process_once(state: Path = STATE, root: Path = SOURCE, claude: str = "claude
         sid, session = pending
         transcript = Path(session["transcript"])
         try:
-            candidates = build_proposals(transcript, root, claude, as_existing(ledger.list()))
+            items = ledger.list()
+            candidates = build_proposals(transcript, root, claude, as_existing(items), rejected_lessons(items))
             changed += record_candidates(sid, transcript, candidates, ledger, state, root)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             reason = str(exc)[:500]
@@ -1025,10 +1105,10 @@ def submit(answer: object, session_id: str, state: Path = STATE, root: Path = SO
     return f"processed: {session_id}: {len(candidates)} proposals; reconciled {changed} decisions"
 
 
-def live_prompt(session_id: str, root: Path = SOURCE) -> str:
+def live_prompt(session_id: str, root: Path = SOURCE, rejected: str = "") -> str:
     """Instructions for the Agent fork that a live hourly tab starts at the end of its run."""
     script = Path(__file__).resolve()
-    return (fork_prompt(session_transcript(session_id), root)
+    return (fork_prompt(session_transcript(session_id), root, rejected)
             + "\n\n答えは次の JSON Schema に合う JSON にし、道具はこの記録のコマンドだけに使う。"
             "標準入力に渡して実行し、出力を一行で報告する:\n"
             f"python3 {script} submit --session-id {session_id} <<'JSON'\n...\nJSON\n\n"
@@ -1096,7 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "run-service":
             run_service(args.state, args.source, ledger)
         elif args.action == "fork-prompt":
-            print(live_prompt(args.session_id or "", args.source))
+            print(live_prompt(args.session_id or "", args.source, rejected_lessons(ledger.list())))
         elif args.action == "submit":
             print(submit(json.load(sys.stdin), args.session_id or "", args.state, args.source, ledger=ledger))
         elif args.action == "retry":
