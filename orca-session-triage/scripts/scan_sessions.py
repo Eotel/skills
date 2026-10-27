@@ -1251,7 +1251,9 @@ def github_of(row: dict) -> str:
 def row_view(row: dict) -> dict:
     """One row with fixed keys and no null strings, so a reader never has to know the scan's raw shapes."""
     verdict = row.get("verdict") or {}
-    codex = row.get("codex") or []
+    final = final_message(row)
+    asked = {"claude": (row.get("claude") or {}).get("last_user"),
+             "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     return {
         "identity": row_identity(row), "name": row_name(row), "path": row["path"],
         "repo": row.get("repo") or "", "environment": row.get("environment") or "", "github": github_of(row),
@@ -1259,8 +1261,7 @@ def row_view(row: dict) -> dict:
         "reasons": row.get("reasons") if isinstance(row.get("reasons"), list) else [],
         "question": verdict.get("question") or "", "waits_on": verdict.get("waits_on") or row.get("waits_on") or "",
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
-        "final": final_message(row),
-        "last_user": (row.get("claude") or {}).get("last_user") or (codex[-1].get("last_user") if codex else "") or "",
+        "final": final, "last_user": asked or "",
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
@@ -1275,8 +1276,8 @@ def row_line(view: dict) -> str:
     where = (view["github"] + (f"#{pr['number']} {pr.get('state') or ''}".rstrip() if pr.get("number") else "")
              if view["github"] else "-")
     said = " ".join(view["final"]["text"].split())
-    note = (view["question"] or view["waits_on"] or view["next_step"]
-            or said[:80] + ("…" if len(said) > 80 else ""))
+    note = " ".join((view["question"] or view["waits_on"] or view["next_step"]).split()) or (
+        said[:80] + ("…" if len(said) > 80 else ""))
     return f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
 
 
@@ -1288,7 +1289,9 @@ def saved_rows(path: str) -> list[dict]:
 
 
 def print_row(rows: list[dict], key: str) -> int:
-    found = [row for row in rows if key in (row_identity(row), row["path"], row_name(row))]
+    # A row identity names one row even when another Mac has a checkout at the same path.
+    found = ([row for row in rows if row_identity(row) == key]
+             or [row for row in rows if key in (row["path"], row_name(row))])
     if len(found) != 1:
         names = ", ".join(row_identity(row) for row in found)
         print(f"--row {key}: " + (f"matches {names}; pass one of them" if found else "no row has this name"),

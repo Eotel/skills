@@ -1222,18 +1222,20 @@ class ScanCommandTests(unittest.TestCase):
              "claude": {"final_text": "PR #10 を出しました。\nmerge してよいですか", "final_at": "2026-10-27T01:00:00Z",
                         "last_user": "直して", "pending_questions": []},
              "codex": [], "git": {"github": "Eotel/app"}, "pr": {"number": 10, "state": "OPEN"},
-             "verdict": {"class": "waiting", "question": "PR #10 を merge するか", "waits_on": None,
+             "verdict": {"class": "waiting", "question": "PR #10 を\nmerge するか", "waits_on": None,
                          "next_step": None}},
             {"path": str(checkout), "repo": "dotfiles", "environment": None, "class": "unsure",
              "reasons": [], "comment": "作業中", "terminals": [],
-             "claude": {"final_text": "古い発言", "final_at": "2026-10-27T01:00:00Z"},
+             "claude": {"final_text": "古い発言", "final_at": "2026-10-27T01:00:00Z", "last_user": "古い依頼"},
              "codex": [{"last_assistant": "前の回", "last_assistant_at": "2026-10-27T00:00:00Z",
                         "last_role": "assistant"},
                        {"last_assistant": "設定を反映しました", "last_assistant_at": "2026-10-27T02:00:00Z",
-                        "last_role": "assistant"}]},
+                        "last_role": "assistant", "last_user": "設定を反映して"}]},
             {"path": "/remote/w/app", "repo": "app", "environment": "mbp16", "class": "waiting",
              "reasons": [], "comment": "", "terminals": [{"handle": None, "agent": None, "title": None}],
              "claude": None, "codex": [], "orca_message": {"text": "どちらにしますか", "at": "2026-10-27T03:00:00Z"}},
+            {"path": "/w/app/fix-login", "repo": "app", "environment": "mbp16", "class": "working",
+             "reasons": [], "comment": "", "terminals": [], "claude": None, "codex": []},
         ]
         path = self.dir / "scan.json"
         path.write_text(json.dumps(rows, ensure_ascii=False))
@@ -1250,6 +1252,7 @@ class ScanCommandTests(unittest.TestCase):
             " | PR #10 を merge するか",
             f"dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました",
             "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか",
+            "mbp16::fix-login | working | - | tabs 0 | - | ",
         ])
 
     def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self):
@@ -1261,12 +1264,13 @@ class ScanCommandTests(unittest.TestCase):
                          (str(checkout), "Eotel/chezmoi-dotfiles", "unsure", "作業中"))
         self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T02:00:00Z",
                                         "text": "設定を反映しました"})
+        self.assertEqual(row["last_user"], "設定を反映して")
 
         with redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(scan.main(["--from", str(saved), "--row", "fix-login"]), 0)
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
         row = json.loads(out.getvalue())
-        self.assertEqual((row["class"], row["question"], row["comment"], row["tabs"]),
-                         ("waiting", "PR #10 を merge するか", "",
+        self.assertEqual((row["identity"], row["class"], row["question"], row["comment"], row["tabs"]),
+                         ("/w/app/fix-login", "waiting", "PR #10 を\nmerge するか", "",
                           [{"handle": "term_1", "agent": "claude", "title": ""}]))
         self.assertEqual(row["final"]["text"], "PR #10 を出しました。\nmerge してよいですか")
 
