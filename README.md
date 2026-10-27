@@ -24,11 +24,16 @@ Authoring rules, script and test conventions, and validation commands live in
 Python files are checked with Ruff's `ANN` and `PTH` rules and with ty. Run the
 same checks as CI with `.githooks/pre-commit` after installing `uv`.
 
-Enable the commit hook in each worktree:
+Install the reviewed hook into Git's directory for each worktree, then enable
+that copy. A later branch checkout cannot change the installed hook:
 
 ```sh
+hook_dir="$(git rev-parse --absolute-git-dir)/python-hooks"
+mkdir -p "$hook_dir"
+cp .githooks/pre-commit "$hook_dir/pre-commit"
+chmod +x "$hook_dir/pre-commit"
 git config extensions.worktreeConfig true
-git config --worktree core.hooksPath .githooks
+git config --worktree core.hooksPath "$hook_dir"
 ```
 
 The file-specific exceptions in `ruff.toml` and `ty.toml` record existing
