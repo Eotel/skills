@@ -48,20 +48,27 @@ Run these per worktree, in order.
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild.
    - `containers` lists docker compose projects defined inside the worktree.
-   - `processes` lists commands or current directories using the path. `orca
-     worktree rm` stops its PTYs before Git removal, but this preflight runs
-     first. If the only process
-     blocker is an Orca-owned login shell and its `direnv export zsh`,
-     `setup-runner.sh`, or `direnv exec` children waiting on setup, inspect all
-     tabs and their process trees with `orca terminal list --worktree
-     path:<path> --json` and `ps -axww -o pid=,ppid=,command=`. When every
-     running PTY tree in that worktree consists only of those setup processes,
-     close them with `orca terminal close --worktree path:<path> --all --json`,
-     then run `rm_check.py` again. Do not signal the login shell separately:
-     its prompt hook can start `direnv` again. A `node` server or another job
-     in any PTY tree is still a blocker; leave it running and report it. Run
-     the inspection and preflight sequentially so their CLI processes do not
-     appear in each other's process list.
+   - `processes` lists commands or current directories using the path. Each
+     says whether it runs in an Orca tab (`in_orca_tab`), the tab's `handle`
+     when the system shows it (`tab`), and whether that tab runs nothing but
+     its login shell or the shell's setup waits (`idle_tab`). An idle tab does
+     not block: `orca worktree rm` stops its PTY. A busy tab blocks with the
+     exact `orca terminal close --terminal <handle> --json`: run it when the
+     scan lists that handle in `closable`, then run `rm_check.py` again. A
+     process outside Orca tabs blocks with its PID; a `node` server or another
+     job is left running and reported.
+   - `nested_worktrees` lists worktrees of other repositories inside the
+     checkout (such as `local-deps/<repo>`), each with its own `blockers`
+     (uncommitted changes, ignored paths to open, HEAD on no remote). When
+     they are the only thing left, run `rm_check.py` again with
+     `--detach-nested`: it removes every copy from its repository before
+     `orca worktree rm`, so no prunable record is left. It removes nothing
+     while the worktree has other blockers, paths to review, or a copy with
+     blockers, since a kept worktree still needs its copies.
+   - On a remote Mac whose gh cannot read the PR, `notes` give a
+     `merged_pr_head.py` command for a Mac where gh works. It confirms the PR
+     is MERGED and prints `--pr-head` and `--head-ahead-of-pr`; pass them to
+     `rm_check.py` on the remote Mac.
 2. Stop those projects with `docker compose -p <project> down` from the worktree.
    Keep named volumes unless the user approved deleting them, and say which
    volumes remain.

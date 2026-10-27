@@ -34,7 +34,9 @@ def git(cwd, *args):
 
 def is_cache(relpath):
     parts = Path(relpath.rstrip("/")).parts
-    return bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
+    # pip writes <name>.egg-info beside an editable install's sources again on each install.
+    return (bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
+            or any(part.endswith(".egg-info") for part in parts))
 
 
 def is_regenerable(relpath):
@@ -99,14 +101,24 @@ def env_keys_beyond_example(env):
             and key not in ENV_LOCAL_KEYS and not key.endswith(ENV_LOCAL_KEY_SUFFIXES)]
 
 
+def nested_worktrees(source: Path) -> list[Path]:
+    """Git worktrees of other repositories at an ignored path or directly inside it (a `.git` file names them)."""
+    if (source / ".git").is_file():
+        return [source]
+    if not source.is_dir() or source.is_symlink():
+        return []
+    return sorted(child for child in source.iterdir() if (child / ".git").is_file())
+
+
 def ignored_paths(worktree, main):
-    """(review, regenerable): ignored paths that hold something and are neither caches nor
-    copies of the main checkout, split into those to open and those a setup or test run writes again.
+    """(review, regenerable, nested): ignored paths that hold something and are neither caches nor
+    copies of the main checkout, split into those to open and those a setup or test run writes again,
+    and the worktrees of other repositories found at them (such as `local-deps/<repo>`).
 
     `--ignored=matching` names each path an ignore pattern matched, so a generated
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
-    review, regenerable = [], []
+    review, regenerable, nested = [], [], []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
     for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
@@ -114,6 +126,10 @@ def ignored_paths(worktree, main):
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
         if holds_nothing(source) or (copy.exists() and same_tree(source, copy)):
+            continue
+        found = nested_worktrees(source)
+        if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
+            nested.extend(found)
             continue
         if is_regenerable(rel):
             regenerable.append(rel)
@@ -127,7 +143,37 @@ def ignored_paths(worktree, main):
             if keys:
                 where += "; values .env.example does not have: " + ", ".join(keys)
         review.append("%s (%s)" % (rel, where))
-    return review, regenerable
+    return review, regenerable, nested
+
+
+def on_remote(worktree: Path, head: str) -> bool:
+    """Whether a remote branch holds HEAD, or (asked over the network) a ref of origin points at it."""
+    if git(worktree, "branch", "-r", "--contains", head).stdout.strip():
+        return True
+    try:
+        refs = subprocess.run(["git", "-C", str(worktree), "ls-remote", "origin"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return refs.returncode == 0 and any(line.split("\t")[0] == head for line in refs.stdout.splitlines())
+
+
+def nested_check(copy: Path) -> dict:
+    """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
+    and HEAD on a remote. `detach` is the command that removes it."""
+    repository = main_checkout(copy) or ""
+    blockers = []
+    changes = [line for line in git(copy, "status", "--porcelain").stdout.splitlines() if line]
+    if changes:
+        blockers.append("%d uncommitted changes" % len(changes))
+    review, _, deeper = ignored_paths(copy, repository)
+    if review or deeper:
+        blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
+    head = git(copy, "rev-parse", "HEAD").stdout.strip()
+    if not head or not on_remote(copy, head):
+        blockers.append("HEAD %s is on no remote branch" % head[:8])
+    return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
+            "detach": ["git", "-C", repository, "worktree", "remove", "--force", str(copy)]}
 
 
 def patches_in_base(worktree, head, base):
@@ -197,9 +243,18 @@ def process_cwds(pids):
     return found
 
 
-def processes_in(worktree):
-    """Processes using the worktree in their command or current directory, excluding ancestors."""
-    path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
+# Orca starts each tab as `login` -> login shell under its terminal host: the relocated
+# `orca-terminal-host` or, from older runs, `Orca Helper` running the same daemon-entry.js.
+# A tab whose processes are only that shell, or the shell waiting on its setup hooks,
+# runs nothing: `orca worktree rm` stops it with the worktree.
+ORCA_TERMINAL_HOSTS = ("orca-terminal-host", "/daemon-entry.js")
+LOGIN_SHELL = re.compile(r"-?(?:\S*/)?(?:zsh|bash|sh|fish)(?: -l| --login)?")
+SETUP_WAITS = ("direnv export ", "direnv exec ", "setup-runner.sh")
+TERMINAL_HANDLE = re.compile(r"\bORCA_TERMINAL_HANDLE=(term_[0-9A-Za-z-]+)")
+
+
+def process_table():
+    """{pid: (ppid, command)} from ps, or None when ps fails."""
     try:
         output = subprocess.run(
             ["ps", "-axww", "-o", "pid=,ppid=,command="],
@@ -217,7 +272,78 @@ def processes_in(worktree):
         except ValueError:
             continue
         processes[pid] = (ppid, fields[2])
+    return processes
 
+
+def process_handles(pids: list[int]) -> dict[int, str]:
+    """The Orca terminal handle in each process's environment, where the system shows it.
+
+    macOS hides the environment of a process started through the setuid `login`, so a
+    tab's own login shell shows none while a program started from it does.
+    """
+    if not pids:
+        return {}
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        found = {}
+        for pid in pids:
+            try:
+                match = TERMINAL_HANDLE.search(Path("/proc/%d/environ" % pid).read_bytes().decode(errors="replace")
+                                               .replace("\0", " "))
+            except OSError:
+                continue
+            if match:
+                found[pid] = match.group(1)
+        return found
+    try:
+        output = subprocess.run(["ps", "-E", "-ww", "-o", "pid=,command=", "-p", ",".join(map(str, pids))],
+                                capture_output=True, text=True).stdout
+    except OSError:
+        return {}
+    lines = (line.strip().split(None, 1) for line in output.splitlines())
+    return {int(fields[0]): match.group(1) for fields in lines
+            if len(fields) == 2 and fields[0].isdigit() and (match := TERMINAL_HANDLE.search(fields[1]))}
+
+
+def tab_root(pid, table):
+    """The process Orca's terminal host started for the tab that runs `pid`, or None outside Orca tabs."""
+    seen = set()
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        parent = table[pid][0]
+        if parent in table and any(host in table[parent][1] for host in ORCA_TERMINAL_HOSTS):
+            return pid
+        pid = parent
+    return None
+
+
+def descendants(root, table):
+    children = {}
+    for pid, (parent, _) in table.items():
+        children.setdefault(parent, []).append(pid)
+    found, stack = [], [root]
+    while stack:
+        pid = stack.pop()
+        found.append(pid)
+        stack.extend(children.get(pid, []))
+    return found
+
+
+def runs_nothing(root, members, table):
+    return all(pid == root or LOGIN_SHELL.fullmatch(table[pid][1].strip())
+               or any(wait in table[pid][1] for wait in SETUP_WAITS) for pid in members)
+
+
+def processes_in(worktree):
+    """Processes using the worktree in their command or current directory, excluding ancestors.
+
+    Each names whether it runs in an Orca tab (`in_orca_tab`), that tab's handle when the
+    system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`).
+    A process of the tab running this check counts as outside a tab: it must not close itself.
+    """
+    path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
+    processes = process_table()
+    if processes is None:
+        return None
     ancestors = set()
     pid = os.getpid()
     while pid in processes and pid not in ancestors:
@@ -232,7 +358,18 @@ def processes_in(worktree):
         inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
         if pid not in ancestors and (path.search(command) or inside):
             found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
-    return found
+    own_tab = tab_root(os.getpid(), processes)
+    roots = {item["pid"]: root for item in found
+             if (root := tab_root(item["pid"], processes)) is not None and root != own_tab}
+    tabs = {}
+    for root in set(roots.values()):
+        members = descendants(root, processes)
+        idle = runs_nothing(root, members, processes)
+        handles = {} if idle else process_handles(sorted(members))
+        tabs[root] = (idle, next((handles[pid] for pid in sorted(handles)), None))
+    return [{**item, "in_orca_tab": item["pid"] in roots,
+             "idle_tab": tabs[roots[item["pid"]]][0] if item["pid"] in roots else False,
+             "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None} for item in found]
 
 
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):
@@ -271,14 +408,34 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable = ignored_paths(worktree, main)
+    review, regenerable, nested = ignored_paths(worktree, main)
+    nested = [nested_check(copy) for copy in nested]
+    ready = [item["path"] for item in nested if not item["blockers"]]
+    held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
+    if ready:
+        blockers.append("worktrees of other repositories remain inside: %s. Pass --detach-nested to remove them "
+                        "from their repositories first, so none is left as a prunable record" % ", ".join(ready))
+    if held:
+        blockers.append("worktrees of other repositories inside cannot be detached: " + ", ".join(held))
     processes = processes_in(str(Path(worktree).resolve()))
     if processes is None:
         blockers.append("processes could not be checked; check running processes before removing the worktree")
-    elif processes:
-        blockers.append("作業場を使うプロセスがあります。その PID を止めてから消してください。起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。")
+    else:
+        outside = [str(item["pid"]) for item in processes if not item["in_orca_tab"]]
+        busy = [item for item in processes if item["in_orca_tab"] and not item["idle_tab"]]
+        if outside:
+            blockers.append("作業場を使うプロセスがあります（Orca のタブの外）。PID %s を止めてから消してください。"
+                            "起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。"
+                            % ", ".join(outside))
+        if busy:
+            closes = sorted({"orca terminal close --terminal %s --json" % item["tab"] for item in busy if item["tab"]})
+            unknown = [str(item["pid"]) for item in busy if not item["tab"]]
+            blockers.append("Orca のタブで作業場を使うプロセスがあります。scan の closable にあるタブなら閉じてから、"
+                            "rm_check をやり直してください: " + "; ".join(closes)
+                            + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
+                               "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
     return {"ok": not blockers and not review, "blockers": blockers, "review": review,
-            "regenerable": regenerable, "merged_by_patch": merged_by_patch,
+            "regenerable": regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
             "containers": compose_in(worktree, compose_projects), "processes": processes or []}
 
 
@@ -373,6 +530,17 @@ def start_base(worktree):
     return ref
 
 
+def merged_pr_head_command(worktree, number):
+    """The merged_pr_head.py command that prints --pr-head and --head-ahead-of-pr on a Mac whose gh works."""
+    origin = git(worktree, "remote", "get-url", "origin")
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    host, slug = remote_identity(origin.stdout.strip()) if origin.returncode == 0 else ("", "")
+    if host != "github.com" or slug.count("/") != 1 or not head:
+        return None
+    return ("python3 ~/.claude/skills/orca-session-triage/scripts/merged_pr_head.py --repo %s --pr %d --head %s"
+            % (slug, number, head))
+
+
 def pr_base(worktree, pr):
     """origin/<the PR's base branch> when that ref exists: where the work merges."""
     name = (pr or {}).get("baseRefName")
@@ -411,6 +579,10 @@ def main(argv=None):
     parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
+    parser.add_argument("--detach-nested", action="store_true",
+                        help="when nested worktrees are all that block the removal and each is clean, has nothing "
+                             "ignored to open, and has HEAD on a remote, remove them from their repositories with "
+                             "git worktree remove --force, then check again")
     args = parser.parse_args(argv)
     if args.pr_head and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", args.pr_head):
         parser.error("--pr-head must be a full commit SHA")
@@ -430,11 +602,29 @@ def main(argv=None):
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
     notes = []
+    if args.detach_nested:
+        nested = result["nested_worktrees"]
+        # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
+        others = [blocker for blocker in result["blockers"]
+                  if not blocker.startswith("worktrees of other repositories")]
+        removable = nested and not others and not result["review"] and not any(item["blockers"] for item in nested)
+        detached = [item["path"] for item in nested if removable
+                    and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
+        if detached:
+            result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
+        elif nested:
+            notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
+                         "paths to review, or a copy with blockers")
+        result["detached"] = detached
+    elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
         if not args.pr_head:
             result["blockers"].append("PR #%d lookup failed: %s" % (args.pr, pr_error))
             result["ok"] = False
-            notes.append("PR #%d lookup failed: %s; confirm it is MERGED on a host with gh, then pass --pr-head <sha>" % (args.pr, pr_error))
+            notes.append("PR #%d lookup failed: %s; on a Mac where gh works, run `%s` and pass the arguments it "
+                         "prints to rm_check.py" % (args.pr, pr_error, elsewhere) if elsewhere else
+                         "PR #%d lookup failed: %s; confirm it is MERGED on a host with gh, then pass --pr-head <sha>"
+                         % (args.pr, pr_error))
         else:
             notes.append("PR #%d lookup failed: %s; using the supplied merged PR head" % (args.pr, pr_error))
     if pr and args.pr_head and pr.get("headRefOid") != args.pr_head:
@@ -453,7 +643,9 @@ def main(argv=None):
                     for blocker in result["blockers"])):
         notes.append("For a merged PR, confirm its head on a host with gh and pass --pr-head <sha>")
     if any("cannot be compared" in blocker for blocker in result["blockers"]):
-        notes.append("PR head object is absent locally; compare <pr-head>...<HEAD> with gh on another host and pass its ahead_by as --head-ahead-of-pr <number>")
+        notes.append("PR head object is absent locally; on a Mac where gh works, run `%s` and pass the arguments "
+                     "it prints" % elsewhere if elsewhere else
+                     "PR head object is absent locally; compare <pr-head>...<HEAD> with gh on another host and pass its ahead_by as --head-ahead-of-pr <number>")
     pr_base_name = (pr or {}).get("baseRefName")
     if not args.base and not by_pr and pr_base_name:
         notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr_base_name))
