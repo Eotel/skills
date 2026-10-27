@@ -44,8 +44,9 @@ def runs_page(orca, workspace, runs_json):
 
 def scheduled_turn_working(agent, status_by_pane):
     status = status_by_pane.get(agent.get("paneKey")) or status_by_pane.get(agent.get("parentPaneKey"))
-    return status == "dispatched" or (status == "completed" and
-                                      (agent.get("mainAgent") or {}).get("state") == "done")
+    # An Orca restart marks the run it was dispatching dispatch_failed while its tab goes on working.
+    return status in ("dispatched", "dispatch_failed") or (
+        status == "completed" and (agent.get("mainAgent") or {}).get("state") == "done")
 
 
 def main(argv=None):
@@ -83,7 +84,7 @@ def main(argv=None):
                 print("skip: could not identify the scheduled runs")
                 return 2
             scheduled_panes = {run.get("terminalPaneKey"): run.get("status") for run in runs
-                               if run.get("status") in ("dispatched", "completed") and
+                               if run.get("status") in ("dispatched", "dispatch_failed", "completed") and
                                run.get("trigger") == "scheduled" and
                                hourly_runtime.workspace_path(run.get("workspaceId")) ==
                                os.path.realpath(args.workspace) and run.get("terminalPaneKey")}

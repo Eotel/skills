@@ -210,7 +210,8 @@ orca automations create --name "session triage" --trigger hourly \
 - An existing workspace with `--fresh-session` gets a new tab and session on
   each allowed run, without making a new worktree.
 - `scripts/precheck.py` skips while a scheduled turn is still dispatched and
-  working, or its completed turn still owns a background job. A later human
+  working (also a run Orca marked `dispatch_failed` on a restart while its tab
+  works on; such a run with a live tab also keeps the inbox cursor), or its completed turn still owns a background job. A later human
   turn in that tab does not hold the next run. A skipped run is visible in
   `orca automations runs --id <id> --json`. A manual `orca automations run`
   does not run the precheck.

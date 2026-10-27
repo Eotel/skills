@@ -2161,6 +2161,16 @@ class PrecheckTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("skip: a scheduled turn in /w/triage is working", out)
 
+    def test_a_working_turn_whose_dispatch_was_marked_failed_holds_the_next_run(self):
+        # Orca marks the dispatching run dispatch_failed when it restarts, while its tab keeps working.
+        row = worktree("/w/triage", "working")
+        row["agents"][0]["paneKey"] = "restarted-pane"
+        runs = [{"status": "dispatch_failed", "trigger": "scheduled", "terminalPaneKey": "restarted-pane",
+                 "workspaceId": "repo::/w/triage"}]
+        code, out = self.run_precheck([row], runs)
+        self.assertEqual(code, 1)
+        self.assertIn("skip: a scheduled turn in /w/triage is working", out)
+
     def test_completed_scheduled_run_with_working_human_followup_allows_next_run(self):
         row = worktree("/w/triage", "working")
         row["agents"][0]["paneKey"] = "old-pane"
@@ -2457,6 +2467,30 @@ class InboxReadTests(unittest.TestCase):
                 self.assertIn("t3 done host1 old\n完了全文\n二行目", rendered)
                 self.assertEqual(rendered.splitlines()[-1], f"NEXT_OFFSET={inbox.stat().st_size}")
                 self.assertFalse(cursor.exists())
+
+    def test_live_tab_of_a_run_marked_dispatch_failed_keeps_the_default_cursor(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "default.offset"
+            write_jsonl(inbox, [{"kind": "ask", "text": "new question"}])
+            cursor.write_text("0")
+            runs = [{"status": "dispatch_failed", "terminalPaneKey": "tab15:leaf"},
+                    {"status": "completed", "terminalPaneKey": "tab14:leaf"}]
+            terminals = [{"tabId": "tab15", "leafId": "leaf", "connected": True},
+                         {"tabId": "tab14", "leafId": "leaf", "connected": True}]
+            env = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": "",
+                   "ORCA_WORKTREE_ID": "repo::/w/triage", "ORCA_PANE_KEY": "tab14:leaf"}
+            with patch.dict(os.environ, env), patch.object(inbox_read, "paths", return_value=(inbox, cursor)), \
+                    patch.object(hourly_runtime, "scheduled_runs", return_value=runs), \
+                    patch.object(hourly_runtime, "orca_result", return_value={"terminals": terminals}):
+                with redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 1)
+                self.assertIn("latest scheduled", error.getvalue())
+                os.environ["ORCA_PANE_KEY"] = "tab15:leaf"
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 0)
+        # A failed dispatch whose tab is gone still leaves the cursor with the newest live run.
+        self.assertEqual(hourly_runtime.latest_pane(runs, frozenset({"tab14:leaf"})), "tab14:leaf")
 
     def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self):
         runs = [{"status": "completed", "terminalPaneKey": None},

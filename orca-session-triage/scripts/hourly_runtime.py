@@ -34,11 +34,19 @@ def scheduled_runs(orca: str, workspace: str) -> list[dict[str, Any]]:
     return runs
 
 
-def latest_pane(runs: list[dict[str, Any]]) -> str | None:
+def live_panes(terminals: list[dict[str, Any]]) -> frozenset[str]:
+    """`tabId:leafId` of each connected terminal, the form of a run's terminalPaneKey."""
+    return frozenset(f"{term.get('tabId')}:{term.get('leafId')}" for term in terminals
+                     if term.get("connected") and not term.get("orphaned"))
+
+
+def latest_pane(runs: list[dict[str, Any]], live: frozenset[str] = frozenset()) -> str | None:
     # Orca clears terminalPaneKey after a tab closes. Never give its cursor to
-    # an older run just because the newest run's tab is gone.
+    # an older run just because the newest run's tab is gone. An Orca restart
+    # marks the run it was dispatching dispatch_failed while its tab goes on.
     return next((run.get("terminalPaneKey") for run in runs
-                 if run.get("status") in ("dispatched", "completed")), None)
+                 if run.get("status") in ("dispatched", "completed")
+                 or (run.get("status") == "dispatch_failed" and run.get("terminalPaneKey") in live)), None)
 
 
 def current_pane(orca: str = "orca") -> bool:
@@ -48,4 +56,11 @@ def current_pane(orca: str = "orca") -> bool:
     if not pane or not workspace:
         return False
     resolved_workspace = workspace_path(workspace)
-    return bool(resolved_workspace and pane == latest_pane(scheduled_runs(orca, resolved_workspace)))
+    if not resolved_workspace:
+        return False
+    runs = scheduled_runs(orca, resolved_workspace)
+    # Read the terminals only when the newest run with a tab may be one marked dispatch_failed.
+    failed_first = next((run.get("status") == "dispatch_failed" for run in runs
+                         if run.get("status") in ("dispatched", "completed", "dispatch_failed")), False)
+    live = live_panes(orca_result(orca, "terminal", "list")["terminals"]) if failed_first else frozenset()
+    return pane == latest_pane(runs, live)
