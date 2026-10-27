@@ -19,3 +19,5 @@
 - 作業場の local-deps/ が共有 repo の入れ子 worktree のときは、各写しにも rm_check.py をかけて blockers が無く review を片付けたことと、HEAD がリモートにあること（git branch -r --contains・ls-remote）を確かめてから git -C <共有 repo> worktree remove で外すと、親の rm_check が ok になる。--force は写しの rm_check が ok のときだけ使う <!-- triage-retro:eb34ba15-0878-57f8-a361-1ffb20911dc3 -->
 - 指揮が答えを受け取ったかは scan の pending_questions で決めない。引き継ぎの直前に `~/.cache/orca-briefs/bin/claude-tx <指揮の transcript> <since-ISO> 400` を実行し、ANSWER 行とその後の動きを見る。 <!-- triage-retro:bae13185-54d4-51be-8294-a6a41410c2c4 -->
 - 定時の引き継ぎを triage-notify で送る直前に `inbox_read.py read --brief` を実行し直し、走査を始めた後に届いた分を引き継ぎに入れる。ack の前にもう一度読む。 <!-- triage-retro:d5866bed-ff8d-5d56-b525-76489944f866 -->
+- chezmoi-dotfiles の作業場の PR（#72・#73 など）は gh の -R Eotel/chezmoi-dotfiles で見る。-R Eotel/dotfiles では『Could not resolve to a PullRequest』になる。迷ったら作業場の git remote get-url origin で確かめる <!-- triage-retro:e58e2a8c-105c-534a-a5fc-b9715898dc3c -->
+- Backlog のコメントは bee issue view --comments --json の JSON に入らない。bee api issues/<KEY>/comments -f order=desc -f count=N で取る（パスに ?order=… を付けると出力が空になり JSONDecodeError） <!-- triage-retro:6e3a812c-515f-59ba-9d2a-43386696dffe -->
