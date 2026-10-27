@@ -32,6 +32,7 @@ def load_script(name):
 
 scan = load_script("scan_sessions")
 rmcheck = load_script("rm_check")
+merged_pr_head = load_script("merged_pr_head")
 precheck = load_script("precheck")
 hourly_runtime = sys.modules["hourly_runtime"]
 hourly_state = load_script("hourly_state")
@@ -1825,6 +1826,104 @@ class RmCheckTests(unittest.TestCase):
             os.chdir(cwd)
 
         self.assertEqual(result["containers"], [])
+
+    def test_processes_in_orca_tabs_name_their_tab_and_idle_shells_do_not_block(self):
+        wt = str(self.wt.resolve())
+        host = "/Applications/Orca Terminal Host.app/Contents/MacOS/orca-terminal-host --socket s"
+        login = "/usr/bin/login -flpq me /bin/bash -c exec -l orca-tcc-login /bin/zsh /bin/zsh -l"
+        table = {1: (0, "launchd"), 10: (1, host),
+                 20: (10, login), 21: (20, "-/bin/zsh -l"),                       # a shell at its prompt
+                 30: (10, login), 31: (30, "-/bin/zsh -l"), 32: (31, "codex --yolo"),  # an agent at work
+                 40: (1, "node server.js")}                                       # started outside Orca
+        cwds = {21: wt, 32: wt, 40: wt}
+        with patch.object(rmcheck, "process_table", return_value=table), \
+                patch.object(rmcheck, "process_cwds", return_value=cwds), \
+                patch.object(rmcheck, "process_handles", return_value={32: "term_busy"}):
+            result = self.check()
+        with patch.object(rmcheck, "process_table", return_value={pid: table[pid] for pid in (1, 10, 20, 21)}), \
+                patch.object(rmcheck, "process_cwds", return_value={21: wt}), \
+                patch.object(rmcheck, "process_handles", return_value={}):
+            idle_only = self.check()
+
+        tabs = {item["pid"]: (item["in_orca_tab"], item["idle_tab"], item["tab"]) for item in result["processes"]}
+        self.assertEqual(tabs, {21: (True, True, None), 32: (True, False, "term_busy"), 40: (False, False, None)})
+        self.assertEqual(len(result["blockers"]), 2)
+        self.assertIn("orca terminal close --terminal term_busy --json", result["blockers"][1])
+        self.assertIn("PID 40 ", result["blockers"][0])
+        self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
+
+    def test_a_failed_pr_lookup_names_the_command_for_a_mac_where_gh_works(self):
+        git(self.main, "remote", "add", "origin", "git@github.com:acme/app.git")
+        head = git(self.wt, "rev-parse", "HEAD")
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == "gh":
+                raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 401: Bad credentials")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(rmcheck.subprocess, "run", side_effect=fake_run):
+            code, result = self.run_main("--pr", "7")
+
+        self.assertEqual(code, 1)
+        self.assertIn("merged_pr_head.py --repo acme/app --pr 7 --head " + head, " ".join(result["notes"]))
+
+    def test_merged_pr_head_prints_rm_check_arguments_only_for_a_merged_pr(self):
+        pr_head, head = "a" * 40, "b" * 40
+
+        def gh(state):
+            def run(cmd, *args, **kwargs):
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    out = {"state": state, "headRefOid": pr_head}
+                else:
+                    self.assertEqual(cmd[:3], ["gh", "api", f"repos/acme/app/compare/{pr_head}...{head}"])
+                    out = {"ahead_by": 0, "status": "behind"}
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(out), stderr="")
+            return run
+
+        argv = ["--repo", "acme/app", "--pr", "7", "--head", head]
+        with patch.object(merged_pr_head.subprocess, "run", side_effect=gh("MERGED")), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(merged_pr_head.main(argv), 0)
+        self.assertEqual(out.getvalue(), f"--pr-head {pr_head} --head-ahead-of-pr 0\n")
+        with patch.object(merged_pr_head.subprocess, "run", side_effect=gh("OPEN")), \
+                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(merged_pr_head.main(argv), 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("OPEN", err.getvalue())
+
+    def test_nested_worktrees_on_a_remote_are_detached_and_others_block(self):
+        remote = Path(self.tmp.name) / "deps.git"
+        git(Path(self.tmp.name), "init", "--bare", "-q", str(remote))
+        deps = Path(self.tmp.name) / "deps"
+        deps.mkdir()
+        git(deps, "init", "-q", "-b", "main")
+        git(deps, "config", "user.email", "t@example.com")
+        git(deps, "config", "user.name", "t")
+        (deps / "lib.txt").write_text("v1\n")
+        git(deps, "add", "lib.txt")
+        git(deps, "commit", "-q", "-m", "lib")
+        git(deps, "remote", "add", "origin", str(remote))
+        git(deps, "push", "-q", "-u", "origin", "main")
+        (self.main / ".git" / "info" / "exclude").write_text("local-deps/\n")
+        pushed, local = self.wt / "local-deps" / "pushed", self.wt / "local-deps" / "local"
+        git(deps, "worktree", "add", "-q", "--detach", str(pushed), "main")
+        git(deps, "worktree", "add", "-q", "-b", "draft", str(local), "main")
+        (local / "lib.txt").write_text("v2\n")
+        git(local, "commit", "-q", "-am", "unpushed")
+
+        code, result = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual({Path(item["path"]).name: item["blockers"] == [] for item in result["nested_worktrees"]},
+                         {"pushed": True, "local": False})
+        self.assertTrue(pushed.exists())
+
+        code, result = self.run_main("--detach-nested")
+        self.assertFalse(pushed.exists())
+        self.assertNotIn(str(pushed.resolve()), git(deps, "worktree", "list"))
+        self.assertEqual([Path(item["path"]).name for item in result["nested_worktrees"]], ["local"])
+        self.assertIn("is on no remote branch", " ".join(result["blockers"]))
+        self.assertEqual(code, 1)
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self):
         real_run = subprocess.run
