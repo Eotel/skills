@@ -931,6 +931,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                     auto = any(d.get("decision") == "adopt" and d.get("actor") == "triage-retro"
                                for d in item.get("decisions", []))
                     path = adopt(proposal, root, auto=auto)
+                    if f"{MARKER}{proposal_id} -->" in data.get("revoked_notes", []):
+                        data["revoked_notes"].remove(f"{MARKER}{proposal_id} -->")
                     remember_versions(data, router, path)
                 data["applied_actions"][proposal_id] = expected
                 writing_completed = True
@@ -960,6 +962,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                         for changed_path in (router, reference):
                             data["target_versions"].pop(str(changed_path.resolve()), None)
                     result = f"removed adopted line from {reference}"
+                    # Main may already hold the note through a merge the checkout has not settled.
+                    data.setdefault("revoked_notes", []).append(f"{MARKER}{proposal_id} -->")
                 else:
                     result = "no skill line was applied"
                 writing_completed = True
@@ -1061,31 +1065,40 @@ def blob(repo: Path, ref: str, name: str) -> bytes | None:
     return None if shown.returncode else shown.stdout
 
 
+def note_id(line: str) -> str:
+    return line[line.index(MARKER):].strip()
+
+
 def note_ids(lines: Sequence[str]) -> set[str]:
-    return {line[line.index(MARKER):] for line in lines if MARKER in line}
+    return {note_id(line) for line in lines if MARKER in line}
 
 
-def replay_facts(repo: Path, name: str, local: bytes | None) -> bytes | None:
-    """The worker's added and removed note lines in ``name`` replayed on origin/main; None when no note is left."""
+def replay_facts(repo: Path, name: str, local: bytes | None, revoked: frozenset[str] = frozenset()) -> bytes | None:
+    """The worker's added and removed note lines in ``name`` replayed on origin/main; None when no note is left.
+
+    ``revoked`` names notes revoked since the checkout last settled; main may hold them after a merge
+    that HEAD has not caught up with.
+    """
     base = (blob(repo, "HEAD", name) or b"").decode("utf-8").splitlines(keepends=True)
     upstream = (blob(repo, "origin/main", name) or b"").decode("utf-8")
     mine = (local or b"").decode("utf-8").splitlines(keepends=True)
-    removed = note_ids(base) - note_ids(mine)
+    removed = (note_ids(base) | revoked) - note_ids(mine)
     kept = [line for line in (upstream or FACTS_HEADER).splitlines(keepends=True)
-            if MARKER not in line or line[line.index(MARKER):] not in removed]
-    added = [line for line in mine if MARKER in line and line not in base and line[line.index(MARKER):] not in note_ids(kept)]
+            if MARKER not in line or note_id(line) not in removed]
+    added = [line for line in mine if MARKER in line and line not in base and note_id(line) not in note_ids(kept)]
     result = "".join(kept) + ("" if not added or "".join(kept).endswith("\n") else "\n") + "".join(added)
     return result.encode("utf-8") if note_ids(result.splitlines(keepends=True)) else None
 
 
-def replay(repo: Path, names: Sequence[str]) -> dict[str, bytes | None]:
+def replay(repo: Path, names: Sequence[str], revoked: frozenset[str] = frozenset()) -> dict[str, bytes | None]:
     """The worker's edits to ``names`` replayed on origin/main; None deletes a file.
 
     The worker only adds or removes marked note lines and router pointers, so replaying them keeps whatever
     main gained meanwhile. A router points to its facts exactly when the replayed facts still hold a note.
     """
     local = {name: (repo / name).read_bytes() if (repo / name).is_file() else None for name in names}
-    facts = {name: replay_facts(repo, name, local[name]) for name in names if name.endswith(f"references/{FACTS_NAME}")}
+    facts = {name: replay_facts(repo, name, local[name], revoked)
+             for name in names if name.endswith(f"references/{FACTS_NAME}")}
 
     def router(name: str) -> bytes | None:
         upstream = blob(repo, "origin/main", name)
@@ -1139,6 +1152,7 @@ def settle(repo: Path, changed: Sequence[Path], data: dict[str, Any]) -> str:
                 path.write_bytes(content)
         return f"publish: notes are in main, but the checkout did not fast-forward: {merged.stderr.strip()[:200]}"
     data.pop("published", None)
+    data.pop("revoked_notes", None)
     return "publish: settled after the merge"
 
 
@@ -1168,11 +1182,14 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
     held = [name for path in files.edited if (name := str(path.relative_to(repo))) in published]
     if held:
         raise RuntimeError(f"published files changed after the worker wrote them: {', '.join(held)}")
-    names = sorted({str(path.relative_to(repo)) for path in files.written} | set(published))
-    if not names:
+    touched = {str(path.relative_to(repo)) for path in files.written} | set(published)
+    if not touched:
         return "publish: nothing to publish"
+    # A router is replayed with its facts so that main's own pointer changes cannot strand a note.
+    names = sorted(touched | {str(Path(name).parent.parent / "SKILL.md")
+                              for name in touched if name.endswith(f"references/{FACTS_NAME}")})
     git(repo, "fetch", "--quiet", "origin")
-    contents = replay(repo, names)
+    contents = replay(repo, names, frozenset(data.get("revoked_notes") or ()))
     if all(content == blob(repo, "origin/main", name) for name, content in contents.items()):
         # Main already says what the worker wants: the PR merged, or a revocation emptied it.
         withdrawn = [pull["number"] for pull in open_pull_requests(repo)]
@@ -1197,7 +1214,8 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
                 else:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(content)
-            git(tree, "add", "--all", "--", *names)
+            git(tree, "add", "--all", "--", *[name for name in names
+                                              if (tree / name).exists() or blob(repo, "origin/main", name) is not None])
             git(tree, "commit", "--quiet", "-m", "docs: record adopted retrospective notes")
             lease = git(repo, "ls-remote", "origin", f"refs/heads/{PUBLISH_BRANCH}").stdout.split()
             git(tree, "push", "--quiet", f"--force-with-lease=refs/heads/{PUBLISH_BRANCH}:{lease[0] if lease else ''}",
