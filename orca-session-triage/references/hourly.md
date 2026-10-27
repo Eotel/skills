@@ -14,7 +14,7 @@ shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
 For a large inbox, `read --summary` shows each entry on one line with the first
 160 characters of its text. `--kind ask,done` filters by type, and
-`--source Eotel/skills/triage-request-ledger` filters by the displayed
+`--source skills/triage-request-ledger` filters by the displayed
 `repo/worktree` (older entries without a repo use their worktree). These options
 only filter the display: `NEXT_OFFSET` still covers every complete inbox entry.
 Read an unfiltered summary before acknowledging an offset from a filtered view
