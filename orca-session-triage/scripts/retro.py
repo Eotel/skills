@@ -879,6 +879,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                 or (status == "revoked" and item.get("reverted_at"))):
             data["applied_actions"].pop(proposal_id, None)
             data["rewrites"].pop(decision_id, None)
+            # Retries counted under an earlier decision no longer stand for a failure once the proposal settles.
+            data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
+                                       if not key.startswith(f"{proposal_id}:")}
             continue
         action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
         if category in SEPARATE_WORK:

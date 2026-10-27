@@ -628,6 +628,19 @@ class RetroTests(unittest.TestCase):
         self.assertNotIn(f"other-skill/references/{retro.FACTS_NAME}", tree)
         self.assertIn(f"orca-session-triage/references/{retro.FACTS_NAME}", tree)
 
+    def test_settled_proposal_leaves_no_failed_action(self) -> None:
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        data = retro.load(self.state)
+        data["action_attempts"][f"{proposal_id}:adopted:2026-10-27T15:14:00+09:00"] = 3
+        retro.sync_decisions(ledger, data, self.root)
+        retro.sync_decisions(ledger, data, self.root)
+        self.assertTrue(ledger.items[proposal_id]["implemented_at"])
+        self.assertEqual(data["action_attempts"], {})
+
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
