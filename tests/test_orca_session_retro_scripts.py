@@ -440,14 +440,18 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "自分たちの道具は直す案にする")
 
-    def test_adopted_upstream_issue_is_not_written_and_notifies(self) -> None:
-        log = self.home / "notify.log"
+    def test_adopted_tool_fix_is_handed_off_once_without_a_notice(self) -> None:
         notifier = self.home / "triage-notify"
-        notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        notifier.write_text(f'#!/bin/sh\necho "$@" >> {self.home / "notify.log"}\n')
         notifier.chmod(0o755)
-        ledger = FakeLedger()
+        config = self.home / "hosts.json"
+        config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
+        ledger = retro.LedgerClient(script=ROOT / "adoption-triage/scripts/ledger.py", events=self.home / "events.jsonl",
+                                    imports=self.home / "imports", decision_config=config)
         proposal_id = str(uuid.uuid4())
-        ledger.propose({"proposal_id": proposal_id, "proposal": "bee の issue view --json にコメントを入れるよう上流に報告する。",
+        ledger.propose({"proposal_id": proposal_id, "source": {"session": self.sid, "worktree": str(self.root)},
+                        "fact": "bee の JSON にコメントが無い。", "proposal": "bee の issue view --json にコメントを入れるよう上流に報告する。",
+                        "reason": "外の道具", "recommendation": "adopt", "priority": "normal", "evidence": ["bee 1.1.1"],
                         "target": "triage-retro:skill:orca-session-triage:upstream"})
         ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
         data = retro.load(self.state)
@@ -455,9 +459,54 @@ class RetroTests(unittest.TestCase):
             with mock.patch.object(retro, "NOTIFY", notifier):
                 retro.sync_decisions(ledger, data, self.root, self.state)
                 retro.sync_decisions(ledger, data, self.root, self.state)
+        item = ledger.list()[0]
+        self.assertEqual([execution["outcome"] for execution in item["executions"]], ["handed_off"])
+        self.assertIsNone(item["implemented_at"])
         self.assertFalse(retro.facts_path(self.target).exists())
-        self.assertEqual(len(log.read_text().splitlines()), 1)
-        self.assertIn(proposal_id, log.read_text())
+        self.assertFalse((self.home / "notify.log").exists())
+
+    def test_worker_notes_are_published_on_one_branch_and_settled_after_merge(self) -> None:
+        remote = self.home / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        git = ["git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+               "-c", "core.hooksPath=/dev/null"]
+        subprocess.run([*git, "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run([*git, "push", "-q", "origin", "main"], check=True)
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        facts = retro.adopt(note, self.root)
+        retro.remember_versions(data, self.target, facts)
+        other = self.root / "orca-session-triage/references/hourly.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("another lane's edit\n")
+        created = []
+        real_run = subprocess.run
+
+        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git":
+                return real_run([*cmd[:1], "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                 "-c", "core.hooksPath=/dev/null", *cmd[1:]], *args, **kwargs)
+            if cmd[0] != "gh":
+                return real_run(cmd, *args, **kwargs)
+            if cmd[1:3] == ["pr", "create"]:
+                created.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "[]" if cmd[1:3] == ["pr", "list"] and not created else "[{}]", "")
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("pushed", retro.publish(data, self.root))
+            self.assertIn("up to date", retro.publish(data, self.root))
+        branch = ["git", "--git-dir", str(remote)]
+        tree = real_run([*branch, "ls-tree", "-r", "--name-only", retro.PUBLISH_BRANCH],
+                        capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("orca-session-triage/references/observed-triage-facts.md", tree)
+        self.assertNotIn("orca-session-triage/references/hourly.md", tree)
+        self.assertEqual(len(created), 1)
+        real_run([*branch, "update-ref", "refs/heads/main", retro.PUBLISH_BRANCH], check=True)
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("settled", retro.publish(data, self.root))
+        self.assertEqual(real_run(["git", "-C", str(self.root), "rev-parse", "HEAD"], capture_output=True, text=True).stdout,
+                         real_run([*branch, "rev-parse", "main"], capture_output=True, text=True).stdout)
+        self.assertIn(note["id"], facts.read_text())
+        self.assertEqual(other.read_text(), "another lane's edit\n")
 
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):

@@ -21,6 +21,8 @@ DEFAULT_EVENTS = Path("~/.local/share/adoption-triage/events.jsonl").expanduser(
 DEFAULT_IMPORTS = Path("~/.local/share/adoption-triage/imports").expanduser()
 DEFAULT_HOSTS = Path("~/.config/adoption-triage/hosts.json").expanduser()
 DECISIONS = {"adopt", "reject", "hold", "revoke"}
+# handed_off: the worker left an adopted change to a lane, which records applied when it ships.
+OUTCOMES = {"applied", "reverted", "failed", "handed_off"}
 
 
 def required_text(value, name, limit=4000):
@@ -154,13 +156,13 @@ def project(rows):
                 raise ValueError(f"execution without proposal: {proposal_id}")
             item = proposals[proposal_id]
             outcome = row["outcome"]
-            if outcome not in {"applied", "reverted", "failed"}:
+            if outcome not in OUTCOMES:
                 raise ValueError(f"invalid execution outcome: {outcome}")
             decision = next((decision for decision in item["decisions"]
                              if decision["id"] == row.get("decision_id")), None)
             if decision is None or decision["decision"] not in {"adopt", "revoke"}:
                 raise ValueError(f"execution without an adoption or revocation: {proposal_id}")
-            if outcome == "applied" and decision["decision"] != "adopt":
+            if outcome in {"applied", "handed_off"} and decision["decision"] != "adopt":
                 raise ValueError(f"application without adoption: {proposal_id}")
             if outcome == "reverted" and decision["decision"] != "revoke":
                 raise ValueError(f"reversal without revocation: {proposal_id}")
@@ -241,8 +243,8 @@ def validate_execution(body):
     decision_id = required_text(body.get("decision_id"), "decision_id", 80)
     uuid.UUID(decision_id)
     outcome = body.get("outcome")
-    if outcome not in {"applied", "reverted", "failed"}:
-        raise ValueError("outcome must be applied, reverted, or failed")
+    if outcome not in OUTCOMES:
+        raise ValueError("outcome must be applied, reverted, failed, or handed_off")
     row = {**envelope("execution", proposal_id), "decision_id": decision_id, "outcome": outcome,
            "actor": required_text(body.get("actor"), "actor", 120),
            "result": required_text(body.get("result"), "result")}
