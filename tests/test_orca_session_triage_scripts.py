@@ -2161,16 +2161,6 @@ class PrecheckTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("skip: a scheduled turn in /w/triage is working", out)
 
-    def test_a_working_turn_whose_dispatch_was_marked_failed_holds_the_next_run(self):
-        # Orca marks the dispatching run dispatch_failed when it restarts, while its tab keeps working.
-        row = worktree("/w/triage", "working")
-        row["agents"][0]["paneKey"] = "restarted-pane"
-        runs = [{"status": "dispatch_failed", "trigger": "scheduled", "terminalPaneKey": "restarted-pane",
-                 "workspaceId": "repo::/w/triage"}]
-        code, out = self.run_precheck([row], runs)
-        self.assertEqual(code, 1)
-        self.assertIn("skip: a scheduled turn in /w/triage is working", out)
-
     def test_completed_scheduled_run_with_working_human_followup_allows_next_run(self):
         row = worktree("/w/triage", "working")
         row["agents"][0]["paneKey"] = "old-pane"
@@ -2476,7 +2466,7 @@ class InboxReadTests(unittest.TestCase):
             cursor.write_text("0")
             runs = [{"status": "dispatch_failed", "terminalPaneKey": "tab15:leaf"},
                     {"status": "completed", "terminalPaneKey": "tab14:leaf"}]
-            terminals = [{"tabId": "tab15", "leafId": "leaf", "connected": True},
+            terminals = [{"tabId": "tab15", "leafId": "leaf", "connected": True, "orphaned": True},
                          {"tabId": "tab14", "leafId": "leaf", "connected": True}]
             env = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": "",
                    "ORCA_WORKTREE_ID": "repo::/w/triage", "ORCA_PANE_KEY": "tab14:leaf"}

@@ -22,7 +22,8 @@ so hidden entries are not skipped.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
-scheduled triage tab may read or acknowledge that cursor. An older tab must
+scheduled triage tab may read or acknowledge that cursor; a run Orca marked
+`dispatch_failed` on a restart still counts while its tab is connected. An older tab must
 leave new inbox entries for the current run; it can finish without handling
 them. The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local
@@ -210,8 +211,7 @@ orca automations create --name "session triage" --trigger hourly \
 - An existing workspace with `--fresh-session` gets a new tab and session on
   each allowed run, without making a new worktree.
 - `scripts/precheck.py` skips while a scheduled turn is still dispatched and
-  working (also a run Orca marked `dispatch_failed` on a restart while its tab
-  works on; such a run with a live tab also keeps the inbox cursor), or its completed turn still owns a background job. A later human
+  working, or its completed turn still owns a background job. A later human
   turn in that tab does not hold the next run. A skipped run is visible in
   `orca automations runs --id <id> --json`. A manual `orca automations run`
   does not run the precheck.

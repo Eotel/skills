@@ -35,9 +35,11 @@ def scheduled_runs(orca: str, workspace: str) -> list[dict[str, Any]]:
 
 
 def live_panes(terminals: list[dict[str, Any]]) -> frozenset[str]:
-    """`tabId:leafId` of each connected terminal, the form of a run's terminalPaneKey."""
-    return frozenset(f"{term.get('tabId')}:{term.get('leafId')}" for term in terminals
-                     if term.get("connected") and not term.get("orphaned"))
+    """`tabId:leafId` of each connected terminal, the form of a run's terminalPaneKey.
+
+    A tab Orca detached from the window is orphaned yet stays connected and runs.
+    """
+    return frozenset(f"{term.get('tabId')}:{term.get('leafId')}" for term in terminals if term.get("connected"))
 
 
 def latest_pane(runs: list[dict[str, Any]], live: frozenset[str] = frozenset()) -> str | None:
