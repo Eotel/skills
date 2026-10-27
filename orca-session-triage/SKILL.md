@@ -81,8 +81,9 @@ board's done cards; close what the user approves.
 - `references/hourly.md`: a run started as `/orca-session-triage hourly`,
   setting up the Orca automation that starts it, or ending a turn of the
   session the automation runs in.
-- `references/retro.md`: the external retrospective service, its adoption
-  ledger, and recovery when an hourly transcript has not been processed.
+- `references/retro.md`: the end-of-run retrospective in a forked Agent, the
+  external service for finished sessions, its adoption ledger, and recovery
+  when an hourly transcript has not been processed.
 
 ## Done
 
@@ -118,3 +119,7 @@ permitted cleanup, and any handoff in `references/hourly.md`.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other
   tab's work and explains the external inbox service.
+
+## Observed triage facts
+
+Read [references/observed-triage-facts.md](references/observed-triage-facts.md) when troubleshooting a tool used in hourly triage.

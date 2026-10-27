@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Render, activate, and inspect the external triage retrospective launchd service."""
 
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
@@ -23,7 +25,8 @@ def paths(home=None):
             home / ".cache/orca-session-triage/retro/service.log")
 
 
-def plist_bytes(home=None, python=None, claude=None, script=None):
+def plist_bytes(home: Path | str | None = None, python: str | None = None, claude: str | None = None,
+                script: Path | str | None = None) -> bytes:
     plist, log = paths(home)
     python = python or shutil.which("python3")
     claude = claude or shutil.which("claude")

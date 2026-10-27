@@ -1,7 +1,10 @@
 """Offline behavior tests for hourly triage retrospective capture and decisions."""
 
+from __future__ import annotations
+
 import json
 import io
+import plistlib
 from contextlib import redirect_stdout
 from datetime import datetime
 import os
@@ -10,6 +13,7 @@ import pwd
 import subprocess
 import sys
 import tempfile
+from typing import Any
 import unittest
 import uuid
 from unittest import mock
@@ -19,27 +23,28 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "orca-session-triage" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import retro  # noqa: E402
+import retro_service  # noqa: E402
 import stop_check  # noqa: E402
 
 
-def transcript(path):
+def transcript(path: Path, cwd: str = "/tmp/hourly-triage") -> None:
     rows = [
-        {"type": "user", "timestamp": "2026-10-26T01:00:00Z", "cwd": "/tmp/hourly-triage", "message": {
+        {"type": "user", "timestamp": "2026-10-26T01:00:00Z", "cwd": cwd, "message": {
             "content": "<command-message>orca-session-triage</command-message><command-args>hourly 日本語で</command-args>"}},
         {"type": "assistant", "timestamp": "2026-10-26T01:10:00Z", "message": {
-            "content": [{"type": "text", "text": "最初は容量不足で止まった。"}]}},
+            "model": "claude-opus-5-5", "content": [{"type": "text", "text": "最初は容量不足で止まった。"}]}},
         {"type": "assistant", "timestamp": "2026-10-26T01:11:00Z", "message": {
-            "content": [{"type": "text", "text": "一行を送ると再開し、完了を確認した。"}]}},
+            "model": "claude-opus-5-5", "content": [{"type": "text", "text": "一行を送ると再開し、完了を確認した。"}]}},
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows))
 
 
-def sample_candidate():
+def sample_candidate() -> dict[str, object]:
     return {"title": "容量不足から再開", "first_failure": "容量不足で止まった",
             "final_success": "一行を送って再開した", "note": "`Selected model is at capacity` の Codex は一行を送ると再開した。",
             "target_skill": "orca-session-triage", "category": "fact",
-            "evidence_ids": ["E00002", "E00003"]}
+            "evidence_quotes": ["最初は容量不足で止まった", "一行を送ると再開し、完了を確認した"]}
 
 
 class FakeLedger:
@@ -102,23 +107,10 @@ class RetroTests(unittest.TestCase):
         self.transcript = self.home / ".claude/projects/triage" / f"{self.sid}.jsonl"
         transcript(self.transcript)
 
-    def test_claude_json_failure_is_recorded_in_worker_state(self):
-        failure = subprocess.CompletedProcess(
-            ["claude", "-p"], 1,
-            stdout=json.dumps({"is_error": True,
-                               "result": "Failed to authenticate: OAuth session expired"}),
-            stderr="")
-        with mock.patch.object(retro.Path, "home", return_value=self.home):
-            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
-            with mock.patch.object(retro.subprocess, "run", return_value=failure):
-                self.assertIn("OAuth session expired", retro.process_once(
-                    self.state, self.root, ignore_load=True, ledger=FakeLedger()))
-        self.assertIn("OAuth session expired", retro.load(self.state)["sessions"][self.sid]["error"])
-
-    def test_claude_uses_selected_orca_profile_without_api_credentials(self):
+    def test_claude_uses_selected_orca_profile_without_api_credentials(self) -> None:
         selected = self.home / "Library/Application Support/orca/claude-profiles/selected-host"
         selected.parent.mkdir(parents=True)
-        selected.write_text(str(self.home / "orca-profile/home"))
+        selected.write_text(str(self.home / "orca-profile/a"))
         success = subprocess.CompletedProcess(
             ["claude", "-p"], 0,
             stdout=json.dumps({"structured_output": {"ok": True}}), stderr="")
@@ -128,10 +120,16 @@ class RetroTests(unittest.TestCase):
                 with mock.patch.object(retro.subprocess, "run", return_value=success) as run:
                     self.assertEqual(retro.run_claude("prompt", {"type": "object"}), {"ok": True})
                     env = run.call_args.kwargs["env"]
-                    self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / "orca-profile/home"))
+                    self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / "orca-profile/a"))
                     self.assertEqual(env["USER"], pwd.getpwuid(os.getuid()).pw_name)
                     self.assertNotIn("ANTHROPIC_API_KEY", env)
                     self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+                    selected.write_text(str(self.home / "orca-profile/b"))
+                    retro.run_claude("prompt", {"type": "object"}, resume=retro.ForkTarget(
+                        self.sid, self.home, "sonnet", 0))
+                    self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"],
+                                     str(self.home / "orca-profile/b"))
 
                     selected.unlink()
                     retro.run_claude("prompt", {"type": "object"})
@@ -476,6 +474,84 @@ class RetroTests(unittest.TestCase):
         session = retro.load(self.state)["sessions"][self.sid]
         self.assertEqual((session["status"], session["attempts"]), ("pending", 0))
         self.assertNotIn("error", session)
+
+
+    def test_finished_session_is_reviewed_in_a_forked_copy(self) -> None:
+        transcript(self.transcript, cwd=str(self.home))
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+        calls = []
+        real_run = subprocess.run
+
+        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[0] != "claude":
+                return real_run(cmd, *args, **kwargs)
+            calls.append((cmd, kwargs.get("cwd")))
+            output = ({"proposals": [sample_candidate()]} if "--resume" in cmd else
+                      {"decisions": [{"index": 0, "supported": True, "duplicate": False,
+                                      "low_risk": False, "reason": "shown"}]})
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(
+                {"is_error": False, "structured_output": output}), "")
+        ledger = FakeLedger()
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+                self.assertIn("1 proposals", retro.process_once(
+                    self.state, self.root, ignore_load=True, ledger=ledger))
+        fork, cwd = calls[0]
+        self.assertEqual(fork[fork.index("--resume") + 1], self.sid)
+        self.assertIn("--fork-session", fork)
+        self.assertIn("--no-session-persistence", fork)
+        self.assertEqual(cwd, self.home)
+        self.assertNotIn("--resume", calls[1][0])
+        evidence = ledger.list()[0]["evidence"]
+        self.assertEqual([line.split()[2] for line in evidence], ["E00002", "E00003"])
+
+    def test_claude_failure_keeps_the_json_reason(self) -> None:
+        failed = subprocess.CompletedProcess(["claude"], 1, json.dumps(
+            {"is_error": True, "subtype": "success",
+             "result": "Failed to authenticate: OAuth session expired and could not be refreshed"}), "")
+        with mock.patch.object(retro.subprocess, "run", return_value=failed):
+            with self.assertRaises(RuntimeError) as raised:
+                retro.run_claude("prompt", retro.REVIEW_SCHEMA)
+        self.assertIn("is_error=True", str(raised.exception))
+        self.assertIn("OAuth session expired", str(raised.exception))
+
+    def test_repeated_failure_notifies_once(self) -> None:
+        log = self.home / "notify.log"
+        notifier = self.home / "triage-notify"
+        notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        notifier.chmod(0o755)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+        error = RuntimeError("claude -p exited 1: is_error=True result=Failed to authenticate")
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "NOTIFY", notifier):
+                with mock.patch.object(retro, "build_proposals", side_effect=error):
+                    for _ in range(3):
+                        retro.process_once(self.state, self.root, ignore_load=True, ledger=FakeLedger())
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertIn("Failed to authenticate", log.read_text())
+        self.assertIn("Failed to authenticate", retro.load(self.state)["sessions"][self.sid]["error"])
+
+    def test_live_tab_submission_is_recorded_once(self) -> None:
+        review = {"decisions": [{"index": 0, "supported": True, "duplicate": False,
+                                 "low_risk": False, "reason": "shown"}]}
+        ledger = FakeLedger()
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.object(retro, "run_claude", return_value=review):
+                self.assertIn("1 proposals", retro.submit(
+                    {"proposals": [sample_candidate()]}, self.sid, self.state, self.root, ledger=ledger))
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+            with mock.patch.object(retro, "build_proposals") as fork:
+                self.assertIn("empty", retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger))
+                fork.assert_not_called()
+        self.assertEqual(len(ledger.items), 1)
+
+    def test_service_does_not_embed_the_claude_profile(self) -> None:
+        with mock.patch.dict(retro_service.os.environ, {"CLAUDE_CONFIG_DIR": "/profiles/a/home"}):
+            plist = plistlib.loads(retro_service.plist_bytes(
+                self.home, "/usr/bin/python3", "/usr/local/bin/claude", SCRIPTS / "retro.py"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plist["EnvironmentVariables"])
 
 
 
