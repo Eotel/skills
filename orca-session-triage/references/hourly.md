@@ -64,6 +64,13 @@ field. When Orca has no provider session ID, the script requires one transcript
 whose scheduled prompt matches the run's start time. Inspect
 `keep:` output and retry on a later hourly run; leave the workspace open.
 
+In every hourly run, run the Asana 99 sweep as `asana-pr-review` describes and
+read its `asana99_status.py` 「次の一手」,
+including when `--judged` hides unchanged differences. A 「レビューの番」 row
+contains the exact `review-pr` command with `--kind` and `--if-needed` when
+the PR's source is known. If the row has no command, confirm who created the
+PR before choosing `cloud` or `colleague`.
+
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
 `requests-needing-owner` as described in `references/hourly-state.md` and
@@ -75,6 +82,9 @@ and instructions for other lanes to the lead in one `triage-notify --kind ask`
 message, including any cleanup done. With nothing to hand off, report cleanup
 with `--kind info`. The lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment.
+Include each 「レビューの番」 PR URL and its command, or the missing source to
+confirm, in this run's handoff to the lead. Do not start its review in the
+hourly tab while another lead is appointed.
 Name any Orca environment the scan could not reach in the handoff. Review
 rows from the reachable Macs in the same run.
 
@@ -100,6 +110,11 @@ that its recorded symptom is gone. Then:
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
+  For 「レビューの番」, run the row's `review-pr ... --if-needed` command in this
+  run. It skips a completed review of the same head and kind or an active
+  review started with this option. If the row has no command, confirm the PR's
+  source before starting. The independent review is a draft; do not submit a
+  GitHub review from this step.
 - Record each new question as `references/hourly-state.md` says, ask with
   AskUserQuestion, and set the triage workspace's Orca comment to「要判断: …」.
   Keep the tab with that unanswered question open. A later run works through
