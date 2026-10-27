@@ -78,6 +78,9 @@ New Python files are checked without exceptions.
 - `exec-plan-migration` (temporary): move a repository from the legacy
   `completed/` plan archive to forward-only plans. Requires `plan-exec` and
   `agentic-docs`. Remove it once the remaining repositories have migrated.
+- `pr`: write a PR body in the template the repository calls for (its own, the
+  review-first template for repositories of the account and its organizations, or the
+  upstream template elsewhere) and check its headings.
 - `real-browser-verify`: verify changed UI behavior in an authenticated browser.
 - `repo-local-git-hooks`: repair repository hooks bypassed by global Git config.
 - `review-response`: handle reviews that came back on many PRs and drive each PR
