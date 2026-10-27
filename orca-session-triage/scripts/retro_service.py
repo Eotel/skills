@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Render, activate, and inspect the external triage retrospective launchd service."""
 
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
@@ -23,7 +25,8 @@ def paths(home=None):
             home / ".cache/orca-session-triage/retro/service.log")
 
 
-def plist_bytes(home=None, python=None, claude=None, script=None):
+def plist_bytes(home: Path | str | None = None, python: str | None = None, claude: str | None = None,
+                script: Path | str | None = None) -> bytes:
     plist, log = paths(home)
     python = python or shutil.which("python3")
     claude = claude or shutil.which("claude")
@@ -32,9 +35,9 @@ def plist_bytes(home=None, python=None, claude=None, script=None):
         raise RuntimeError("python3, claude, and retro.py are required")
     service_path = ":".join(dict.fromkeys((str(Path(python).parent), str(Path(claude).parent),
                                            "/usr/bin", "/bin", "/usr/sbin", "/sbin")))
-    environment = {"PATH": service_path}
-    if os.environ.get("TRIAGE_RETRO_SKILLS_REPO"):
-        environment["TRIAGE_RETRO_SKILLS_REPO"] = os.environ["TRIAGE_RETRO_SKILLS_REPO"]
+    # CLAUDE_CONFIG_DIR keeps the signed-in Claude profile; launchd's default one may hold expired OAuth.
+    environment = {"PATH": service_path} | {name: os.environ[name] for name in ("TRIAGE_RETRO_SKILLS_REPO", "CLAUDE_CONFIG_DIR")
+                                            if os.environ.get(name)}
     return plistlib.dumps({
         "Label": LABEL,
         "ProgramArguments": [str(python), str(script), "run-service"],
