@@ -1923,12 +1923,24 @@ class RmCheckTests(unittest.TestCase):
                          {"pushed": True, "local": False})
         self.assertTrue(pushed.exists())
 
+        # While one copy cannot go, the worktree stays, so no copy is taken from it.
         code, result = self.run_main("--detach-nested")
+        self.assertEqual((code, result["detached"]), (1, []))
+        self.assertTrue(pushed.exists())
+        self.assertIn("is on no remote branch", " ".join(result["blockers"]))
+
+        git(local, "push", "-q", "origin", "draft")
+        code, result = self.run_main("--detach-nested")
+        self.assertEqual((code, result["ok"], len(result["detached"])), (0, True, 2))
         self.assertFalse(pushed.exists())
         self.assertNotIn(str(pushed.resolve()), git(deps, "worktree", "list"))
-        self.assertEqual([Path(item["path"]).name for item in result["nested_worktrees"]], ["local"])
-        self.assertIn("is on no remote branch", " ".join(result["blockers"]))
-        self.assertEqual(code, 1)
+        self.assertEqual(result["nested_worktrees"], [])
+
+        (self.wt / "draft.txt").write_text("kept work\n")
+        git(deps, "worktree", "add", "-q", "--detach", str(pushed), "main")
+        code, result = self.run_main("--detach-nested")
+        self.assertEqual((code, result["detached"]), (1, []))
+        self.assertTrue(pushed.exists())
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self):
         real_run = subprocess.run

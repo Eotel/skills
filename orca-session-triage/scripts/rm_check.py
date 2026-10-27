@@ -580,8 +580,9 @@ def main(argv=None):
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     parser.add_argument("--detach-nested", action="store_true",
-                        help="remove each nested worktree without blockers (clean, nothing ignored to open, HEAD "
-                             "on a remote) from its repository with git worktree remove --force, then check again")
+                        help="when nested worktrees are all that block the removal and each is clean, has nothing "
+                             "ignored to open, and has HEAD on a remote, remove them from their repositories with "
+                             "git worktree remove --force, then check again")
     args = parser.parse_args(argv)
     if args.pr_head and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", args.pr_head):
         parser.error("--pr-head must be a full commit SHA")
@@ -600,12 +601,21 @@ def main(argv=None):
     projects = [] if args.no_docker else compose_projects()
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
-    if args.detach_nested and result["nested_worktrees"]:
-        detached = [item["path"] for item in result["nested_worktrees"] if not item["blockers"]
-                    and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
-        result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
-        result["detached"] = detached
     notes = []
+    if args.detach_nested:
+        nested = result["nested_worktrees"]
+        # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
+        others = [blocker for blocker in result["blockers"]
+                  if not blocker.startswith("worktrees of other repositories")]
+        removable = nested and not others and not result["review"] and not any(item["blockers"] for item in nested)
+        detached = [item["path"] for item in nested if removable
+                    and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
+        if detached:
+            result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
+        elif nested:
+            notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
+                         "paths to review, or a copy with blockers")
+        result["detached"] = detached
     elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
         if not args.pr_head:

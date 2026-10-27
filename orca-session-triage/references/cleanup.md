@@ -59,10 +59,12 @@ Run these per worktree, in order.
      job is left running and reported.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
-     (uncommitted changes, ignored paths to open, HEAD on no remote). Run
-     `rm_check.py` again with `--detach-nested` to remove each one without
-     blockers from its repository before `orca worktree rm`, so no prunable
-     record is left; one with blockers stays and is reported.
+     (uncommitted changes, ignored paths to open, HEAD on no remote). When
+     they are the only thing left, run `rm_check.py` again with
+     `--detach-nested`: it removes every copy from its repository before
+     `orca worktree rm`, so no prunable record is left. It removes nothing
+     while the worktree has other blockers, paths to review, or a copy with
+     blockers, since a kept worktree still needs its copies.
    - On a remote Mac whose gh cannot read the PR, `notes` give a
      `merged_pr_head.py` command for a Mac where gh works. It confirms the PR
      is MERGED and prints `--pr-head` and `--head-ahead-of-pr`; pass them to
