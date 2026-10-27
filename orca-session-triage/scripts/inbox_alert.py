@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 
 from inbox_read import complete_end
 
@@ -23,7 +24,7 @@ APPLE_SCRIPT = (
 )
 
 
-def notify(item):
+def notify(item: dict[str, object]) -> None:
     lane = str(item.get("worktree") or item.get("handle") or "担当未記載").splitlines()[0]
     first_line = str(item.get("text") or "確認依頼が届きました").splitlines()[0]
     title = f"担当からの確認依頼: {lane[:80]}"
@@ -36,7 +37,7 @@ def notify(item):
     print(f"ask alert: {lane}", flush=True)
 
 
-def process(inbox, cursor, send=notify):
+def process(inbox: Path, cursor: Path, send: Callable[[dict[str, object]], None] = notify) -> int:
     start = int(cursor.read_text().strip())
     with inbox.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
@@ -57,11 +58,11 @@ def process(inbox, cursor, send=notify):
         position += len(raw)
         temporary = cursor.with_name(cursor.name + ".tmp")
         temporary.write_text(str(position))
-        os.replace(temporary, cursor)
+        temporary.replace(cursor)
     return position
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inbox", type=Path, default=Path.home() / ".cache/orca-briefs/triage-inbox.jsonl")
     parser.add_argument("--cursor", type=Path, default=Path.home() / ".cache/orca-session-triage/inbox-alert.offset")

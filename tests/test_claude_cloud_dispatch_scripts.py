@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "claude-cloud-dispatch" / "scripts" / "cloud_launch.py"
 
 spec = importlib.util.spec_from_file_location("cloud_launch", SCRIPT)
+assert spec is not None and spec.loader is not None
 cloud_launch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cloud_launch)
 

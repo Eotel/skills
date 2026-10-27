@@ -19,14 +19,18 @@ from retro_ledger import LedgerClient
 LABEL = "com.eotel.orca-session-triage.retro"
 
 
-def paths(home=None):
+def paths(home: str | Path | None = None) -> tuple[Path, Path]:
     home = Path(home or Path.home())
     return (home / "Library/LaunchAgents" / f"{LABEL}.plist",
             home / ".cache/orca-session-triage/retro/service.log")
 
 
-def plist_bytes(home: Path | str | None = None, python: str | None = None, claude: str | None = None,
-                script: Path | str | None = None) -> bytes:
+def plist_bytes(
+    home: str | Path | None = None,
+    python: str | None = None,
+    claude: str | None = None,
+    script: str | Path | None = None,
+) -> bytes:
     plist, log = paths(home)
     python = python or shutil.which("python3")
     claude = claude or shutil.which("claude")
@@ -50,7 +54,7 @@ def plist_bytes(home: Path | str | None = None, python: str | None = None, claud
     })
 
 
-def status():
+def status() -> tuple[bool, str]:
     result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
                             capture_output=True, text=True, timeout=10)
     if result.returncode or not re.search(r"^\s*state = running\s*$", result.stdout, re.M):
@@ -58,7 +62,7 @@ def status():
     return True, "external retrospective worker is running"
 
 
-def activate():
+def activate() -> None:
     plist, log = paths()
     ledger = LedgerClient()
     if not ledger.script.is_file() or not ledger.writer_enabled():
@@ -84,7 +88,7 @@ def activate():
     raise RuntimeError(f"service did not start; inspect {log}")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("render", "status", "activate"))
     args = parser.parse_args(argv)

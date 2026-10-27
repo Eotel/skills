@@ -131,7 +131,7 @@ class ClaudeTranscriptTests(unittest.TestCase):
 
     def test_ignores_lines_that_are_json_but_not_objects(self):
         path = self.transcript([user("go"), assistant(text("answer"))])
-        with open(path, "a") as handle:
+        with Path(path).open("a") as handle:
             handle.write("null\n5\n\"text\"\n")
 
         self.assertEqual(scan.read_claude(self.projects, self.worktree)["final_text"], "answer")
@@ -199,7 +199,7 @@ class CodexRolloutTests(unittest.TestCase):
         ])
 
         broken = self.rollout("rollout-c.jsonl", "/w/app/three", [])
-        with open(broken, "a") as handle:
+        with Path(broken).open("a") as handle:
             handle.write("null\n[1, 2]\n")
 
         result = scan.read_codex([self.root])
@@ -224,7 +224,7 @@ class CodexRolloutTests(unittest.TestCase):
                 "type": "error", "message": "Selected model is at capacity"}),
         ])
         self.assertEqual(scan.summarize_rollout(path)[1]["api_error"], "Selected model is at capacity")
-        with open(path, "a") as handle:
+        with Path(path).open("a") as handle:
             handle.write(json.dumps(codex_assistant("2026-10-01T01:02:00Z", "Recovered.")) + "\n")
         self.assertIsNone(scan.summarize_rollout(path)[1]["api_error"])
 
@@ -1188,6 +1188,26 @@ class ScanCommandTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_expand_roots_accepts_absolute_patterns_with_spaces(self):
+        accounts = self.dir / "Application Support" / "accounts"
+        (accounts / "first" / "sessions").mkdir(parents=True)
+        (accounts / "first" / "nested" / "sessions").mkdir(parents=True)
+        (accounts / "second" / "sessions").mkdir(parents=True)
+        (accounts / ".hidden" / "sessions").mkdir(parents=True)
+        (accounts / "third").mkdir()
+        (accounts / "third" / "sessions").write_text("not a directory")
+        pattern = str(accounts / "*" / "sessions")
+
+        self.assertEqual(sorted(scan.expand_roots([pattern])), sorted([
+            str(accounts / "first" / "sessions"),
+            str(accounts / "second" / "sessions"),
+        ]))
+        self.assertEqual(sorted(scan.expand_roots([str(accounts / "**" / "sessions")])),
+                         sorted(scan.expand_roots([pattern])))
+
+    def test_expand_roots_accepts_literal_current_and_absolute_roots(self):
+        self.assertEqual(scan.expand_roots([".", "./", "/"]), [".", ".", "/"])
+
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
         local = {"worktrees": [worktree("/local/w", "done")],
                  "hostScope": {"omittedHostSelectors": [
@@ -1711,15 +1731,23 @@ class RmCheckTests(unittest.TestCase):
     def test_a_dangling_symlink_is_reported_instead_of_crashing(self):
         (self.main / "uploads").mkdir()
         (self.main / "uploads" / "a.png").write_text("png")
-        os.symlink(str(Path(self.tmp.name) / "gone"), str(self.wt / "uploads"))
+        (self.wt / "uploads").symlink_to(Path(self.tmp.name) / "gone")
 
         result = self.check()
 
         self.assertEqual(result["review"], ["uploads (differs from main checkout)"])
 
+    def test_same_tree_compares_raw_symlink_targets(self):
+        left = self.wt / "link"
+        right = self.main / "link"
+        left.symlink_to("file/")
+        right.symlink_to("file")
+
+        self.assertFalse(rmcheck.same_tree(left, right))
+
     def test_compose_placeholder_entries_never_match_the_worktree(self):
         projects = [{"Name": "elsewhere", "Status": "running(1)", "ConfigFiles": "/other/compose.yaml,-"}]
-        cwd = os.getcwd()
+        cwd = Path.cwd()
         os.chdir(self.wt)
         try:
             result = rmcheck.check(self.wt, self.main, base="main", compose_projects=projects)

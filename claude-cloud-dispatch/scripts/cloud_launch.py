@@ -14,6 +14,7 @@ the repository. Run this from a clean checkout on a pushed branch.
 import argparse
 import json
 import os
+from pathlib import Path
 import pty
 import re
 import select
@@ -190,7 +191,7 @@ def launch(checkout, brief, *, claude="claude", trust_folder=False, timeout=150.
         stop(pid, screen)
         os.close(fd)
         if log:
-            with open(log, "w", encoding="utf-8") as handle:
+            with Path(log).open("w", encoding="utf-8") as handle:
                 handle.write(screen.text())
 
 
@@ -206,7 +207,7 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true", help="print {session_id, url} as JSON")
     args = parser.parse_args(argv)
     try:
-        with open(args.brief, encoding="utf-8") as handle:
+        with Path(args.brief).open(encoding="utf-8") as handle:
             brief = handle.read()
     except OSError as error:
         print(f"cannot read the brief: {error}", file=sys.stderr)

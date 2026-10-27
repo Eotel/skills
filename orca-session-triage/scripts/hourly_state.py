@@ -43,7 +43,7 @@ def save(path, data):
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
-    os.replace(temp, path)
+    temp.replace(path)
 
 
 def stamp():
@@ -196,9 +196,10 @@ def main(argv=None):
             read_only = ("show", "left-now", "requests-needing-owner")
             fcntl.flock(lock, fcntl.LOCK_EX if args.action not in read_only else fcntl.LOCK_SH)
             data = read(path)
+            left_matches = False
             if args.action == "left-now":
-                same = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
-                result = {"left": same}
+                left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
+                result = {"left": left_matches}
             elif args.action == "requests-needing-owner":
                 live = {owner_name(value) for value in args.live_owner}
                 result = [{"id": key, **request} for key, request in data["requests"].items()
@@ -211,7 +212,7 @@ def main(argv=None):
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 1 if args.action == "left-now" and not result["left"] else 0
+    return 1 if args.action == "left-now" and not left_matches else 0
 
 
 if __name__ == "__main__":
