@@ -1056,34 +1056,77 @@ def digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
-def main_digest(repo: Path, name: str) -> str | None:
-    shown = subprocess.run(["git", "-C", str(repo), "show", f"origin/main:{name}"], capture_output=True, timeout=60)
-    return None if shown.returncode else hashlib.sha256(shown.stdout).hexdigest()
+def blob(repo: Path, ref: str, name: str) -> bytes | None:
+    shown = subprocess.run(["git", "-C", str(repo), "show", f"{ref}:{name}"], capture_output=True, timeout=60)
+    return None if shown.returncode else shown.stdout
 
 
-def worker_changes(data: dict[str, Any], repo: Path) -> list[Path]:
-    """Files that differ from HEAD exactly as the worker last wrote them; other edits stay out."""
+def note_ids(lines: Sequence[str]) -> set[str]:
+    return {line[line.index(MARKER):] for line in lines if MARKER in line}
+
+
+def onto_main(repo: Path, name: str, local: bytes | None) -> bytes | None:
+    """Replay the worker's edits to ``name`` on origin/main; None deletes the file.
+
+    The worker only adds or removes marked note lines and the router pointer, so replaying those edits
+    keeps whatever main gained meanwhile, even at the same end of the file.
+    """
+    base = (blob(repo, "HEAD", name) or b"").decode("utf-8").splitlines(keepends=True)
+    upstream_blob = blob(repo, "origin/main", name)
+    upstream = (upstream_blob or b"").decode("utf-8")
+    mine = (local or b"").decode("utf-8").splitlines(keepends=True)
+    if name.endswith(f"references/{FACTS_NAME}"):
+        removed = note_ids(base) - note_ids(mine)
+        kept = [line for line in (upstream or FACTS_HEADER).splitlines(keepends=True)
+                if MARKER not in line or line[line.index(MARKER):] not in removed]
+        added = [line for line in mine if MARKER in line and line not in base
+                 and line[line.index(MARKER):] not in note_ids(kept)]
+        result = "".join(kept) + ("" if not added or "".join(kept).endswith("\n") else "\n") + "".join(added)
+        return None if not note_ids(result.splitlines(keepends=True)) else result.encode("utf-8")
+    if name.endswith("SKILL.md") and upstream_blob is not None:
+        had, has = ROUTER_SECTION in "".join(base), ROUTER_SECTION in "".join(mine)
+        if has and not had and ROUTER_SECTION not in upstream:
+            return (upstream + ("" if upstream.endswith("\n") else "\n") + ROUTER_SECTION).encode("utf-8")
+        if had and not has:
+            return upstream.replace(ROUTER_SECTION, "", 1).encode("utf-8")
+        return upstream_blob
+    if upstream_blob == blob(repo, "HEAD", name):
+        return local
+    raise RuntimeError(f"{name} changed in main and here; a person must merge it")
+
+
+class WorkerFiles(NamedTuple):
+    """Files that differ from HEAD after the worker wrote them: still as written, or edited by someone since."""
+    written: list[Path]
+    edited: list[Path]
+
+
+def worker_files(data: dict[str, Any], repo: Path) -> WorkerFiles:
     status = git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout
     dirty = {(repo / entry[3:]).resolve() for entry in status.split("\0") if entry}
-    return sorted(path for key, recorded in data["target_versions"].items()
-                  if (path := Path(key)) in dirty and digest(path) == recorded)
+    owned = [(path, recorded) for key, recorded in data["target_versions"].items() if (path := Path(key)) in dirty]
+    return WorkerFiles(sorted(path for path, recorded in owned if digest(path) == recorded),
+                       sorted(path for path, recorded in owned if digest(path) != recorded))
 
 
 def settle(repo: Path, changed: Sequence[Path], data: dict[str, Any]) -> str:
     """The notes are in main: drop the local copies and fast-forward, restoring them if that fails."""
-    saved = {path: path.read_bytes() for path in changed if path.is_file()}
+    saved = {path: path.read_bytes() if path.is_file() else None for path in changed}
     names = [str(path.relative_to(repo)) for path in changed]
-    tracked = [name for name in names if git(repo, "cat-file", "-e", f"HEAD:{name}", check=False).returncode == 0]
+    tracked = [name for name in names if blob(repo, "HEAD", name) is not None]
     if tracked:
         git(repo, "checkout", "--", *tracked)
-    for path in changed:
-        if str(path.relative_to(repo)) not in tracked:
+    for path, name in zip(changed, names):
+        if name not in tracked:
             path.unlink(missing_ok=True)
     merged = git(repo, "merge", "--ff-only", "--quiet", "origin/main", check=False)
     if merged.returncode:
         for path, content in saved.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
         return f"publish: notes are in main, but the checkout did not fast-forward: {merged.stderr.strip()[:200]}"
     data.pop("published", None)
     return "publish: settled after the merge"
@@ -1094,27 +1137,32 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
     repo = root.resolve()
     if git(repo, "remote", "get-url", "origin", check=False).returncode:
         return "publish: the source checkout has no origin"
-    changed = worker_changes(data, repo)
-    if not changed:
+    files = worker_files(data, repo)
+    held = [name for path in files.edited if (name := str(path.relative_to(repo))) in data.get("published", {})]
+    if held:
+        raise RuntimeError(f"published files changed after the worker wrote them: {', '.join(held)}")
+    if not files.written:
         data.pop("published", None)
         return "publish: nothing to publish"
     git(repo, "fetch", "--quiet", "origin")
-    names = [str(path.relative_to(repo)) for path in changed]
-    if all(main_digest(repo, name) == digest(path) for name, path in zip(names, changed)):
-        return settle(repo, changed, data)
-    digests = {name: digest(path) for name, path in zip(names, changed)}
+    names = [str(path.relative_to(repo)) for path in files.written]
+    contents = {name: onto_main(repo, name, path.read_bytes() if path.is_file() else None)
+                for name, path in zip(names, files.written)}
+    if all(content == blob(repo, "origin/main", name) for name, content in contents.items()):
+        return settle(repo, files.written, data)
+    digests = {name: digest(path) for name, path in zip(names, files.written)}
     if data.get("published") == digests:
         return "publish: the PR branch is up to date"
     with tempfile.TemporaryDirectory(prefix="triage-retro-publish-") as scratch:
         tree = Path(scratch) / "tree"
         git(repo, "worktree", "add", "--detach", "--quiet", str(tree), "origin/main")
         try:
-            for name, path in zip(names, changed):
-                (tree / name).parent.mkdir(parents=True, exist_ok=True)
-                if path.is_file():
-                    shutil.copyfile(path, tree / name)
-                else:
+            for name, content in contents.items():
+                if content is None:
                     (tree / name).unlink(missing_ok=True)
+                else:
+                    (tree / name).parent.mkdir(parents=True, exist_ok=True)
+                    (tree / name).write_bytes(content)
             git(tree, "add", "--all", "--", *names)
             git(tree, "commit", "--quiet", "-m", "docs: record adopted retrospective notes")
             lease = git(repo, "ls-remote", "origin", f"refs/heads/{PUBLISH_BRANCH}").stdout.split()
@@ -1131,7 +1179,7 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
                         "--title", "docs: record adopted retrospective notes", "--body", body],
                        capture_output=True, text=True, timeout=60, cwd=repo, check=True)
     data["published"] = digests
-    return f"publish: pushed {len(changed)} files to {PUBLISH_BRANCH}"
+    return f"publish: pushed {len(files.written)} files to {PUBLISH_BRANCH}"
 
 
 def publish_safely(state: Path = STATE, root: Path = SOURCE) -> str:

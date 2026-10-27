@@ -472,6 +472,12 @@ class RetroTests(unittest.TestCase):
                "-c", "core.hooksPath=/dev/null"]
         subprocess.run([*git, "remote", "add", "origin", str(remote)], check=True)
         subprocess.run([*git, "push", "-q", "origin", "main"], check=True)
+        upstream = self.home / "upstream"
+        subprocess.run(["git", "clone", "-q", str(remote), str(upstream)], check=True)
+        (upstream / "orca-session-triage/SKILL.md").write_text("# Triage\n\nUpstream line.\n")
+        subprocess.run(["git", "-C", str(upstream), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "-c", "core.hooksPath=/dev/null", "commit", "-qam", "upstream"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "push", "-q", "origin", "main"], check=True)
         data = retro.load(self.state)
         note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
         facts = retro.adopt(note, self.root)
@@ -499,6 +505,10 @@ class RetroTests(unittest.TestCase):
                         capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("orca-session-triage/references/observed-triage-facts.md", tree)
         self.assertNotIn("orca-session-triage/references/hourly.md", tree)
+        router = real_run([*branch, "show", f"{retro.PUBLISH_BRANCH}:orca-session-triage/SKILL.md"],
+                          capture_output=True, text=True, check=True).stdout
+        self.assertIn("Upstream line.", router)
+        self.assertIn(retro.ROUTER_SECTION, router)
         self.assertEqual(len(created), 1)
         real_run([*branch, "update-ref", "refs/heads/main", retro.PUBLISH_BRANCH], check=True)
         with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):

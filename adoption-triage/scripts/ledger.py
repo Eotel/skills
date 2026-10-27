@@ -298,7 +298,7 @@ def append(events, imports, row):
                              if decision["id"] == row["decision_id"]), None)
             if decision is None or decision["decision"] not in {"adopt", "revoke"}:
                 raise ValueError("execution needs an adoption or revocation")
-            if row["outcome"] == "applied" and decision["decision"] != "adopt":
+            if row["outcome"] in {"applied", "handed_off"} and decision["decision"] != "adopt":
                 raise ValueError("adoption was not decided")
             if row["outcome"] == "reverted" and decision["decision"] != "revoke":
                 raise ValueError("reversal was not decided")
