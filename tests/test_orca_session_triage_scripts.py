@@ -1830,9 +1830,11 @@ class RmCheckTests(unittest.TestCase):
     def test_processes_in_orca_tabs_name_their_tab_and_idle_shells_do_not_block(self):
         wt = str(self.wt.resolve())
         host = "/Applications/Orca Terminal Host.app/Contents/MacOS/orca-terminal-host --socket s"
+        older_host = "/Applications/Orca.app/Contents/Frameworks/Orca Helper.app/Contents/MacOS/Orca Helper " \
+                     "/Applications/Orca.app/Contents/Resources/app.asar.unpacked/out/main/daemon-entry.js --socket s"
         login = "/usr/bin/login -flpq me /bin/bash -c exec -l orca-tcc-login /bin/zsh /bin/zsh -l"
-        table = {1: (0, "launchd"), 10: (1, host),
-                 20: (10, login), 21: (20, "-/bin/zsh -l"),                       # a shell at its prompt
+        table = {1: (0, "launchd"), 10: (1, host), 11: (1, older_host),
+                 20: (11, login), 21: (20, "-/bin/zsh -l"),                       # a shell at its prompt
                  30: (10, login), 31: (30, "-/bin/zsh -l"), 32: (31, "codex --yolo"),  # an agent at work
                  40: (1, "node server.js")}                                       # started outside Orca
         cwds = {21: wt, 32: wt, 40: wt}
@@ -1840,7 +1842,7 @@ class RmCheckTests(unittest.TestCase):
                 patch.object(rmcheck, "process_cwds", return_value=cwds), \
                 patch.object(rmcheck, "process_handles", return_value={32: "term_busy"}):
             result = self.check()
-        with patch.object(rmcheck, "process_table", return_value={pid: table[pid] for pid in (1, 10, 20, 21)}), \
+        with patch.object(rmcheck, "process_table", return_value={pid: table[pid] for pid in (1, 11, 20, 21)}), \
                 patch.object(rmcheck, "process_cwds", return_value={21: wt}), \
                 patch.object(rmcheck, "process_handles", return_value={}):
             idle_only = self.check()

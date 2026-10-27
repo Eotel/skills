@@ -241,10 +241,11 @@ def process_cwds(pids):
     return found
 
 
-# Orca starts each tab as `login` -> login shell under its terminal host. A tab whose
-# processes are only that shell, or the shell waiting on its setup hooks, runs nothing:
-# `orca worktree rm` stops it with the worktree.
-ORCA_TERMINAL_HOST = "orca-terminal-host"
+# Orca starts each tab as `login` -> login shell under its terminal host: the relocated
+# `orca-terminal-host` or, from older runs, `Orca Helper` running the same daemon-entry.js.
+# A tab whose processes are only that shell, or the shell waiting on its setup hooks,
+# runs nothing: `orca worktree rm` stops it with the worktree.
+ORCA_TERMINAL_HOSTS = ("orca-terminal-host", "/daemon-entry.js")
 LOGIN_SHELL = re.compile(r"-?(?:\S*/)?(?:zsh|bash|sh|fish)(?: -l| --login)?")
 SETUP_WAITS = ("direnv export ", "direnv exec ", "setup-runner.sh")
 TERMINAL_HANDLE = re.compile(r"\bORCA_TERMINAL_HANDLE=(term_[0-9A-Za-z-]+)")
@@ -307,7 +308,7 @@ def tab_root(pid, table):
     while pid in table and pid not in seen:
         seen.add(pid)
         parent = table[pid][0]
-        if parent in table and ORCA_TERMINAL_HOST in table[parent][1]:
+        if parent in table and any(host in table[parent][1] for host in ORCA_TERMINAL_HOSTS):
             return pid
         pid = parent
     return None
