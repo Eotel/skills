@@ -30,6 +30,7 @@ class ReadOptions:
     kinds: frozenset[ReportKind] | None = None
     source: str | None = None
     summary: bool = False
+    ids: frozenset[str] | None = None
 
 
 def report_kinds(value: str) -> frozenset[ReportKind]:
@@ -37,6 +38,13 @@ def report_kinds(value: str) -> frozenset[ReportKind]:
     if "" in kinds or not kinds <= REPORT_KINDS:
         raise argparse.ArgumentTypeError("--kind must contain ask, done, or info")
     return cast(frozenset[ReportKind], kinds)
+
+
+def entry_ids(value: str) -> frozenset[str]:
+    ids = frozenset(part.strip() for part in value.split(","))
+    if "" in ids:
+        raise argparse.ArgumentTypeError("--id must be comma-separated entry ids")
+    return ids
 
 
 def paths() -> tuple[Path, Path]:
@@ -61,31 +69,39 @@ def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
     return start, data, complete_end(data)
 
 
-def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
+def read(inbox: Path, cursor: Path, options: ReadOptions) -> frozenset[str]:
+    """Print the entries after the cursor; return the requested ids that none of them has."""
     start, data, complete = pending_bytes(inbox, cursor)
     end = start + complete
+    shown: set[str] = set()
     for raw in data[:end - start].splitlines():
         try:
             item = json.loads(raw)
             if options.kinds is not None and item.get("kind") not in options.kinds:
+                continue
+            if options.ids is not None and item.get("id") not in options.ids:
                 continue
             label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
             worktree = str(item.get("worktree") or "-")
             location = f"{item['repo']}/{worktree}" if item.get("repo") else worktree
             if options.source is not None and location != options.source:
                 continue
+            if item.get("id"):
+                location += f" id={item['id']}"
+                shown.add(str(item["id"]))
             body = item.get("text") or ""
-            if options.summary or (options.brief and item.get("kind") == "info"):
+            if options.ids is None and (options.summary or (options.brief and item.get("kind") == "info")):
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
-            if options.summary:
+            if options.summary and options.ids is None:
                 print(f"{label} {location}  {body}")
             else:
                 print(f"{label} {location}\n{body}\n")
         except (ValueError, TypeError, AttributeError):
-            if options.kinds is None and options.source is None:
+            if options.kinds is None and options.source is None and options.ids is None:
                 print(raw.decode("utf-8", "replace"))
     print(f"NEXT_OFFSET={end}")
+    return (options.ids or frozenset()) - shown
 
 
 def unread_asks(inbox: Path, cursor: Path) -> list[str]:
@@ -120,7 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     read_command.add_argument("--brief", action="store_true", help="show only the first 160 characters of info")
     read_command.add_argument("--kind", type=report_kinds, help="filter by comma-separated ask,done,info")
     read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries)")
-    read_command.add_argument("--summary", action="store_true", help="show one line per entry with a 160-character excerpt")
+    read_command.add_argument("--summary", action="store_true",
+                              help="show one line per entry with its id and a 160-character excerpt")
+    read_command.add_argument("--id", type=entry_ids, dest="ids",
+                              help="show only these comma-separated entry ids, in full")
     ack = actions.add_parser("ack", help="acknowledge the byte position printed by read")
     ack.add_argument("position", type=int)
     actions.add_parser("initialize", help="set a new cursor at the current complete end")
@@ -131,8 +150,10 @@ def main(argv: list[str] | None = None) -> int:
                 not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
             raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
         if args.action == "read":
-            read(inbox, cursor, ReadOptions(
-                brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary))
+            missing = read(inbox, cursor, ReadOptions(
+                brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary, ids=args.ids))
+            if missing:
+                raise ValueError("no entry after the cursor has id " + ",".join(sorted(missing)))
             return 0
         data = inbox.read_bytes()
         end = complete_end(data)
