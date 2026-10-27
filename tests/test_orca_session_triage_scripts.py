@@ -2647,10 +2647,13 @@ class InboxWatchServiceTests(unittest.TestCase):
     def test_alert_service_uses_a_separate_cursor_and_notifier(self):
         with tempfile.TemporaryDirectory() as root:
             payload = inbox_service.plistlib.loads(inbox_service.alert_plist_bytes(
-                root, python="/test/bin/python3"))
+                root, python="/test/bin/python3", tools=("/o/bin/orca", "/n/bin/terminal-notifier")))
             self.assertEqual(payload["Label"], inbox_service.ALERT_LABEL)
             self.assertEqual(payload["ProgramArguments"], [
                 "/test/bin/python3", str(SCRIPTS / "inbox_alert.py")])
+            # launchd's PATH lacks both tools the notification needs to open the sender's tab.
+            self.assertLessEqual({"/o/bin", "/n/bin", "/usr/bin"},
+                                 set(payload["EnvironmentVariables"]["PATH"].split(":")))
             self.assertNotIn("close-done-triage.offset", str(payload))
 
     def test_alert_activation_starts_after_existing_inbox_records(self):
@@ -2873,12 +2876,92 @@ class InboxAlertTests(unittest.TestCase):
     def test_notification_uses_the_first_line_as_arguments(self):
         item = {"kind": "ask", "worktree": "sample-lane", "text": "first line\nprivate second line"}
         with patch.object(inbox_alert.subprocess, "run") as run, redirect_stdout(io.StringIO()):
-            inbox_alert.notify(item)
+            inbox_alert.notify(item, NoTab(), inbox_alert.AppleScript())
         args = run.call_args.args[0]
         self.assertEqual(args[0], "/usr/bin/osascript")
         self.assertIn("sample-lane", args[-2])
         self.assertEqual(args[-1], "first line")
         self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_pressing_the_notification_runs_the_senders_click_action(self):
+        item = {"kind": "ask", "worktree": "sample-lane", "text": "first line\nprivate second line"}
+        notifier = inbox_alert.TerminalNotifier("/n/terminal-notifier")
+        switch = inbox_alert.Command(("/o/orca", "terminal", "switch", "--terminal", "term a"))
+        cases = [(switch, "-execute", "/o/orca terminal switch --terminal 'term a'"),
+                 (inbox_alert.Link("orca://terminal/term_a"), "-open", "orca://terminal/term_a")]
+        for action, option, value in cases:
+            with patch.object(inbox_alert.subprocess, "run") as run, redirect_stdout(io.StringIO()):
+                inbox_alert.notify(item, NoTab(action), notifier)
+            args = run.call_args.args[0]
+            self.assertEqual(args[0], "/n/terminal-notifier")
+            self.assertEqual(args[args.index("-message") + 1], "first line")
+            self.assertEqual(args[args.index(option) + 1], value)
+        with patch.object(inbox_alert.subprocess, "run") as run, redirect_stdout(io.StringIO()):
+            inbox_alert.notify(item, NoTab(), notifier)
+        self.assertFalse({"-execute", "-open"} & set(run.call_args.args[0]))
+        # Without notification permission terminal-notifier exits 3; the ask still shows.
+        refused = subprocess.CalledProcessError(3, "terminal-notifier")
+        with patch.object(inbox_alert.subprocess, "run", side_effect=[refused, None]) as run, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            inbox_alert.notify(item, NoTab(switch), notifier)
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/osascript")
+
+    def test_orca_switches_to_the_sender_tab_on_the_mac_that_sent_the_ask(self):
+        terminals = {
+            None: [{"handle": "term_a", "connected": True, "agentIdentity": "claude", "worktreePath": "/w/repo/lane-a"},
+                   {"handle": "term_b", "connected": True, "agentIdentity": "codex", "worktreePath": "/w/repo/lane-b"},
+                   {"handle": "term_shell", "connected": True, "worktreePath": "/w/repo/lane-b"}],
+            "laptop": [{"handle": "term_c", "connected": True, "agentIdentity": "claude",
+                                "worktreePath": "/r/repo/lane-c"}],
+        }
+        machines = {"mini": "Mac-mini", "laptop": "Laptop-16"}
+        tabs = inbox_alert.OrcaTabs("/o/orca", local_host="this-mac")
+        items = [
+            {"host": "this-mac", "worktree": "lane-a", "handle": "term_a"},
+            {"worktree": "lane-a", "handle": "term_a"},
+            # A closed tab's handle falls back to the one agent tab in that worktree.
+            {"host": "this-mac", "worktree": "lane-b", "handle": "term_closed"},
+            {"host": "Laptop-16.local", "worktree": "lane-c", "handle": "term_c"},
+            {"host": "this-mac", "worktree": "gone", "handle": "term_closed"},
+            {"host": "unpaired-mac", "worktree": "lane-c", "handle": "term_c"},
+        ]
+        with patch.object(inbox_alert.subprocess, "run", side_effect=fake_orca(terminals, machines)), \
+                redirect_stderr(io.StringIO()):
+            actions = [tabs.action(item) for item in items]
+        switch = ("/o/orca", "terminal", "switch", "--terminal")
+        self.assertEqual(actions, [
+            inbox_alert.Command((*switch, "term_a")),
+            inbox_alert.Command((*switch, "term_a")),
+            inbox_alert.Command((*switch, "term_b")),
+            inbox_alert.Command((*switch, "term_c", "--environment", "laptop")),
+            None,
+            None,
+        ])
+
+
+class NoTab:
+    def __init__(self, action=None):
+        self.result = action
+
+    def action(self, item):
+        return self.result
+
+
+def fake_orca(terminals, machines):
+    """Answer the Orca CLI calls the alert makes, keyed by the --environment they target."""
+    def run(args, **kwargs):
+        environment = args[args.index("--environment") + 1] if "--environment" in args else None
+        command = tuple(args[1:3])
+        if command == ("terminal", "list"):
+            result = {"terminals": terminals[environment]}
+        elif command == ("environment", "list"):
+            result = {"environments": [{"name": name} for name in machines]}
+        elif command == ("host", "name"):
+            result = {"machineName": machines[environment]}
+        else:
+            raise AssertionError(f"unexpected orca call {args}")
+        return subprocess.CompletedProcess(args, 0, json.dumps({"ok": True, "result": result}), "")
+    return run
 
 
 def published(url, live="arming"):
