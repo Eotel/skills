@@ -24,7 +24,8 @@ so hidden entries are not skipped.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
-scheduled triage tab may read or acknowledge that cursor. An older tab must
+scheduled triage tab may read or acknowledge that cursor; a run Orca marked
+`dispatch_failed` on a restart still counts while its tab is connected. An older tab must
 leave new inbox entries for the current run; it can finish without handling
 them. The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local

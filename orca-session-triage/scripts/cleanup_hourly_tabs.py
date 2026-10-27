@@ -186,7 +186,7 @@ def main(argv=None):
         if row is None:
             print("keep: workspace is missing")
             return 0
-        current = hourly_runtime.latest_pane(runs)
+        current = hourly_runtime.latest_pane(runs, hourly_runtime.live_panes(terminals))
         for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current):
             if not no_pending_questions(args.state_file, run["terminalPaneKey"]):
                 print(f"keep: {term['handle']} may have an unanswered question")
