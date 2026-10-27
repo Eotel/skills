@@ -75,7 +75,9 @@ board's done cards; close what the user approves.
   `finished` goes to `cleanup.md`. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
   `verdict` until its final message, PR, latest review or comment from a person other than
-  the PR author, or tree changes; act on it the same way in every run. A Stop
+  the PR author, tree, or newest `done` or `ask` in the triage inbox changes;
+  act on it the same way in every run. Each queued row carries those inbox
+  reports and which report came last, since the Orca comment has no time. A Stop
   hook keeps the turn open while a queued row has no verdict.
   Codex ignores the fork, the model, and the hook: there, follow
   `orca-row-classify` in this session with that directory.

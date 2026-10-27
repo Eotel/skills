@@ -24,6 +24,11 @@ judge each row from its own facts.
 - `claude.final_text` / `codex.last_assistant` / `orca_message.text`: the agent's newest final
   message (its last part). `claude.last_user`: the prompt it answered.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
+  Orca keeps no time for it.
+- `inbox`: the newest `done` and `ask` the worktree sent to the triage inbox
+  (`at`, `text`), when it sent any. `newest_report` names which came last of
+  the final message, that `done`, and that `ask` (`source`: `final_message`,
+  `inbox_done`, or `inbox_ask`).
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
   CLOSED, `review`, `latest_human_activity` from a person other than the PR author,
   `requested` reviewers, `checks`), or null.
@@ -48,6 +53,10 @@ judge each row from its own facts.
    not keep the row open. When the message reports work on other PRs than `pr`
    (the worktree moved on to new work), those PRs decide; say so in `evidence`.
    A claim the facts disprove is not a leftover: leave it out of `remaining`.
+   The report `newest_report` names outranks the comment, which has no time:
+   when that `done` reports the work finished, a comment still saying 待ち or
+   作業中 is stale. Class the row from the report and say in `evidence` that
+   the comment should be rewritten.
    `pr.reply_after_last_commit` and `waits_on: self` mean a human added a
    review, PR comment, or line comment after the latest commit date. Read it
    and give the lane `in_progress` if it can respond now. GitHub does not

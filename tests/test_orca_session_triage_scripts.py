@@ -1121,6 +1121,29 @@ class NextStepFactTests(unittest.TestCase):
             "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
             "final_at": "t1", "read": scan.read_key(rows[0])})
 
+    def test_a_queued_row_carries_its_newest_inbox_reports_and_which_report_came_last(self):
+        # The Orca comment has no time; a done report newer than the final message must reach the reader.
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            write_jsonl(inbox, [
+                {"ts": "2026-10-27T12:00:00+0900", "kind": "done", "repo": "app", "worktree": "qa", "text": "古い完了"},
+                {"ts": "2026-10-27T13:14:00+0900", "kind": "done", "repo": "app", "worktree": "qa",
+                 "text": "復旧と一時 RDS の削除が済みました"},
+                {"ts": "2026-10-27T13:20:00+0900", "kind": "info", "repo": "app", "worktree": "qa", "text": "経過"},
+                {"ts": "2026-10-27T13:30:00+0900", "kind": "done", "repo": "other", "worktree": "qa", "text": "別の repo"},
+            ])
+            reports = scan.inbox_reports(inbox)
+        row = {"path": "/w/app/qa", "repo": "app", "class": "stalled", "reasons": ["r"], "jev": {"asks": 0.1},
+               "comment": "一時RDS の利用可能待ち", "pr": None, "git": {"dirty": 0}, "codex": [],
+               "claude": {"final_text": "RDS の作成を待っています", "final_at": "2026-10-27T03:00:00Z"}}
+        before = {"/w/app/qa": {"read": scan.read_key(row), "class": "in_progress"}}
+
+        [queued] = scan.review_queue(scan.with_inbox(rows=[row], reports=reports), before)
+
+        self.assertEqual(queued["inbox"], {"done": {"at": "2026-10-27T13:14:00+0900", "host": None,
+                                                    "text": "復旧と一時 RDS の削除が済みました"}})
+        self.assertEqual(queued["newest_report"], {"source": "inbox_done", "at": "2026-10-27T13:14:00+0900"})
+
     def test_rows_a_reader_classes_get_git_and_pr_facts(self):
         # A waiting row is read too: its decision marker may be answered by a merge.
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
@@ -1179,8 +1202,9 @@ class ScanCommandTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         # A host's real Jev key and verdict store must never reach a test run.
-        for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": ""}),
+        for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": ""}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
+                         patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json"))):
             hermetic.start()
             self.addCleanup(hermetic.stop)
