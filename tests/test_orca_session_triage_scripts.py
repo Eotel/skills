@@ -2189,6 +2189,37 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(self.call("show")[1]["requests"][request["id"]]["symptom"],
                          "各 session の direnv が固まる")
 
+    def test_open_issues_of_listed_repos_without_a_checkout_become_requests_needing_owner(self):
+        (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
+        local = self.root / "app-1"
+        subprocess.run(["git", "init", "-q", str(local)], check=True)
+        subprocess.run(["git", "-C", str(local), "remote", "add", "origin", "git@github.com:acme/app.git"],
+                       check=True)
+        url = "https://github.com/acme/app/issues/"
+        issues = [{"number": n, "title": f"issue {n}", "url": url + str(n), "assignees": [],
+                   "closedByPullRequestsReferences": [{"number": 7}] if n == 2 else []} for n in (1, 2, 3)]
+        worktrees = [
+            {"path": str(local), "repo": "app", "linkedIssue": 1, "linkedItems": [], "linkedPR": None},
+            {"path": "/remote/app-pr7", "repo": "app", "_environment": "mbp16", "linkedIssue": None,
+             "linkedItems": [{"provider": "github", "type": "pr", "number": 7}],
+             "linkedPR": {"number": 7, "url": "https://github.com/acme/app/pull/7"}},
+            # Issue 3 of another repository is not acme/app#3.
+            {"path": "/w/other", "repo": "other", "linkedIssue": 3, "linkedItems": [], "linkedPR": None},
+        ]
+        live = ["--live-owner", str(local), "--live-owner", "mbp16::/remote/app-pr7"]
+        with patch.object(hourly_state, "gh_open_issues", return_value=issues) as listed, \
+                patch.object(hourly_state, "orca_worktrees", return_value=worktrees):
+            code, needing = self.call("requests-needing-owner", *live)
+            again = self.call("requests-needing-owner", *live)
+
+        listed.assert_called_with("acme/app")
+        self.assertEqual(code, 0)
+        self.assertEqual([request["source"]["url"] for request in needing], [url + "3"])
+        self.assertEqual(again[1], needing)
+        owners = {request["source"]["url"]: request["owner"]
+                  for request in self.call("show")[1]["requests"].values()}
+        self.assertEqual(owners, {url + "1": str(local), url + "2": "mbp16::/remote/app-pr7", url + "3": None})
+
     def test_request_commands_accept_existing_state_without_requests(self):
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {}}))
         self.assertEqual(self.call("requests-needing-owner"), (0, []))
