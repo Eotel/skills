@@ -44,11 +44,23 @@ permissions, procedures, and scripts wait for a person.
 A lesson about a hard-to-use tool becomes a fix, as `adoption-triage`'s
 policy asks: a change to a tool this setup maintains (category `script`) or
 an upstream issue for one it cannot change (category `upstream`), with the
-workaround as a separate fact until the fix ships. A fact that names a script
-in Eotel/skills or `~/.cache/orca-briefs/bin` is never adopted automatically.
-An adopted `script` or `upstream` proposal is not written as a note: the
-worker records it as failed and sends the triage lead one `triage-notify
---kind ask` so that a lane takes it.
+workaround as a separate fact until the fix ships. A procedure that a tool's
+arguments, defaults, checks, or output could enforce also becomes a `script`
+proposal. A fact that names a script in Eotel/skills or
+`~/.cache/orca-briefs/bin` is never adopted automatically. An adopted
+`script` or `upstream` proposal is not written as a note: the worker records
+one `handed_off` execution, and the lane that ships it records `applied`. The
+adoption board tells the triage lead about adoptions made there; whoever
+adopts from the ledger command directs the lane.
+
+The worker never commits in the skill source checkout. Each check, it puts
+the files it wrote there, and only those still exactly as it wrote them, on
+the branch `triage-retro/observed-facts` from `origin/main`, and opens one PR
+for that branch when none is open. The branch belongs to the worker, which
+rebuilds it with `--force-with-lease`; review fixes go in a separate PR. Once
+the PR merges, the worker drops its local copies and fast-forwards the
+checkout, or restores them when the fast-forward fails. A failure is logged
+as `publish failed:` and noticed once per reason.
 
 The skill list offers Eotel/skills, skills kept in a repository's
 `.claude/skills` or `.agents/skills`, and the sources of skills installed by

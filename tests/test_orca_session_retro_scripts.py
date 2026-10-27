@@ -440,14 +440,18 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "自分たちの道具は直す案にする")
 
-    def test_adopted_upstream_issue_is_not_written_and_notifies(self) -> None:
-        log = self.home / "notify.log"
+    def test_adopted_tool_fix_is_handed_off_once_without_a_notice(self) -> None:
         notifier = self.home / "triage-notify"
-        notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        notifier.write_text(f'#!/bin/sh\necho "$@" >> {self.home / "notify.log"}\n')
         notifier.chmod(0o755)
-        ledger = FakeLedger()
+        config = self.home / "hosts.json"
+        config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
+        ledger = retro.LedgerClient(script=ROOT / "adoption-triage/scripts/ledger.py", events=self.home / "events.jsonl",
+                                    imports=self.home / "imports", decision_config=config)
         proposal_id = str(uuid.uuid4())
-        ledger.propose({"proposal_id": proposal_id, "proposal": "bee の issue view --json にコメントを入れるよう上流に報告する。",
+        ledger.propose({"proposal_id": proposal_id, "source": {"session": self.sid, "worktree": str(self.root)},
+                        "fact": "bee の JSON にコメントが無い。", "proposal": "bee の issue view --json にコメントを入れるよう上流に報告する。",
+                        "reason": "外の道具", "recommendation": "adopt", "priority": "normal", "evidence": ["bee 1.1.1"],
                         "target": "triage-retro:skill:orca-session-triage:upstream"})
         ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
         data = retro.load(self.state)
@@ -455,9 +459,104 @@ class RetroTests(unittest.TestCase):
             with mock.patch.object(retro, "NOTIFY", notifier):
                 retro.sync_decisions(ledger, data, self.root, self.state)
                 retro.sync_decisions(ledger, data, self.root, self.state)
+        item = ledger.list()[0]
+        self.assertEqual([execution["outcome"] for execution in item["executions"]], ["handed_off"])
+        self.assertIsNone(item["implemented_at"])
         self.assertFalse(retro.facts_path(self.target).exists())
-        self.assertEqual(len(log.read_text().splitlines()), 1)
-        self.assertIn(proposal_id, log.read_text())
+        self.assertFalse((self.home / "notify.log").exists())
+
+    def published_remote(self) -> tuple[Path, list[dict[str, int]], Any]:
+        """A bare origin for the skill checkout, a list of open PRs, and a run() that fakes gh over it."""
+        remote = self.home / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+        identity = ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null"]
+        subprocess.run(["git", "-C", str(self.root), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "push", "-q", "origin", "main"], check=True)
+        pulls: list[dict[str, int]] = []
+        real_run = subprocess.run
+
+        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git":
+                return real_run([cmd[0], *identity, *cmd[1:]], *args, **kwargs)
+            if cmd[0] != "gh":
+                return real_run(cmd, *args, **kwargs)
+            if cmd[1:3] == ["pr", "create"]:
+                pulls.append({"number": len(pulls) + 1})
+            if cmd[1:3] == ["pr", "close"]:
+                pulls.clear()
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(pulls), "")
+        return remote, pulls, fake_run
+
+    def test_worker_notes_are_published_on_one_branch_and_settled_after_merge(self) -> None:
+        remote, pulls, fake_run = self.published_remote()
+        upstream = self.home / "upstream"
+        subprocess.run(["git", "clone", "-q", str(remote), str(upstream)], check=True)
+        (upstream / "orca-session-triage/SKILL.md").write_text("# Triage\n\nUpstream line.\n")
+        subprocess.run(["git", "-C", str(upstream), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "-c", "core.hooksPath=/dev/null", "commit", "-qam", "upstream"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "push", "-q", "origin", "main"], check=True)
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        facts = retro.adopt(note, self.root)
+        retro.remember_versions(data, self.target, facts)
+        other = self.root / "orca-session-triage/references/hourly.md"
+        other.write_text("another lane's edit\n")
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("pushed", retro.publish(data, self.root))
+            self.assertIn("up to date", retro.publish(data, self.root))
+        branch = ["git", "--git-dir", str(remote)]
+        tree = subprocess.run([*branch, "ls-tree", "-r", "--name-only", retro.PUBLISH_BRANCH],
+                              capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn("orca-session-triage/references/observed-triage-facts.md", tree)
+        self.assertNotIn("orca-session-triage/references/hourly.md", tree)
+        router = subprocess.run([*branch, "show", f"{retro.PUBLISH_BRANCH}:orca-session-triage/SKILL.md"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertIn("Upstream line.", router)
+        self.assertIn(retro.ROUTER_SECTION, router)
+        self.assertEqual(len(pulls), 1)
+        subprocess.run([*branch, "update-ref", "refs/heads/main", retro.PUBLISH_BRANCH], check=True)
+        pulls.clear()  # merged
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("settled", retro.publish(data, self.root))
+        self.assertEqual(subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True).stdout,
+                         subprocess.run([*branch, "rev-parse", "main"], capture_output=True, text=True).stdout)
+        self.assertIn(note["id"], facts.read_text())
+        self.assertEqual(other.read_text(), "another lane's edit\n")
+
+    def test_revocation_before_the_merge_closes_the_published_pr(self) -> None:
+        _, pulls, fake_run = self.published_remote()
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        facts = retro.adopt(note, self.root)
+        retro.remember_versions(data, self.target, facts)
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            self.assertIn("pushed", retro.publish(data, self.root))
+            retro.undo({**note, "target_path": str(facts), "router_path": str(self.target)})
+            retro.remember_versions(data, self.target, facts)
+            self.assertIn("closed PR #1", retro.publish(data, self.root))
+        self.assertEqual(pulls, [])
+        self.assertFalse(facts.exists())
+
+    def test_publishing_refuses_a_symlink_from_main(self) -> None:
+        remote, pulls, fake_run = self.published_remote()
+        outside = self.home / "outside"
+        outside.mkdir()
+        upstream = self.home / "upstream"
+        subprocess.run(["git", "clone", "-q", str(remote), str(upstream)], check=True)
+        (upstream / "orca-session-triage/references").symlink_to(outside)
+        subprocess.run(["git", "-C", str(upstream), "add", "orca-session-triage/references"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "-c", "core.hooksPath=/dev/null", "commit", "-qm", "link"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "push", "-q", "origin", "main"], check=True)
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        retro.remember_versions(data, self.target, retro.adopt(note, self.root))
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                retro.publish(data, self.root)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(pulls, [])
 
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):

@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,7 @@ MAX_SKILL_BYTES = 12_000
 MAX_NOTES_PER_SKILL = 3
 MAX_NOTE_CHARS = 190
 MAX_REJECTED = 20
-# Adopted tool fixes and upstream reports need a lane; the worker never writes them as notes.
+# Adopted tool fixes and upstream reports go to a lane; the worker records the hand-off, never a note.
 SEPARATE_WORK = frozenset(("script", "upstream"))
 SESSION_ID = re.compile(r"^[a-f0-9-]{36}$")
 MARKER = "<!-- triage-retro:"
@@ -454,6 +455,8 @@ RETRO_PROMPT = (
     "（下の skill の scripts、~/.cache/orca-briefs/bin、orca-board）なら、引数・option を足すか出力を直す案を"
     "category script で出す。直せない外の道具（gh・bee など）なら上流への issue の案を category upstream で出し、"
     "直るまでの使い方は別に category fact で出してよい。"
+    "手順や決まりの案でも、道具の機能（引数・既定値・検査・出力）で間違いを決定論的に防げるなら、"
+    "手順を書き足さず category script で道具を直す案にする。"
     "利用者の決まり、権限、削除・merge・投稿の条件、手順やスクリプトの変更は category を fact 以外にする。"
     "target_skill は下の skill 名から選ぶ。repo/project 固有 skill も候補にしてよい。"
     "evidence_quotes には失敗と成功のそれぞれについて、会話中の道具の出力・実行したコマンド・発言から"
@@ -878,13 +881,22 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             data["rewrites"].pop(decision_id, None)
             continue
         action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
+        if category in SEPARATE_WORK:
+            # A lane makes the tool fix or the upstream report; the board or the deciding person tells the lead.
+            if status == "adopted" and not any(execution.get("outcome") == "handed_off"
+                                               and execution.get("decision_id") == decision_id
+                                               for execution in item.get("executions", [])):
+                ledger.record({"proposal_id": proposal_id, "decision_id": decision_id, "outcome": "handed_off",
+                               "actor": "triage-retro",
+                               "result": "worker は skill に書かず、担当へ渡した。担当が実施したら applied を記録する。"})
+                data["action_attempts"].pop(action_key, None)
+                changed += 1
+            continue
         if data["action_attempts"].get(action_key, 0) >= 3 and proposal_id not in data["applied_actions"]:
             continue
         proposal = {"id": proposal_id, "note": item["proposal"], "target_skill": skill}
         writing_completed = False
         try:
-            if category in SEPARATE_WORK and status == "adopted":
-                raise ValueError(f"{category} proposal requires separate work, not a skill note")
             router = skill_target(skill, root)
             if router is None:
                 raise ValueError("target skill is missing")
@@ -964,7 +976,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             if writing_completed:
                 raise  # A written note or reversal needs a receipt, not another local edit.
             attempts = data["action_attempts"][action_key] = (
-                3 if category in SEPARATE_WORK else data["action_attempts"].get(action_key, 0) + 1)
+                data["action_attempts"].get(action_key, 0) + 1)
             if state is not None:
                 save(data, state)
             ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
@@ -1030,6 +1042,194 @@ def record_candidates(sid: str, transcript: Path, candidates: Sequence[dict[str,
     return changed
 
 
+PUBLISH_BRANCH = "triage-retro/observed-facts"
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=120)
+    if check and result.returncode:
+        raise RuntimeError(f"git {' '.join(args[:3])} failed: {result.stderr.strip()[:300]}")
+    return result
+
+
+def digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def blob(repo: Path, ref: str, name: str) -> bytes | None:
+    shown = subprocess.run(["git", "-C", str(repo), "show", f"{ref}:{name}"], capture_output=True, timeout=60)
+    return None if shown.returncode else shown.stdout
+
+
+def note_ids(lines: Sequence[str]) -> set[str]:
+    return {line[line.index(MARKER):] for line in lines if MARKER in line}
+
+
+def replay_facts(repo: Path, name: str, local: bytes | None) -> bytes | None:
+    """The worker's added and removed note lines in ``name`` replayed on origin/main; None when no note is left."""
+    base = (blob(repo, "HEAD", name) or b"").decode("utf-8").splitlines(keepends=True)
+    upstream = (blob(repo, "origin/main", name) or b"").decode("utf-8")
+    mine = (local or b"").decode("utf-8").splitlines(keepends=True)
+    removed = note_ids(base) - note_ids(mine)
+    kept = [line for line in (upstream or FACTS_HEADER).splitlines(keepends=True)
+            if MARKER not in line or line[line.index(MARKER):] not in removed]
+    added = [line for line in mine if MARKER in line and line not in base and line[line.index(MARKER):] not in note_ids(kept)]
+    result = "".join(kept) + ("" if not added or "".join(kept).endswith("\n") else "\n") + "".join(added)
+    return result.encode("utf-8") if note_ids(result.splitlines(keepends=True)) else None
+
+
+def replay(repo: Path, names: Sequence[str]) -> dict[str, bytes | None]:
+    """The worker's edits to ``names`` replayed on origin/main; None deletes a file.
+
+    The worker only adds or removes marked note lines and router pointers, so replaying them keeps whatever
+    main gained meanwhile. A router points to its facts exactly when the replayed facts still hold a note.
+    """
+    local = {name: (repo / name).read_bytes() if (repo / name).is_file() else None for name in names}
+    facts = {name: replay_facts(repo, name, local[name]) for name in names if name.endswith(f"references/{FACTS_NAME}")}
+
+    def router(name: str) -> bytes | None:
+        upstream = blob(repo, "origin/main", name)
+        if not name.endswith("SKILL.md") or upstream is None:
+            if upstream == blob(repo, "HEAD", name):
+                return local[name]
+            raise RuntimeError(f"{name} changed in main and here; a person must merge it")
+        reference = str(Path(name).parent / "references" / FACTS_NAME)
+        notes = facts[reference] if reference in facts else blob(repo, "origin/main", reference)
+        wanted = bool(notes and note_ids(notes.decode("utf-8").splitlines(keepends=True)))
+        text = upstream.decode("utf-8")
+        if wanted and ROUTER_SECTION not in text:
+            return (text + ("" if text.endswith("\n") else "\n") + ROUTER_SECTION).encode("utf-8")
+        if not wanted and ROUTER_SECTION in text:
+            return text.replace(ROUTER_SECTION, "", 1).encode("utf-8")
+        return upstream
+    return facts | {name: router(name) for name in names if name not in facts}
+
+
+class WorkerFiles(NamedTuple):
+    """Files that differ from HEAD after the worker wrote them: still as written, or edited by someone since."""
+    written: list[Path]
+    edited: list[Path]
+
+
+def worker_files(data: dict[str, Any], repo: Path) -> WorkerFiles:
+    status = git(repo, "status", "--porcelain", "-z", "--untracked-files=all").stdout
+    dirty = {(repo / entry[3:]).resolve() for entry in status.split("\0") if entry}
+    owned = [(path, recorded) for key, recorded in data["target_versions"].items() if (path := Path(key)) in dirty]
+    return WorkerFiles(sorted(path for path, recorded in owned if digest(path) == recorded),
+                       sorted(path for path, recorded in owned if digest(path) != recorded))
+
+
+def settle(repo: Path, changed: Sequence[Path], data: dict[str, Any]) -> str:
+    """The notes are in main: drop the local copies and fast-forward, restoring them if that fails."""
+    saved = {path: path.read_bytes() if path.is_file() else None for path in changed}
+    names = [str(path.relative_to(repo)) for path in changed]
+    tracked = [name for name in names if blob(repo, "HEAD", name) is not None]
+    if tracked:
+        git(repo, "checkout", "--", *tracked)
+    for path, name in zip(changed, names):
+        if name not in tracked:
+            path.unlink(missing_ok=True)
+    merged = git(repo, "merge", "--ff-only", "--quiet", "origin/main", check=False)
+    if merged.returncode:
+        for path, content in saved.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+        return f"publish: notes are in main, but the checkout did not fast-forward: {merged.stderr.strip()[:200]}"
+    data.pop("published", None)
+    return "publish: settled after the merge"
+
+
+def inside(tree: Path, name: str) -> Path:
+    """``tree / name`` when neither it nor a directory above it inside ``tree`` is a symlink."""
+    destination = tree / name
+    links = [path for path in (destination, *destination.parents) if path.is_relative_to(tree) and path != tree
+             and path.is_symlink()]
+    if links or not destination.resolve().is_relative_to(tree.resolve()):
+        raise RuntimeError(f"{name} reaches a symlink in main; a person must check it before publishing")
+    return destination
+
+
+def open_pull_requests(repo: Path) -> list[dict[str, Any]]:
+    listed = subprocess.run(["gh", "pr", "list", "--head", PUBLISH_BRANCH, "--state", "open", "--json", "number"],
+                            capture_output=True, text=True, timeout=60, cwd=repo, check=True)
+    return json.loads(listed.stdout or "[]")
+
+
+def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
+    """Put the worker's notes in the source checkout on one PR branch; after the merge, return it to main."""
+    repo = root.resolve()
+    if git(repo, "remote", "get-url", "origin", check=False).returncode:
+        return "publish: the source checkout has no origin"
+    files = worker_files(data, repo)
+    published = data.get("published") or {}
+    held = [name for path in files.edited if (name := str(path.relative_to(repo))) in published]
+    if held:
+        raise RuntimeError(f"published files changed after the worker wrote them: {', '.join(held)}")
+    names = sorted({str(path.relative_to(repo)) for path in files.written} | set(published))
+    if not names:
+        return "publish: nothing to publish"
+    git(repo, "fetch", "--quiet", "origin")
+    contents = replay(repo, names)
+    if all(content == blob(repo, "origin/main", name) for name, content in contents.items()):
+        # Main already says what the worker wants: the PR merged, or a revocation emptied it.
+        withdrawn = [pull["number"] for pull in open_pull_requests(repo)]
+        for number in withdrawn:
+            subprocess.run(["gh", "pr", "close", str(number), "--delete-branch", "--comment",
+                            "取り消しにより、main と同じ内容になったので閉じます。triage-retro worker"],
+                           capture_output=True, text=True, timeout=60, cwd=repo, check=True)
+        settled = settle(repo, files.written, data)
+        return f"publish: closed PR #{withdrawn[0]}; {settled}" if withdrawn else settled
+    digests = {name: hashlib.sha256(content).hexdigest() if content is not None else None
+               for name, content in contents.items()}
+    if published == digests:
+        return "publish: the PR branch is up to date"
+    with tempfile.TemporaryDirectory(prefix="triage-retro-publish-") as scratch:
+        tree = Path(scratch) / "tree"
+        git(repo, "worktree", "add", "--detach", "--quiet", str(tree), "origin/main")
+        try:
+            for name, content in contents.items():
+                destination = inside(tree, name)
+                if content is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(content)
+            git(tree, "add", "--all", "--", *names)
+            git(tree, "commit", "--quiet", "-m", "docs: record adopted retrospective notes")
+            lease = git(repo, "ls-remote", "origin", f"refs/heads/{PUBLISH_BRANCH}").stdout.split()
+            git(tree, "push", "--quiet", f"--force-with-lease=refs/heads/{PUBLISH_BRANCH}:{lease[0] if lease else ''}",
+                "origin", f"HEAD:refs/heads/{PUBLISH_BRANCH}")
+        finally:
+            git(repo, "worktree", "remove", "--force", str(tree), check=False)
+    if not open_pull_requests(repo):
+        body = ("振り返りの worker が、採用された文を skill に書いた分です。branch は worker が作り直します。\n\n"
+                + "\n".join(f"- `{name}`" for name in names) + "\n\ntriage-retro worker")
+        subprocess.run(["gh", "pr", "create", "--base", "main", "--head", PUBLISH_BRANCH, "--assignee", "Eotel",
+                        "--title", "docs: record adopted retrospective notes", "--body", body],
+                       capture_output=True, text=True, timeout=60, cwd=repo, check=True)
+    data["published"] = digests
+    return f"publish: pushed {len(names)} files to {PUBLISH_BRANCH}"
+
+
+def publish_safely(state: Path = STATE, root: Path = SOURCE) -> str:
+    """Publish under the state lock; a failure is logged and noticed once per reason, never fatal."""
+    with locked(paths(state)[2]):
+        data = load(state)
+        try:
+            message = publish(data, root)
+            data.pop("publish_failure", None)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            message = f"publish failed: {exc}"
+            if data.get("publish_failure") != message:
+                notify(f"振り返りの worker が、採用した文の PR を出せませんでした: {message[:300]}")
+            data["publish_failure"] = message
+        save(data, state)
+    return message
+
+
 def failure_repeated(data: dict[str, Any], reason: str) -> bool:
     """Count one failure reason across runs; true only when it has just happened twice in a row."""
     key = re.sub(r"[0-9a-f-]{8,}|\d+", "#", reason)
@@ -1061,6 +1261,9 @@ def process_once(state: Path = STATE, root: Path = SOURCE, claude: str = "claude
                             if s["status"] == "pending" and s["attempts"] < 3), None)
             changed = sync_decisions(ledger, data, root, state)
             save(data, state)
+        publication = publish_safely(state, root)
+        if not publication.endswith(("nothing to publish", "has no origin", "is up to date")):
+            print(publication, file=sys.stderr, flush=True)
         if pending is None:
             return f"empty; reconciled {changed} decisions"
         cpu = os.cpu_count() or 8
