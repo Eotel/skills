@@ -4,7 +4,9 @@ import json
 import io
 from contextlib import redirect_stdout
 from datetime import datetime
+import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -99,6 +101,38 @@ class RetroTests(unittest.TestCase):
         self.sid = "4d4aa0ed-cff3-416c-9e67-3136c059789b"
         self.transcript = self.home / ".claude/projects/triage" / f"{self.sid}.jsonl"
         transcript(self.transcript)
+
+    def test_claude_json_failure_records_result_text(self):
+        failure = subprocess.CompletedProcess(
+            ["claude", "-p"], 1,
+            stdout=json.dumps({"is_error": True,
+                               "result": "Failed to authenticate: OAuth session expired"}),
+            stderr="")
+        with mock.patch.object(retro.subprocess, "run", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "OAuth session expired"):
+                retro.run_claude("prompt", {"type": "object"})
+
+    def test_claude_uses_selected_orca_profile_without_api_credentials(self):
+        selected = self.home / "Library/Application Support/orca/claude-profiles/selected-host"
+        selected.parent.mkdir(parents=True)
+        selected.write_text(str(self.home / "orca-profile/home"))
+        success = subprocess.CompletedProcess(
+            ["claude", "-p"], 0,
+            stdout=json.dumps({"structured_output": {"ok": True}}), stderr="")
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "paid-key",
+                                              "ANTHROPIC_AUTH_TOKEN": "paid-token"}, clear=True):
+                with mock.patch.object(retro.subprocess, "run", return_value=success) as run:
+                    self.assertEqual(retro.run_claude("prompt", {"type": "object"}), {"ok": True})
+                    env = run.call_args.kwargs["env"]
+                    self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / "orca-profile/home"))
+                    self.assertEqual(env["USER"], pwd.getpwuid(os.getuid()).pw_name)
+                    self.assertNotIn("ANTHROPIC_API_KEY", env)
+                    self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+                    selected.unlink()
+                    retro.run_claude("prompt", {"type": "object"})
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", run.call_args.kwargs["env"])
 
     def test_stop_capture_is_one_line_only_for_hourly_session(self):
         hook = {"session_id": self.sid, "transcript_path": str(self.transcript)}

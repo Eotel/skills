@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import subprocess
 import sys
@@ -298,13 +299,32 @@ def skill_index(root=SOURCE):
     return "\n".join(result)
 
 
+def claude_environment():
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env.setdefault("USER", pwd.getpwuid(os.getuid()).pw_name)
+    selected = Path.home() / "Library/Application Support/orca/claude-profiles/selected-host"
+    if selected.is_file():
+        profile = selected.read_text(encoding="utf-8").strip()
+        if profile:
+            env["CLAUDE_CONFIG_DIR"] = profile
+    return env
+
+
 def run_claude(prompt, schema, claude="claude"):
     cmd = [claude, "-p", "--no-session-persistence", "--model", "sonnet", "--max-budget-usd", "1",
            "--tools", "", "--strict-mcp-config",
            "--output-format", "json", "--json-schema", json.dumps(schema)]
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                            timeout=300, env=claude_environment())
     if result.returncode:
-        raise RuntimeError(f"claude -p exited {result.returncode}: {result.stderr[-400:]}")
+        detail = result.stderr.strip()
+        try:
+            detail = str(json.loads(result.stdout).get("result") or detail)
+        except (ValueError, AttributeError):
+            pass
+        raise RuntimeError(f"claude -p exited {result.returncode}: {detail[-400:]}")
     wrapper = json.loads(result.stdout)
     print(f"claude -p cost_usd={wrapper.get('total_cost_usd', 'unknown')}", file=sys.stderr, flush=True)
     output = wrapper.get("structured_output")
@@ -826,6 +846,15 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
 
 def run_service(state=STATE, root=SOURCE, ledger=None):
     """Poll one queued session at a time outside the triage tab."""
+    try:
+        auth = subprocess.run(["claude", "auth", "status", "--json"],
+                              capture_output=True, text=True, timeout=15,
+                              env=claude_environment())
+        status = json.loads(auth.stdout) if auth.returncode == 0 else {}
+        print(f"claude auth: authMethod={status.get('authMethod', 'unavailable')} "
+              f"subscriptionType={status.get('subscriptionType', 'unavailable')}", flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"claude auth check failed: {exc}", file=sys.stderr, flush=True)
     while True:
         try:
             print(process_once(state, root, ledger=ledger), flush=True)
