@@ -837,6 +837,8 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
 
 QUEUE_FIELDS = ("path", "repo", "environment", "class", "reasons", "waits_on", "comment",
                 "jev", "pr", "git", "claude", "orca_message")
+INBOX_FILE = "~/.cache/orca-briefs/triage-inbox.jsonl"
+INBOX_KINDS = ("done", "ask")
 VERDICTS_FILE = "~/.cache/orca-session-triage/verdicts.json"
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
 READ_CLASSES = ("unsure", "stalled", "waiting")
@@ -851,8 +853,56 @@ def row_final_at(row):
     return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
 
 
+def inbox_reports(path: Path) -> dict[tuple[str, str], dict[str, dict]]:
+    """The newest `done` and `ask` each worktree sent to the triage inbox, by (repo, worktree name).
+
+    An entry from before reports named their repository is keyed by ("", name).
+    """
+    try:
+        lines = path.read_bytes().splitlines()
+    except OSError:
+        return {}
+    reports: dict[tuple[str, str], dict[str, dict]] = {}
+    for raw in lines:
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            continue
+        if (not isinstance(item, dict) or item.get("kind") not in INBOX_KINDS or not item.get("worktree")
+                or parse_time(item.get("ts")) is None):
+            continue
+        held = reports.setdefault((item.get("repo") or "", item["worktree"]), {})
+        older = held.get(item["kind"])
+        if older is None or parse_time(item["ts"]) >= parse_time(older["at"]):
+            held[item["kind"]] = {"at": item["ts"], "host": item.get("host"),
+                                  "text": (item.get("text") or "")[-JEV_MAX_CHARS:]}
+    return reports
+
+
+def with_inbox(rows: list[dict], reports: dict[tuple[str, str], dict[str, dict]]) -> list[dict]:
+    """Rows carry `inbox`: the newest done and ask their worktree reported, when it reported any."""
+    def newest(row: dict) -> dict:
+        name = Path(row["path"]).name
+        found = [reports.get((row.get("repo") or "", name)) or {}, reports.get(("", name)) or {}]
+        return {kind: max(held, key=lambda report: parse_time(report["at"]))
+                for kind in INBOX_KINDS if (held := [f[kind] for f in found if kind in f])}
+    return [{**row, "inbox": inbox} if (inbox := newest(row)) else row for row in rows]
+
+
+def newest_report(row: dict) -> dict | None:
+    """Which came last of the final message and the inbox reports; the Orca comment has no time."""
+    said = [("final_message", row_final_at(row)),
+            *((f"inbox_{kind}", report["at"]) for kind, report in (row.get("inbox") or {}).items())]
+    timed = [(source, at) for source, at in said if at and parse_time(at)]
+    if not timed:
+        return None
+    source, at = max(timed, key=lambda pair: parse_time(pair[1]))
+    return {"source": source, "at": at}
+
+
 def read_key(row):
-    """What a careful read saw: final message, PR, latest human review, and tree. None without a message.
+    """What a careful read saw: final message, PR, latest human review, tree, and inbox reports.
+    None without a message.
 
     A verdict holds only while this key is unchanged.
     """
@@ -860,8 +910,10 @@ def read_key(row):
     if final_at is None:
         return None
     pr, git = row.get("pr") or {}, row.get("git") or {}
+    inbox = [report["at"] for _, report in sorted((row.get("inbox") or {}).items())]
     return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
-                       pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty")])
+                       pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty"),
+                       *([inbox] if inbox else [])])
 
 
 def row_identity(row):
@@ -895,6 +947,7 @@ def review_queue(rows, verdicts=None):
         return current_verdict(row, verdicts) is None
 
     return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             **({"inbox": row["inbox"], "newest_report": newest_report(row)} if row.get("inbox") else {}),
              **({"open_pr_cleanup": True} if row.get("open_pr_cleanup") else {}),
              **({"identity": row_identity(row)} if row.get("environment") else {}),
              "codex": row["codex"][-1] if row.get("codex") else None,
@@ -1179,6 +1232,9 @@ def parse_args(argv=None):
                             "its path, or its row identity")
     parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                         help="read the rows a previous scan printed as JSON instead of scanning again")
+    parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
+                        help="triage inbox whose newest done and ask per worktree go into the review queue "
+                             "(default: $TRIAGE_INBOX or %(default)s)")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
                         help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
     args = parser.parse_args(argv)
@@ -1324,6 +1380,7 @@ def main(argv=None):
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args)))
+    rows = with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)
     if args.review_out:
