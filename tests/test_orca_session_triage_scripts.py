@@ -39,6 +39,7 @@ stopcheck = load_script("stop_check")
 inbox_service = load_script("inbox_watch_service")
 inbox_read = load_script("inbox_read")
 cleanup_hourly = load_script("cleanup_hourly_tabs")
+hourly_runs = load_script("hourly_runs")
 inbox_alert = load_script("inbox_alert")
 
 
@@ -2409,6 +2410,31 @@ def tool_result(content, result):
     """A transcript entry holding a tool's result, as Claude Code writes it."""
     return {"type": "user", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}]}, "toolUseResult": result}
+
+
+class HourlyRunsTests(unittest.TestCase):
+    def test_lists_each_scheduled_run_with_its_precheck_reason_and_transcript(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "Application Support" / "home"
+            transcript = home / ".claude/projects/-w-triage/sid-1.jsonl"
+            write_jsonl(transcript, [user("/orca-session-triage hourly")])
+            runs = [{"status": "completed", "scheduledFor": 1793084400000, "startedAt": 1793084415827,
+                     "terminalPaneKey": "tab:leaf", "usage": {"providerSessionId": "sid-1"},
+                     "workspaceId": "repo::/w/triage"},
+                    {"status": "skipped_precheck", "scheduledFor": 1793080800000, "startedAt": 1793080828333,
+                     "terminalPaneKey": None, "workspaceId": "repo::/w/triage",
+                     "precheckResult": {"exitCode": 1, "stdout": "skip: a scheduled turn is working\n"}}]
+            with patch.object(hourly_runtime, "scheduled_runs", return_value=runs), \
+                    patch.object(Path, "home", return_value=home), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hourly_runs.main(["--workspace", "/w/triage"]), 0)
+
+        def local(ms):
+            return datetime.fromtimestamp(ms / 1000).astimezone().isoformat(timespec="seconds")
+        self.assertEqual(out.getvalue().splitlines(), [
+            f"{local(1793084400000)} | completed | started {local(1793084415827)} | - | pane tab:leaf | {transcript}",
+            f"{local(1793080800000)} | skipped_precheck | started {local(1793080828333)}"
+            " | skip: a scheduled turn is working | pane - | -",
+        ])
 
 
 class InboxWatchServiceTests(unittest.TestCase):

@@ -214,8 +214,13 @@ orca automations create --name "session triage" --trigger hourly \
   each allowed run, without making a new worktree.
 - `scripts/precheck.py` skips while a scheduled turn is still dispatched and
   working, or its completed turn still owns a background job. A later human
-  turn in that tab does not hold the next run. A skipped run is visible in
-  `orca automations runs --id <id> --json`. A manual `orca automations run`
+  turn in that tab does not hold the next run.
+  `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_runs.py` lists
+  the workspace's scheduled runs, newest first: scheduled and start time,
+  status, the precheck's reason for a skipped run, the tab pane, and the
+  Claude transcript (`--json` for a list). Read runs and their transcripts
+  through it rather than from the automation's JSON or a shell loop over
+  transcript paths, which contain spaces. A manual `orca automations run`
   does not run the precheck.
 - Orca runs the precheck through `/bin/sh` with the login `PATH`, but in the
   repo's main checkout rather than the workspace, so the command names the
