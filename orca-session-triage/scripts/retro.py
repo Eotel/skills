@@ -422,26 +422,34 @@ def review_proposals(raw, transcript, root=SOURCE, claude="claude", existing=())
     events = extract_events(transcript)
     mentioned = transcript_text(transcript)
     candidates = []
+
+    def omit(item, reason):
+        # Omitted lessons are not ledger rows; the log keeps what was dropped and why.
+        title = str(item.get("title", "")) if isinstance(item, dict) else ""
+        print(f"omitted: {title[:100]}: {reason[:300]}", file=sys.stderr, flush=True)
+
     for item in raw[:5]:
         if not isinstance(item, dict):
             continue
         evidence = quoted_events(item.get("evidence_quotes") or [], events)
         if evidence is None:
+            omit(item, "quotes not found in the transcript")
             continue
         try:
             for event in evidence:
                 datetime.fromisoformat(event["at"])
         except (TypeError, ValueError):
+            omit(item, "evidence has no timestamp")
             continue
         target = str(item.get("target_skill", ""))
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9][A-Za-z0-9-]*){0,2}", target):
-            continue
-        if skill_target(target, root) is None:
-            continue
-        if "/" in target and target.split("/")[1].casefold() not in mentioned:
+        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9][A-Za-z0-9-]*){0,2}", target)
+                or skill_target(target, root) is None
+                or ("/" in target and target.split("/")[1].casefold() not in mentioned)):
+            omit(item, f"unknown target skill {target}")
             continue
         note = str(item.get("note", "")).strip()
         if not note or "\n" in note or len(note) > 500:
+            omit(item, "note is empty, multi-line, or too long")
             continue
         candidates.append({"title": str(item.get("title", ""))[:100],
                            "first_failure": str(item.get("first_failure", ""))[:500],
@@ -486,8 +494,13 @@ def review_proposals(raw, transcript, root=SOURCE, claude="claude", existing=())
             if any(p.get("id") == target_id and p.get("target_skill") == candidate["target_skill"]
                    for p in existing):
                 candidate["duplicate_of"] = target_id
-    return [c for c in candidates if c["review"]["supported"] is True
+    kept = [c for c in candidates if c["review"]["supported"] is True
             and (c["review"]["duplicate"] is False or c.get("duplicate_of"))]
+    for candidate in candidates:
+        if candidate not in kept:
+            omit(candidate, f"review supported={candidate['review']['supported']} "
+                            f"duplicate={candidate['review']['duplicate']}: {candidate['review']['reason']}")
+    return kept
 
 
 def proposal_id(session_id, candidate):

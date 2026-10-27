@@ -28,10 +28,11 @@ session's worktree it runs
 `claude -p --resume <session-id> --fork-session --no-session-persistence` on
 the session's model, with tools, MCP servers, and hooks off. The copy answers
 like the live fork, and the same review and ledger steps follow. The copy
-reads the whole conversation without a cache: about $1 for a 125k–205k-token
-hourly session on Claude Opus 5.5 (measured on 2026-10-27). `claude -p` counts
-the original conversation's cost in its total; `service.log` prints the
-copy's own `cost_usd`.
+reads the whole conversation without a cache. For seven 133k–202k-token
+hourly sessions on Claude Opus 5.5 on 2026-10-27, the copy cost $1.17–1.79
+and the review $0.09–0.25 per session. `claude -p` counts the original
+conversation's cost in its total; `service.log` prints the copy's own
+`cost_usd`, and an `omitted:` line for each lesson dropped with its reason.
 
 Only short, supported facts about commands, paths, and errors are appended
 automatically to `references/observed-triage-facts.md` in the selected skill;
