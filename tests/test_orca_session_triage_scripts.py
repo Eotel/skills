@@ -2433,6 +2433,38 @@ class InboxReadTests(unittest.TestCase):
                     f"NEXT_OFFSET={inbox.stat().st_size}",
                 ])
 
+    def test_summary_names_each_entry_and_id_reads_only_those_in_full(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            write_jsonl(inbox, [
+                {"id": "a1", "ts": "t1", "kind": "ask", "host": "host1", "repo": "repo-a",
+                 "worktree": "same", "text": "前半の質問\n" + "詳" * 200},
+                {"id": "b2", "ts": "t2", "kind": "info", "host": "host1", "repo": "repo-b",
+                 "worktree": "other", "text": "経過"},
+                {"id": "c3", "ts": "t3", "kind": "done", "host": "host1", "repo": "repo-c",
+                 "worktree": "last", "text": "完了"},
+            ])
+            end = inbox.stat().st_size
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read", "--summary"]), 0)
+                self.assertEqual([line.split("  ")[0] for line in output.getvalue().splitlines()], [
+                    "t1 ask host1 repo-a/same id=a1", "t2 info host1 repo-b/other id=b2",
+                    "t3 done host1 repo-c/last id=c3", f"NEXT_OFFSET={end}"])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(inbox_read.main(["read", "--brief", "--id", "c3,a1"]), 0)
+                self.assertEqual(output.getvalue(),
+                                 "t1 ask host1 repo-a/same id=a1\n前半の質問\n" + "詳" * 200 + "\n\n"
+                                 "t3 done host1 repo-c/last id=c3\n完了\n\n"
+                                 f"NEXT_OFFSET={end}\n")
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(inbox_read.main(["read", "--id", "a1,zz"]), 1)
+                self.assertIn("zz", error.getvalue())
+                self.assertFalse(cursor.exists())
+
     def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"

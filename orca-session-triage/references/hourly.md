@@ -12,8 +12,10 @@ At the start of each run, use `scripts/inbox_read.py read --brief` to see new
 inbox entries in append order. `--brief` keeps `ask` and `done` in full and
 shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
-For a large inbox, `read --summary` shows each entry on one line with the first
-160 characters of its text. `--kind ask,done` filters by type, and
+For a large inbox, `read --summary` shows each entry on one line with its
+`id=` and the first 160 characters of its text, and `read --id ID[,ID]` prints
+only those entries in full; it fails when an id is not after the cursor. Read a
+long inbox this way rather than cutting the output. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
 `repo/worktree` (older entries without a repo use their worktree). These options
 only filter the display: `NEXT_OFFSET` still covers every complete inbox entry.
