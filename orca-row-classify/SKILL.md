@@ -135,3 +135,7 @@ free text. A `finished` row's
 `next_step` is "close the worktree". Then reply with one line per row:
 `<worktree name> | <class> | <question if set, else waits_on, else next_step>`,
 where the worktree name is the last segment of `path`.
+
+## Observed triage facts
+
+Read [references/observed-triage-facts.md](references/observed-triage-facts.md) when troubleshooting a tool used in hourly triage.
