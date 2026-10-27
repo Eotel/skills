@@ -1,15 +1,38 @@
 # Hourly retrospective
 
+A copy that inherits the hourly conversation's context reviews the run. The
+original transcript is never changed.
+
+## At the end of a live hourly run
+
+After the handoff, start one Agent with `subagent_type: "fork"` and the prompt
+"Run `python3 ~/.claude/skills/orca-session-triage/scripts/retro.py fork-prompt`
+and follow its output." The fork inherits the run's context and cache. It lists
+failures that later succeeded, each with verbatim quotes from the run, and
+pipes them to `retro.py submit`. `submit` keeps only quotes found in the
+transcript, asks a separate `claude -p` context to review the evidence and
+risk, records the result in the adoption ledger, and marks the session done.
+Wait for the fork's one-line result before ending the turn. If `submit` fails,
+report its error; the Stop hook still queues the session for the service below.
+
+## Finished sessions
+
 The Stop hook appends the hourly transcript path to
 `~/.cache/orca-session-triage/retro/queue.jsonl` after the existing review,
 inbox, and Artifact checks allow the turn to end. A repeated stop is deduped.
 The queue is local and private; a failed append never blocks the triage tab.
 
-The external `retro.py run-service` process checks the one-minute Mac load before
-processing one transcript. It records a failure and a later verified success,
-checks the relevant skills and memory for overlap, and asks a separate
-`claude -p` context to review the evidence and risk. It records candidate
-lessons and source times through the adoption-policy ledger.
+The external `retro.py run-service` process checks the one-minute Mac load
+before processing one queued session that no fork has submitted. In the
+session's worktree it runs
+`claude -p --resume <session-id> --fork-session --no-session-persistence` on
+the session's model, with tools, MCP servers, and hooks off. The copy answers
+like the live fork, and the same review and ledger steps follow. The copy
+reads the whole conversation without a cache: about $1 for a 125k–205k-token
+hourly session on Claude Opus 5.5 (measured on 2026-10-27). `claude -p` counts
+the original conversation's cost in its total; `service.log` prints the
+copy's own `cost_usd`.
+
 Only short, supported facts about commands, paths, and errors are appended
 automatically to `references/observed-triage-facts.md` in the selected skill;
 its root `SKILL.md` gets one short pointer. The limit is three adoptions per
@@ -17,12 +40,26 @@ local night and three automatic notes per skill. A full skill gets a rewrite
 proposal for morning review. Rules about human decisions, destructive actions,
 permissions, procedures, and scripts wait for a person.
 
+## Failures
+
+A failed `claude -p` call records its exit code and the `is_error`,
+`subtype`, and `result` fields of its JSON output in `worker-state.json` and
+`service.log`; authentication errors appear only there. When the same reason
+fails twice in a row, the worker sends one `triage-notify --kind ask`.
+`retro.py status` shows `last_failure`. After fixing the cause, run
+`retro.py retry --session-id UUID` for each failed session ID.
+
 ## Service and morning review
 
-After this change and `adoption-triage` are merged and installed, on the Mac
-hosting the hourly triage workspace run
+On the Mac hosting the hourly triage workspace, render and activate the
+service from a shell whose `CLAUDE_CONFIG_DIR` names a signed-in Claude
+profile, such as an Orca tab. The plist keeps that variable; launchd's default
+profile may hold an expired OAuth session. Run
 `python3 ~/.claude/skills/orca-session-triage/scripts/retro_service.py render`
 to inspect the user service and `activate` to start it outside Orca tabs.
+`activate` refuses to replace a different plist: stop the old service with
+`launchctl bootout gui/$(id -u)/com.eotel.orca-session-triage.retro` and move
+`~/Library/LaunchAgents/com.eotel.orca-session-triage.retro.plist` aside first.
 `status` confirms launchd. The service log is
 `~/.cache/orca-session-triage/retro/service.log`. A busy Mac leaves the
 session pending for the next five-minute check.
@@ -34,9 +71,6 @@ If the skill source checkout has a different path, set
 Use the adoption-policy dashboard for morning decisions. `retro.py status`
 shows queue and proposal counts. `retro.py process-once`
 processes at most one pending session when the load permits.
-If `status` lists a failed session ID, inspect `service.log`, then run
-`retro.py retry --session-id UUID` to queue that session again. The service
-will pick it up on its next check.
 
 Automatic changes in the skill source checkout require the normal Eotel/skills
 PR, merge, and Mac-family installation before all Macs receive them. Review

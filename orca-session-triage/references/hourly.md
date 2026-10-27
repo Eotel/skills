@@ -40,9 +40,9 @@ The Stop hook keeps the current scheduled run open while an `ask` is past the ac
 cursor, including on a repeated stop. Read it, handle it or hand it to the
 appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
 After these checks permit the turn to end, the same hook queues this hourly
-session's transcript for the external retrospective service. It does not run
-the retrospective in the tab. See `references/retro.md` when checking that
-service or reviewing its proposals.
+session's transcript. The external retrospective service skips a session the
+run's own forked retrospective already recorded and reviews one it did not.
+See `references/retro.md` for both and for reviewing their proposals.
 
 ## In the run
 
@@ -89,6 +89,8 @@ that its recorded symptom is gone. Then:
   every run, changed or not, so a finished or stalled row is handled again
   until it is closed; `cleanup.md` decides which removals need no question.
 - When nothing needs the user, end with one line and no question.
+- Before the comment, run the retrospective in a forked Agent as
+  `references/retro.md` describes and wait for its one-line result.
 - Last, set the triage workspace's comment to the run time and what the run
   did, so the board shows the last run.
 - Leave no Monitor or other background job in this tab after the turn. A
