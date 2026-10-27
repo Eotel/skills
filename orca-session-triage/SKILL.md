@@ -118,3 +118,7 @@ permitted cleanup, and any handoff in `references/hourly.md`.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other
   tab's work and explains the external inbox service.
+
+## Observed triage facts
+
+Read [references/observed-triage-facts.md](references/observed-triage-facts.md) when troubleshooting a tool used in hourly triage.
