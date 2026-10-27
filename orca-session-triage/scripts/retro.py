@@ -7,7 +7,10 @@ The Stop hook calls ``enqueue`` only after its other checks allow the turn to en
 in a forked copy (``claude -p --resume --fork-session``) that leaves the original unchanged.
 """
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import fcntl
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any, NamedTuple, Protocol, TypedDict
 import uuid
 
 from retro_ledger import LedgerClient, DEFAULT_SCRIPT
@@ -196,7 +200,43 @@ def ingest(data, state=STATE):
                                                          "status": "pending", "attempts": 0})
 
 
-def content_text(content):
+class Ledger(Protocol):
+    """The adoption-ledger calls the worker makes; ``LedgerClient`` is the real one."""
+    def list(self) -> Sequence[dict[str, Any]]: ...
+    def writer_enabled(self) -> bool: ...
+    def propose(self, body: dict[str, Any]) -> object: ...
+    def decide(self, body: dict[str, Any]) -> object: ...
+    def record(self, body: dict[str, Any]) -> object: ...
+    def add_evidence(self, body: dict[str, Any]) -> object: ...
+
+
+class Event(TypedDict):
+    """One visible part of a transcript row, with an ID stable for that transcript."""
+    id: str
+    at: str
+    role: str
+    text: str
+
+
+class ForkTarget(NamedTuple):
+    """Where and how to resume a finished session as a forked copy."""
+    session_id: str
+    cwd: Path
+    model: str
+    prior_cost: float  # The original's cost; claude -p adds it to the copy's reported total.
+
+
+def transcript_rows(transcript: Path) -> Iterator[dict[str, Any]]:
+    """JSON rows of a Claude transcript; a line cut off mid-write is skipped."""
+    with transcript.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def content_text(content: object) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -206,57 +246,52 @@ def content_text(content):
     return ""
 
 
-def extract_events(transcript):
-    """Keep visible turns, commands, and short tool results with stable timestamped IDs."""
-    events = []
-    with Path(transcript).open(encoding="utf-8") as stream:
-        for line in stream:
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            kind = row.get("type")
-            if kind not in ("user", "assistant") or row.get("isSidechain"):
-                continue
-            message = row.get("message") or {}
-            content = message.get("content")
-            snippets = []
-            if kind == "user":
-                if isinstance(content, str):
-                    snippets.append(("user", content))
-                elif isinstance(content, list):
-                    snippets.append(("result", content_text(content)))
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text":
-                        snippets.append(("assistant", part.get("text", "")))
-                    elif part.get("type") == "tool_use":
-                        name = part.get("name", "tool")
-                        arguments = part.get("input") or {}
-                        command = arguments.get("command") if isinstance(arguments, dict) else ""
-                        snippets.append(("tool", f"{name}: {command or json.dumps(arguments, ensure_ascii=False)[:500]}"))
-            for role, value in snippets:
-                value = re.sub(r"\s+", " ", str(value)).strip()
-                if not value:
-                    continue
-                events.append({"id": f"E{len(events)+1:05d}", "at": row.get("timestamp", ""),
-                               "role": role, "text": value})
-    return events
+def tool_text(part: dict[str, Any]) -> str:
+    arguments = part.get("input") or {}
+    command = arguments.get("command") if isinstance(arguments, dict) else ""
+    return f"{part.get('name', 'tool')}: {command or json.dumps(arguments, ensure_ascii=False)[:500]}"
 
 
-def quoted_events(quotes, events):
-    """Events holding the copy's verbatim quotes, cut around each quote; None below two events."""
-    found = {}
-    for quote in quotes[:6]:
-        needle = re.sub(r"\s+", " ", str(quote)).strip()
-        event = next((e for e in events if len(needle) >= 8 and needle in e["text"]), None)
-        if event is None or event["id"] in found:
-            continue  # A paraphrase cannot be traced; the review judges what remains.
-        start = max(0, event["text"].index(needle) - 100)
-        found[event["id"]] = {**event, "text": event["text"][start:start + 750]}
-    return sorted(found.values(), key=lambda e: e["id"]) if len(found) >= 2 else None
+def row_parts(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """The (role, text) parts of one user or assistant row that the conversation showed."""
+    content = (row.get("message") or {}).get("content")
+    if row.get("type") == "user":
+        return [("user", content)] if isinstance(content, str) else [("result", content_text(content))]
+    if row.get("type") != "assistant" or not isinstance(content, list):
+        return []
+    return [("assistant", part.get("text", "")) if part.get("type") == "text" else ("tool", tool_text(part))
+            for part in content if isinstance(part, dict) and part.get("type") in ("text", "tool_use")]
+
+
+def extract_events(transcript: Path | str) -> list[Event]:
+    """Visible turns, commands, and tool results of the main chain, with stable timestamped IDs."""
+    parts = [(row.get("timestamp", ""), role, re.sub(r"\s+", " ", str(text)).strip())
+             for row in transcript_rows(Path(transcript)) if not row.get("isSidechain")
+             for role, text in row_parts(row)]
+    return [Event(id=f"E{index:05d}", at=at, role=role, text=text)
+            for index, (at, role, text) in enumerate((part for part in parts if part[2]), start=1)]
+
+
+def first_containing(events: Sequence[Event], needle: str) -> Event | None:
+    return next((event for event in events if needle in event["text"]), None)
+
+
+def around(event: Event, needle: str) -> Event:
+    start = max(0, event["text"].index(needle) - 100)
+    return Event(id=event["id"], at=event["at"], role=event["role"], text=event["text"][start:start + 750])
+
+
+def quoted_events(quotes: Sequence[object], events: Sequence[Event]) -> list[Event] | None:
+    """Events holding the copy's verbatim quotes, cut around each quote; None below two events.
+
+    A paraphrase cannot be traced and is dropped; the separate review judges what remains.
+    """
+    needles = [needle for needle in (re.sub(r"\s+", " ", str(quote)).strip() for quote in quotes[:6])
+               if len(needle) >= 8]
+    hits = [(event, needle) for needle in needles if (event := first_containing(events, needle))]
+    # The first quote found in an event decides its excerpt.
+    found = {event["id"]: around(event, needle) for event, needle in reversed(hits)}
+    return sorted(found.values(), key=lambda event: event["id"]) if len(found) >= 2 else None
 
 
 def skill_catalog(root=SOURCE):
@@ -290,36 +325,35 @@ def skill_target(name, root=SOURCE):
     return target
 
 
-def skill_index(root=SOURCE, mentioned=None):
+def skill_description(path: Path) -> str | None:
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    description = re.search(r"^description:\s*(.*)$", body, re.M)
+    return description.group(1)[:180] if description else ""
+
+
+def skill_index(root: Path = SOURCE, mentioned: str | None = None) -> str:
     """Describe candidate skills; with ``mentioned``, only repositories named in that text."""
-    result = []
-    for name, path in skill_catalog(root).items():
-        if mentioned is not None and "/" in name and name.split("/")[1].casefold() not in mentioned:
-            continue
-        try:
-            body = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        description = re.search(r"^description:\s*(.*)$", body, re.M)
-        result.append(f"{name}: {description.group(1)[:180] if description else ''}")
-    return "\n".join(result)
+    described = [(name, skill_description(path)) for name, path in skill_catalog(root).items()
+                 if mentioned is None or "/" not in name or name.split("/")[1].casefold() in mentioned]
+    return "\n".join(f"{name}: {description}" for name, description in described if description is not None)
 
 
-def run_claude(prompt, schema, claude="claude", resume=None):
-    """One structured ``claude -p`` answer; ``resume`` is ``fork_target`` for a forked copy."""
+def run_claude(prompt: str, schema: dict[str, Any], claude: str = "claude",
+               resume: ForkTarget | None = None) -> dict[str, Any]:
+    """One structured ``claude -p`` answer, from a forked copy of a finished session when ``resume`` is set."""
+    # The copy gets a new ID and is not saved, so the original transcript stays as it was.
+    # Hooks are off: the hourly Stop hook would queue or block the copy as another hourly run.
+    # No budget cap: the resumed history's earlier cost counts toward it.
+    mode = (["--resume", resume.session_id, "--fork-session", "--model", resume.model,
+             "--settings", json.dumps({"disableAllHooks": True})] if resume
+            else ["--model", "sonnet", "--max-budget-usd", "1"])
     cmd = [claude, "-p", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
-           "--output-format", "json", "--json-schema", json.dumps(schema)]
-    cwd = None
-    if resume:
-        session_id, cwd, model, _ = resume
-        # The copy gets a new ID and is not saved, so the original transcript stays as it was.
-        # Hooks are off: the hourly Stop hook would queue or block the copy as another hourly run.
-        # No budget cap: the resumed history's earlier cost counts toward it.
-        cmd += ["--resume", session_id, "--fork-session", "--model", model,
-                "--settings", json.dumps({"disableAllHooks": True})]
-    else:
-        cmd += ["--model", "sonnet", "--max-budget-usd", "1"]
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=600, cwd=cwd)
+           "--output-format", "json", "--json-schema", json.dumps(schema), *mode]
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=600,
+                            cwd=resume.cwd if resume else None)
     try:
         wrapper = json.loads(result.stdout)
     except ValueError:
@@ -331,11 +365,10 @@ def run_claude(prompt, schema, claude="claude", resume=None):
                   else f"stdout={result.stdout[-300:]!r}")
         raise RuntimeError(f"claude -p exited {result.returncode}: {detail} stderr={result.stderr[-200:]!r}")
     usage = wrapper.get("usage") or {}
-    tokens = {k: usage.get(k) for k in ("cache_creation_input_tokens", "cache_read_input_tokens",
-                                        "input_tokens", "output_tokens")}
-    cost = wrapper.get("total_cost_usd")
-    if resume and isinstance(cost, (int, float)):
-        cost -= resume[3]  # A forked copy's total also counts the original conversation's cost.
+    tokens = {key: usage.get(key) for key in ("cache_creation_input_tokens", "cache_read_input_tokens",
+                                              "input_tokens", "output_tokens")}
+    total = wrapper.get("total_cost_usd")
+    cost = total - resume.prior_cost if resume and isinstance(total, (int, float)) else total
     print(f"claude -p{' fork' if resume else ''} cost_usd={cost if cost is not None else 'unknown'} "
           f"tokens={json.dumps(tokens)}", file=sys.stderr, flush=True)
     output = wrapper.get("structured_output")
@@ -379,37 +412,30 @@ RETRO_PROMPT = (
     "20〜200字を一字一句そのまま引用する。要約や言い換えは照合できず捨てられる。")
 
 
-def transcript_text(transcript):
-    return Path(transcript).read_text(encoding="utf-8", errors="replace").casefold()
+def transcript_text(transcript: Path) -> str:
+    return transcript.read_text(encoding="utf-8", errors="replace").casefold()
 
 
-def fork_prompt(transcript, root=SOURCE):
+def fork_prompt(transcript: Path, root: Path = SOURCE) -> str:
     return RETRO_PROMPT + "\n\nSKILLS\n" + skill_index(root, transcript_text(transcript))
 
 
-def fork_target(transcript):
-    """Session ID, cwd, last main-chain model, and recorded cost for a forked copy of the session."""
-    model, cost = None, 0.0
-    with Path(transcript).open(encoding="utf-8") as stream:
-        for line in stream:
-            if '"assistant"' not in line and '"cost-state"' not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            value = (row.get("message") or {}).get("model")
-            if (row.get("type") == "assistant" and not row.get("isSidechain")
-                    and isinstance(value, str) and value.startswith("claude-")):
-                model = value
-            elif row.get("type") == "cost-state" and isinstance(row.get("totalCostUSD"), (int, float)):
-                cost = row["totalCostUSD"]
-    if model is None:
+def fork_target(transcript: Path) -> ForkTarget:
+    """The session's worktree, its last main-chain model, and its recorded cost."""
+    rows = list(transcript_rows(transcript))
+    models = [row["message"]["model"] for row in rows
+              if row.get("type") == "assistant" and not row.get("isSidechain")
+              and str((row.get("message") or {}).get("model", "")).startswith("claude-")]
+    costs = [row["totalCostUSD"] for row in rows
+             if row.get("type") == "cost-state" and isinstance(row.get("totalCostUSD"), (int, float))]
+    if not models:
         raise ValueError("hourly transcript has no model")
-    return Path(transcript).stem, transcript_worktree(transcript), model, cost
+    return ForkTarget(transcript.stem, Path(transcript_worktree(transcript)), models[-1],
+                      costs[-1] if costs else 0.0)
 
 
-def build_proposals(transcript, root=SOURCE, claude="claude", existing=()):
+def build_proposals(transcript: Path, root: Path = SOURCE, claude: str = "claude",
+                    existing: Sequence[dict[str, Any]] = ()) -> list[dict[str, Any]]:
     """Ask a forked copy of the finished session for lessons, then review them independently."""
     if not root.is_dir():
         raise FileNotFoundError(f"skill source checkout is missing: {root}")
@@ -417,45 +443,53 @@ def build_proposals(transcript, root=SOURCE, claude="claude", existing=()):
     return review_proposals(output.get("proposals") or [], transcript, root, claude, existing)
 
 
-def review_proposals(raw, transcript, root=SOURCE, claude="claude", existing=()):
+def omit(title: str, reason: str) -> None:
+    """Omitted lessons are not ledger rows; the log keeps what was dropped and why."""
+    print(f"omitted: {title[:100]}: {reason[:300]}", file=sys.stderr, flush=True)
+
+
+def is_time(value: str) -> bool:
+    try:
+        datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def candidate_from(item: dict[str, Any], events: Sequence[Event], root: Path,
+                   mentioned: str) -> tuple[dict[str, Any] | None, str]:
+    """A review candidate built from one proposal, or None and the reason it is omitted."""
+    evidence = quoted_events(item.get("evidence_quotes") or [], events)
+    target = str(item.get("target_skill", ""))
+    note = str(item.get("note", "")).strip()
+    if evidence is None:
+        return None, "quotes not found in the transcript"
+    if not all(is_time(event["at"]) for event in evidence):
+        return None, "evidence has no timestamp"
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9][A-Za-z0-9-]*){0,2}", target)
+            or skill_target(target, root) is None
+            or ("/" in target and target.split("/")[1].casefold() not in mentioned)):
+        return None, f"unknown target skill {target}"
+    if not note or "\n" in note or len(note) > 500:
+        return None, "note is empty, multi-line, or too long"
+    return {"title": str(item.get("title", ""))[:100],
+            "first_failure": str(item.get("first_failure", ""))[:500],
+            "final_success": str(item.get("final_success", ""))[:500],
+            "note": note, "target_skill": target, "category": item.get("category"),
+            "evidence": evidence}, ""
+
+
+def review_proposals(raw: Sequence[object], transcript: Path, root: Path = SOURCE, claude: str = "claude",
+                     existing: Sequence[dict[str, Any]] = ()) -> list[dict[str, Any]]:
     """Keep proposals whose quotes are found in the transcript and pass a separate review."""
     events = extract_events(transcript)
     mentioned = transcript_text(transcript)
-    candidates = []
-
-    def omit(item, reason):
-        # Omitted lessons are not ledger rows; the log keeps what was dropped and why.
-        title = str(item.get("title", "")) if isinstance(item, dict) else ""
-        print(f"omitted: {title[:100]}: {reason[:300]}", file=sys.stderr, flush=True)
-
-    for item in raw[:5]:
-        if not isinstance(item, dict):
-            continue
-        evidence = quoted_events(item.get("evidence_quotes") or [], events)
-        if evidence is None:
-            omit(item, "quotes not found in the transcript")
-            continue
-        try:
-            for event in evidence:
-                datetime.fromisoformat(event["at"])
-        except (TypeError, ValueError):
-            omit(item, "evidence has no timestamp")
-            continue
-        target = str(item.get("target_skill", ""))
-        if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:/[A-Za-z0-9][A-Za-z0-9-]*){0,2}", target)
-                or skill_target(target, root) is None
-                or ("/" in target and target.split("/")[1].casefold() not in mentioned)):
-            omit(item, f"unknown target skill {target}")
-            continue
-        note = str(item.get("note", "")).strip()
-        if not note or "\n" in note or len(note) > 500:
-            omit(item, "note is empty, multi-line, or too long")
-            continue
-        candidates.append({"title": str(item.get("title", ""))[:100],
-                           "first_failure": str(item.get("first_failure", ""))[:500],
-                           "final_success": str(item.get("final_success", ""))[:500],
-                           "note": note, "target_skill": target, "category": item.get("category"),
-                           "evidence": evidence})
+    checked = [(item, *candidate_from(item, events, root, mentioned))
+               for item in raw[:5] if isinstance(item, dict)]
+    for item, candidate, reason in checked:
+        if candidate is None:
+            omit(str(item.get("title", "")), reason)
+    candidates = [candidate for _, candidate, _ in checked if candidate is not None]
     if not candidates:
         return []
     knowledge = "\n\n".join(
@@ -498,8 +532,9 @@ def review_proposals(raw, transcript, root=SOURCE, claude="claude", existing=())
             and (c["review"]["duplicate"] is False or c.get("duplicate_of"))]
     for candidate in candidates:
         if candidate not in kept:
-            omit(candidate, f"review supported={candidate['review']['supported']} "
-                            f"duplicate={candidate['review']['duplicate']}: {candidate['review']['reason']}")
+            review = candidate["review"]
+            omit(candidate["title"], f"review supported={review['supported']} "
+                                     f"duplicate={review['duplicate']}: {review['reason']}")
     return kept
 
 
@@ -830,7 +865,8 @@ def sync_decisions(ledger, data, root=SOURCE, state=None):
     return changed
 
 
-def record_candidates(sid, transcript, candidates, ledger, state=STATE, root=SOURCE):
+def record_candidates(sid: str, transcript: Path, candidates: Sequence[dict[str, Any]], ledger: Ledger,
+                      state: Path = STATE, root: Path = SOURCE) -> int:
     """Record reviewed lessons, adopt eligible facts, and mark the session done; callers hold the worker lock."""
     with locked(paths(state)[2]):
         data = load(state)
@@ -883,7 +919,7 @@ def record_candidates(sid, transcript, candidates, ledger, state=STATE, root=SOU
     return changed
 
 
-def failure_repeated(data, reason):
+def failure_repeated(data: dict[str, Any], reason: str) -> bool:
     """Count one failure reason across runs; true only when it has just happened twice in a row."""
     key = re.sub(r"[0-9a-f-]{8,}|\d+", "#", reason)
     last = data.get("last_failure") or {}
@@ -892,7 +928,7 @@ def failure_repeated(data, reason):
     return count == 2
 
 
-def notify(message):
+def notify(message: str) -> None:
     """Ask the triage lead to look; a missing notifier must not stop the worker."""
     try:
         subprocess.run([str(NOTIFY), "--kind", "ask", message], capture_output=True, text=True, timeout=30)
@@ -900,7 +936,8 @@ def notify(message):
         print(f"triage-notify failed: {exc}", file=sys.stderr, flush=True)
 
 
-def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, ledger=None):
+def process_once(state: Path = STATE, root: Path = SOURCE, claude: str = "claude", ignore_load: bool = False,
+                 ledger: Ledger | None = None) -> str:
     """Reconcile decisions and process at most one hourly transcript outside Orca tabs."""
     ledger = ledger or LedgerClient()
     if not ledger.writer_enabled():
@@ -920,9 +957,10 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
         if not ignore_load and os.getloadavg()[0] > limit:
             return f"deferred: load {os.getloadavg()[0]:.1f} > {limit:.1f}"
         sid, session = pending
+        transcript = Path(session["transcript"])
         try:
-            candidates = build_proposals(session["transcript"], root, claude, as_existing(ledger.list()))
-            changed += record_candidates(sid, session["transcript"], candidates, ledger, state, root)
+            candidates = build_proposals(transcript, root, claude, as_existing(ledger.list()))
+            changed += record_candidates(sid, transcript, candidates, ledger, state, root)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             reason = str(exc)[:500]
             with locked(paths(state)[2]):
@@ -940,7 +978,7 @@ def process_once(state=STATE, root=SOURCE, claude="claude", ignore_load=False, l
         return f"processed: {sid}: {len(candidates)} proposals; reconciled {changed} decisions"
 
 
-def session_transcript(session_id):
+def session_transcript(session_id: str) -> Path:
     if not SESSION_ID.fullmatch(session_id or ""):
         raise ValueError("session ID must be a UUID")
     found = sorted((Path.home() / ".claude/projects").glob(f"*/{session_id}.jsonl"))
@@ -949,7 +987,8 @@ def session_transcript(session_id):
     return found[0].resolve()
 
 
-def submit(answer, session_id, state=STATE, root=SOURCE, claude="claude", ledger=None):
+def submit(answer: object, session_id: str, state: Path = STATE, root: Path = SOURCE, claude: str = "claude",
+           ledger: Ledger | None = None) -> str:
     """Record a live hourly tab's own forked retrospective; the queued copy is then skipped."""
     ledger = ledger or LedgerClient()
     if not ledger.writer_enabled():
@@ -972,7 +1011,7 @@ def submit(answer, session_id, state=STATE, root=SOURCE, claude="claude", ledger
     return f"processed: {session_id}: {len(candidates)} proposals; reconciled {changed} decisions"
 
 
-def live_prompt(session_id, root=SOURCE):
+def live_prompt(session_id: str, root: Path = SOURCE) -> str:
     """Instructions for the Agent fork that a live hourly tab starts at the end of its run."""
     script = Path(__file__).resolve()
     return (fork_prompt(session_transcript(session_id), root)
@@ -1008,7 +1047,7 @@ def retry_failed(state, session_id):
             save(data, state)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("process-once", "run-service", "status", "enqueue", "retry",
                                            "fork-prompt", "submit"))

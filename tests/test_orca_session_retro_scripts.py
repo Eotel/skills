@@ -1,5 +1,7 @@
 """Offline behavior tests for hourly triage retrospective capture and decisions."""
 
+from __future__ import annotations
+
 import json
 import io
 import plistlib
@@ -9,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from typing import Any
 import unittest
 import uuid
 from unittest import mock
@@ -22,7 +25,7 @@ import retro_service  # noqa: E402
 import stop_check  # noqa: E402
 
 
-def transcript(path, cwd="/tmp/hourly-triage"):
+def transcript(path: Path, cwd: str = "/tmp/hourly-triage") -> None:
     rows = [
         {"type": "user", "timestamp": "2026-10-26T01:00:00Z", "cwd": cwd, "message": {
             "content": "<command-message>orca-session-triage</command-message><command-args>hourly 日本語で</command-args>"}},
@@ -35,7 +38,7 @@ def transcript(path, cwd="/tmp/hourly-triage"):
     path.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows))
 
 
-def sample_candidate():
+def sample_candidate() -> dict[str, object]:
     return {"title": "容量不足から再開", "first_failure": "容量不足で止まった",
             "final_success": "一行を送って再開した", "note": "`Selected model is at capacity` の Codex は一行を送ると再開した。",
             "target_skill": "orca-session-triage", "category": "fact",
@@ -443,14 +446,14 @@ class RetroTests(unittest.TestCase):
         self.assertNotIn("error", session)
 
 
-    def test_finished_session_is_reviewed_in_a_forked_copy(self):
+    def test_finished_session_is_reviewed_in_a_forked_copy(self) -> None:
         transcript(self.transcript, cwd=str(self.home))
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
         calls = []
         real_run = subprocess.run
 
-        def fake_run(cmd, *args, **kwargs):
+        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
             if cmd[0] != "claude":
                 return real_run(cmd, *args, **kwargs)
             calls.append((cmd, kwargs.get("cwd")))
@@ -468,12 +471,12 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(fork[fork.index("--resume") + 1], self.sid)
         self.assertIn("--fork-session", fork)
         self.assertIn("--no-session-persistence", fork)
-        self.assertEqual(cwd, str(self.home))
+        self.assertEqual(cwd, self.home)
         self.assertNotIn("--resume", calls[1][0])
         evidence = ledger.list()[0]["evidence"]
         self.assertEqual([line.split()[2] for line in evidence], ["E00002", "E00003"])
 
-    def test_claude_failure_keeps_the_json_reason(self):
+    def test_claude_failure_keeps_the_json_reason(self) -> None:
         failed = subprocess.CompletedProcess(["claude"], 1, json.dumps(
             {"is_error": True, "subtype": "success",
              "result": "Failed to authenticate: OAuth session expired and could not be refreshed"}), "")
@@ -483,7 +486,7 @@ class RetroTests(unittest.TestCase):
         self.assertIn("is_error=True", str(raised.exception))
         self.assertIn("OAuth session expired", str(raised.exception))
 
-    def test_repeated_failure_notifies_once(self):
+    def test_repeated_failure_notifies_once(self) -> None:
         log = self.home / "notify.log"
         notifier = self.home / "triage-notify"
         notifier.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
@@ -500,7 +503,7 @@ class RetroTests(unittest.TestCase):
         self.assertIn("Failed to authenticate", log.read_text())
         self.assertIn("Failed to authenticate", retro.load(self.state)["sessions"][self.sid]["error"])
 
-    def test_live_tab_submission_is_recorded_once(self):
+    def test_live_tab_submission_is_recorded_once(self) -> None:
         review = {"decisions": [{"index": 0, "supported": True, "duplicate": False,
                                  "low_risk": False, "reason": "shown"}]}
         ledger = FakeLedger()
@@ -514,7 +517,7 @@ class RetroTests(unittest.TestCase):
                 fork.assert_not_called()
         self.assertEqual(len(ledger.items), 1)
 
-    def test_service_uses_the_authenticated_claude_profile(self):
+    def test_service_uses_the_authenticated_claude_profile(self) -> None:
         with mock.patch.dict(retro_service.os.environ, {"CLAUDE_CONFIG_DIR": "/profiles/a/home"}):
             plist = plistlib.loads(retro_service.plist_bytes(
                 self.home, "/usr/bin/python3", "/usr/local/bin/claude", SCRIPTS / "retro.py"))
