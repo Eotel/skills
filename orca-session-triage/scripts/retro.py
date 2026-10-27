@@ -1142,6 +1142,16 @@ def settle(repo: Path, changed: Sequence[Path], data: dict[str, Any]) -> str:
     return "publish: settled after the merge"
 
 
+def inside(tree: Path, name: str) -> Path:
+    """``tree / name`` when neither it nor a directory above it inside ``tree`` is a symlink."""
+    destination = tree / name
+    links = [path for path in (destination, *destination.parents) if path.is_relative_to(tree) and path != tree
+             and path.is_symlink()]
+    if links or not destination.resolve().is_relative_to(tree.resolve()):
+        raise RuntimeError(f"{name} reaches a symlink in main; a person must check it before publishing")
+    return destination
+
+
 def open_pull_requests(repo: Path) -> list[dict[str, Any]]:
     listed = subprocess.run(["gh", "pr", "list", "--head", PUBLISH_BRANCH, "--state", "open", "--json", "number"],
                             capture_output=True, text=True, timeout=60, cwd=repo, check=True)
@@ -1181,11 +1191,12 @@ def publish(data: dict[str, Any], root: Path = SOURCE) -> str:
         git(repo, "worktree", "add", "--detach", "--quiet", str(tree), "origin/main")
         try:
             for name, content in contents.items():
+                destination = inside(tree, name)
                 if content is None:
-                    (tree / name).unlink(missing_ok=True)
+                    destination.unlink(missing_ok=True)
                 else:
-                    (tree / name).parent.mkdir(parents=True, exist_ok=True)
-                    (tree / name).write_bytes(content)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(content)
             git(tree, "add", "--all", "--", *names)
             git(tree, "commit", "--quiet", "-m", "docs: record adopted retrospective notes")
             lease = git(repo, "ls-remote", "origin", f"refs/heads/{PUBLISH_BRANCH}").stdout.split()

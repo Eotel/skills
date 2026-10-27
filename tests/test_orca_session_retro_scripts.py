@@ -538,6 +538,26 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(pulls, [])
         self.assertFalse(facts.exists())
 
+    def test_publishing_refuses_a_symlink_from_main(self) -> None:
+        remote, pulls, fake_run = self.published_remote()
+        outside = self.home / "outside"
+        outside.mkdir()
+        upstream = self.home / "upstream"
+        subprocess.run(["git", "clone", "-q", str(remote), str(upstream)], check=True)
+        (upstream / "orca-session-triage/references").symlink_to(outside)
+        subprocess.run(["git", "-C", str(upstream), "add", "orca-session-triage/references"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "-c", "core.hooksPath=/dev/null", "commit", "-qm", "link"], check=True)
+        subprocess.run(["git", "-C", str(upstream), "push", "-q", "origin", "main"], check=True)
+        data = retro.load(self.state)
+        note = {"id": str(uuid.uuid4()), "note": "Tool.py returns JSON.", "target_skill": "orca-session-triage"}
+        retro.remember_versions(data, self.target, retro.adopt(note, self.root))
+        with mock.patch.object(retro.subprocess, "run", side_effect=fake_run):
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                retro.publish(data, self.root)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(pulls, [])
+
     def test_load_gate_defers_without_paid_model_call(self):
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
