@@ -74,7 +74,8 @@ board's done cards; close what the user approves.
   `orca-row-classify` in this session with that directory.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
-- `references/delivery.md`: batching questions and sending answers.
+- `references/delivery.md`: batching questions, sending answers, and giving
+  lanes work.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.
