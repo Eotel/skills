@@ -35,9 +35,9 @@ def plist_bytes(home: Path | str | None = None, python: str | None = None, claud
         raise RuntimeError("python3, claude, and retro.py are required")
     service_path = ":".join(dict.fromkeys((str(Path(python).parent), str(Path(claude).parent),
                                            "/usr/bin", "/bin", "/usr/sbin", "/sbin")))
-    # CLAUDE_CONFIG_DIR keeps the signed-in Claude profile; launchd's default one may hold expired OAuth.
-    environment = {"PATH": service_path} | {name: os.environ[name] for name in ("TRIAGE_RETRO_SKILLS_REPO", "CLAUDE_CONFIG_DIR")
-                                            if os.environ.get(name)}
+    environment = {"PATH": service_path}
+    if os.environ.get("TRIAGE_RETRO_SKILLS_REPO"):
+        environment["TRIAGE_RETRO_SKILLS_REPO"] = os.environ["TRIAGE_RETRO_SKILLS_REPO"]
     return plistlib.dumps({
         "Label": LABEL,
         "ProgramArguments": [str(python), str(script), "run-service"],

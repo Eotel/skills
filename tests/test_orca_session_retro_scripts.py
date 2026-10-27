@@ -7,7 +7,9 @@ import io
 import plistlib
 from contextlib import redirect_stdout
 from datetime import datetime
+import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 import tempfile
@@ -104,6 +106,34 @@ class RetroTests(unittest.TestCase):
         self.sid = "4d4aa0ed-cff3-416c-9e67-3136c059789b"
         self.transcript = self.home / ".claude/projects/triage" / f"{self.sid}.jsonl"
         transcript(self.transcript)
+
+    def test_claude_uses_selected_orca_profile_without_api_credentials(self) -> None:
+        selected = self.home / "Library/Application Support/orca/claude-profiles/selected-host"
+        selected.parent.mkdir(parents=True)
+        selected.write_text(str(self.home / "orca-profile/a"))
+        success = subprocess.CompletedProcess(
+            ["claude", "-p"], 0,
+            stdout=json.dumps({"structured_output": {"ok": True}}), stderr="")
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "paid-key",
+                                              "ANTHROPIC_AUTH_TOKEN": "paid-token"}, clear=True):
+                with mock.patch.object(retro.subprocess, "run", return_value=success) as run:
+                    self.assertEqual(retro.run_claude("prompt", {"type": "object"}), {"ok": True})
+                    env = run.call_args.kwargs["env"]
+                    self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / "orca-profile/a"))
+                    self.assertEqual(env["USER"], pwd.getpwuid(os.getuid()).pw_name)
+                    self.assertNotIn("ANTHROPIC_API_KEY", env)
+                    self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+                    selected.write_text(str(self.home / "orca-profile/b"))
+                    retro.run_claude("prompt", {"type": "object"}, resume=retro.ForkTarget(
+                        self.sid, self.home, "sonnet", 0))
+                    self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"],
+                                     str(self.home / "orca-profile/b"))
+
+                    selected.unlink()
+                    retro.run_claude("prompt", {"type": "object"})
+                    self.assertNotIn("CLAUDE_CONFIG_DIR", run.call_args.kwargs["env"])
 
     def test_stop_capture_is_one_line_only_for_hourly_session(self):
         hook = {"session_id": self.sid, "transcript_path": str(self.transcript)}
@@ -517,11 +547,11 @@ class RetroTests(unittest.TestCase):
                 fork.assert_not_called()
         self.assertEqual(len(ledger.items), 1)
 
-    def test_service_uses_the_authenticated_claude_profile(self) -> None:
+    def test_service_does_not_embed_the_claude_profile(self) -> None:
         with mock.patch.dict(retro_service.os.environ, {"CLAUDE_CONFIG_DIR": "/profiles/a/home"}):
             plist = plistlib.loads(retro_service.plist_bytes(
                 self.home, "/usr/bin/python3", "/usr/local/bin/claude", SCRIPTS / "retro.py"))
-        self.assertEqual(plist["EnvironmentVariables"]["CLAUDE_CONFIG_DIR"], "/profiles/a/home")
+        self.assertNotIn("CLAUDE_CONFIG_DIR", plist["EnvironmentVariables"])
 
 
 

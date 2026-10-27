@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import subprocess
 import sys
@@ -341,6 +342,19 @@ def skill_index(root: Path = SOURCE, mentioned: str | None = None) -> str:
     return "\n".join(f"{name}: {description}" for name, description in described if description is not None)
 
 
+def claude_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env.setdefault("USER", pwd.getpwuid(os.getuid()).pw_name)
+    selected = Path.home() / "Library/Application Support/orca/claude-profiles/selected-host"
+    if selected.is_file():
+        profile = selected.read_text(encoding="utf-8").strip()
+        if profile:
+            env["CLAUDE_CONFIG_DIR"] = profile
+    return env
+
+
 def run_claude(prompt: str, schema: dict[str, Any], claude: str = "claude",
                resume: ForkTarget | None = None) -> dict[str, Any]:
     """One structured ``claude -p`` answer, from a forked copy of a finished session when ``resume`` is set."""
@@ -353,7 +367,7 @@ def run_claude(prompt: str, schema: dict[str, Any], claude: str = "claude",
     cmd = [claude, "-p", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
            "--output-format", "json", "--json-schema", json.dumps(schema), *mode]
     result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=600,
-                            cwd=resume.cwd if resume else None)
+                            cwd=resume.cwd if resume else None, env=claude_environment())
     try:
         wrapper = json.loads(result.stdout)
     except ValueError:
@@ -1021,8 +1035,18 @@ def live_prompt(session_id: str, root: Path = SOURCE) -> str:
             "SCHEMA\n" + json.dumps(SCHEMA, ensure_ascii=False))
 
 
-def run_service(state=STATE, root=SOURCE, ledger=None):
+def run_service(state: Path = STATE, root: Path = SOURCE, ledger: Ledger | None = None) -> None:
     """Poll one queued session at a time outside the triage tab."""
+    try:
+        auth = subprocess.run(["claude", "auth", "status", "--json"],
+                              capture_output=True, text=True, timeout=15,
+                              env=claude_environment())
+        status = json.loads(auth.stdout) if auth.returncode == 0 else {}
+        status = status if isinstance(status, dict) else {}
+        print(f"claude auth: authMethod={status.get('authMethod', 'unavailable')} "
+              f"subscriptionType={status.get('subscriptionType', 'unavailable')}", flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"claude auth check failed: {exc}", file=sys.stderr, flush=True)
     while True:
         try:
             print(process_once(state, root, ledger=ledger), flush=True)
