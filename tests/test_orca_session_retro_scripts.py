@@ -102,15 +102,18 @@ class RetroTests(unittest.TestCase):
         self.transcript = self.home / ".claude/projects/triage" / f"{self.sid}.jsonl"
         transcript(self.transcript)
 
-    def test_claude_json_failure_records_result_text(self):
+    def test_claude_json_failure_is_recorded_in_worker_state(self):
         failure = subprocess.CompletedProcess(
             ["claude", "-p"], 1,
             stdout=json.dumps({"is_error": True,
                                "result": "Failed to authenticate: OAuth session expired"}),
             stderr="")
-        with mock.patch.object(retro.subprocess, "run", return_value=failure):
-            with self.assertRaisesRegex(RuntimeError, "OAuth session expired"):
-                retro.run_claude("prompt", {"type": "object"})
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
+            with mock.patch.object(retro.subprocess, "run", return_value=failure):
+                self.assertIn("OAuth session expired", retro.process_once(
+                    self.state, self.root, ignore_load=True, ledger=FakeLedger()))
+        self.assertIn("OAuth session expired", retro.load(self.state)["sessions"][self.sid]["error"])
 
     def test_claude_uses_selected_orca_profile_without_api_credentials(self):
         selected = self.home / "Library/Application Support/orca/claude-profiles/selected-host"
