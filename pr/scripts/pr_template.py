@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Pick the PR body template for a checkout, and check a body against its headings.
 
-pick: the repository's own pull request template wins. Otherwise a repository owned by the
-signed-in GitHub account or one of its organizations gets review-first, and any other
-repository gets show-me, the upstream template.
+pick: the repository's own pull request template wins. Otherwise the repository a PR goes to
+(a fork's parent, else origin) gets review-first when the signed-in GitHub account or one of its
+organizations owns it, and show-me, the upstream template, when anyone else does.
 
-check: the body must contain the picked template's level-2 headings in order, none empty.
+check: the body must contain the template's top-level headings in order, none empty.
 
 Exit status: 0 ok, 1 the body does not follow the template, 2 the template cannot be decided.
 """
@@ -29,17 +29,20 @@ ASSETS = Path(__file__).resolve().parent.parent / "assets"
 TEMPLATE_DIRS = (".", "docs", ".github")
 TEMPLATE_NAME = "pull_request_template.md"
 
-_REMOTE_RE = re.compile(r"github\.com[:/](?P<owner>[^/]+)/[^/]+$")
+_REMOTE_RE = re.compile(r"github\.com[:/](?P<repo>[^/]+/[^/]+)$")
+_REPO_RE = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
 _LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 # CommonMark fenced code: up to 3 spaces of indent, closed by the same character at least as
-# long; an unclosed fence runs to the end.
+# long; an unclosed fence runs to the end. A backtick fence line holds no other backtick.
 _FENCE_RE = re.compile(
-    r"^ {0,3}(?P<fence>(?P<char>[`~])(?P=char){2,})[^\n]*$.*?"
+    r"^ {0,3}(?P<fence>(?P<char>[`~])(?P=char){2,})(?!(?<=`)[^\n]*`)[^\n]*$.*?"
     r"(?:^ {0,3}(?P=fence)(?P=char)*[ \t]*$|\Z)",
     re.DOTALL | re.MULTILINE,
 )
-_HEADING_RE = re.compile(r"^## +(?P<title>.+?)[ \t]*$", re.MULTILINE)
+_HEADING_RE = re.compile(
+    r"^ {0,3}(?P<marks>#{1,6})[ \t]+(?P<title>.+?)(?:[ \t]+#+)?[ \t]*$", re.MULTILINE
+)
 
 
 class Undecided(Exception):
@@ -58,21 +61,49 @@ class Template:
     path: Path
 
     @property
+    def level(self) -> int | None:
+        """The shallowest heading level the template uses, if it has headings."""
+        levels = [len(heading["marks"]) for heading in _headings(self.text)]
+        return min(levels, default=None)
+
+    @property
     def headings(self) -> tuple[str, ...]:
-        """Level-2 headings of the template, in order."""
-        text = self.path.read_text(encoding="utf-8")
-        return tuple(section.title for section in parse_sections(text))
+        """The template's headings at its shallowest level, in order."""
+        level = self.level
+        if level is None:
+            return ()
+        return tuple(section.title for section in parse_sections(self.text, level))
+
+    @property
+    def text(self) -> str:
+        return self.path.read_text(encoding="utf-8")
 
 
-def parse_sections(markdown: str) -> tuple[Section, ...]:
-    """Split visible Markdown into level-2 sections; code blocks never open one."""
+def _visible(markdown: str) -> str:
     text = markdown.replace("\r\n", "\n")
-    visible = _FENCE_RE.sub("\0code\0", _COMMENT_RE.sub("", text))
-    headings = tuple(_HEADING_RE.finditer(visible))
+    return _FENCE_RE.sub("\0code\0", _COMMENT_RE.sub("", text))
+
+
+def _headings(markdown: str) -> tuple[re.Match[str], ...]:
+    return tuple(_HEADING_RE.finditer(_visible(markdown)))
+
+
+def parse_sections(markdown: str, level: int) -> tuple[Section, ...]:
+    """Sections headed at `level`; a deeper heading stays inside its section.
+
+    Code blocks never open a section.
+    """
+    visible = _visible(markdown)
+    headings = tuple(
+        heading
+        for heading in _HEADING_RE.finditer(visible)
+        if len(heading["marks"]) <= level
+    )
     ends = (*(heading.start() for heading in headings[1:]), len(visible))
     return tuple(
         Section(heading["title"], visible[heading.end() : end].strip())
-        for heading, end in zip(headings, ends, strict=True)
+        for heading, end in zip(headings, ends[: len(headings)], strict=True)
+        if len(heading["marks"]) == level
     )
 
 
@@ -100,13 +131,21 @@ def repo_template(repo_dir: Path) -> Path | None:
     return found[0] if found else None
 
 
-def github_owner(repo_dir: Path) -> str:
-    """Owner of the checkout's origin on GitHub."""
+def target_owner(repo_dir: Path) -> str:
+    """Owner of the repository a PR from this checkout goes to: a fork's parent, else origin."""
     url = _run(("git", "remote", "get-url", "origin"), repo_dir).strip()
     match = _REMOTE_RE.search(url.removesuffix("/").removesuffix(".git"))
     if match is None:
         raise Undecided(f"origin is not a GitHub repository: {url}")
-    return match["owner"]
+    output = _run(
+        ("gh", "api", f"repos/{match['repo']}", "--jq", '.parent.full_name // ""'),
+        repo_dir,
+    )
+    # gh can print debug lines to stdout; keep only an owner/name line.
+    parents = [
+        line.strip() for line in output.splitlines() if _REPO_RE.fullmatch(line.strip())
+    ]
+    return (parents[0] if parents else match["repo"]).split("/")[0]
 
 
 def own_owners(repo_dir: Path) -> frozenset[str]:
@@ -131,30 +170,32 @@ def pick(repo_dir: Path) -> Template:
     path = repo_template(repo_dir)
     if path is not None:
         return Template("repo", path)
-    owned = github_owner(repo_dir).lower() in own_owners(repo_dir)
+    owned = target_owner(repo_dir).lower() in own_owners(repo_dir)
     return builtin("review-first" if owned else "show-me")
 
 
 def check(body: str, template: Template) -> list[str]:
     """Report missing, misordered, and empty template headings."""
+    level = template.level
+    if level is None:
+        raise Undecided(f"{template.path} has no headings to check against")
     required = template.headings
-    if not required:
-        raise Undecided(f"{template.path} has no level-2 headings to check against")
-    sections = parse_sections(body)
+    marks = "#" * level
+    sections = parse_sections(body, level)
     titles = [section.title for section in sections]
     missing = [title for title in required if title not in titles]
     if missing:
-        return [f"missing heading: ## {title}" for title in missing]
+        return [f"missing heading: {marks} {title}" for title in missing]
     problems = []
     positions = [titles.index(title) for title in required]
     if positions != sorted(positions):
         problems.append(
             "headings out of template order: "
-            + " → ".join(f"## {title}" for title in required)
+            + " → ".join(f"{marks} {title}" for title in required)
         )
     bodies = {section.title: section.body for section in reversed(sections)}
     problems += [
-        f"empty section: ## {title}" for title in required if not bodies[title]
+        f"empty section: {marks} {title}" for title in required if not bodies[title]
     ]
     return problems
 

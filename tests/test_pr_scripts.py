@@ -28,6 +28,7 @@ echo '* Request at 2026-10-27 15:46:00 +0900 JST'
 case "$2" in
   user) echo Eotel ;;
   user/orgs) echo acme ;;
+  repos/*) echo "${FAKE_GH_PARENT:-}" ;;
 esac
 """
 
@@ -90,6 +91,16 @@ class PrTemplateTests(unittest.TestCase):
             (0, ["Summary", "Evidence", "Merge Danger"]),
         )
 
+        # A fork of an outside project sends its PR to the parent.
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", "https://github.com/Eotel/oss"],
+            cwd=self.repo,
+            check=True,
+        )
+        with patch.dict(os.environ, {"FAKE_GH_PARENT": "someone/oss"}):
+            status, out, _ = self.run_main("pick")
+        self.assertEqual((status, json.loads(out)["kind"]), (0, "show-me"))
+
     def test_check_rejects_the_upstream_shape_in_an_owned_repository(self) -> None:
         self.clone_of("https://github.com/Eotel/skills.git")
         self.body.write_text(SHOW_ME_BODY, encoding="utf-8")
@@ -105,14 +116,22 @@ class PrTemplateTests(unittest.TestCase):
         self.clone_of("https://github.com/Eotel/skills.git")
         (self.repo / ".github").mkdir()
         (self.repo / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(
-            "## 概要\n\n<!-- ここに書く -->\n\n## 検証\n", encoding="utf-8"
+            "### 概要\n\n<!-- ここに書く -->\n\n### 検証\n", encoding="utf-8"
         )
         self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
         status, out, _ = self.run_main("check", str(self.body))
         self.assertEqual(status, 1)
         self.assertEqual(
-            out.splitlines(), ["missing heading: ## 概要", "missing heading: ## 検証"]
+            out.splitlines(), ["missing heading: ### 概要", "missing heading: ### 検証"]
         )
+
+        self.body.write_text("", encoding="utf-8")
+        self.assertEqual(self.run_main("check", str(self.body))[0], 1)
+        self.body.write_text(
+            "### 概要\n\n#### 詳細\n\n書いた。\n\n### 検証\n\n通った。\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_main("check", str(self.body))[0], 0)
 
     def test_a_checkout_without_a_github_origin_is_undecided(self) -> None:
         self.clone_of("https://gitlab.com/someone/project.git")

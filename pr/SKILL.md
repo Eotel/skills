@@ -20,8 +20,9 @@ It prints the kind, the template file, and its headings:
 
 - `repo`: the repository's own `pull_request_template.md`. Use its headings in order; it
   outranks both built-in templates.
-- `review-first`: a repository owned by the signed-in GitHub account or one of its
-  organizations. Read [references/review-first.md](references/review-first.md).
+- `review-first`: the repository the PR goes to (a fork's parent, else origin) is owned by the
+  signed-in GitHub account or one of its organizations. Read
+  [references/review-first.md](references/review-first.md).
 - `show-me`: any other repository, such as an open-source project. Read
   [references/show-me.md](references/show-me.md), the upstream template, and write in the
   project's language.
@@ -32,7 +33,7 @@ rules and pass `--kind` to `check`.
 ## Check
 
 Run `python3 scripts/pr_template.py check <body-file> --repo-dir <checkout>` (`-` reads stdin).
-It fails on a missing, misordered, or empty heading. It checks shape only: whether the first
+It fails on a missing, misordered, or empty heading at the template's top heading level. It checks shape only: whether the first
 section says what happened to users or data is still the writer's job. A repository's own CI
 check on PR bodies, where one exists, has the final say.
 
