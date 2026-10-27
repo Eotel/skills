@@ -55,7 +55,8 @@ fails twice in a row, the worker sends one `triage-notify --kind ask`.
 On the Mac hosting the hourly triage workspace, render and activate the
 service from a shell whose `CLAUDE_CONFIG_DIR` names a signed-in Claude
 profile, such as an Orca tab. The plist keeps that variable; launchd's default
-profile may hold an expired OAuth session. Run
+profile may hold an expired OAuth session. The worker reads transcripts under
+`~/.claude/projects`; Orca profiles link their `projects` there. Run
 `python3 ~/.claude/skills/orca-session-triage/scripts/retro_service.py render`
 to inspect the user service and `activate` to start it outside Orca tabs.
 `activate` refuses to replace a different plist: stop the old service with

@@ -1053,7 +1053,7 @@ def main(argv=None):
                               "last_failure": (data.get("last_failure") or {}).get("reason"),
                               "proposals": len(ledger.list())}, ensure_ascii=False))
         return 0
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"triage-retro: {exc}", file=sys.stderr)
         return 1
 
