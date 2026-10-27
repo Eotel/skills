@@ -56,7 +56,10 @@ time when importing a prior verified closure. An implementation report, passing
 test, or merged PR alone is not evidence that the symptom disappeared.
 
 `show` retains full final messages, asked times, answers, handoff terms, and
-requests with their owners and closure evidence. It
+requests with their owners and closure evidence. `pending` lists only what is
+still open (unanswered questions, undelivered handoffs, open requests, and left
+rows), each as a list entry carrying its `id` (`row` for a left row); read the
+open items with it rather than walking `show`'s dictionaries by hand. It
 does not infer a user's answer from a tab closing or from a later verdict.
 Consult the actual answer and update the state. A waiting tab is not an
 invitation to ask the same question in the new session.

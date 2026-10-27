@@ -78,6 +78,16 @@ def owner_name(value):
     return owner
 
 
+def pending(data: dict) -> dict[str, list[dict]]:
+    """The open items of `show` as lists: each entry carries its key as `id` (`row` for a left row)."""
+    return {
+        "questions": [{"id": key, **item} for key, item in data["questions"].items() if item["answer"] is None],
+        "handoffs": [{"id": key, **item} for key, item in data["handoffs"].items() if item["delivered_at"] is None],
+        "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
+        "left": [{"row": row, **item} for row, item in data["left"].items()],
+    }
+
+
 def change(data, args):
     if args.action == "request-open":
         key = uuid.uuid4().hex[:16]
@@ -148,6 +158,8 @@ def main(argv=None):
     parser.add_argument("--state-file", default=DEFAULT_STATE, help="shared hourly state JSON path")
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("show", help="read all saved decisions, questions, handoffs, and requests")
+    commands.add_parser("pending", help="list each unanswered question, undelivered handoff, open request, "
+                                        "and left row, each with its id (row for left rows)")
     needs_owner = commands.add_parser("requests-needing-owner", help="list open requests without a live owner")
     needs_owner.add_argument("--live-owner", action="append", default=[],
                              help="active scan row identity (PATH or ENVIRONMENT::PATH); repeat per owner")
@@ -193,7 +205,7 @@ def main(argv=None):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
-            read_only = ("show", "left-now", "requests-needing-owner")
+            read_only = ("show", "pending", "left-now", "requests-needing-owner")
             fcntl.flock(lock, fcntl.LOCK_EX if args.action not in read_only else fcntl.LOCK_SH)
             data = read(path)
             left_matches = False
@@ -204,6 +216,8 @@ def main(argv=None):
                 live = {owner_name(value) for value in args.live_owner}
                 result = [{"id": key, **request} for key, request in data["requests"].items()
                           if request["closed_at"] is None and request["owner"] not in live]
+            elif args.action == "pending":
+                result = pending(data)
             else:
                 result = data if args.action == "show" else change(data, args)
             if args.action not in read_only:
