@@ -215,6 +215,18 @@ once, then `status-alerts` and inspect `~/.cache/orca-briefs/triage-alert.log`.
 Activation starts at the current complete inbox line; later arrivals are
 notified. Existing reports remain available to the hourly reader.
 
+With terminal-notifier 3.x (nix-config installs it through zerobrew), pressing
+the notification runs `orca terminal switch` for the sender's agent tab, adding
+`--environment` when the ask came from a paired Mac. Without it, or when the tab
+is gone, the notification only shows the ask. Activation records the PATH of
+`orca` and `terminal-notifier`, so after installing terminal-notifier run
+`launchctl bootout gui/$(id -u)/com.eotel.orca-session-triage.alert`, remove
+`~/Library/LaunchAgents/com.eotel.orca-session-triage.alert.plist`, and run
+`activate-alerts` again. On a Mac where `terminal-notifier -diagnose` reports
+that permission was never requested, run
+`open -a /opt/zerobrew/opt/terminal-notifier/terminal-notifier.app --args -message test`
+once and allow notifications; a request from a terminal tab is refused.
+
 ## The automation
 
 ```sh

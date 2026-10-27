@@ -62,14 +62,21 @@ def alert_paths(home=None):
             home / ".cache/orca-briefs/triage-alert.log")
 
 
-def alert_plist_bytes(home=None, python=None):
+def alert_plist_bytes(home: str | None = None, python: str | None = None,
+                      tools: tuple[str, ...] | None = None) -> bytes:
     _, _, _, log = alert_paths(home)
     python = python or shutil.which("python3")
     if not python:
         raise RuntimeError("python3 must be on PATH when rendering the alert service")
+    # A pressed notification opens the sender's tab with these, and launchd's PATH has neither.
+    if tools is None:
+        tools = tuple(path for name in ("orca", "terminal-notifier") if (path := shutil.which(name)))
+    service_path = ":".join(dict.fromkeys((*(str(Path(tool).parent) for tool in tools), str(Path(python).parent),
+                                         "/usr/bin", "/bin", "/usr/sbin", "/sbin")))
     return plistlib.dumps({
         "Label": ALERT_LABEL,
         "ProgramArguments": [python, str(Path(__file__).with_name("inbox_alert.py"))],
+        "EnvironmentVariables": {"PATH": service_path},
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,
