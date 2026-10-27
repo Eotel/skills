@@ -40,6 +40,15 @@ responsible lane when work passes to another lane. Use the scan's
 `ENVIRONMENT::PATH` for another Mac. A repository and worktree name alone can
 identify more than one lane across Macs.
 
+`requests-needing-owner` also records open GitHub issues as requests. List
+the repositories in `issue-repos.json` beside the state file
+(`{"repos": ["owner/name", ...]}`, kept on this Mac only). Each open issue is
+recorded once, with its title and URL as the original request and its
+`source.url`. Its owner is the Orca worktree Orca links to that issue or to a
+PR that closes it; an ownerless one gets that worktree when it appears. The
+lead assigns the rest like any request. A repository gh cannot read is skipped
+with a warning, and nothing is imported while Orca's worktrees are unreadable.
+
 Every hourly run reads the open requests in `show` and compares each assigned
 lane with the scan. After the scan, run `requests-needing-owner`, passing
 `--live-owner ROW_IDENTITY` once for each lane still actively handling its

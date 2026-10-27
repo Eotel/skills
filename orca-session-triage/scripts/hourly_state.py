@@ -6,17 +6,133 @@ it atomically, so a waiting session and a new run cannot lose each other's edits
 """
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import tempfile
 import uuid
 
+import scan_sessions
+
 DEFAULT_STATE = "~/.cache/orca-session-triage/hourly-state.json"
+# Beside the state file: {"repos": ["owner/name", ...]} whose open issues become requests.
+ISSUE_REPOS = "issue-repos.json"
+REPO_SLUG = re.compile(r"[\w.-]+/[\w.-]+")
+
+
+@dataclass(frozen=True)
+class Issue:
+    repo: str
+    number: int
+    title: str
+    url: str
+    closing_prs: frozenset[int]
+    assignees: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """An Orca worktree and the GitHub issues and PRs Orca links to it."""
+    identity: str
+    repo: str  # owner/name, or Orca's repository name when the owner is unknown
+    issues: frozenset[int]
+    prs: frozenset[int]
+
+    def works_on(self, issue: Issue) -> bool:
+        same_repo = self.repo == issue.repo or ("/" not in self.repo and self.repo == issue.repo.split("/")[1])
+        return same_repo and (issue.number in self.issues or bool(self.prs & issue.closing_prs))
+
+
+def issue_repos(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    repos = data.get("repos") if isinstance(data, dict) else None
+    if not isinstance(repos, list) or not all(isinstance(repo, str) and REPO_SLUG.fullmatch(repo) for repo in repos):
+        raise ValueError(f'{path} must hold {{"repos": ["owner/name", ...]}}')
+    return repos
+
+
+def gh_open_issues(repo: str) -> list[dict]:
+    out = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "1000",
+                          "--json", "number,title,url,assignees,closedByPullRequestsReferences"],
+                         capture_output=True, text=True, check=True, timeout=60).stdout
+    return json.loads(out)
+
+
+def orca_worktrees(orca: str) -> list[dict]:
+    return scan_sessions.collect_worktrees_and_terminals(orca)[0]
+
+
+def origin_slug(path: str) -> str | None:
+    try:
+        origin = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return scan_sessions.github_slug(origin.stdout.strip()) if origin.returncode == 0 else None
+
+
+def checkout_of(worktree: dict) -> Checkout:
+    linked = worktree.get("linkedPR") or {}
+    found = scan_sessions.PR_URL.search(linked.get("url") or "")
+    slug = found.group(1) if found else None if worktree.get("_environment") else origin_slug(worktree["path"])
+    items = [item for item in worktree.get("linkedItems") or [] if isinstance(item, dict)]
+    return Checkout(
+        identity=scan_sessions.row_identity({"environment": worktree.get("_environment"), "path": worktree["path"]}),
+        repo=slug or worktree.get("repo") or "",
+        issues=frozenset([*([worktree["linkedIssue"]] if worktree.get("linkedIssue") else []),
+                          *(item.get("number") for item in items if item.get("type") == "issue")]),
+        prs=frozenset([*([linked["number"]] if linked.get("number") else []),
+                       *(item.get("number") for item in items if item.get("type") == "pr")]))
+
+
+def issue_intake(state: Path, orca: str) -> tuple[list[Issue], list[Checkout]] | None:
+    """Open issues of the listed repositories and the checkouts working on issues, or None when none are listed.
+
+    A repository gh cannot read is left out with a warning; without Orca's worktrees nothing is imported.
+    """
+    repos = issue_repos(state.parent / ISSUE_REPOS)
+    if not repos:
+        return None
+    try:
+        checkouts = [checkout_of(worktree) for worktree in orca_worktrees(orca)]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        print(f"hourly state: open issues not imported, Orca worktrees unreadable: {error}", file=sys.stderr)
+        return None
+    issues = []
+    for repo in repos:
+        try:
+            issues += [Issue(repo=repo, number=item["number"], title=item["title"], url=item["url"],
+                             closing_prs=frozenset(pr["number"] for pr in item.get("closedByPullRequestsReferences") or []),
+                             assignees=tuple(person["login"] for person in item.get("assignees") or []))
+                       for item in gh_open_issues(repo)]
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            print(f"hourly state: open issues of {repo} not imported: {error}", file=sys.stderr)
+    return issues, checkouts
+
+
+def import_issues(data: dict, issues: list[Issue], checkouts: list[Checkout]) -> None:
+    """Record each open issue as a request once; an ownerless one gets the checkout that works on it."""
+    recorded = {request["source"].get("url"): request for request in data["requests"].values()
+                if isinstance(request.get("source"), dict)}
+    for issue in issues:
+        owner = next((checkout.identity for checkout in checkouts if checkout.works_on(issue)), None)
+        request = recorded.get(issue.url)
+        if request is None:
+            data["requests"][uuid.uuid4().hex[:16]] = {
+                "original": f"{issue.title}\n{issue.url}", "symptom": f"{issue.repo}#{issue.number} is open",
+                "owner": owner, "opened_at": stamp(), "closed_at": None, "closure_evidence": None,
+                "source": {"kind": "github_issue", "url": issue.url, "assignees": list(issue.assignees)}}
+        elif request["closed_at"] is None and request["owner"] is None and owner:
+            request["owner"] = owner
 
 
 def read(path):
@@ -160,9 +276,15 @@ def main(argv=None):
     commands.add_parser("show", help="read all saved decisions, questions, handoffs, and requests")
     commands.add_parser("pending", help="list each unanswered question, undelivered handoff, open request, "
                                         "and left row, each with its id (row for left rows)")
-    needs_owner = commands.add_parser("requests-needing-owner", help="list open requests without a live owner")
+    needs_owner = commands.add_parser(
+        "requests-needing-owner",
+        help="list open requests without a live owner; first record each open GitHub issue of the repositories "
+             f"in {ISSUE_REPOS} beside the state file once, owned by the Orca worktree Orca links to it or to a PR "
+             "that closes it")
     needs_owner.add_argument("--live-owner", action="append", default=[],
                              help="active scan row identity (PATH or ENVIRONMENT::PATH); repeat per owner")
+    needs_owner.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                             help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
     request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
     request_open.add_argument("--original-file", required=True)
     request_open.add_argument("--symptom-file", required=True)
@@ -204,10 +326,14 @@ def main(argv=None):
     path = Path(args.state_file).expanduser()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        intake = issue_intake(path, args.orca) if args.action == "requests-needing-owner" else None
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
             read_only = ("show", "pending", "left-now", "requests-needing-owner")
-            fcntl.flock(lock, fcntl.LOCK_EX if args.action not in read_only else fcntl.LOCK_SH)
+            writes = args.action not in read_only or intake is not None
+            fcntl.flock(lock, fcntl.LOCK_EX if writes else fcntl.LOCK_SH)
             data = read(path)
+            if intake is not None:
+                import_issues(data, *intake)
             left_matches = False
             if args.action == "left-now":
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
@@ -220,7 +346,7 @@ def main(argv=None):
                 result = pending(data)
             else:
                 result = data if args.action == "show" else change(data, args)
-            if args.action not in read_only:
+            if writes:
                 save(path, data)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
