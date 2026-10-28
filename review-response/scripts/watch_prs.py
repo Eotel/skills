@@ -3,9 +3,19 @@
 
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,
 and each Codex review's status, which Codex edits into one summary comment.
+
+Cost per cycle: one `gh api rate_limit`, which GitHub does not count against any
+limit, then one GraphQL `gh pr view` per open PR. The three REST feeds (reviews,
+line comments, issue comments; one call per 100 items each) are read only after
+the PR's updatedAt moves, which GitHub does for new comments, reviews, pushes and
+comment edits, and once more on the next cycle because updatedAt counts whole
+seconds. A PR whose merge or close is recorded in the state file is not read
+again; remove its entry to watch it after a reopen. While fewer than 1000 GraphQL
+points remain, the cycle prints RATE_LIMIT_LOW and sleeps until the reset.
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
@@ -14,6 +24,9 @@ import sys
 import time
 
 
+MIN_INTERVAL = 60
+MIN_GRAPHQL_REMAINING = 1000
+TERMINAL = ("MERGED", "CLOSED")
 SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
 # Codex edits one summary comment in place, so its review progress never arrives as a new comment.
@@ -64,17 +77,25 @@ def codex_reviews(comments):
     return reviews
 
 
-def diff_events(spec, previous, snapshot, me):
+def diff_events(spec: str, previous: dict, snapshot: dict, me: str) -> tuple[list[str], dict]:
     """Pure diff: return (event lines, new state) without mutating either input.
 
     snapshot contains the gh PR view fields plus reviews, line_comments and
-    comments arrays. previous is the returned state from the last successful poll
-    (or an empty dict). CI history and feed IDs survive pending checks and retries.
+    comments arrays, which are absent when they were not read. Absent feeds report
+    nothing, because only unseen IDs and changed Codex reviews are reported.
+    previous is the returned state from the last successful poll (or an empty
+    dict). CI history and feed IDs survive pending checks and retries.
     """
     state = dict(previous or {})
     events = []
+    if "comments" in snapshot:
+        updated_at = snapshot.get("updatedAt")
+        # Two reads at one updatedAt rule out a change later in that same second.
+        if updated_at and updated_at == state.get("feeds_read_at"):
+            state["feeds_settled_at"] = updated_at
+        state["feeds_read_at"] = updated_at
     current_state = snapshot["state"]
-    if current_state in ("MERGED", "CLOSED") and current_state != state.get("state"):
+    if current_state in TERMINAL and current_state != state.get("state"):
         events.append(f"{spec} {current_state}")
     state["state"] = current_state
     checks = snapshot.get("statusCheckRollup") or []
@@ -136,9 +157,17 @@ def gh_json(args):
     return json.loads(result.stdout)
 
 
-def fetch_snapshot(spec):
+def graphql_budget() -> tuple[int, int]:
+    """Return the GraphQL points remaining and their reset epoch; this read is free."""
+    graphql = gh_json(["api", "rate_limit"])["resources"]["graphql"]
+    return int(graphql["remaining"]), int(graphql["reset"])
+
+
+def fetch_snapshot(spec: str, previous: dict) -> dict:
     repo, number = spec.split("#", 1)
-    view = gh_json(["pr", "view", number, "--repo", repo, "--json", "state,headRefOid,mergeable,statusCheckRollup"])
+    view = gh_json(["pr", "view", number, "--repo", repo, "--json", "state,headRefOid,mergeable,statusCheckRollup,updatedAt"])
+    if view.get("updatedAt") and view["updatedAt"] == previous.get("feeds_settled_at"):
+        return view
     for feed, endpoint in (
         ("reviews", f"repos/{repo}/pulls/{number}/reviews"),
         ("line_comments", f"repos/{repo}/pulls/{number}/comments"),
@@ -173,32 +202,53 @@ def read_specs(path):
     return specs
 
 
-def positive_interval(value):
-    value = float(value)
-    if not 0 < value < float("inf"):
-        raise argparse.ArgumentTypeError("interval must be positive and finite")
-    return value
+def poll_interval(value: str) -> float:
+    interval = float(value)
+    if not MIN_INTERVAL <= interval < float("inf"):
+        raise argparse.ArgumentTypeError(f"interval must be at least {MIN_INTERVAL} seconds and finite")
+    return interval
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("list_file", type=Path, help="one owner/repo#N per line; blank lines and # comments are ignored")
     parser.add_argument("--state-file", type=Path, required=True, help="persisted event state; a missing file starts empty")
     parser.add_argument("--me", required=True, help="ignore reviews and comments by this GitHub login")
     parser.add_argument("--baseline", action="store_true", help="silently record new PRs during the first cycle")
-    parser.add_argument("--interval", type=positive_interval, default=60, help="poll interval in seconds (default: 60)")
-    parser.add_argument("--once", action="store_true", help="poll one cycle and exit")
+    parser.add_argument(
+        "--interval", type=poll_interval, default=MIN_INTERVAL,
+        help=f"poll interval in seconds, at least {MIN_INTERVAL}; smaller values are rejected (default: {MIN_INTERVAL})",
+    )
+    parser.add_argument("--once", action="store_true", help="poll one cycle and exit; exits 1 instead of sleeping on RATE_LIMIT_LOW")
     args = parser.parse_args(argv)
     try:
         states = load_state(args.state_file)
         first_cycle = True
         while True:
             had_errors = False
+            try:
+                remaining, reset = graphql_budget()
+            except FileNotFoundError:
+                raise ValueError("gh CLI is required") from None
+            except (ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+                # The budget check is advisory, so a failed check still polls.
+                print(f"watch_prs: rate limit check failed: {exc}", file=sys.stderr, flush=True)
+            else:
+                if remaining < MIN_GRAPHQL_REMAINING:
+                    reset_at = datetime.fromtimestamp(reset, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    print(f"RATE_LIMIT_LOW graphql remaining={remaining} reset={reset_at}", flush=True)
+                    if args.once:
+                        return 1
+                    time.sleep(max(reset - time.time(), args.interval))
+                    continue
             # Callers can add or remove PRs while this process is running.
             for spec in read_specs(args.list_file):
+                previous = states.get(spec, {})
+                if previous.get("state") in TERMINAL:
+                    continue
                 try:
-                    snapshot = fetch_snapshot(spec)
-                    events, updated = diff_events(spec, states.get(spec, {}), snapshot, args.me)
+                    snapshot = fetch_snapshot(spec, previous)
+                    events, updated = diff_events(spec, previous, snapshot, args.me)
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:

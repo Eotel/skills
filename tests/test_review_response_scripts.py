@@ -1,5 +1,6 @@
 """Offline behavior tests for the public review-response command line tools."""
 
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 import copy
 from email.message import Message
@@ -441,6 +442,25 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(repeated, [])
         return events, state
 
+    def fake_gh(
+        self, views: dict[str, dict], feeds: dict[str, list[dict]], remaining: int = 5000, reset: int = 1793160542,
+    ) -> tuple[list[list[str]], Callable[..., subprocess.CompletedProcess[str]]]:
+        """Answer gh at the subprocess boundary and record each command's arguments."""
+        calls: list[list[str]] = []
+
+        def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            args = command[1:]
+            calls.append(args)
+            if args[:2] == ["api", "rate_limit"]:
+                body = {"resources": {"graphql": {"remaining": remaining, "reset": reset}}}
+            elif args[:2] == ["pr", "view"]:
+                body = views[args[2]]
+            else:
+                body = [feeds.get(args[-1].split("?")[0], [])]
+            return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
+
+        return calls, run
+
     def codex_summary(self, status, findings=None):
         state = {"commit_sha": "a" * 40, "status": status, "has_any_findings": findings}
         body = "<!-- codex-review-state:v1 " + json.dumps({"code_review": state, "security_review": state}) + " -->"
@@ -610,17 +630,74 @@ class WatchPrsTests(unittest.TestCase):
                     raise KeyboardInterrupt
                 listing.write_text("# list updated\n" + self.spec + "\n" + extra + "\n", encoding="utf-8")
 
-            snapshots = [self.snapshot(state="MERGED"), self.snapshot(state="MERGED"), self.snapshot(state="CLOSED")]
-            with patch.object(prs, "fetch_snapshot", side_effect=snapshots) as fetch, patch.object(prs.time, "sleep", side_effect=next_cycle), redirect_stdout(output):
+            snapshots = [self.snapshot(state="MERGED"), self.snapshot(state="CLOSED")]
+            with patch.object(prs, "fetch_snapshot", side_effect=snapshots) as fetch, patch.object(prs, "graphql_budget", return_value=(5000, 0)), patch.object(prs.time, "sleep", side_effect=next_cycle), redirect_stdout(output):
                 self.assertEqual(prs.main([str(listing), "--state-file", str(state_file), "--me", self.me, "--baseline"]), 130)
-            self.assertEqual([call.args[0] for call in fetch.call_args_list], [self.spec, self.spec, extra])
+            # The recorded merge is not read again in the second cycle.
+            self.assertEqual([call.args[0] for call in fetch.call_args_list], [self.spec, extra])
             self.assertEqual(output.getvalue(), extra + " CLOSED\n")
             self.assertEqual(json.loads(state_file.read_text())[self.spec]["state"], "MERGED")
+
+    def test_unchanged_open_pr_costs_one_gh_call_and_reported_merge_costs_none(self) -> None:
+        view = {"state": "OPEN", "headRefOid": "a" * 40, "mergeable": "MERGEABLE", "statusCheckRollup": [], "updatedAt": "2026-10-28T03:00:00Z"}
+        views = {"12": view, "13": dict(view, state="MERGED")}
+        feeds: dict[str, list[dict]] = {}
+        calls, run = self.fake_gh(views, feeds)
+        per_cycle: list[int] = []
+
+        def next_cycle(_: float) -> None:
+            per_cycle.append(len(calls))
+            calls.clear()
+            if len(per_cycle) == 3:
+                # A new comment moves the PR's updatedAt.
+                views["12"] = dict(view, updatedAt="2026-10-28T03:05:00Z")
+                feeds["repos/acme/api/issues/12/comments"] = [{"id": 1, "user": {"login": "reviewer"}, "body": "please fix"}]
+            elif len(per_cycle) == 4:
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            listing = Path(temporary) / "prs.txt"
+            listing.write_text("acme/api#12\nacme/api#13\n", encoding="utf-8")
+            output = io.StringIO()
+            with patch.object(prs.subprocess, "run", side_effect=run), patch.object(prs.time, "sleep", side_effect=next_cycle), redirect_stdout(output):
+                code = prs.main([str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me])
+        self.assertEqual(code, 130)
+        # Each cycle reads rate_limit once; a PR read is its view plus three feeds.
+        # Cycle 2 reads #12's feeds once more because updatedAt counts whole seconds.
+        self.assertEqual(per_cycle, [1 + 4 + 4, 1 + 4, 1 + 1, 1 + 4])
+        self.assertEqual(output.getvalue().splitlines(), ["acme/api#13 MERGED", "acme/api#12 NEW COMMENT by reviewer  :: please fix"])
+
+    def test_low_graphql_budget_waits_for_reset_without_reading_prs(self) -> None:
+        reset = 1793160542
+        calls, run = self.fake_gh({}, {}, remaining=999, reset=reset)
+        for once in (False, True):
+            with self.subTest(once=once), tempfile.TemporaryDirectory() as temporary:
+                calls.clear()
+                listing = Path(temporary) / "prs.txt"
+                listing.write_text(self.spec + "\n", encoding="utf-8")
+                output = io.StringIO()
+                with patch.object(prs.subprocess, "run", side_effect=run), patch.object(prs.time, "time", return_value=reset - 600), patch.object(prs.time, "sleep", side_effect=KeyboardInterrupt) as sleep, redirect_stdout(output):
+                    code = prs.main([str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me, *(["--once"] if once else [])])
+                self.assertEqual(calls, [["api", "rate_limit"]])
+                self.assertEqual(output.getvalue(), "RATE_LIMIT_LOW graphql remaining=999 reset=2026-10-28T04:09:02Z\n")
+                if once:
+                    self.assertEqual(code, 1)
+                    sleep.assert_not_called()
+                else:
+                    self.assertEqual(code, 130)
+                    sleep.assert_called_once_with(600)
+
+    def test_interval_below_sixty_seconds_is_rejected(self) -> None:
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+            prs.main(["prs.txt", "--state-file", "state.json", "--me", self.me, "--interval", "59"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("at least 60", errors.getvalue())
 
     def test_api_pagination_is_flattened(self):
         item = {"id": 1, "user": {"login": "reviewer"}}
         with patch.object(prs, "gh_json", side_effect=[self.snapshot(), [[item], [{"id": 2}]], [[]], [[]]]) as gh:
-            snapshot = prs.fetch_snapshot(self.spec)
+            snapshot = prs.fetch_snapshot(self.spec, {})
         self.assertEqual(len(snapshot["reviews"]), 2)
         self.assertIn("--paginate", gh.call_args_list[1].args[0])
         self.assertIn("--slurp", gh.call_args_list[1].args[0])
@@ -644,7 +721,7 @@ class WatchPrsTests(unittest.TestCase):
             _, state = prs.diff_events(self.spec, {}, self.snapshot(), self.me)
             state_file.write_text(json.dumps({self.spec: state}), encoding="utf-8")
             errors = io.StringIO()
-            with patch.object(prs, "fetch_snapshot", side_effect=ValueError("API unavailable")), redirect_stderr(errors):
+            with patch.object(prs, "fetch_snapshot", side_effect=ValueError("API unavailable")), patch.object(prs, "graphql_budget", return_value=(5000, 0)), redirect_stderr(errors):
                 self.assertEqual(prs.main([str(listing), "--state-file", str(state_file), "--me", self.me, "--once"]), 1)
             self.assertEqual(json.loads(state_file.read_text()), {self.spec: state})
             self.assertIn("API unavailable", errors.getvalue())
