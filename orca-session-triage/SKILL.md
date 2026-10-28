@@ -24,7 +24,13 @@ board's done cards; close what the user approves.
   transcript's question still gets its usual class and must be relayed.
   It reads the paired Orca environments listed by this Mac. A remote row
   carries `environment` and uses Orca's last agent message when its transcript
-  is unavailable locally. Remote `git.dirty`, `git.unpushed`, and
+  is unavailable locally. When Orca keeps no message of the worktree's agents
+  there, the scan reads its tabs' screens: Claude Code's reply bullet (⏺), turn-end line
+  (`✻ … for …`), or mode line (⏵⏵) names an agent the terminal list leaves
+  out (it does on some reads), and the last ⏺ reply, or the indented lines
+  above the turn-end line when the ⏺ scrolled off, is the row's
+  `orca_message` (`from: screen`).
+  Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
   `--summary` prints class counts, review rows, finished worktree/tab counts,
@@ -54,8 +60,13 @@ board's done cards; close what the user approves.
   `done_cards`, one per agent Orca shows
   as done: the `handle` that closes its tab (null while the tab sleeps or
   no live tab can be assigned to it uniquely),
-  whether the user `interrupted` it, the `prompt` it last got, and Orca's copy
-  of its last message. The board keeps a card in Done until its tab closes.
+  whether the user `interrupted` it, the `prompt` it last got, Orca's copy
+  of its last message, the last lines of its tab's screen (`screen_tail`), and
+  whether its composer holds unsent text (`draft`, the same check
+  `cleanup_hourly_tabs.py` makes; null when the screen was not read).
+  `--cards` prints each done card, `closable` tab, and `meaningful_tabs` entry
+  on its own line, led by the worktree's name: read cards through it.
+  The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
   repository's main checkout is a row (`main`) while it hosts an agent. A
   Claude or Codex turn an API error cut off, and a lead whose

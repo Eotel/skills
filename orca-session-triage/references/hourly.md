@@ -14,13 +14,15 @@ shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
 For a large inbox, `read --summary` shows each entry on one line with its
 `id=` and the first 160 characters of its text, and `read --id ID[,ID]` prints
-only those entries in full; it fails when an id is not after the cursor. Read a
-long inbox this way rather than cutting the output. `--kind ask,done` filters by type, and
+only those entries in full, wherever the cursor stands (an acknowledged one is
+marked 既読). An id may be its first 8 or more characters, as handoffs and
+`~/.cache/orca-briefs/bin/inbox` print it; one naming several entries lists them
+and prints nothing. Read a long inbox this way rather than cutting the output,
+and read past entries by time or worktree with `inbox --since`. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
-`repo/worktree` (older entries without a repo use their worktree). These options
-only filter the display: `NEXT_OFFSET` still covers every complete inbox entry.
-Read an unfiltered summary before acknowledging an offset from a filtered view
-so hidden entries are not skipped.
+`repo/worktree` (older entries without a repo use their worktree). A read with
+`--kind`, `--source`, or `--id` prints no `NEXT_OFFSET`, so an entry the filter
+hid is never acknowledged: acknowledge from an unfiltered read.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
@@ -42,7 +44,22 @@ from other lanes to the lead in one handoff. It does not reforward its own
 handoff entry. The lead checks inbox IDs and shared hourly state
 before answering so a later hourly handoff cannot repeat an answered question.
 The lead may read `info` and `done` for context but leaves the scheduled sweep
-to the hourly run. A report pulled late from another Mac is still shown even
+to the hourly run. The lead watches new reports with a Monitor running
+`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch`,
+a cursor of its own that `initialize` starts once (watch refuses a missing one,
+and refuses to run without `TRIAGE_READ_OFFSET`, so it never skips `info` on the
+scheduled run's cursor).
+It prints every new `ask` and `done`, whatever its source, as a summary line,
+and `unanswered <n> min: <line>` once per ask left unanswered for 15 minutes.
+Being read is not being answered. `send --decision <answer> --ask <id>[:<n>]`
+records the ask (or one of its questions) answered once the send lands (the
+id's first 8 or more characters will do, as for `read --id`);
+`scripts/inbox_read.py answered <id> --note <why>` records one answered another
+way (on another Mac, by the user in the lane, or no longer asked), and
+`open-asks` lists the rest, oldest first (`--json` for other tools; the board
+reads it). Asks from before the record began stay open until the lead marks
+them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
+A report pulled late from another Mac is still shown even
 if its original timestamp is old. The watch and notification services each
 keep their own cursor. The watch's output is in
 `~/.cache/orca-briefs/triage-watch.log` for diagnosis.
@@ -123,8 +140,11 @@ until the key has an answer, `asana99_status.py` marks that difference
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
 The lead records an answer with
-`lead_decisions.py record --decision KEY --answer-file FILE`; records are only
-appended, and a later record for a key replaces its earlier answer.
+`lead_decisions.py record --decision KEY --answer-file FILE`, or, when it relays
+the answer to a lane, with `send --decision <answer> --key KEY` (repeat per key,
+with `--ask <id>` for the ask it answers): the key and the ask are recorded
+answered once the send lands. Records are only appended, and a later record for
+a key replaces its earlier answer.
 
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and

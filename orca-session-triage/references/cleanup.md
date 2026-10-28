@@ -25,10 +25,14 @@ Run these per worktree, in order.
    has a PR: a MERGED PR whose head equals HEAD counts as merged (squash merges),
    an OPEN PR whose head equals HEAD clears the unmerged-commit check, and the
    PR's fetched base branch becomes the base. Without it the base is the
-   remote branch the worktree started from, else the remote's default branch.
-   Pass `--base` when the output's `base` is not where the work merges.
+   remote branch the worktree started from, else the remote's default branch,
+   and when HEAD is not in that base, gh is asked for a MERGED PR of the
+   checked-out branch whose head is HEAD: one found counts as `--pr` (`notes`
+   names it). Pass `--base` when the output's `base` is not where the work merges.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
-     report them and leave the worktree. A commit whose patch is already in the
+     `uncommitted` lists the paths of the changes. Report them and leave the
+     worktree. Untracked Python bytecode (`__pycache__/` of `.pyc` files) is
+     not a change: it is listed in `regenerable`. A commit whose patch is already in the
      base under another hash (a PR rebased before it merged) does not block; it
      is listed in `merged_by_patch`, so name it in the report. A merge commit
      outside the base still blocks, and a patch that the base later reverted
@@ -38,17 +42,29 @@ Run these per worktree, in order.
      (screenshots, uploaded fixtures) are regenerable; anything else (exports,
      reports, hand-written notes) goes back to the user before removal. A `.env`
      entry names the keys whose values its `.env.example` lacks, never the
-     values: they may be the only copy of an API key. A scratch investigation
-     folder (`.investigate/` and the like) in a worktree the user chose to remove
+     values: they may be the only copy of an API key. In a worktree the user
+     chose to remove, a scratch record folder (`.yomiyasu/`, `.investigate/`)
      moves next to the lane's brief and report, and the removal goes on without
-     another question.
-   - `regenerable` lists generated sources and e2e output (`__generated__/`,
-     `src/paraglide/`, `e2e/screenshots/`, `e2e/.state/`, `e2e/.auth/`): a setup
-     or a test run writes them again, so they do not hold up the removal. Neither
+     another question: run `rm_check.py` again with `--archive-scratch`. When
+     those folders alone keep the worktree, it moves them to
+     `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/` (listed in
+     `archived`) and checks again; it moves nothing while anything else blocks
+     or needs review. Without the option nothing moves.
+   - `regenerable` lists what a tool writes again from tracked files or
+     installed packages with no one's input: untracked Python bytecode, and,
+     among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
+     `graphql/generated/`, `src/paraglide/`), e2e output (`e2e/screenshots/`, `e2e/.state/`,
+     `e2e/.auth/`), and the hook scripts husky and vite-hooks write on install
+     (`.husky/_/`, `.vite-hooks/_/`). They do not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
      at the worktree root: its random installation identity binds only that
-     checkout, and the next install writes a new one.
+     checkout, and the next install writes a new one. Ignored caches and test
+     reports (`.cache/`, `.coverage`, `playwright-report*/`, and the like) are
+     skipped without a listing. An untracked path is never judged by its name,
+     since a `build/` the repository does not ignore may be new source, and a
+     `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its
+     records.
    - `containers` lists docker compose projects defined inside the worktree.
    - `processes` lists commands or current directories using the path. Each
      says whether it runs in an Orca tab (`in_orca_tab`), the tab's `handle`
@@ -114,9 +130,11 @@ Closing drops Orca's resume record, not the transcript: `claude --resume
 ## Clearing done cards
 
 A row's `done_cards` are the agents whose turn ended; the board keeps each one
-in Done until its tab closes. Read the card's final message (the row's
-transcript; the card's `last_message` when none was read; its screen when both
-are empty), then:
+in Done until its tab closes. `scan_sessions.py --cards` prints each card with
+its tab, its `draft` (whether the composer holds unsent text), Orca's copy of
+its last message, and the end of its screen. Read the card's final message (the
+row's transcript; the card's `last_message` when none was read; its
+`screen_tail` when both are empty), then:
 
 - Something is left for the user: it is a question (`delivery.md`). An
   `interrupted` card is a request they cut short: ask whether its `prompt`
@@ -132,7 +150,8 @@ are empty), then:
   or deploy arrives, a later sweep reopens the session there (`claude --resume
   <session-id>` or `codex resume <session-id>`) or carries the step itself.
 - A lead whose helper still works, and a session with the user's draft in its
-  composer, stay: report each with that reason.
+  composer (`draft: true`), stay: report each with that reason. A card whose
+  `draft` is null was not read: read its screen before closing it.
 
 A null `handle` means the tab is asleep or no live tab can be assigned to the
 card uniquely. Check the worktree's agent terminals and transcript before

@@ -411,7 +411,9 @@ def classify(row, decision_marker):
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
-    if not (row["agents"] or row["claude"] or row["codex"]):
+    # Another Mac's tab may show its agent only on its screen; this Mac's transcripts are read directly.
+    screen_agent_tab = row.get("environment") and any(t["agent"] for t in row["terminals"])
+    if not (row["agents"] or row["claude"] or row["codex"] or screen_agent_tab):
         return "stalled", [NO_SESSION_REASON]
     return "stalled", [state] if state else []
 
@@ -448,15 +450,86 @@ def iso_time(epoch_ms):
     return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def done_cards(agents, terms):
+SCREEN_TAIL_LINES = 8
+RULE = re.compile(r"[─━]+")
+# Claude Code's reply bullet and the line it leaves when a turn ends ("✻ Baked for 3m 2s").
+CLAUDE_LINE_STARTS = re.compile(r"⏺ |✻ \S+ for ")
+CLAUDE_MODE_LINE = "⏵⏵ "
+# A ⏺ line that names a tool call ("⏺ Bash(git push)", "⏺ serena - find_symbol (MCP)(…)"), sums up collapsed calls
+# ("… (ctrl+o to expand)"), or is followed by a tool result (⎿) is not a reply.
+TOOL_CALL = re.compile(r"⏺ (?:[A-Za-z][\w.:-]*\(|.*\(MCP\))")
+COLLAPSED_CALLS = "(ctrl+o to expand)"
+TOOL_RESULT = "⎿"
+
+
+def screen_lines(screen: dict) -> list[str]:
+    tail = screen.get("tail") or []
+    return tail if isinstance(tail, list) else tail.splitlines()
+
+
+def rendered(screen: dict | None) -> dict | None:
+    """The screen when Orca rendered it; None when the read failed or gave accumulated output."""
+    return screen if screen and screen.get("source") == "screen" else None
+
+
+def has_draft(screen: dict) -> bool:
+    """Whether the composer holds unsent text; Orca reports it as `draft`, apart from the screen's tail."""
+    return screen.get("draft") not in (None, "")
+
+
+def screen_tail(screen: dict) -> list[str]:
+    """The last lines a rendered screen shows, without blank lines and rules."""
+    shown = [line.strip() for line in screen_lines(screen) if line.strip() and not RULE.fullmatch(line.strip())]
+    return shown[-SCREEN_TAIL_LINES:]
+
+
+def screen_agent(screen: dict) -> str | None:
+    """"claude" when the screen shows Claude Code: its reply bullet, its turn-end line, or its mode line."""
+    shows = any(CLAUDE_LINE_STARTS.match(line.strip()) or CLAUDE_MODE_LINE in line for line in screen_lines(screen))
+    return "claude" if shows else None
+
+
+def screen_message(screen: dict) -> str:
+    """Claude's last reply on the screen: the last ⏺ block, its indented continuation lines unindented.
+
+    A reply whose ⏺ line scrolled off the top is read from the indented lines above the last turn-end line.
+    """
+    lines = screen_lines(screen)
+    def tool_call(index):
+        following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        return (TOOL_CALL.match(lines[index]) or lines[index].rstrip().endswith(COLLAPSED_CALLS)
+                or following.startswith(TOOL_RESULT))
+
+    starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ") and not tool_call(index)]
+    ends = [index for index, line in enumerate(lines) if line.startswith("✻ ")]
+    if starts:
+        block = [lines[starts[-1]][2:]]
+        for line in lines[starts[-1] + 1:]:
+            if line.strip() and not line[:1].isspace():
+                break
+            block.append(line)
+    elif ends:
+        above = lines[:ends[-1]]
+        top = next((index + 1 for index in range(len(above) - 1, -1, -1)
+                    if above[index].strip() and not above[index][:1].isspace()), 0)
+        block = above[top:]
+    else:
+        return ""
+    return "\n".join(line[2:] if line.startswith("  ") else line.strip() for line in block).strip()
+
+
+def done_cards(agents, terms, screens=None, environment=None):
     """One card per agent Orca shows as done, with the live tab that closes it.
 
     A tab Orca reopened carries a new pane id, so a card whose pane is gone
     takes the worktree's only unclaimed tab of its agent. `handle` is None
     while the tab sleeps, or when several tabs could be its own.
     `last_message` is what Orca kept of the agent's last word and can be empty;
-    the row's transcripts hold the rest.
+    the row's transcripts hold the rest. `screen_tail` is the end of the tab's
+    rendered screen (`screens` maps (environment, handle) to it) and `draft`
+    whether its composer holds unsent text; [] and None when it was not read.
     """
+    screens = screens or {}
     by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terms}
     panes = {a.get("paneKey") for a in agents}
     unclaimed = {}
@@ -471,31 +544,63 @@ def done_cards(agents, terms):
                     and by_pane.get(a.get("paneKey")) is None) == 1
         return own or (spare[0] if len(spare) == 1 and alone else None)
 
-    return [{
-        "agent": a.get("agentType"), "handle": handle_of(a),
-        "done_at": iso_time(a.get("stateStartedAt")), "interrupted": bool(a.get("interrupted")),
-        "prompt": a.get("prompt") or "", "last_message": a.get("lastAssistantMessage") or "",
-    } for a in agents if a.get("state") == "done"]
+    def card(agent):
+        handle = handle_of(agent)
+        screen = rendered(screens.get((environment, handle))) if handle else None
+        return {
+            "agent": agent.get("agentType"), "handle": handle,
+            "done_at": iso_time(agent.get("stateStartedAt")), "interrupted": bool(agent.get("interrupted")),
+            "prompt": agent.get("prompt") or "", "last_message": agent.get("lastAssistantMessage") or "",
+            "screen_tail": screen_tail(screen) if screen else [], "draft": has_draft(screen) if screen else None,
+        }
+
+    return [card(a) for a in agents if a.get("state") == "done"]
+
+
+def orca_said(worktree):
+    """Whether Orca keeps a last message of one of the worktree's agents."""
+    return any(agent.get("lastAssistantMessage") for agent in worktree.get("agents") or [])
+
+
+def with_screen_agents(terms, screens, environment):
+    """(terms, message): the tabs, each without an agent given the one its screen shows, and the last
+    Claude reply read on them. Another Mac's terminal list names a tab's agent on some reads only."""
+    found, message = [], ""
+    for term in terms:
+        screen = rendered(screens.get((environment, term.get("handle"))))
+        agent = screen_agent(screen) if screen else None
+        if screen and agent:
+            found.append(term if term.get("agentIdentity") else {**term, "agentIdentity": agent})
+            message = screen_message(screen) or message
+        else:
+            found.append(term)
+    return found, message
 
 
 def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
-                    now=None, shell_idle_minutes=30, judge=lambda message: None, mail=None):
+                    now=None, shell_idle_minutes=30, judge=lambda message: None, mail=None, screens=None):
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
     `asks`, `status`, and `confidence` (see jev_judge), or None when it failed.
     `mail` maps a lead's terminal handle to its unread worker mail (see
-    unread_worker_mail).
+    unread_worker_mail). `screens` maps (environment, handle) to a tab's
+    rendered screen (see read_screens): done cards show its end, and another
+    Mac's worktree whose agents Orca keeps no message of takes the agent and
+    last reply its tabs show.
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
+    screens = screens or {}
     now = time.time() if now is None else now
     by_worktree = {}
     for term in terminals:
         # An orphaned shell with no agent, title, screen, or output time cannot
-        # be read through its stale handle. Keep agent tabs and tabs with output.
+        # be read through its stale handle. Keep agent tabs, tabs with output,
+        # and tabs whose screen was read: another Mac lists live agent tabs so.
         if (term.get("orphaned") and not term.get("agentIdentity")
                 and not term.get("title") and not term.get("preview")
-                and term.get("lastOutputAt") is None):
+                and term.get("lastOutputAt") is None
+                and not rendered(screens.get((term.get("_environment"), term.get("handle"))))):
             continue
         # Orphaned and disconnected is the stale record of a closed tab; a tab
         # Orca detached from the window can stay connected and still run.
@@ -508,6 +613,9 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         if main and not w.get("agents"):
             continue
         terms = by_worktree.get((w.get("_environment"), w.get("worktreeId")), [])
+        screen_said = ""
+        if remote and not orca_said(w):
+            terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"))
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
@@ -520,7 +628,7 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
                           for t in terms],
             "codex_screen_error": next((error for t in terms if t.get("agentIdentity") == "codex"
                                         if (error := api_failure(t.get("preview")))), None),
-            "done_cards": done_cards(w.get("agents") or [], terms),
+            "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "claude": None if remote else read_claude(claude_root, w["path"]),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
@@ -530,6 +638,8 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
                 newest = max(spoken, key=lambda a: a.get("updatedAt") or 0)
                 row["orca_message"] = {"text": newest["lastAssistantMessage"],
                                        "at": iso_time(newest.get("updatedAt"))}
+            elif screen_said:
+                row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
         latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
@@ -1140,6 +1250,36 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
 ORCA_TIMEOUT = 60
 
 
+def screen_targets(worktrees, terminals):
+    """Tabs whose screens the scan reads: those of a worktree with a done agent, for its done cards, and
+    those of another Mac's worktree Orca holds no agent message for, for the agent and reply they show."""
+    done = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
+            if any(a.get("state") == "done" for a in w.get("agents") or [])}
+    bare = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
+            if w.get("_environment") and not orca_said(w)}
+    return [t for t in terminals if t.get("handle") and (
+        (key := (t.get("_environment"), t.get("worktreeId"))) in done or key in bare)]
+
+
+def read_screens(orca, terms):
+    """Each tab's rendered screen by (environment, handle), read from the Orca server that issued the
+    handle; a tab whose read fails is left out."""
+    def read(term):
+        where = ["--environment", term["_environment"]] if term.get("_environment") else []
+        try:
+            result = orca_payload(orca, ["terminal", "read", "--terminal", term["handle"], "--screen", *where])
+            return result.get("terminal") or result
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
+    if not terms:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(8, len(terms))) as pool:
+        read_back = list(pool.map(read, terms))
+    return {(term.get("_environment"), term["handle"]): screen
+            for term, screen in zip(terms, read_back) if isinstance(screen, dict)}
+
+
 def orca_runs(orca):
     """Every orchestration Run; run-list returns at most 100 a page."""
     runs, cursor, seen = [], None, set()
@@ -1225,6 +1365,10 @@ def parse_args(argv=None):
                        help="print one line per row: name | class (the verdict's, else the scan's) | GitHub "
                             "repo#PR state | tab count | newest final message time | question, waits_on, "
                             "next_step, or the final message's start")
+    views.add_argument("--cards", action="store_true",
+                       help="print one line per done card (handle, agent, interrupted, whether its composer holds a "
+                            "draft, Orca's copy of its last message, and the end of its screen), closable tab, and "
+                            "meaningful tab, each led by the worktree's name and class as in --rows")
     views.add_argument("--row", metavar="NAME",
                        help="print one row as JSON with fixed keys: strings are never null, `final` is the newest "
                             "final message of Claude, Codex, or Orca, and `github` is owner/repo from origin; "
@@ -1326,8 +1470,12 @@ def row_view(row: dict) -> dict:
     }
 
 
+def class_label(shown: str, scanned: str) -> str:
+    return shown + (f" (scan: {scanned})" if shown != scanned else "")
+
+
 def row_line(view: dict) -> str:
-    klass = view["class"] + (f" (scan: {view['scan_class']})" if view["class"] != view["scan_class"] else "")
+    klass = class_label(view["class"], view["scan_class"])
     pr = view["pr"] or {}
     where = (view["github"] + (f"#{pr['number']} {pr.get('state') or ''}".rstrip() if pr.get("number") else "")
              if view["github"] else "-")
@@ -1335,6 +1483,23 @@ def row_line(view: dict) -> str:
     note = " ".join((view["question"] or view["waits_on"] or view["next_step"]).split()) or (
         said[:80] + ("…" if len(said) > 80 else ""))
     return f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
+
+
+def card_lines(row: dict) -> list[str]:
+    """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown."""
+    lead = f"{row_name(row)} | {class_label((row.get('verdict') or {}).get('class') or row['class'], row['class'])}"
+    lines = []
+    for card in row.get("done_cards") or []:
+        said = " ".join((card.get("last_message") or "").split())
+        who = f"card {card.get('handle') or '-'} {card.get('agent') or '-'}" + (
+            " interrupted" if card.get("interrupted") else "")
+        draft = {True: "yes", False: "no"}.get(card.get("draft"), "unknown")
+        excerpt = (said[:160] + ("…" if len(said) > 160 else "")) or "-"
+        lines.append(f"{lead} | {who} | draft {draft} | {excerpt} | screen: "
+                     + (" ⏎ ".join(card.get("screen_tail") or []) or "-"))
+    lines.extend(f"{lead} | closable {handle}" for handle in row.get("closable") or [])
+    lines.extend(f"{lead} | meaningful {handle}" for handle in row.get("meaningful_tabs") or [])
+    return lines
 
 
 def saved_rows(path: str) -> list[dict]:
@@ -1376,10 +1541,12 @@ def main(argv=None):
         print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
               "idle final messages come back unsure, so read them", file=sys.stderr)
     judge = jev_judge(key) if key else (lambda message: None)
+    # Orca state read from files has no live tabs to read.
+    screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals))
     rows = add_next_step_facts(build_inventory(worktrees, terminals, str(Path(args.claude_projects).expanduser()),
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
-                                               mail=read_mail(args)))
+                                               mail=read_mail(args), screens=screens))
     rows = with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)
@@ -1394,6 +1561,10 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
     if args.rows:
         for row in rows:
             print(row_line(row_view(row)))
+    elif args.cards:
+        for row in rows:
+            for line in card_lines(row):
+                print(line)
     elif args.summary:
         print_summary(rows, verdicts)
     else:

@@ -1,7 +1,7 @@
 """Offline behavior tests for the orca-session-triage command line tools."""
 
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib.util
 import http.client
 import io
@@ -401,7 +401,8 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["done_cards"], [
             {"agent": "codex", "handle": "term_codex", "done_at": "2027-01-15T06:00:00Z",
-             "interrupted": False, "prompt": "fix #4", "last_message": "PR #5 is open for review."}])
+             "interrupted": False, "prompt": "fix #4", "last_message": "PR #5 is open for review.",
+             "screen_tail": [], "draft": None}])
 
     def test_a_done_card_whose_tab_sleeps_has_no_handle(self):
         rows = self.inventory(
@@ -433,6 +434,56 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([(r["path"], r["main"], [c["handle"] for c in r["done_cards"]]) for r in rows],
                          [("/repo/hosting", True, ["term_main"]), ("/w/t", False, [])])
+
+    def test_done_cards_carry_the_screen_end_and_whether_the_composer_holds_a_draft(self):
+        screen = {"source": "screen", "draft": "あとで送る返事", "tail": [
+            "⏺ PR #5 を出しました。", "", "✻ Baked for 3m 2s", "─" * 40, "❯", "─" * 40,
+            "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]}
+        rows = scan.build_inventory(
+            [{**worktree("/w/d"), "agents": [done_agent("claude", "tab1:leaf1"), done_agent("codex", "tab9:leaf9")]}],
+            [in_pane(terminal("/w/d", "claude", "term_claude"), "tab1:leaf1")],
+            self.projects, {}, "要判断", now=NOW, judge=judging({}), screens={(None, "term_claude"): screen})
+
+        cards = rows[0]["done_cards"]
+        self.assertEqual([(c["handle"], c["draft"], c["screen_tail"]) for c in cards], [
+            ("term_claude", True, ["⏺ PR #5 を出しました。", "✻ Baked for 3m 2s", "❯",
+                                   "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]),
+            (None, None, [])])
+
+    def test_a_remote_tab_without_agent_details_is_read_from_its_screen(self):
+        # MBP16's terminal list gave test-338 no agent, title, or preview while a Claude waited after worker_done.
+        remote = {**worktree("/remote/test-338"), "_environment": "macbook-pro-16"}
+        term = {**terminal("/remote/test-338", None, "term_r", title=None), "_environment": "macbook-pro-16",
+                "orphaned": True, "connected": True, "lastOutputAt": None}
+        screen = {"source": "screen", "tail": [
+            "⏺ PR #345 のレビュー指摘を直して push し、", "  coordinator に worker_done を送りました。", "",
+            "⏺ Bash(git push origin HEAD)", "  ⎿  Everything up-to-date", "",
+            "⏺ serena - find_symbol (MCP)(name_path: \"main\")", "  ⎿  {\"result\": []}", "",
+            "⏺ serena - search_for_pattern (MCP)(substring_pattern: \"worker_done\",", "  relative_path: \"e2e\")", "",
+            "⏺ Searched for 2 patterns, read 3 files (ctrl+o to expand)", "",
+            "✻ Baked for 5h 30m 24s · done 4:33 PM", "─" * 40, "❯", "─" * 40,
+            "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]}
+        # test-338's reply began above the visible screen: the lines before its turn-end line stand in.
+        # The same list names the agent of that tab on some reads, and the reply is still read.
+        scrolled = {**worktree("/remote/test-338b"), "_environment": "macbook-pro-16"}
+        scrolled_term = {**terminal("/remote/test-338b", "claude", "term_s"), "_environment": "macbook-pro-16"}
+        scrolled_screen = {"source": "screen", "tail": [
+            "    の計算値が原因です。", "  DB は残してあります。", "✻ Baked for 5h 30m 24s · done 4:33 PM", "❯"]}
+        # A working agent Orca keeps no message of was "unstarted" for want of a transcript.
+        working = {**worktree("/remote/masters-ui-125", "working"), "_environment": "macbook-pro-16"}
+        working_term = {**terminal("/remote/masters-ui-125", "claude", "term_w"), "_environment": "macbook-pro-16"}
+        said = []
+        rows = scan.build_inventory([remote, scrolled, working], [term, scrolled_term, working_term], self.projects,
+                                    {}, "要判断", now=NOW, judge=lambda message: said.append(message) or verdict(),
+                                    screens={("macbook-pro-16", "term_r"): screen,
+                                             ("macbook-pro-16", "term_s"): scrolled_screen,
+                                             ("macbook-pro-16", "term_w"): screen})
+
+        self.assertEqual(said, ["PR #345 のレビュー指摘を直して push し、\ncoordinator に worker_done を送りました。",
+                                "の計算値が原因です。\nDB は残してあります。"])
+        self.assertEqual(rows[0]["terminals"][0]["agent"], "claude")
+        self.assertEqual((rows[0]["class"], rows[0]["reasons"]), ("stalled", ["final message says done (Jev 0.90)"]))
+        self.assertEqual(rows[2]["class"], "working")
 
     def test_a_tab_orca_detached_but_still_runs_is_read(self):
         detached = {**terminal("/w/u", "claude", "term_detached"), "orphaned": True, "connected": True,
@@ -1249,7 +1300,11 @@ class ScanCommandTests(unittest.TestCase):
                         "last_user": "直して", "pending_questions": []},
              "codex": [], "git": {"github": "Eotel/app"}, "pr": {"number": 10, "state": "OPEN"},
              "verdict": {"class": "waiting", "question": "PR #10 を\nmerge するか", "waits_on": None,
-                         "next_step": None}},
+                         "next_step": None},
+             "done_cards": [{"agent": "claude", "handle": "term_1", "interrupted": False,
+                             "last_message": "PR #10 を出しました。\nmerge してよいですか",
+                             "screen_tail": ["✻ Baked for 3m", "❯"], "draft": False}],
+             "closable": ["term_2"], "meaningful_tabs": ["term_1"]},
             {"path": str(checkout), "repo": "dotfiles", "environment": None, "class": "unsure",
              "reasons": [], "comment": "作業中", "terminals": [],
              "claude": {"final_text": "古い発言", "final_at": "2026-10-27T01:00:00Z", "last_user": "古い依頼"},
@@ -1259,7 +1314,8 @@ class ScanCommandTests(unittest.TestCase):
                         "last_role": "assistant", "last_user": "設定を反映して"}]},
             {"path": "/remote/w/app", "repo": "app", "environment": "mbp16", "class": "waiting",
              "reasons": [], "comment": "", "terminals": [{"handle": None, "agent": None, "title": None}],
-             "claude": None, "codex": [], "orca_message": {"text": "どちらにしますか", "at": "2026-10-27T03:00:00Z"}},
+             "claude": None, "codex": [], "orca_message": {"text": "どちらにしますか", "at": "2026-10-27T03:00:00Z"},
+             "done_cards": [{"agent": "codex", "handle": None, "interrupted": True, "last_message": ""}]},
             {"path": "/w/app/fix-login", "repo": "app", "environment": "mbp16", "class": "working",
              "reasons": [], "comment": "", "terminals": [], "claude": None, "codex": []},
         ]
@@ -1279,6 +1335,19 @@ class ScanCommandTests(unittest.TestCase):
             f"dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました",
             "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか",
             "mbp16::fix-login | working | - | tabs 0 | - | ",
+        ])
+
+    def test_cards_print_each_done_card_and_tab_on_its_own_line_named_by_the_worktree(self):
+        saved, _ = self.saved_scan()
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--cards"]), 0)
+
+        self.assertEqual(out.getvalue().splitlines(), [
+            "fix-login | waiting (scan: stalled) | card term_1 claude | draft no"
+            " | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
+            "fix-login | waiting (scan: stalled) | closable term_2",
+            "fix-login | waiting (scan: stalled) | meaningful term_1",
+            "mbp16::app | waiting | card - codex interrupted | draft unknown | - | screen: -",
         ])
 
     def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self):
@@ -1346,6 +1415,23 @@ class ScanCommandTests(unittest.TestCase):
             scan.collect_worktrees_and_terminals("orca")
         self.assertIn("cannot read terminals", err.getvalue())
         self.assertIn("ws://remote.example:6768", err.getvalue())
+
+    def test_screens_are_read_from_the_server_that_issued_each_handle(self):
+        calls = []
+
+        def orca(cmd, *args, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stderr="", stdout=json.dumps(
+                {"result": {"terminal": {"source": "screen", "tail": [cmd[cmd.index("--terminal") + 1]]}}}))
+
+        terms = [{"handle": "term_l"}, {"handle": "term_r", "_environment": "macbook-pro-16"}]
+        with patch.object(scan.subprocess, "run", side_effect=orca):
+            screens = scan.read_screens("orca", terms)
+
+        self.assertEqual(screens, {(None, "term_l"): {"source": "screen", "tail": ["term_l"]},
+                                   ("macbook-pro-16", "term_r"): {"source": "screen", "tail": ["term_r"]}})
+        self.assertIn(["orca", "terminal", "read", "--terminal", "term_r", "--screen", "--environment",
+                       "macbook-pro-16", "--json"], calls)
 
     def test_removed_host_id_is_named_when_no_environment_selector_exists(self):
         local = {"worktrees": [], "hostScope": {"omittedHostSelectors": [
@@ -1727,6 +1813,48 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/web/src/api/__generated__/", "e2e/.auth/",
                                                         "e2e/.state/", "e2e/screenshots/", "src/paraglide/"])
 
+    def test_untracked_python_bytecode_is_regenerable_not_uncommitted(self):
+        (self.wt / "tool").mkdir()
+        (self.wt / "tool" / "run.py").write_text("print(1)\n")
+        git(self.wt, "add", "tool/run.py")
+        git(self.wt, "commit", "-q", "-m", "tool")
+        git(self.main, "merge", "-q", "--ff-only", "feature")
+        (self.wt / "tool" / "__pycache__").mkdir()
+        (self.wt / "tool" / "__pycache__" / "run.cpython-314.pyc").write_bytes(b"\x00")
+        (self.wt / "stale.pyc").write_bytes(b"\x00")
+        (self.wt / "notes" / "__pycache__").mkdir(parents=True)
+        (self.wt / "notes" / "__pycache__" / "keep.txt").write_text("hand-written\n")
+
+        result = self.check()
+
+        self.assertEqual(result["blockers"], ["1 uncommitted changes"])
+        self.assertEqual(result["uncommitted"], ["notes/"])
+        self.assertEqual(sorted(result["regenerable"]), ["stale.pyc", "tool/__pycache__/"])
+
+    def test_tool_output_the_repository_ignores_does_not_hold_up_removal(self):
+        # Seen in Orca worktrees: hook managers' install output, test reports and coverage, codegen, tool caches.
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n.vite-hooks/_/\nplaywright-report-real/\n"
+                                               ".coverage\nsrc/graphql/generated/\n.cache/\n")
+        git(self.main, "commit", "-q", "-am", "ignore tool output")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.wt / ".husky" / "_").mkdir(parents=True)
+        (self.wt / ".husky" / "_" / ".gitignore").write_text("*")
+        (self.wt / ".husky" / "_" / "h").write_text("#!/usr/bin/env sh\n")
+        (self.main / ".gitignore").write_text((self.main / ".gitignore").read_text() + "reports/generated/\n")
+        git(self.main, "commit", "-q", "-am", "ignore generated reports")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        for rel in (".vite-hooks/_/h", "playwright-report-real/index.html", "apps/api/.coverage",
+                    "src/graphql/generated/types.ts", ".cache/typecheck/state.json",
+                    "reports/generated/summary.html"):
+            (self.wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.wt / rel).write_text("x")
+
+        result = self.check()
+
+        self.assertEqual(result["review"], ["reports/generated/ (not in main checkout)"])
+        self.assertEqual(sorted(result["regenerable"]), [".husky/_/.gitignore", ".husky/_/h", ".vite-hooks/_/",
+                                                        "src/graphql/generated/"])
+
     def test_the_apm_installation_identity_does_not_hold_up_removal(self):
         # APM 0.35 writes these into each checkout it installs to, ignoring them with their own .gitignore.
         (self.wt / ".apm-local").mkdir()
@@ -1751,6 +1879,56 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(blocked["blockers"], ["HEAD %s is not in main" % head[:8]])
         self.assertTrue(squashed["ok"])
         self.assertTrue(reopened["ok"])
+
+    def test_a_merged_pr_of_the_branch_at_head_counts_without_pr(self):
+        git(self.main, "remote", "add", "origin", "git@github.com:acme/app.git")
+        (self.wt / "app.txt").write_text("squashed\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        head = git(self.wt, "rev-parse", "HEAD")
+        real_run = subprocess.run
+        lookups = []
+
+        def gh_lists(prs):
+            def fake_run(cmd, *args, **kwargs):
+                if cmd[0] == "gh":
+                    lookups.append(cmd)
+                    return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(prs), stderr="")
+                return real_run(cmd, *args, **kwargs)
+            return fake_run
+
+        merged = {"number": 7, "state": "MERGED", "headRefOid": head, "baseRefName": "main"}
+        with patch.object(rmcheck.subprocess, "run", side_effect=gh_lists([merged])):
+            code, result = self.run_main()
+        with patch.object(rmcheck.subprocess, "run", side_effect=gh_lists([{**merged, "headRefOid": "c" * 40}])):
+            other_code, other = self.run_main()
+
+        self.assertEqual((code, result["blockers"]), (0, []))
+        self.assertIn("PR #7", " ".join(result["notes"]))
+        self.assertEqual(lookups[0][:5], ["gh", "pr", "list", "--head", "feature"])
+        self.assertEqual((other_code, other["blockers"]), (1, ["HEAD %s is not in main" % head[:8]]))
+
+    def test_archive_scratch_moves_records_only_when_they_alone_keep_the_worktree(self):
+        (self.wt / ".yomiyasu" / "inputs").mkdir(parents=True)
+        (self.wt / ".yomiyasu" / ".gitignore").write_text("*\n")
+        (self.wt / ".yomiyasu" / "inputs" / "draft.md").write_text("原文\n")
+        (self.wt / ".investigate").mkdir()
+        (self.wt / ".investigate" / "notes.md").write_text("調べた記録\n")
+        archive = Path(self.tmp.name) / "archive"
+
+        default_code, _ = self.run_main()
+        (self.wt / "app.txt").write_text("unsaved work\n")
+        dirty_code, dirty = self.run_main("--archive-scratch", "--archive-dir", str(archive))
+        (self.wt / "app.txt").write_text("v1\n")
+        code, result = self.run_main("--archive-scratch", "--archive-dir", str(archive))
+
+        self.assertEqual((default_code, dirty_code), (1, 1))
+        self.assertEqual(dirty["archived"], [])
+        self.assertEqual((code, result["ok"], result["review"], result["blockers"]), (0, True, [], []))
+        self.assertFalse((self.wt / ".yomiyasu").exists() or (self.wt / ".investigate").exists())
+        moved = sorted(path.name for path in archive.iterdir())
+        self.assertRegex(" ".join(moved), r"^wt-investigate-\d{8} wt-yomiyasu-\d{8}$")
+        self.assertEqual((archive / moved[1] / "inputs" / "draft.md").read_text(), "原文\n")
+        self.assertEqual(sorted(Path(item["to"]).name for item in result["archived"]), moved)
 
     def test_open_pr_at_clean_checkout_head_is_removable(self):
         (self.wt / "app.txt").write_text("pushed change\n")
@@ -2680,7 +2858,8 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
-    def test_read_filters_by_kind_and_source_without_advancing_cursor(self):
+    def test_a_filtered_read_gives_no_offset_to_acknowledge(self):
+        # A filtered watch acknowledged the asks it hid (HOSYU_TEST-329 and 325, 2026-10-27 to 28).
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "read.offset"
@@ -2702,16 +2881,141 @@ class InboxReadTests(unittest.TestCase):
                     self.assertEqual(inbox_read.main([
                         "read", "--kind", "ask,done", "--source", "repo-a/same"]), 0)
                 self.assertEqual(output.getvalue(),
-                                 f"t1 ask host1 repo-a/same\n質問\n\n"
-                                 f"t3 done host1 repo-a/same\n完了\n\n"
-                                 f"NEXT_OFFSET={inbox.stat().st_size}\n")
+                                 "t1 ask host1 repo-a/same\n質問\n\n"
+                                 "t3 done host1 repo-a/same\n完了\n\n")
                 self.assertFalse(cursor.exists())
                 output = io.StringIO()
                 with redirect_stdout(output):
                     self.assertEqual(inbox_read.main(["read", "--source", "old"]), 0)
                 self.assertEqual(output.getvalue(),
-                                 f"t5 ask host1 old\n旧形式\n\n"
-                                 f"NEXT_OFFSET={inbox.stat().st_size}\n")
+                                 "t5 ask host1 old\n旧形式\n\n")
+
+    def test_questions_come_four_at_a_time_ready_for_ask_user_question(self):
+        def question(n, **extra):
+            return {"question": f"Q{n} をどうしますか？", "header": f"判断{n}", "multiSelect": False,
+                    "options": [{"label": "残す", "description": "今の帳票のまま"},
+                                {"label": "直す", "description": "移した帳票に合わせる"}],
+                    "recommended": "直す", **extra}
+
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            write_jsonl(inbox, [
+                {"id": "r1", "ts": "t1", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
+                 "handle": "term_a", "text": "判断 4 件", "questions": [
+                     question(1, issue="spin-dd/taihei-report#239"), question(2), question(3), question(4)]},
+                {"id": "r2", "ts": "t2", "kind": "ask", "host": "h", "worktree": "plain", "text": "文章だけの質問"},
+                {"id": "r3", "ts": "t3", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
+                 "text": "判断 2 件", "questions": [question(5), question(6)]},
+            ])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset"),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
+
+            def run(*argv):
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(list(argv)), 0)
+                return out.getvalue()
+
+            run("answered", "r1:2", "--note", "Q2 は直す")
+            first = json.loads(run("questions"))
+            rest = json.loads(run("questions", "--after", first["next_after"]))
+            # The lead answers the batch, then asks for the one after it.
+            run("answered", ",".join(item["id"] for item in first["items"]))
+            after_answered = json.loads(run("questions", "--after", first["next_after"]))
+
+        self.assertEqual([item["id"] for item in first["items"]], ["r1:1", "r1:3", "r1:4", "r3:1"])
+        self.assertEqual(first["questions"][0], {
+            "question": "Q1 をどうしますか？（spin-dd/taihei-report#239）", "header": "判断1", "multiSelect": False,
+            "options": [{"label": "直す（推奨）", "description": "移した帳票に合わせる"},
+                        {"label": "残す", "description": "今の帳票のまま"}]})
+        self.assertEqual((first["items"][0]["source"], first["items"][0]["handle"]), ("report/decisions", "term_a"))
+        self.assertEqual((first["remaining"], rest["remaining"], rest["next_after"]), (1, 0, None))
+        self.assertEqual([item["id"] for item in rest["items"]], ["r3:2"])
+        self.assertEqual([item["id"] for item in after_answered["items"]], ["r3:2"])
+
+    def test_open_asks_lists_unanswered_asks_oldest_first_until_answered(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            two = [{"question": f"Q{n}？", "header": f"Q{n}", "recommended": "A", "multiSelect": False,
+                    "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]}
+                   for n in (1, 2)]
+            write_jsonl(inbox, [
+                {"id": "late", "ts": "2026-10-28T09:00:00+0900", "kind": "ask", "host": "h", "worktree": "a",
+                 "text": "文章の質問"},
+                {"id": "done1", "ts": "2026-10-28T08:30:00+0900", "kind": "done", "host": "h", "worktree": "a",
+                 "text": "完了"},
+                {"id": "early", "ts": "2026-10-28T08:00:00+09:00", "kind": "ask", "host": "mbp16", "repo": "r",
+                 "worktree": "b", "text": "判断 2 件", "questions": two},
+                {"id": "c8f79c0f-1111-4222-8333-444455556666", "ts": "2026-10-28T09:30:00+09:00", "kind": "ask",
+                 "host": "h", "worktree": "c", "text": "merge してよいか"},
+            ])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
+
+            def run(*argv):
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
+                        redirect_stderr(io.StringIO()) as err:
+                    code = inbox_read.main(list(argv))
+                return code, out.getvalue(), err.getvalue()
+
+            listed = json.loads(run("open-asks", "--json")[1])
+            run("answered", "late,early:1", "--note", "send --decision で答えた")
+            partly = json.loads(run("open-asks", "--json")[1])
+            run("answered", "early:2")
+            by_prefix = run("answered", "c8f79c0f")
+            unknown = run("answered", "done1")
+            recorded = [json.loads(line)["id"] for line in (Path(root) / "answers.jsonl").read_text().splitlines()]
+
+            self.assertEqual([(ask["id"], ask["source"], ask["open_questions"]) for ask in listed],
+                             [("early", "r/b", [1, 2]), ("late", "a", []),
+                              ("c8f79c0f-1111-4222-8333-444455556666", "c", [])])
+            self.assertEqual([(ask["id"], ask["open_questions"]) for ask in partly],
+                             [("early", [2]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
+            self.assertEqual((by_prefix[0], recorded[-1]), (0, "c8f79c0f-1111-4222-8333-444455556666"))
+            self.assertEqual(run("open-asks")[1], "")
+            self.assertEqual(unknown[0], 1)
+            self.assertIn("done1", unknown[2])
+
+    def test_watch_shows_every_ask_and_done_and_reminds_of_asks_left_unanswered(self):
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "watch.offset"
+            old = (datetime.now().astimezone() - timedelta(minutes=30)).isoformat(timespec="seconds")
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            write_jsonl(inbox, [
+                {"id": "a1", "ts": old, "kind": "ask", "host": "h", "repo": "epm", "worktree": "x", "text": "古い質問"},
+                {"id": "i1", "ts": now, "kind": "info", "host": "h", "repo": "epm", "worktree": "x", "text": "経過"},
+                {"id": "a2", "ts": now, "kind": "ask", "host": "h", "repo": "cvm", "worktree": "y", "text": "新しい質問"},
+                {"id": "d1", "ts": now, "kind": "done", "host": "h", "repo": "cvm", "worktree": "y", "text": "完了"},
+            ])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as refused:
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+            self.assertIn("initialize", refused.getvalue())
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as shared:
+                del os.environ["TRIAGE_READ_OFFSET"]
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+            self.assertIn("TRIAGE_READ_OFFSET", shared.getvalue())
+            cursor.write_text("0")
+
+            def watch():
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["watch", "--once"]), 0)
+                return out.getvalue().splitlines()
+
+            first = watch()
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()):
+                inbox_read.main(["answered", "a1"])
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"id": "d2", "ts": now, "kind": "done", "host": "h", "worktree": "z",
+                                         "text": "次の完了"}, ensure_ascii=False) + "\n")
+            second = watch()
+
+        self.assertEqual([line.split("  ")[0] for line in first], [
+            f"{old} ask h epm/x id=a1", f"{now} ask h cvm/y id=a2", f"{now} done h cvm/y id=d1",
+            f"unanswered 30 min: {old} ask h epm/x id=a1"])
+        self.assertEqual([line.split("  ")[0] for line in second], [f"{now} done h z id=d2"])
 
     def test_summary_prints_one_short_line_per_entry(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2761,12 +3065,73 @@ class InboxReadTests(unittest.TestCase):
                     self.assertEqual(inbox_read.main(["read", "--brief", "--id", "c3,a1"]), 0)
                 self.assertEqual(output.getvalue(),
                                  "t1 ask host1 repo-a/same id=a1\n前半の質問\n" + "詳" * 200 + "\n\n"
-                                 "t3 done host1 repo-c/last id=c3\n完了\n\n"
-                                 f"NEXT_OFFSET={end}\n")
+                                 "t3 done host1 repo-c/last id=c3\n完了\n\n")
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
                     self.assertEqual(inbox_read.main(["read", "--id", "a1,zz"]), 1)
                 self.assertIn("zz", error.getvalue())
                 self.assertFalse(cursor.exists())
+
+    def test_id_reads_an_8_character_prefix_and_acknowledged_lines_without_moving_the_cursor(self):
+        # 2026-10-27 20:10: a handoff named "id c8f79c0f"; the full UUID copied by hand was mistyped.
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            handoff, twin = "beee5c90-48b7-425b-b802-568f7e486716", "beee5c90-9999-425b-b802-568f7e486716"
+            done = "c8f79c0f-1111-4222-8333-444455556666"
+            write_jsonl(inbox, [
+                {"id": handoff, "ts": "t1", "kind": "ask", "host": "h", "worktree": "a", "text": "前の回の引き継ぎ"},
+                {"id": twin, "ts": "t2", "kind": "info", "host": "h", "worktree": "b", "text": "経過"},
+                {"ts": "t0", "kind": "info", "host": "h", "worktree": "old", "text": "id の無い古い行"},
+            ])
+            acknowledged = str(inbox.stat().st_size)
+            cursor.write_text(acknowledged)
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"id": done, "ts": "t3", "kind": "done", "host": "h", "worktree": "c",
+                                         "text": "完了"}, ensure_ascii=False) + "\n")
+
+            def run(*argv):
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    return inbox_read.main(["read", *argv]), out.getvalue(), err.getvalue()
+
+            read = run("--id", "c8f79c0f,beee5c90-48b7")
+            ambiguous = run("--id", "beee5c90")
+            short = run("--id", "beee5c9")
+            position = cursor.read_text()
+
+        self.assertEqual(read, (0, f"t1 ask h a id={handoff} 既読\n前の回の引き継ぎ\n\n"
+                                   f"t3 done h c id={done}\n完了\n\n", read[2]))
+        self.assertEqual((ambiguous[0], ambiguous[1]), (1, ""))
+        self.assertIn(handoff, ambiguous[2])
+        self.assertIn(twin, ambiguous[2])
+        self.assertEqual(short[0], 1)
+        self.assertEqual(position, acknowledged)
+
+    def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self):
+        # 2026-10-28: read --id of epm-11432-review-fix's ask d57cdf88 showed only its one-line text.
+        asked = [{"question": "どちらで直しますか？", "header": "方針", "multiSelect": False, "recommended": "A",
+                  "issue": "spin-dd/taihei-epm-server#11432",
+                  "options": [{"label": "A", "description": "画面で止める"}, {"label": "B", "description": "API で止める"}]},
+                 {"question": "いつ出しますか？", "header": "時期", "multiSelect": False, "recommended": "今日",
+                  "options": [{"label": "今日", "description": "devel へ"}, {"label": "明日", "description": "本番と同時"}]}]
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            write_jsonl(inbox, [{"id": "d57cdf88-1111-4222-8333-444455556666", "ts": "t1", "kind": "ask", "host": "h",
+                                 "worktree": "epm-11432-review-fix", "text": "伺い直します", "questions": asked}])
+
+            def run(*argv):
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox),
+                                             "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset")}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["read", *argv]), 0)
+                return out.getvalue()
+
+            full, summary = run("--id", "d57cdf88"), run("--summary")
+
+        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] どちらで直しますか？（推奨: A）\n"
+                      "  - A: 画面で止める\n  - B: API で止める\n  関わる issue: spin-dd/taihei-epm-server#11432\n"
+                      "Q2 id=d57cdf88-1111-4222-8333-444455556666:2 [時期]", full)
+        self.assertIn("伺い直します  [質問 2 件: 方針・時期]", summary.splitlines()[0])
 
     def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
         with tempfile.TemporaryDirectory() as root:

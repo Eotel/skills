@@ -6,6 +6,15 @@
   titles and options come from the rollout. A request marked
   `answered_in_chat_later` was usually answered by a later user message: confirm
   before listing it. Put a recommended option first.
+- An inbox `ask` sent with `triage-notify --questions` carries its questions in
+  AskUserQuestion's shape. `scripts/inbox_read.py questions` prints the next
+  four as AskUserQuestion input (`questions`: the recommended option first and
+  marked, the issue named after the question) with each one's `id`, `source`,
+  and `handle` in `items` for relaying the answer. Relay each answer with
+  `send --decision <answer> --ask <id>`: the question drops out of the next
+  batch once the send lands. `--after <next_after>` pages on without recording
+  anything. The questions come from the asks not answered yet (`open-asks`),
+  wherever the inbox cursor stands.
 - Before asking a decision that a verdict or final message leaves open, search
   that lane's user messages and, in an hourly run, the shared questions and
   answers in `hourly-state.md`. A final
