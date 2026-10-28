@@ -3084,6 +3084,32 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual(short[0], 1)
         self.assertEqual(position, acknowledged)
 
+    def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self):
+        # 2026-10-28: read --id of epm-11432-review-fix's ask d57cdf88 showed only its one-line text.
+        asked = [{"question": "どちらで直しますか？", "header": "方針", "multiSelect": False, "recommended": "A",
+                  "issue": "spin-dd/taihei-epm-server#11432",
+                  "options": [{"label": "A", "description": "画面で止める"}, {"label": "B", "description": "API で止める"}]},
+                 {"question": "いつ出しますか？", "header": "時期", "multiSelect": False, "recommended": "今日",
+                  "options": [{"label": "今日", "description": "devel へ"}, {"label": "明日", "description": "本番と同時"}]}]
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            write_jsonl(inbox, [{"id": "d57cdf88-1111-4222-8333-444455556666", "ts": "t1", "kind": "ask", "host": "h",
+                                 "worktree": "epm-11432-review-fix", "text": "伺い直します", "questions": asked}])
+
+            def run(*argv):
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox),
+                                             "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset")}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["read", *argv]), 0)
+                return out.getvalue()
+
+            full, summary = run("--id", "d57cdf88"), run("--summary")
+
+        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] どちらで直しますか？（推奨: A）\n"
+                      "  - A: 画面で止める\n  - B: API で止める\n  関わる issue: spin-dd/taihei-epm-server#11432\n"
+                      "Q2 id=d57cdf88-1111-4222-8333-444455556666:2 [時期]", full)
+        self.assertIn("伺い直します  [質問 2 件: 方針・時期]", summary.splitlines()[0])
+
     def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"

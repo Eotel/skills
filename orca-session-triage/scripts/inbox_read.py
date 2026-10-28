@@ -117,12 +117,34 @@ def source_of(item: dict) -> str:
     return f"{item['repo']}/{worktree}" if item.get("repo") else worktree
 
 
+def asked_questions(item: dict) -> list[dict]:
+    return [question for question in questions_of(item) if isinstance(question, dict)]
+
+
 def summary_line(item: dict) -> str:
-    """`<ts> <kind> <host> <source> id=<id>  <first 160 characters>`, as `read --summary` prints an entry."""
+    """`<ts> <kind> <host> <source> id=<id>  <first 160 characters>`, as `read --summary` prints an entry,
+    then the headers of an ask's structured questions."""
     label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
     location = source_of(item) + (f" id={item['id']}" if item.get("id") else "")
     compact = " ".join((item.get("text") or "").split())
-    return f"{label} {location}  {compact[:160]}" + ("…" if len(compact) > 160 else "")
+    asked = asked_questions(item)
+    headers = f"  [質問 {len(asked)} 件: {'・'.join(str(q.get('header')) for q in asked)}]" if asked else ""
+    return f"{label} {location}  {compact[:160]}" + ("…" if len(compact) > 160 else "") + headers
+
+
+def full_text(item: dict) -> str:
+    """An entry's text, then each structured question with the id that answers it (`send --ask <id>:<n>`)."""
+    lines = [item.get("text") or ""]
+    for number, question in enumerate(questions_of(item), 1):
+        if not isinstance(question, dict):
+            continue
+        lines.append(f"Q{number} id={item.get('id')}:{number} [{question.get('header')}] {question.get('question')}"
+                     f"（推奨: {question.get('recommended')}）")
+        lines.extend(f"  - {option.get('label')}: {option.get('description')}"
+                     for option in question.get("options") or [] if isinstance(option, dict))
+        if question.get("issue"):
+            lines.append(f"  関わる issue: {question['issue']}")
+    return "\n".join(lines)
 
 
 def entry_header(item: dict) -> str:
@@ -147,7 +169,7 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
             if options.summary:
                 print(summary_line(item))
                 continue
-            body = item.get("text") or ""
+            body = full_text(item)
             if options.brief and item.get("kind") == "info":
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
@@ -198,7 +220,7 @@ def read_ids(inbox: Path, cursor: Path, options: ReadOptions) -> None:
         raise ValueError("no entry has id " + ",".join(missing))
     for end, item in sorted({id(item): (end, item) for found in hits.values() for end, item in found}.values(),
                             key=lambda hit: hit[0]):
-        print(f"{entry_header(item)}{' 既読' if end <= acknowledged else ''}\n{item.get('text') or ''}\n")
+        print(f"{entry_header(item)}{' 既読' if end <= acknowledged else ''}\n{full_text(item)}\n")
 
 
 def inbox_entries(inbox: Path) -> list[dict]:

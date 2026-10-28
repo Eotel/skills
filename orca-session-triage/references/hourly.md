@@ -126,8 +126,11 @@ as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
 The lead records an answer with
-`lead_decisions.py record --decision KEY --answer-file FILE`; records are only
-appended, and a later record for a key replaces its earlier answer.
+`lead_decisions.py record --decision KEY --answer-file FILE`, or, when it relays
+the answer to a lane, with `send --decision <answer> --key KEY` (repeat per key,
+with `--ask <id>` for the ask it answers): the key and the ask are recorded
+answered once the send lands. Records are only appended, and a later record for
+a key replaces its earlier answer.
 
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and
