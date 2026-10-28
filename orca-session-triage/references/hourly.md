@@ -107,7 +107,12 @@ The lead does not send terminal input to a scheduled tab, so its answers reach
 later runs through `scripts/lead_decisions.py`. Give each question in the
 handoff a stable key in the form `hourly_state.py asked --decision` uses, such
 as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
-`--decision` key already has an answer and prints those answers.
+`--decision` key already has an answer and prints those answers, and records
+each key it sends. Key a question about an Asana 99 value as
+`asana:<item>:<owner/repo>#<number>`, item one of `complete`, `priority`,
+`assignee`, `review-state`, `pr-state` (`asana:complete:example/app#12`):
+until the key has an answer, `asana99_status.py` marks that difference
+答え待ち and `asana_pr.py ensure` refuses to write it.
 `lead_decisions.py show` gives the answers: follow each as
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.

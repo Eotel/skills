@@ -5,7 +5,9 @@
 byte offset the run read at its start (`--since`, its first NEXT_OFFSET), and the
 lead's latest message and unanswered questions read again from its transcript. It
 refuses to send while a handed-off decision key already has the lead's answer in
-lead_decisions.py: follow that answer and drop the question instead. After sending,
+lead_decisions.py: follow that answer and drop the question instead. Just before sending it
+records each --decision key as handed off (lead_decisions.handed_off reads them), so tools can
+hold a write until the key's answer is recorded. After sending,
 ack the NEXT_OFFSET it prints: every inbox entry before it is in the handoff.
 """
 
@@ -73,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="triage inbox (default: $TRIAGE_INBOX or %(default)s)")
     send.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                       help="the lead's decision log (default: %(default)s)")
+    send.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG,
+                      help="where the handed-off --decision keys are appended (default: %(default)s)")
     send.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                       help="Claude Code transcript root (default: %(default)s)")
     send.add_argument("--notify", default=NOTIFY, help="triage-notify executable (default: %(default)s)")
@@ -92,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
                  f"走査の開始後に届いた報告: {len(reports)} 件" + ("" if reports else "（なし）"), *reports]
         if args.lead_worktree:
             facts.append(lead_state(args.claude_projects.expanduser(), args.lead_worktree))
+        if args.decision:
+            lead_decisions.append(args.handed_off_file.expanduser(),
+                                  *map(lead_decisions.HandOff.now, dict.fromkeys(args.decision)))
         subprocess.run([str(Path(args.notify).expanduser()), "--kind", args.kind, "\n\n".join([body, "\n".join(facts)])],
                        check=True, capture_output=True, text=True, timeout=60)
     except subprocess.CalledProcessError as error:
