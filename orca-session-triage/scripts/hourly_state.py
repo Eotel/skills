@@ -9,6 +9,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+from functools import cached_property
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from typing import Protocol
 import uuid
 
 import scan_sessions
@@ -25,6 +27,13 @@ DEFAULT_STATE = "~/.cache/orca-session-triage/hourly-state.json"
 # Beside the state file: {"repos": ["owner/name", ...]} whose open issues become requests.
 ISSUE_REPOS = "issue-repos.json"
 REPO_SLUG = re.compile(r"[\w.-]+/[\w.-]+")
+ISSUE_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/issues/\d+")
+ISSUE_LIMIT = 1000  # open issues gh lists per repository; a list this long may be cut
+GH_TIMEOUT = 60
+# A paired Mac that does not answer Orca within this is skipped, so a run that reads
+# Orca itself still ends well inside the 300 seconds before the next hourly run.
+REMOTE_ORCA_TIMEOUT = 15
+READ_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError)
 
 
 @dataclass(frozen=True)
@@ -39,15 +48,74 @@ class Issue:
 
 @dataclass(frozen=True)
 class Checkout:
-    """An Orca worktree and the GitHub issues and PRs Orca links to it."""
+    """A worktree and the GitHub issues and PRs its host links to it."""
     identity: str
-    repo: str  # owner/name, or Orca's repository name when the owner is unknown
+    repo: str  # owner/name, or the host's repository name when the owner is unknown
     issues: frozenset[int]
     prs: frozenset[int]
 
     def works_on(self, issue: Issue) -> bool:
         same_repo = self.repo == issue.repo or ("/" not in self.repo and self.repo == issue.repo.split("/")[1])
         return same_repo and (issue.number in self.issues or bool(self.prs & issue.closing_prs))
+
+
+class WorktreeHost(Protocol):
+    """Where the checkouts come from, and which of them a live lane works in.
+
+    Orca is the host today; another one (t3code, say) answers the same two questions.
+    """
+
+    def checkouts(self) -> list[Checkout]: ...
+
+    def live_owners(self) -> frozenset[str]: ...
+
+
+@dataclass(frozen=True)
+class OrcaHost:
+    """Orca's worktrees, read now. Telling a live lane from a finished one takes the scan, so it names none."""
+    orca: str
+
+    def checkouts(self) -> list[Checkout]:
+        return [checkout_of(scan_keys(worktree)) for worktree in orca_worktrees(self.orca)]
+
+    def live_owners(self) -> frozenset[str]:
+        return frozenset()
+
+
+@dataclass(frozen=True)
+class SavedScan:
+    """The rows scan_sessions.py printed, read without asking Orca again."""
+    rows: list[dict]
+
+    def checkouts(self) -> list[Checkout]:
+        return [checkout_of(row) for row in self.rows]
+
+    def live_owners(self) -> frozenset[str]:
+        """Rows with an agent tab whose class (a careful read's verdict over the scan's) is not finished."""
+        return frozenset(scan_sessions.row_identity(row) for row in self.rows
+                         if any(term.get("agent") for term in row.get("terminals") or [])
+                         and ((row.get("verdict") or {}).get("class") or row.get("class")) != "finished")
+
+
+@dataclass(frozen=True)
+class Intake:
+    """What one run read: the open issues, the repositories gh listed in full, and the host's checkouts."""
+    issues: tuple[Issue, ...]
+    complete: frozenset[str]  # lowercased owner/name of each repository whose whole open list gh returned
+    checkouts: tuple[Checkout, ...]
+
+    @cached_property
+    def open_urls(self) -> frozenset[str]:
+        return frozenset(issue.url for issue in self.issues)
+
+    def no_longer_open(self, request: dict) -> str | None:
+        """owner/name when the request came from an issue that its repository's full open list, read now, lacks."""
+        source = request.get("source")
+        url = source.get("url") if isinstance(source, dict) and source.get("kind") == "github_issue" else None
+        found = ISSUE_URL.fullmatch(url) if isinstance(url, str) else None
+        if found is None or found.group(1).lower() not in self.complete or url in self.open_urls:
+            return None
+        return found.group(1)
 
 
 def issue_repos(path: Path) -> list[str]:
@@ -61,14 +129,34 @@ def issue_repos(path: Path) -> list[str]:
 
 
 def gh_open_issues(repo: str) -> list[dict]:
-    out = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", "1000",
+    out = subprocess.run(["gh", "issue", "list", "-R", repo, "--state", "open", "--limit", str(ISSUE_LIMIT),
                           "--json", "number,title,url,assignees,closedByPullRequestsReferences"],
-                         capture_output=True, text=True, check=True, timeout=60).stdout
+                         capture_output=True, text=True, check=True, timeout=GH_TIMEOUT).stdout
     return json.loads(out)
 
 
+def listed_issues(repo: str) -> list[Issue]:
+    return [Issue(repo=repo, number=item["number"], title=item["title"], url=item["url"],
+                  closing_prs=frozenset(pr["number"] for pr in item.get("closedByPullRequestsReferences") or []),
+                  assignees=tuple(person["login"] for person in item.get("assignees") or []))
+            for item in gh_open_issues(repo)]
+
+
+def open_issues(repo: str) -> list[Issue] | None:
+    """The open issues gh lists for repo, asking once more after a failed read; None when both fail."""
+    try:
+        return listed_issues(repo)
+    except READ_ERRORS as error:
+        print(f"hourly state: reading open issues of {repo} again after: {error}", file=sys.stderr)
+    try:
+        return listed_issues(repo)
+    except READ_ERRORS as error:
+        print(f"hourly state: open issues of {repo} not imported: {error}", file=sys.stderr)
+        return None
+
+
 def orca_worktrees(orca: str) -> list[dict]:
-    return scan_sessions.collect_worktrees_and_terminals(orca)[0]
+    return scan_sessions.collect_worktrees_and_terminals(orca, remote_timeout=REMOTE_ORCA_TIMEOUT)[0]
 
 
 def origin_slug(path: str) -> str | None:
@@ -80,51 +168,54 @@ def origin_slug(path: str) -> str | None:
     return scan_sessions.github_slug(origin.stdout.strip()) if origin.returncode == 0 else None
 
 
-def checkout_of(worktree: dict) -> Checkout:
-    linked = worktree.get("linkedPR") or {}
+def scan_keys(worktree: dict) -> dict:
+    """An Orca worktree under the key names a scan row gives the same facts."""
+    return {"path": worktree["path"], "environment": worktree.get("_environment"), "repo": worktree.get("repo"),
+            "linked_pr": worktree.get("linkedPR"), "linked_issue": worktree.get("linkedIssue"),
+            "linked_items": worktree.get("linkedItems") or []}
+
+
+def checkout_of(row: dict) -> Checkout:
+    """A scan row's checkout, with the issues and PRs Orca links to it."""
+    linked = row.get("linked_pr") or {}
     found = scan_sessions.PR_URL.search(linked.get("url") or "")
-    slug = found.group(1) if found else None if worktree.get("_environment") else origin_slug(worktree["path"])
-    items = [item for item in worktree.get("linkedItems") or [] if isinstance(item, dict)]
+    slug = found.group(1) if found else None if row.get("environment") else origin_slug(row["path"])
+    items = [item for item in row.get("linked_items") or [] if isinstance(item, dict)]
     return Checkout(
-        identity=scan_sessions.row_identity({"environment": worktree.get("_environment"), "path": worktree["path"]}),
-        repo=slug or worktree.get("repo") or "",
-        issues=frozenset([*([worktree["linkedIssue"]] if worktree.get("linkedIssue") else []),
+        identity=scan_sessions.row_identity(row),
+        repo=slug or row.get("repo") or "",
+        issues=frozenset([*([row["linked_issue"]] if row.get("linked_issue") else []),
                           *(item.get("number") for item in items if item.get("type") == "issue")]),
         prs=frozenset([*([linked["number"]] if linked.get("number") else []),
                        *(item.get("number") for item in items if item.get("type") == "pr")]))
 
 
-def issue_intake(state: Path, orca: str) -> tuple[list[Issue], list[Checkout]] | None:
-    """Open issues of the listed repositories and the checkouts working on issues, or None when none are listed.
+def issue_intake(state: Path, host: WorktreeHost) -> Intake | None:
+    """Open issues of the listed repositories and the host's checkouts, or None when none are listed.
 
-    A repository gh cannot read is left out with a warning; without Orca's worktrees nothing is imported.
+    A repository gh cannot read twice is left out with a warning; without the checkouts nothing is imported.
     """
     repos = issue_repos(state.parent / ISSUE_REPOS)
     if not repos:
         return None
     try:
-        checkouts = [checkout_of(worktree) for worktree in orca_worktrees(orca)]
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
-        print(f"hourly state: open issues not imported, Orca worktrees unreadable: {error}", file=sys.stderr)
+        checkouts = tuple(host.checkouts())
+    except READ_ERRORS as error:
+        print(f"hourly state: open issues not imported, worktrees unreadable: {error}", file=sys.stderr)
         return None
-    issues = []
-    for repo in repos:
-        try:
-            issues += [Issue(repo=repo, number=item["number"], title=item["title"], url=item["url"],
-                             closing_prs=frozenset(pr["number"] for pr in item.get("closedByPullRequestsReferences") or []),
-                             assignees=tuple(person["login"] for person in item.get("assignees") or []))
-                       for item in gh_open_issues(repo)]
-        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
-            print(f"hourly state: open issues of {repo} not imported: {error}", file=sys.stderr)
-    return issues, checkouts
+    read = {repo: open_issues(repo) for repo in repos}
+    listed = {repo: issues for repo, issues in read.items() if issues is not None}
+    return Intake(issues=tuple(issue for issues in listed.values() for issue in issues),
+                  complete=frozenset(repo.lower() for repo, issues in listed.items() if len(issues) < ISSUE_LIMIT),
+                  checkouts=checkouts)
 
 
-def import_issues(data: dict, issues: list[Issue], checkouts: list[Checkout]) -> None:
+def import_issues(data: dict, intake: Intake) -> None:
     """Record each open issue as a request once; an ownerless one gets the checkout that works on it."""
     recorded = {request["source"].get("url"): request for request in data["requests"].values()
                 if isinstance(request.get("source"), dict)}
-    for issue in issues:
-        owner = next((checkout.identity for checkout in checkouts if checkout.works_on(issue)), None)
+    for issue in intake.issues:
+        owner = next((checkout.identity for checkout in intake.checkouts if checkout.works_on(issue)), None)
         request = recorded.get(issue.url)
         if request is None:
             data["requests"][uuid.uuid4().hex[:16]] = {
@@ -133,6 +224,19 @@ def import_issues(data: dict, issues: list[Issue], checkouts: list[Checkout]) ->
                 "source": {"kind": "github_issue", "url": issue.url, "assignees": list(issue.assignees)}}
         elif request["closed_at"] is None and request["owner"] is None and owner:
             request["owner"] = owner
+
+
+def owner_report(data: dict, live: frozenset[str], intake: Intake | None) -> dict[str, list[dict]]:
+    """Open requests without a live owner; apart from them, those whose GitHub issue is no longer open."""
+    open_requests = [(key, request, intake.no_longer_open(request) if intake else None)
+                     for key, request in data["requests"].items() if request["closed_at"] is None]
+    return {
+        "needs_owner": [{"id": key, **request} for key, request, gone in open_requests
+                        if gone is None and request["owner"] not in live],
+        "closed_issues": [{"id": key, **request,
+                           "decided_by": f"gh issue list -R {gone} --state open in this run does not list it"}
+                          for key, request, gone in open_requests if gone is not None],
+    }
 
 
 def read(path):
@@ -269,7 +373,7 @@ def change(data, args):
     raise ValueError(args.action)
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-file", default=DEFAULT_STATE, help="shared hourly state JSON path")
     commands = parser.add_subparsers(dest="action", required=True)
@@ -278,13 +382,22 @@ def main(argv=None):
                                         "and left row, each with its id (row for left rows)")
     needs_owner = commands.add_parser(
         "requests-needing-owner",
-        help="list open requests without a live owner; first record each open GitHub issue of the repositories "
-             f"in {ISSUE_REPOS} beside the state file once, owned by the Orca worktree Orca links to it or to a PR "
-             "that closes it")
+        help="print {needs_owner, closed_issues}: open requests without a live owner, and apart from them the "
+             "requests whose GitHub issue gh no longer lists as open; first record each open GitHub issue of the "
+             f"repositories in {ISSUE_REPOS} beside the state file once, owned by the worktree Orca links to it "
+             "or to a PR that closes it")
     needs_owner.add_argument("--live-owner", action="append", default=[],
                              help="active scan row identity (PATH or ENVIRONMENT::PATH); repeat per owner")
+    needs_owner.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
+                             help="read the rows scan_sessions.py printed as JSON instead of Orca: each row with an "
+                                  "agent tab whose class (the verdict's, else the scan's) is not finished is a live "
+                                  "owner, added to --live-owner")
+    needs_owner.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
+                             help="with --from, the careful reads' verdict store whose verdicts the rows take, "
+                                  "including those classed after the scan was saved (default: %(default)s)")
     needs_owner.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
-                             help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
+                             help="Orca CLI executable, read without --from (default: $ORCA_CLI_COMMAND or orca); "
+                                  f"a paired Mac that does not answer within {REMOTE_ORCA_TIMEOUT} s is skipped")
     request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
     request_open.add_argument("--original-file", required=True)
     request_open.add_argument("--symptom-file", required=True)
@@ -326,22 +439,28 @@ def main(argv=None):
     path = Path(args.state_file).expanduser()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        intake = issue_intake(path, args.orca) if args.action == "requests-needing-owner" else None
+        live: frozenset[str] = frozenset()
+        intake: Intake | None = None
+        if args.action == "requests-needing-owner":
+            # A saved scan predates the verdicts orca-row-classify wrote after it; take them as scan --from does.
+            host: WorktreeHost = (SavedScan(scan_sessions.with_verdicts(
+                scan_sessions.saved_rows(args.from_file), scan_sessions.absorb_verdicts(args.verdicts, write=False)))
+                if args.from_file else OrcaHost(args.orca))
+            live = frozenset(owner_name(value) for value in args.live_owner) | host.live_owners()
+            intake = issue_intake(path, host)
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
             read_only = ("show", "pending", "left-now", "requests-needing-owner")
             writes = args.action not in read_only or intake is not None
             fcntl.flock(lock, fcntl.LOCK_EX if writes else fcntl.LOCK_SH)
             data = read(path)
             if intake is not None:
-                import_issues(data, *intake)
+                import_issues(data, intake)
             left_matches = False
             if args.action == "left-now":
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": left_matches}
             elif args.action == "requests-needing-owner":
-                live = {owner_name(value) for value in args.live_owner}
-                result = [{"id": key, **request} for key, request in data["requests"].items()
-                          if request["closed_at"] is None and request["owner"] not in live]
+                result = owner_report(data, live, intake)
             elif args.action == "pending":
                 result = pending(data)
             else:

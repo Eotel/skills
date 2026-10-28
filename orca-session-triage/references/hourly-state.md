@@ -44,19 +44,36 @@ identify more than one lane across Macs.
 the repositories in `issue-repos.json` beside the state file
 (`{"repos": ["owner/name", ...]}`, kept on this Mac only). Each open issue is
 recorded once, with its title and URL as the original request and its
-`source.url`. Its owner is the Orca worktree Orca links to that issue or to a
+`source.url`. Its owner is the worktree Orca links to that issue or to a
 PR that closes it; an ownerless one gets that worktree when it appears. The
-lead assigns the rest like any request. A repository gh cannot read is skipped
-with a warning, and nothing is imported while Orca's worktrees are unreadable.
+lead assigns the rest like any request. A failed `gh issue list` is read once
+more; a repository gh still cannot read is skipped with a warning, and nothing
+is imported while the worktrees are unreadable.
 
 Every hourly run reads the open requests in `show` and compares each assigned
-lane with the scan. After the scan, run `requests-needing-owner`, passing
-`--live-owner ROW_IDENTITY` once for each lane still actively handling its
-assigned request. Send every returned request to the lead on every run, even
-when that lane reported `done` earlier. The lead assigns a live lane or asks
-for the needed direction. If the hourly run is the lead, it handles these
-requests itself. A lane's `done` only changes its lane status; it does not close
-the user's request.
+lane with the scan. After the scan, run `requests-needing-owner --from
+SCAN_JSON` with the JSON the scan printed, saved to a file. The rows take the
+verdicts in `~/.cache/orca-session-triage/verdicts.json` as `scan_sessions.py
+--from` does, including those `orca-row-classify` wrote after the scan was
+saved. Each row with an agent tab whose class (the verdict's, else the scan's)
+is not `finished` is a live owner, and the issue links come from the same rows,
+so Orca is not read again. Add `--live-owner ROW_IDENTITY` for a lane the scan did not show that is
+still handling its assigned request. Without `--from`, the command reads Orca
+itself, skips a paired Mac that does not answer within 15 seconds, and treats
+only the `--live-owner` lanes as live.
+
+It prints `{"needs_owner": [...], "closed_issues": [...]}`, each entry with its
+`id`. Send every `needs_owner` request to the lead on every run, even when that
+lane reported `done` earlier. The lead assigns a live lane or asks for the
+needed direction. If the hourly run is the lead, it handles these requests
+itself. A lane's `done` only changes its lane status; it does not close the
+user's request. `closed_issues` lists the requests whose GitHub issue is
+missing from its repository's open issues read in this run; `decided_by` names
+that read. Their recorded symptom, the issue being open, is gone, so they are
+candidates to close: the lead closes each with `request-close`, citing that
+read, without opening the issues one by one. A repository gh could not read,
+or whose open list reached gh's 1,000-issue limit, decides nothing, and its
+requests stay in `needs_owner`.
 
 The lead checks the original symptom in the real environment before closing
 the request. Record the observation in a UTF-8 file and run `request-close

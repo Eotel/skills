@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -629,6 +630,7 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
             "comment": w.get("comment"), "linked_pr": w.get("linkedPR"),
+            "linked_issue": w.get("linkedIssue"), "linked_items": w.get("linkedItems") or [],
             "status": w.get("workspaceStatus"),
             "unread": bool(w.get("unread")),
             "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a)}
@@ -1326,18 +1328,18 @@ def read_codex(session_roots, since=None):
     return by_cwd
 
 
-def orca_payload(orca, args, json_file=None):
+def orca_payload(orca: str, args: list[str], json_file: str | None = None, timeout: float | None = None) -> Any:
     if json_file:
         data = json.loads(Path(json_file).read_text())
     else:
         out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True,
-                             check=True, timeout=ORCA_TIMEOUT).stdout
+                             check=True, timeout=timeout or ORCA_TIMEOUT).stdout
         data = json.loads(out)
     return data.get("result", data) if isinstance(data, dict) else data
 
 
-def orca_result(orca, args, key, json_file):
-    return orca_payload(orca, args, json_file)[key]
+def orca_result(orca: str, args: list[str], key: str, json_file: str | None, timeout: float | None = None) -> Any:
+    return orca_payload(orca, args, json_file, timeout)[key]
 
 
 def endpoint_diagnostic(environment, environments):
@@ -1367,8 +1369,13 @@ def endpoint_diagnostic(environment, environments):
         return f"saved endpoint {endpoint}; TCP port {parsed.port} reachable from this Mac: no ({error})"
 
 
-def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
-    """Read this Mac and the paired Orca servers named in its scope."""
+def collect_worktrees_and_terminals(orca: str, ps_json: str | None = None, terminals_json: str | None = None,
+                                    remote_timeout: float | None = None) -> tuple[list[dict], list[dict]]:
+    """Read this Mac and the paired Orca servers named in its scope.
+
+    `remote_timeout` caps each read of a paired server (default ORCA_TIMEOUT), so one that
+    does not answer is skipped with its warning sooner.
+    """
     local = orca_payload(orca, ["worktree", "ps"], ps_json)
     worktrees = list(local["worktrees"])
     terminals = orca_result(orca, ["terminal", "list"], "terminals", terminals_json)
@@ -1396,7 +1403,7 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
             continue
         environment = parts[1]
         try:
-            remote = orca_payload(orca, ["worktree", "ps", "--environment", environment])
+            remote = orca_payload(orca, ["worktree", "ps", "--environment", environment], timeout=remote_timeout)
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
             detail = endpoint_diagnostic(environment, environments)
             print(f"cannot scan Orca environment {environment}: {error}; {detail}; local rows remain available",
@@ -1405,7 +1412,7 @@ def collect_worktrees_and_terminals(orca, ps_json=None, terminals_json=None):
         worktrees.extend({**worktree, "_environment": environment} for worktree in remote["worktrees"])
         try:
             remote_terms = orca_result(orca, ["terminal", "list", "--environment", environment],
-                                       "terminals", None)
+                                       "terminals", None, remote_timeout)
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
             detail = endpoint_diagnostic(environment, environments)
             print(f"cannot read terminals in Orca environment {environment}: {error}; {detail}",
