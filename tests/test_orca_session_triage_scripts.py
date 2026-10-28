@@ -3703,6 +3703,26 @@ class InboxAlertTests(unittest.TestCase):
             None,
         ])
 
+    def test_a_slow_paired_server_still_switches_to_the_reported_tab(self):
+        answer = fake_orca({}, {"laptop": "Laptop-16"})
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(tuple(args[1:3]))
+            if calls[-1] == ("terminal", "list"):
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return answer(args, **kwargs)
+
+        tabs = inbox_alert.OrcaTabs("/o/orca", local_host="this-mac")
+        item = {"host": "Laptop-16.local", "worktree": "lane-c", "handle": "term_c"}
+        with patch.object(inbox_alert.subprocess, "run", side_effect=run), redirect_stderr(io.StringIO()):
+            actions = [tabs.action(item), tabs.action(item)]
+        switch = inbox_alert.Command(("/o/orca", "terminal", "switch", "--terminal", "term_c",
+                                      "--environment", "laptop"))
+        self.assertEqual(actions, [switch, switch])
+        # Each ask from that Mac waited again on the server's name before the cache.
+        self.assertEqual(calls.count(("host", "name")), 1)
+
 
 class NoTab:
     def __init__(self, action=None):
