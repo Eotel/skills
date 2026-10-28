@@ -1,5 +1,6 @@
 """Offline behavior tests for the hourly handoff that adds what changed after the scan."""
 
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +10,12 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts" / "handoff.py"
+spec = importlib.util.spec_from_file_location("lead_decisions", SCRIPT.with_name("lead_decisions.py"))
+assert spec is not None and spec.loader is not None
+lead_decisions = importlib.util.module_from_spec(spec)
+# dataclasses resolve string annotations through sys.modules.
+sys.modules[spec.name] = lead_decisions
+spec.loader.exec_module(lead_decisions)
 
 
 class HandoffTests(unittest.TestCase):
@@ -18,6 +25,7 @@ class HandoffTests(unittest.TestCase):
         self.root.mkdir()
         self.inbox = self.root / "inbox.jsonl"
         self.decisions = self.root / "lead-decisions.jsonl"
+        self.handed_off = self.root / "handed-off.jsonl"
         self.projects = self.root / "projects"
         self.sent = self.root / "sent.json"
         # triage-notify is outside this repository; record what it was given.
@@ -33,7 +41,8 @@ class HandoffTests(unittest.TestCase):
 
     def run_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "send", "--inbox", str(self.inbox),
-                               "--decisions-file", str(self.decisions), "--claude-projects", str(self.projects),
+                               "--decisions-file", str(self.decisions), "--handed-off-file", str(self.handed_off),
+                               "--claude-projects", str(self.projects),
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True)
 
@@ -75,6 +84,17 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("remove:/w/a", result.stderr)
         self.assertIn("消してよい", result.stderr)
         self.assertFalse(self.sent.exists())
+        self.assertFalse(self.handed_off.exists())
+
+    def test_records_each_key_it_hands_off_for_tools_that_must_wait_for_the_answer(self) -> None:
+        self.inbox.write_text("")
+
+        result = self.run_tool("--since", "0", "--decision", "asana:complete:example/app#12",
+                               "--decision", "merge:Eotel/skills#80")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item.decision for item in lead_decisions.handed_off(self.handed_off)],
+                         ["asana:complete:example/app#12", "merge:Eotel/skills#80"])
 
 
 if __name__ == "__main__":

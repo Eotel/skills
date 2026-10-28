@@ -4,6 +4,8 @@
 The lead never types into a scheduled triage tab, so it appends each answer here with `record`.
 Every hourly run reads the log, drops answered questions from its handoff, and follows the answers.
 Records are only appended; a later record for the same decision replaces the earlier answer.
+handoff.py appends each key it hands off to a second log; `handed_off` reads it, so a tool that
+writes what a question decides (asana_pr.py) can hold the write while the key has no answer.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import sys
 import uuid
 
 DEFAULT_LOG = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
+HANDED_OFF_LOG = Path("~/.cache/orca-session-triage/handed-off.jsonl")
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,24 @@ class Decision:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
 
 
+@dataclass(frozen=True)
+class HandOff:
+    decision: str
+    handed_off_at: str
+
+    @classmethod
+    def parse(cls, raw: str, where: str) -> HandOff:
+        try:
+            item = json.loads(raw)
+            return cls(decision=str(item["decision"]), handed_off_at=str(item["handed_off_at"]))
+        except (ValueError, TypeError, KeyError) as error:
+            raise ValueError(f"damaged handoff record at {where}: {error}") from error
+
+    @classmethod
+    def now(cls, decision: str) -> HandOff:
+        return cls(decision=decision, handed_off_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+
 def decided_at(value: str | None) -> str:
     if value is None:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -47,25 +68,33 @@ def decided_at(value: str | None) -> str:
     return parsed.isoformat()
 
 
-def records(log: Path) -> Iterator[Decision]:
+def lines(log: Path) -> Iterator[tuple[str, str]]:
+    """Each non-empty line of an append-only log, with its place for error messages."""
     if not log.exists():
         return
     with log.open(encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_SH)
-        lines = stream.read().splitlines()
-    yield from (Decision.parse(raw, f"{log}:{number}")
-                for number, raw in enumerate(lines, start=1) if raw.strip())
+        read = stream.read().splitlines()
+    yield from ((raw, f"{log}:{number}") for number, raw in enumerate(read, start=1) if raw.strip())
+
+
+def records(log: Path) -> Iterator[Decision]:
+    yield from (Decision.parse(raw, where) for raw, where in lines(log))
+
+
+def handed_off(log: Path) -> Iterator[HandOff]:
+    yield from (HandOff.parse(raw, where) for raw, where in lines(log))
 
 
 def latest(decisions: Iterable[Decision]) -> dict[str, Decision]:
     return {item.decision: item for item in decisions}
 
 
-def append(log: Path, decision: Decision) -> None:
+def append(log: Path, *entries: Decision | HandOff) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.write(json.dumps(asdict(decision), ensure_ascii=False) + "\n")
+        stream.writelines(json.dumps(asdict(entry), ensure_ascii=False) + "\n" for entry in entries)
         stream.flush()
 
 
