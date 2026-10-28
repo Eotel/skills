@@ -363,7 +363,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/a"], ["term_setup"])
 
-    def test_a_shell_at_a_starship_arrow_or_cross_after_direnv_output_is_closable(self):
+    def test_a_shell_at_a_starship_arrow_or_cross_after_direnv_output_is_closable(self) -> None:
         direnv = "direnv: error /w/a/.envrc is blocked. Run `direnv allow` to approve its content\napp on main\n"
         result = self.closable(
             [worktree("/w/a", "working")],
