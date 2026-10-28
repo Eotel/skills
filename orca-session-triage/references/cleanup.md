@@ -112,8 +112,8 @@ then `gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`.
 ## Closing tabs in a kept worktree
 
 A worktree's `closable` list names the tabs it can lose while the checkout stays:
-shells whose last line is a bare prompt (`❯`) with no output for
-`--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
+shells whose last line is a bare prompt (`❯`, `➜`, `✗`, `$`, `%`) with no
+output for `--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
 worktree is `finished` or `stalled`, its agent sessions, unless the final
 message says work continues: a background job may still run in that tab. A
 helper agent in a `working` or `waiting` worktree stays: its lead may send it

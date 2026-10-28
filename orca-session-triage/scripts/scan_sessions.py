@@ -35,10 +35,11 @@ DEFAULT_CODEX_SESSIONS = [
 
 CLAUDE_DIR_LIMIT = 200
 
-# A line holding only one of these is a shell waiting for input (starship and
-# similar prompts put the glyph on its own line). Prompts that carry text, such
-# as `taihei=#` or `42%`, may belong to a running program, so they never count.
-BARE_PROMPTS = ("❯", "$", "%")
+# A line holding only one of these is a shell waiting for input: starship's
+# default ❯, the ➜ and ✗ (success, error) another Mac's starship sets, or a plain
+# $ or %. Prompts that carry text, such as `app=#` or `42%`, may belong to a
+# running program, so they never count.
+BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
 
 
 def claude_project_dir(projects_root, worktree_path):

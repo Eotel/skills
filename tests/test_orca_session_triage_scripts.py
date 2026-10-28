@@ -363,6 +363,16 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/a"], ["term_setup"])
 
+    def test_a_shell_at_a_starship_arrow_or_cross_after_direnv_output_is_closable(self):
+        direnv = "direnv: error /w/a/.envrc is blocked. Run `direnv allow` to approve its content\napp on main\n"
+        result = self.closable(
+            [worktree("/w/a", "working")],
+            [terminal("/w/a", "claude", "term_agent"),
+             terminal("/w/a", None, "term_shell", preview=direnv + "➜", quiet_minutes=90),
+             terminal("/w/a", None, "term_setup", title="Setup", preview=direnv + "✗ ", quiet_minutes=90)])
+
+        self.assertEqual(result["/w/a"], ["term_shell", "term_setup"])
+
     def test_a_stalled_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
         self.claude_says("/w/b", user("go"), assistant(text("PR #2 is open for review.")))
         result = self.closable(
