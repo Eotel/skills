@@ -722,12 +722,13 @@ class RetroTests(unittest.TestCase):
 
     def test_claude_failure_keeps_the_json_reason(self) -> None:
         failed = subprocess.CompletedProcess(["claude"], 1, json.dumps(
-            {"is_error": True, "subtype": "success",
+            {"is_error": True, "subtype": "success", "terminal_reason": "api_error",
              "result": "Failed to authenticate: OAuth session expired and could not be refreshed"}), "")
         with mock.patch.object(retro.subprocess, "run", return_value=failed):
             with self.assertRaises(RuntimeError) as raised:
                 retro.run_claude("prompt", retro.REVIEW_SCHEMA)
         self.assertIn("is_error=True", str(raised.exception))
+        self.assertIn("terminal_reason=api_error", str(raised.exception))
         self.assertIn("OAuth session expired", str(raised.exception))
 
     def test_repeated_failure_notifies_once(self) -> None:

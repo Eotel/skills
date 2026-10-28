@@ -87,8 +87,9 @@ comment. The worker's own `triage-retro` reasons are not comments.
 ## Failures
 
 A failed `claude -p` call records its exit code and the `is_error`,
-`subtype`, and `result` fields of its JSON output in `worker-state.json` and
-`service.log`; authentication errors appear only there. When the same reason
+`subtype`, `terminal_reason`, and `result` fields of its JSON output in
+`worker-state.json` and `service.log`; authentication errors appear only
+there (`subtype` stays `success` on an API error). When the same reason
 fails twice in a row, the worker sends one `triage-notify --kind ask`.
 `retro.py status` shows `last_failure`. After fixing the cause, run
 `retro.py retry --session-id UUID` for each failed session ID.
