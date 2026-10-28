@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Inventory Orca agent sessions from Orca state and agent transcripts."""
+"""Inventory Orca agent sessions from Orca state and agent transcripts.
+
+GitHub calls per run, for the rows that get PR facts: one GraphQL query per
+repository (25 PRs a query), plus three REST reads (reviews, conversation
+comments, line comments) for each PR whose updatedAt changed since the copy
+kept in --pr-cache.
+"""
 
 import argparse
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import partial
 import http.client
 import json
 import os
@@ -13,6 +21,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from urllib.parse import urlsplit
@@ -753,35 +762,181 @@ def summarize_pr(data, reviews=(), comments=(), line_comments=()):
     }
 
 
-PR_FIELDS = ("number,url,state,author,headRefName,headRefOid,reviewDecision,reviewRequests,latestReviews,"
-             "mergeStateStatus,mergedAt,statusCheckRollup,commits")
+PrRef = int | str  # a PR number, or the head branch to find the PR by
+PrLookup = Callable[[str, list[PrRef]], dict[PrRef, dict | None]]
+
 GH_TIMEOUT = 15
+GRAPHQL_CHUNK = 25  # 25 PRs by number in one query cost 1 point, as one `gh pr view` did (measured 2026-10-28)
+# gh reads 30 PRs of a branch; the newest 5 keep it cheap (25 branches in one query cost 5 points).
+BRANCH_CANDIDATES = 5
+PR_ACTIVITY_DIR = "~/.cache/orca-session-triage/pr-activity"
+SLUG = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+NOT_IN_BRANCH = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")  # git refuses these in a branch name
+# The `gh pr view --json` fields summarize_pr reads, with only the last commit
+# (gh pages through every commit) and the check states. gh also pages past 100
+# checks; a PR with more counts only its first 100 here.
+PR_FACTS = """
+fragment PrFacts on PullRequest {
+  number url state updatedAt isCrossRepository headRefName headRefOid
+  reviewDecision mergeStateStatus mergedAt
+  author { __typename login }
+  reviewRequests(first: 100) { nodes { requestedReviewer {
+    __typename ... on User { login } ... on Bot { login } ... on Team { name } } } }
+  latestReviews(first: 100) { nodes { author { login } state } }
+  commits(last: 1) { nodes { commit { committedDate statusCheckRollup { contexts(first: 100) {
+    nodes { __typename ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } }
+}"""
+ACTIVITY = (("reviews", "pulls/{}/reviews"), ("comments", "issues/{}/comments"),
+            ("line_comments", "pulls/{}/comments"))
 
 
-def gh_pr(slug, ref):
-    """Summary of a GitHub PR by number or head branch, or None when gh finds none or fails."""
+def is_pr_ref(ref: object) -> bool:
+    """A positive PR number, or a name git accepts for a branch (quoted with json.dumps in the query)."""
+    if isinstance(ref, bool):
+        return False
+    if isinstance(ref, int):
+        return ref > 0
+    return isinstance(ref, str) and bool(ref) and not NOT_IN_BRANCH.search(ref)
+
+
+def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, PrRef]]:
+    """One GraphQL query for these PRs of a repository, and the ref each alias answers."""
+    aliases: dict[str, PrRef] = {}
+    fields = ["defaultBranchRef { name }"]
+    for index, ref in enumerate(refs):
+        if isinstance(ref, int):
+            alias = f"pr_{ref}"
+            fields.append(f"{alias}: pullRequest(number: {ref}) {{ ...PrFacts }}")
+        else:
+            alias = f"branch_{index}"
+            fields.append(f"{alias}: pullRequests(headRefName: {json.dumps(ref, ensure_ascii=False)}, "
+                          f"first: {BRANCH_CANDIDATES}, orderBy: {{field: CREATED_AT, direction: DESC}}) "
+                          "{ nodes { ...PrFacts } }")
+        aliases[alias] = ref
+    return (f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ "
+            + " ".join(fields) + " } }" + PR_FACTS), aliases
+
+
+def graphql_repository(slug: str, query: str) -> dict | None:
+    """The `repository` object a query returned, or None when gh gave no data.
+
+    A PR that does not exist comes back as a null alias with a NOT_FOUND error,
+    and gh exits 1 while the other aliases still hold data, so stdout is read
+    whatever the exit code.
+    """
     try:
-        out = subprocess.run(["gh", "pr", "view", str(ref), "-R", slug, "--json", PR_FIELDS],
+        out = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query],
                              capture_output=True, text=True, timeout=GH_TIMEOUT)
-        if out.returncode != 0:
-            return None
-        data = json.loads(out.stdout)
-        def read_pages(endpoint):
-            try:
-                result = subprocess.run(["gh", "api", "--paginate", "--slurp",
-                                         f"repos/{slug}/{endpoint}"], capture_output=True,
-                                        text=True, timeout=GH_TIMEOUT)
-                pages = json.loads(result.stdout) if result.returncode == 0 else []
-                return [entry for page in pages for entry in page]
-            except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError):
-                return []
+        repository = (json.loads(out.stdout).get("data") or {}).get("repository")
+        failure = out.stderr.strip() or out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as error:
+        repository, failure = None, repr(error)
+    if isinstance(repository, dict):
+        return repository
+    print(f"GitHub query for {slug} failed, so its rows have no PR facts: {failure}", file=sys.stderr)
+    return None
 
-        number = data["number"]
-        return summarize_pr(data, read_pages(f"pulls/{number}/reviews"),
-                            read_pages(f"issues/{number}/comments"),
-                            read_pages(f"pulls/{number}/comments"))
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+
+def pr_for_branch(nodes: list, branch: str, default_branch: str | None) -> dict | None:
+    """The PR `gh pr view <branch>` shows from the newest PRs with that head branch.
+
+    gh puts an open PR first and keeps the rest newest first; it skips a PR from
+    a fork's branch of the same name, and a closed or merged PR whose head is
+    the repository's default branch.
+    """
+    ordered = sorted((node for node in nodes if isinstance(node, dict)), key=lambda node: node.get("state") != "OPEN")
+    return next((node for node in ordered if not node.get("isCrossRepository")
+                 and (node.get("state") == "OPEN" or branch != default_branch)), None)
+
+
+def view_fields(node: dict) -> dict:
+    """The `gh pr view --json` fields summarize_pr reads, from a PullRequest node of PR_FACTS."""
+    author = node.get("author")
+    last = ((node.get("commits") or {}).get("nodes") or [None])[-1] or {}
+    commit = last.get("commit") or {}
+    requested = [(entry or {}).get("requestedReviewer") for entry in (node.get("reviewRequests") or {}).get("nodes") or []]
+    return {
+        **{key: node.get(key) for key in ("number", "url", "state", "headRefName", "headRefOid",
+                                          "reviewDecision", "mergeStateStatus", "mergedAt")},
+        # gh prints an author that is not a User (a bot) as app/<login>.
+        "author": None if not author else {
+            "login": author.get("login") if author.get("__typename") == "User" else f"app/{author.get('login')}"},
+        "reviewRequests": [r for r in requested if r and r.get("__typename") in ("User", "Bot", "Team")],
+        "latestReviews": (node.get("latestReviews") or {}).get("nodes") or [],
+        "statusCheckRollup": (((commit.get("statusCheckRollup") or {}).get("contexts") or {}).get("nodes") or []),
+        "commits": [commit] if commit else [],
+    }
+
+
+def activity_entry(entry: dict) -> dict:
+    """What summarize_pr reads of a review or comment: its author, state, and time."""
+    user = entry.get("user")
+    return {"user": {"login": user.get("login"), "type": user.get("type")} if isinstance(user, dict) else None,
+            **{key: entry[key] for key in ("state", "submitted_at", "created_at") if key in entry}}
+
+
+def rest_list(endpoint: str) -> list[dict] | None:
+    """Every entry of a paginated REST list, or None when the read failed."""
+    try:
+        result = subprocess.run(["gh", "api", "--paginate", "--slurp", endpoint],
+                                capture_output=True, text=True, timeout=GH_TIMEOUT)
+        if result.returncode != 0:
+            return None
+        return [activity_entry(entry) for page in json.loads(result.stdout) for entry in page
+                if isinstance(entry, dict)]
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
         return None
+
+
+def pr_activity(slug: str, node: dict, cache_dir: Path) -> list[list[dict]]:
+    """A PR's reviews, conversation comments, and line comments, kept per PR in `cache_dir`.
+
+    GitHub moves a PR's updatedAt on every review, comment, and push, so the copy
+    kept from a run that saw the same updatedAt still holds and the three REST
+    reads are skipped. A read that failed counts as empty, as before, and is not kept.
+    """
+    number, updated = node["number"], node.get("updatedAt")
+    path = cache_dir / slug / f"{number}.json"
+    kept = read_json_file(path)
+    if (updated and isinstance(kept, dict) and kept.get("updated_at") == updated
+            and all(isinstance(kept.get(kind), list) for kind, _ in ACTIVITY)):
+        return [kept[kind] for kind, _ in ACTIVITY]
+    read = {kind: rest_list(f"repos/{slug}/{endpoint.format(number)}") for kind, endpoint in ACTIVITY}
+    if updated and all(entries is not None for entries in read.values()):
+        try:
+            write_json_atomically(path, {"updated_at": updated, **read})
+        except OSError as error:
+            print(f"could not keep the activity of {slug}#{number}: {error}", file=sys.stderr)
+    return [read[kind] or [] for kind, _ in ACTIVITY]
+
+
+def gh_prs(slug: str, refs: list[PrRef],
+           cache_dir: Path = Path(PR_ACTIVITY_DIR).expanduser()) -> dict[PrRef, dict | None]:
+    """Summaries of a repository's PRs by number or head branch; None where gh finds none or fails.
+
+    One GraphQL query reads up to GRAPHQL_CHUNK PRs. Each PR's reviews and
+    comments take three REST reads, skipped while its updatedAt is the one kept
+    in `cache_dir` (see pr_activity).
+    """
+    found: dict[PrRef, dict | None] = dict.fromkeys(refs)
+    owner, _, name = slug.partition("/")
+    if not SLUG.fullmatch(slug) or name in (".", ".."):
+        return found
+    wanted = [ref for ref in found if is_pr_ref(ref)]
+    for start in range(0, len(wanted), GRAPHQL_CHUNK):
+        query, aliases = pr_query(owner, name, wanted[start:start + GRAPHQL_CHUNK])
+        repository = graphql_repository(slug, query) or {}
+        default_branch = (repository.get("defaultBranchRef") or {}).get("name")
+        for alias, ref in aliases.items():
+            answer = repository.get(alias) or {}
+            node = (pr_for_branch(answer.get("nodes") or [], ref, default_branch)
+                    if isinstance(ref, str) else answer)
+            found[ref] = node if isinstance(node, dict) and isinstance(node.get("number"), int) else None
+    nodes = {node["number"]: node for node in found.values() if node}
+    with ThreadPoolExecutor(max_workers=max(1, min(4, len(nodes)))) as pool:
+        activity = dict(zip(nodes, pool.map(lambda node: pr_activity(slug, node, cache_dir), nodes.values())))
+    return {ref: summarize_pr(view_fields(node), *activity[node["number"]]) if node else None
+            for ref, node in found.items()}
 
 
 def parse_time(value):
@@ -879,9 +1034,12 @@ def open_pr_with_no_local_work(row, pr, git):
             and git.get("dirty") == 0)
 
 
-def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
+def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | None] = git_state,
+                        pr_lookup: PrLookup = gh_prs) -> list[dict]:
     """Add git and PR facts to rows needing review or completed rows with no current agent.
 
+    `pr_lookup(slug, refs)` reads every PR one repository's rows need at once
+    and returns a summary or None per ref; repositories are read in parallel.
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
@@ -892,29 +1050,28 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
     fact_row_ids = {id(row) for row in fact_rows}
     git_by_row = {id(row): (remote_git_hint(row) if row.get("environment") else git_lookup(row["path"]))
                    for row in fact_rows}
-    keys = []
-    seen = set()
+    refs_by_repo: dict[str, list[PrRef]] = {}
     for row in rows:
         if id(row) not in fact_row_ids:
             continue
         git = git_by_row.get(id(row))
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         if git and git.get("github") and ref:
-            key = (git["github"], ref)
-            if key not in seen:
-                keys.append(key)
-                seen.add(key)
+            refs = refs_by_repo.setdefault(git["github"], [])
+            if ref not in refs:
+                refs.append(ref)
 
-    def lookup(key):
+    def lookup(slug: str) -> dict[PrRef, dict | None]:
         try:
-            return pr_lookup(*key)
+            return pr_lookup(slug, refs_by_repo[slug])
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            return {}
 
-    prs = {}
-    if keys:
-        with ThreadPoolExecutor(max_workers=min(8, len(keys))) as pool:
-            prs = dict(zip(keys, pool.map(lookup, keys)))
+    prs: dict[tuple[str, PrRef], dict | None] = {}
+    if refs_by_repo:
+        with ThreadPoolExecutor(max_workers=min(8, len(refs_by_repo))) as pool:
+            for slug, found in zip(refs_by_repo, pool.map(lookup, refs_by_repo)):
+                prs.update({(slug, ref): pr for ref, pr in found.items()})
 
     result = []
     for row in rows:
@@ -924,7 +1081,7 @@ def add_next_step_facts(rows, git_lookup=git_state, pr_lookup=gh_pr):
         git = git_by_row[id(row)]
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
-        if pr is not None:
+        if pr is not None and git is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
         row = {**row, "git": git, "pr": pr}
         open_pr_cleanup = pr is not None and git is not None and open_pr_with_no_local_work(row, pr, git)
@@ -1072,11 +1229,22 @@ def read_json_file(path):
         return None
 
 
-def write_json_atomically(path, data):
+def write_json_atomically(path: Path, data: object) -> None:
+    """Write through a temporary file beside `path`, so a reader never sees half a file.
+
+    Each write gets its own temporary name: two scans running at once must not
+    replace each other's half-written file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    handle, name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    os.close(handle)
+    temp = Path(name)
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def load_verdicts(store_path):
@@ -1329,8 +1497,8 @@ def expand_roots(patterns):
     return roots
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
     parser.add_argument("--ps-json", help="read `orca worktree ps --json` output from this file")
@@ -1381,6 +1549,9 @@ def parse_args(argv=None):
                              "(default: $TRIAGE_INBOX or %(default)s)")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
                         help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
+    parser.add_argument("--pr-cache", default=PR_ACTIVITY_DIR,
+                        help="where each PR's reviews and comments are kept between runs, one file per PR; "
+                             "they are read again only when the PR's updatedAt moves (default: %(default)s)")
     args = parser.parse_args(argv)
     if args.from_file and args.review_out:
         parser.error("--review-out needs a live scan; drop --from")
@@ -1523,7 +1694,7 @@ def print_row(rows: list[dict], key: str) -> int:
     return 0
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.from_file:
         try:
@@ -1546,7 +1717,8 @@ def main(argv=None):
     rows = add_next_step_facts(build_inventory(worktrees, terminals, str(Path(args.claude_projects).expanduser()),
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
-                                               mail=read_mail(args), screens=screens))
+                                               mail=read_mail(args), screens=screens),
+                               pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
     rows = with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)

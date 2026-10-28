@@ -19,6 +19,9 @@ board's done cards; close what the user approves.
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus
   Claude and Codex transcripts, lists the tabs it could close (`closable`), and
   gives each `stalled`, `unsure`, and `waiting` row its `git` and `pr` state.
+  It reads GitHub with one GraphQL query per repository, and reads a PR's
+  reviews and comments again only after its `updatedAt` moves (kept per PR in
+  `--pr-cache`, `~/.cache/orca-session-triage/pr-activity/`).
   `open_pr_cleanup` marks a checkout with no current agent, no local changes,
   and HEAD at its open PR head for removal without asking; a historical
   transcript's question still gets its usual class and must be relayed.
