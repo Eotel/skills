@@ -1307,6 +1307,22 @@ class NextStepFactTests(unittest.TestCase):
                           "dirty": ("stalled", False), "unpushed": ("finished", True),
                           "other-head": ("stalled", False), "unknown-unpushed": ("finished", True)})
 
+    def test_open_pr_cleanup_keeps_worktrees_with_keep_notes(self) -> None:
+        comments = ("parallel-tests-b6: PR #3568 のレビュー対応中（消さないでください）",
+                    "parallel-devenv: ベンチマークの比較に使うので残す")
+        for comment in comments:
+            with self.subTest(comment=comment):
+                row = {"path": "/w/keep", "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+                       "linked_pr": None, "claude": None, "codex": [], "comment": comment}
+                result = scan.add_next_step_facts(
+                    [row], git_lookup=lambda path: {"branch": "keep", "head": "aaa", "dirty": 0,
+                                                   "unpushed": 0, "github": "acme/app"},
+                    pr_lookup=lambda slug, refs: {"keep": {"number": 7, "state": "OPEN", "head_oid": "aaa"}})[0]
+
+                self.assertFalse(result.get("open_pr_cleanup", False))
+                self.assertNotEqual(result["class"], "finished")
+                self.assertIn(comment, " ".join(result["reasons"]))
+
     def test_open_pr_cleanup_preserves_a_historical_transcript_question(self):
         rows = [
             {"path": "/w/history", "class": "waiting", "reasons": ["final message asks"],
@@ -1882,6 +1898,27 @@ def git(cwd, *args):
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+class WorktreeNotesTests(unittest.TestCase):
+    def test_orca_returns_the_comment_or_none_for_an_unknown_worktree(self) -> None:
+        from worktree_notes import OrcaNotes
+
+        comment = "parallel-tests-b6: PR #3568 のレビュー対応中（消さないでください）"
+        replies = ((0, {"ok": True, "result": {"worktree": {"comment": comment}}}, comment),
+                   (1, {"ok": False, "error": {"code": "selector_not_found"}}, None))
+        for code, payload, expected in replies:
+            with self.subTest(payload=payload), patch("worktree_notes.subprocess.run", return_value=
+                    subprocess.CompletedProcess([], code, stdout=json.dumps(payload), stderr="")):
+                self.assertEqual(OrcaNotes().comment(Path("/w/keep")), expected)
+
+
+class FakeWorktreeNotes:
+    def __init__(self, note: str | None = None) -> None:
+        self.note = note
+
+    def comment(self, worktree: Path) -> str | None:
+        return self.note
+
+
 class RmCheckTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1909,6 +1946,34 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["blockers"], [])
         self.assertEqual(result["processes"], [])
+
+    def test_keep_note_blocks_until_the_lead_answers_remove(self) -> None:
+        import lead_decisions
+
+        comment = "parallel-tests-b6: PR #3568 のレビュー対応中（消さないでください）"
+        notes = FakeWorktreeNotes(comment)
+        log = Path(self.tmp.name) / "decisions.jsonl"
+        key = "remove:" + str(self.wt.resolve())
+
+        code, result = self.run_main("--decisions-file", str(log), notes=notes)
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(comment, " ".join(result["blockers"]))
+        self.assertIn(key, " ".join(result["blockers"]))
+
+        lead_decisions.append(log, lead_decisions.Decision("allow", key, "消してよい", "2026-10-28T00:00:00Z"))
+        code, result = self.run_main("--decisions-file", str(log), notes=notes)
+        self.assertEqual((code, result["ok"]), (0, True))
+        self.assertIn("消してよい", " ".join(result["notes"]))
+
+    def test_keep_note_prevents_nested_detach(self) -> None:
+        copy = self.nested_catalog()
+        comment = "parallel-devenv: ベンチマークの比較に使うので残す"
+
+        code, result = self.run_main("--detach-nested", "--decisions-file",
+                                     str(Path(self.tmp.name) / "decisions.jsonl"), notes=FakeWorktreeNotes(comment))
+        self.assertEqual((code, result["detached"]), (1, []))
+        self.assertIn(comment, " ".join(result["blockers"]))
+        self.assertTrue(copy.exists())
 
     def test_running_process_using_the_worktree_blocks_removal(self):
         process = subprocess.Popen(
@@ -1951,9 +2016,14 @@ class RmCheckTests(unittest.TestCase):
             process.stdout.close()
 
     def test_check_does_not_count_itself_or_its_shell(self):
+        binary = Path(self.tmp.name) / "bin/orca"
+        binary.parent.mkdir()
+        binary.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"ok":false,"error":{"code":"selector_not_found"}}\'\nexit 1\n')
+        binary.chmod(0o755)
         command = (f'{sys.executable} {rmcheck.__file__} --worktree {self.wt} '
                    '--base main --no-docker; :')
-        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True,
+                                   env={**os.environ, "PATH": f"{binary.parent}:{os.environ.get('PATH', '')}"})
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
@@ -2397,6 +2467,48 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["detached"]), (1, []))
         self.assertTrue(pushed.exists())
 
+    def nested_catalog(self) -> Path:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(Path(self.tmp.name), "init", "--bare", "-q", str(remote))
+        deps = Path(self.tmp.name) / "deps"
+        deps.mkdir()
+        git(deps, "init", "-q", "-b", "main")
+        git(deps, "config", "user.email", "t@example.com")
+        git(deps, "config", "user.name", "t")
+        locale = deps / "locale/de/LC_MESSAGES"
+        locale.mkdir(parents=True)
+        (locale / "django.po").write_text('msgid "hello"\nmsgstr "Hallo"\n')
+        (locale / "django.mo").write_bytes(b"compiled catalog")
+        git(deps, "add", "locale")
+        git(deps, "commit", "-q", "-m", "catalog")
+        git(deps, "remote", "add", "origin", str(remote))
+        git(deps, "push", "-q", "-u", "origin", "main")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        copy = self.wt / "local-deps/pushed"
+        git(deps, "worktree", "add", "-q", "--detach", str(copy), "main")
+        (copy / "locale/de/LC_MESSAGES/django.mo").write_bytes(b"recompiled catalog")
+        return copy
+
+    def test_nested_recompiled_catalog_is_restored_and_detached(self) -> None:
+        copy = self.nested_catalog()
+        rel = "locale/de/LC_MESSAGES/django.mo"
+
+        _, before = self.run_main()
+        self.assertEqual(before["nested_worktrees"][0]["regenerable"], [rel])
+
+        code, result = self.run_main("--detach-nested")
+        self.assertEqual((code, result["ok"], result["detached"]), (0, True, [str(copy.resolve())]))
+        self.assertFalse(copy.exists())
+
+    def test_nested_catalog_with_changed_source_blocks_detach(self) -> None:
+        copy = self.nested_catalog()
+        (copy / "locale/de/LC_MESSAGES/django.po").write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
+
+        code, result = self.run_main("--detach-nested")
+        self.assertEqual((code, result["ok"], result["detached"]), (1, False, []))
+        self.assertEqual(result["nested_worktrees"][0]["blockers"], ["2 uncommitted changes"])
+        self.assertTrue(copy.exists())
+
     def test_a_failed_pr_lookup_blocks_with_a_reason(self):
         real_run = subprocess.run
 
@@ -2510,10 +2622,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("--pr-head", " ".join(stale["notes"]))
         self.assertNotIn("origin の参照は", " ".join(fresh.get("notes", [])))
 
-    def run_main(self, *argv):
+    def run_main(self, *argv: str, notes: FakeWorktreeNotes | None = None) -> tuple[int, dict]:
         out = io.StringIO()
         with redirect_stdout(out):
-            code = rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--no-docker", *argv])
+            code = rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--no-docker", *argv],
+                                worktree_notes=notes or FakeWorktreeNotes())
         return code, json.loads(out.getvalue())
 
     def run_main_without_base(self, *argv, pr=None):
@@ -2526,7 +2639,7 @@ class RmCheckTests(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(rmcheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
-            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker", *argv])
+            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker", *argv], worktree_notes=FakeWorktreeNotes())
         return code, json.loads(out.getvalue())
 
     def remote_default_and_working_base(self):
@@ -2607,7 +2720,7 @@ class RmCheckTests(unittest.TestCase):
         (self.wt / "app.txt").write_text("v2\n")
         out = io.StringIO()
         with redirect_stdout(out):
-            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker"])
+            code = rmcheck.main(["--worktree", str(self.wt), "--no-docker"], worktree_notes=FakeWorktreeNotes())
 
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["blockers"],
