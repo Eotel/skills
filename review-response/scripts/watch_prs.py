@@ -4,14 +4,16 @@
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,
 and each Codex review's status, which Codex edits into one summary comment.
 
-Cost per cycle: one `gh api rate_limit`, which GitHub does not count against any
-limit, then one GraphQL `gh pr view` per open PR. The three REST feeds (reviews,
-line comments, issue comments; one call per 100 items each) are read only after
-the PR's updatedAt moves, which GitHub does for new comments, reviews, pushes and
-comment edits, and once more on the next cycle because updatedAt counts whole
-seconds. A PR whose merge or close is recorded in the state file is not read
-again; remove its entry to watch it after a reopen. While fewer than 1000 GraphQL
-points remain, the cycle prints RATE_LIMIT_LOW and sleeps until the reset.
+Cost per cycle: one `gh api rate_limit`, which does not count against the primary
+rate limits (it can count against secondary limits), then one GraphQL `gh pr view`
+per open PR. The three REST feeds (reviews, line comments, issue comments; one call
+per 100 items each) are read only after the PR's updatedAt moves, which GitHub does
+for new comments, reviews, pushes and comment edits, and once more on the next cycle
+because updatedAt counts whole seconds. A PR whose merge or close is recorded in the
+state file is not read again; to watch it after a reopen, stop the watcher, remove
+the PR's entry from the state file, and start the watcher again (a running watcher
+keeps the entry in memory and writes it back). While fewer than 1000 GraphQL points
+remain, the cycle prints RATE_LIMIT_LOW and sleeps until the reset.
 """
 
 import argparse
