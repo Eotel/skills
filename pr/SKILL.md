@@ -30,6 +30,13 @@ It prints the kind, the template file, and its headings:
 Exit 2 means it could not tell (no GitHub origin, `gh` not signed in). Decide by the same
 rules and pass `--kind` to `check`.
 
+## Screen changes
+
+A PR that changes what a screen shows must carry before/after PNGs taken on the real screen: the
+changed part cropped and the whole screen. Read [references/screenshots.md](references/screenshots.md)
+when writing one, for where the section goes and how `gh --attach` uploads the images. Never commit
+the images to the repository.
+
 ## Check
 
 Run `python3 scripts/pr_template.py check <body-file> --repo-dir <checkout>` (`-` reads stdin).
@@ -40,4 +47,6 @@ check on PR bodies, where one exists, has the final say.
 ## Done
 
 - `check` passes on the body that is posted.
+- A PR that changes a screen shows its before/after PNGs in the posted body, with no local path
+  left.
 - Verified results and unverified points are listed apart; nothing unverified reads as fact.

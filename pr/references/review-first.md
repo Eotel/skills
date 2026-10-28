@@ -2,7 +2,8 @@
 
 For repositories owned by the signed-in account or one of its organizations, when the repository
 has no pull request template of its own. Start from [the template](../assets/review-first.md);
-keep its five headings and their order. Other headings (対象外, 残件) may sit between them.
+keep its five headings and their order. Other headings (対象外, 残件) may sit between them. A PR
+that changes a screen adds 画面の before/after after the second; see [screenshots.md](screenshots.md).
 
 The reader is a reviewer who has not seen the issue or the session. They should learn from the
 first section what went wrong, and from the third where to spend their time.
