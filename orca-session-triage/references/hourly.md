@@ -131,8 +131,12 @@ Include each 「レビューの番」 PR URL and its command, or the missing sou
 confirm, in this run's handoff to the lead. Do not start its review in the
 hourly tab while another lead is appointed. Hand each 「指摘対応担当」 PR to the
 lead the same way, as a lane for the lead to start with `spawn-lane --topic`.
-Name any Orca environment the scan could not reach in the handoff. Review
-rows from the reachable Macs in the same run.
+Name any Orca environment the scan could not reach in the handoff, and each
+`hook errors` line of `scan_sessions.py --from SCAN_JSON --summary` (the Mac
+and the hook file it could not find: that Mac's checks do not run). First check
+on that Mac that the file is still missing: a tab that has not run since keeps
+the old error on its screen. Review rows from the reachable Macs in the same
+run.
 
 The lead does not send terminal input to a scheduled tab, so its answers reach
 later runs through `scripts/lead_decisions.py`. Give each question in the

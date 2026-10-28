@@ -503,6 +503,30 @@ class ClassifyTests(unittest.TestCase):
                                    "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]),
             (None, None, [])])
 
+    def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self):
+        # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
+        remote = {**worktree("/remote/lane-241", "working"), "_environment": "macbook-pro-16"}
+        term = {**terminal("/remote/lane-241", "claude", "term_r", preview="\n".join([
+            "⏺ CI is all green.", "  ⎿  PreToolUse:Bash hook error",
+            "  ⎿  Failed with non-blocking status code: /bin/sh: /Users/me/.claude/hooks/git-hook-guard.sh: "
+            "No such file or directory"])), "_environment": "macbook-pro-16"}
+        screen = {"source": "screen", "tail": [
+            "⏺ Ran 7 stop hooks", "  ⎿  Stop hook error: Failed with non-blocking status code: /bin/sh: "
+            "/Users/me/.claude/hooks/ask-question-guard.sh: No such file or directory", "❯"]}
+        # An agent that only talks about a missing file is not a failing hook.
+        local = worktree("/w/app", "working")
+        local_term = terminal("/w/app", "claude", "term_l", preview="⏺ ls: /tmp/x: No such file or directory")
+        rows = scan.build_inventory([remote, local], [term, local_term], self.projects, {}, "要判断", now=NOW,
+                                    screens={("macbook-pro-16", "term_r"): screen})
+
+        by_path = {row["path"]: row for row in rows}
+        self.assertEqual(by_path["/remote/lane-241"]["hook_errors"], [
+            {"host": "macbook-pro-16", "path": "/Users/me/.claude/hooks/git-hook-guard.sh", "tab": "term_r"},
+            {"host": "macbook-pro-16", "path": "/Users/me/.claude/hooks/ask-question-guard.sh", "tab": "term_r"}])
+        self.assertIn("hook error on macbook-pro-16: /Users/me/.claude/hooks/git-hook-guard.sh: No such file or directory",
+                      by_path["/remote/lane-241"]["reasons"])
+        self.assertEqual(by_path["/w/app"]["hook_errors"], [])
+
     def test_a_remote_tab_without_agent_details_is_read_from_its_screen(self):
         # MBP16's terminal list gave test-338 no agent, title, or preview while a Claude waited after worker_done.
         remote = {**worktree("/remote/test-338"), "_environment": "macbook-pro-16"}
@@ -1501,6 +1525,18 @@ class ScanCommandTests(unittest.TestCase):
         path = self.dir / "scan.json"
         path.write_text(json.dumps(rows, ensure_ascii=False))
         return path, checkout
+
+    def test_summary_names_each_missing_hook_file_with_its_host(self):
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        rows[2]["hook_errors"] = [{"host": "mbp16", "path": "/Users/me/.claude/hooks/git-hook-guard.sh",
+                                   "tab": "term_9"}]
+        saved.write_text(json.dumps(rows, ensure_ascii=False))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+
+        self.assertIn("hook errors: 1\n  mbp16 /Users/me/.claude/hooks/git-hook-guard.sh (mbp16::app term_9)",
+                      out.getvalue())
 
     def test_rows_print_one_line_per_saved_row_without_rescanning(self):
         saved, checkout = self.saved_scan()
