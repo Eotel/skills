@@ -1663,8 +1663,15 @@ def row_line(view: dict) -> str:
     return f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
 
 
-def card_lines(row: dict) -> list[str]:
-    """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown."""
+CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
+
+
+def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
+    """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown.
+
+    With the saved scan's path, a row with closable tabs ends with the close_tabs.py command that closes them
+    once nothing moved after the scan.
+    """
     lead = f"{row_name(row)} | {class_label((row.get('verdict') or {}).get('class') or row['class'], row['class'])}"
     lines = []
     for card in row.get("done_cards") or []:
@@ -1677,6 +1684,9 @@ def card_lines(row: dict) -> list[str]:
                      + (" ⏎ ".join(card.get("screen_tail") or []) or "-"))
     lines.extend(f"{lead} | closable {handle}" for handle in row.get("closable") or [])
     lines.extend(f"{lead} | meaningful {handle}" for handle in row.get("meaningful_tabs") or [])
+    if scan_file and row.get("closable"):
+        lines.append(f"{lead} | close: " + shlex.join(["python3", str(CLOSE_TABS), "--from", str(scan_file),
+                                                      *row["closable"]]))
     return lines
 
 
@@ -1711,6 +1721,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         verdicts = absorb_verdicts(args.verdicts, write=False)
         return print_rows(args, with_verdicts(rows, verdicts), verdicts)
+    # close_tabs.py keeps a tab whose worktree moved after this moment.
+    scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
     codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
@@ -1726,7 +1738,8 @@ def main(argv: list[str] | None = None) -> int:
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
-    rows = with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))
+    rows = [{**row, "scanned_at": scanned_at}
+            for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))]
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)
     if args.review_out:
@@ -1741,8 +1754,9 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         for row in rows:
             print(row_line(row_view(row)))
     elif args.cards:
+        scan_file = Path(args.from_file).expanduser().absolute() if args.from_file else None
         for row in rows:
-            for line in card_lines(row):
+            for line in card_lines(row, scan_file):
                 print(line)
     elif args.summary:
         print_summary(rows, verdicts)

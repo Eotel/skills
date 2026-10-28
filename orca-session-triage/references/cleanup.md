@@ -72,8 +72,9 @@ Run these per worktree, in order.
      when the system shows it (`tab`), and whether that tab runs nothing but
      its login shell or the shell's setup waits (`idle_tab`). An idle tab does
      not block: `orca worktree rm` stops its PTY. A busy tab blocks with the
-     exact `orca terminal close --terminal <handle> --json`: run it when the
-     scan lists that handle in `closable`, then run `rm_check.py` again. A
+     `close_tabs.py --from SCAN_JSON <handle>` that closes it: run it with the
+     saved scan when that scan lists the handle in `closable`, then run
+     `rm_check.py` again. A
      process outside Orca tabs blocks with its PID; a `node` server or another
      job is left running and reported.
    - `nested_worktrees` lists worktrees of other repositories inside the
@@ -120,9 +121,16 @@ the next round. An `unsure` worktree keeps its agents until you have read the
 final message and classed it. Shells close on the user's choice; agent sessions
 follow "Clearing done cards".
 
-1. `orca terminal close --terminal <handle> --json` per approved handle. It stops
-   that pane's process (`ptyKilled: true`) and removes a single-pane tab; `--tab`
-   would also close any pane split beside it.
+1. `scripts/close_tabs.py --from SCAN_JSON <handle> ...` with the approved
+   handles and the scan that listed them (`--cards` with `--from` prints this
+   command for each row's `closable` tabs). Just before closing, it reads the
+   worktree's transcripts, its triage inbox reports, and its agents' state in
+   Orca again; a tab whose worktree moved after the scan stays, printed as
+   `KEPT -> 走査の後に動いた（time what）`. Scan again and read that row
+   before deciding again. Never close a listed tab with a bare
+   `orca terminal close`: it closed a lane that deployed after the scan
+   (2026-10-28). Closing stops that pane's process and removes a single-pane
+   tab.
 2. Confirm the handles are gone from `orca terminal list --json`.
 
 Closing drops Orca's resume record, not the transcript: `claude --resume
@@ -146,8 +154,9 @@ row's transcript; the card's `last_message` when none was read; its
 - Nothing is left for the user (finished, or waiting only on a reviewer, a
   release, a deploy, or another lane): write what remains and who it waits on
   with `orca worktree set --worktree path:<path> --comment "<text>" --json`,
-  close the tab with `orca terminal close --terminal <handle> --json`, then
-  report it. The worktree, its files, and the transcript stay; when the review
+  close the tab with `scripts/close_tabs.py --from SCAN_JSON <handle>`, then
+  report it; a card it keeps moved after the scan, so read it again. The
+  worktree, its files, and the transcript stay; when the review
   or deploy arrives, a later sweep reopens the session there (`claude --resume
   <session-id>` or `codex resume <session-id>`) or carries the step itself.
 - A lead whose helper still works, and a session with the user's draft in its
@@ -160,7 +169,9 @@ closing.
 If ownership remains ambiguous, keep the card and report why. If no tab of
 that agent type is live, `orca terminal close --worktree path:<path> --all --json`
 retires every tab of that worktree, shells included: use it when the worktree's
-live tabs are all in `closable`, and otherwise report the card as asleep. A
+live tabs are all in `closable` and `close_tabs.py` closed them first (it keeps
+them when the worktree moved after the scan), and otherwise report the card as
+asleep. A
 card whose worktree is removed goes with it; what it left for the user is still
 a question. Confirm each closed card is gone from its worktree's `agents` in
 `orca worktree ps --json`.

@@ -18,7 +18,9 @@ import hourly_runtime
 import scan_sessions
 
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
-BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", "Esc to cancel")
+# Claude Code's selectors say "Enter to select"; Codex's pickers (model switch, /model) say "enter select · esc back".
+BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", "Esc to cancel",
+        "enter select", "esc back")
 QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回答|選んで|教えて|"
                       r"(?:です|ます|でしょう|よろしい|します)か|"
                       r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)

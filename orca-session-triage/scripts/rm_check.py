@@ -44,6 +44,8 @@ REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
 SCRATCH_DIRS = (".yomiyasu", ".investigate")
 ARCHIVE_DIR = Path.home() / ".cache/orca-briefs/archive"
+# Closes a busy tab only while its worktree has not moved since the scan that listed it.
+CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 # A per-worktree .env may move these away from its .env.example and still be written again.
 ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
 ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
@@ -478,9 +480,11 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                             "起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。"
                             % ", ".join(outside))
         if busy:
-            closes = sorted({"orca terminal close --terminal %s --json" % item["tab"] for item in busy if item["tab"]})
+            closes = sorted({"python3 %s --from SCAN_JSON %s" % (CLOSE_TABS, item["tab"])
+                             for item in busy if item["tab"]})
             unknown = [str(item["pid"]) for item in busy if not item["tab"]]
-            blockers.append("Orca のタブで作業場を使うプロセスがあります。scan の closable にあるタブなら閉じてから、"
+            blockers.append("Orca のタブで作業場を使うプロセスがあります。scan の closable にあるタブなら、保存した走査の "
+                            "JSON を SCAN_JSON に渡して閉じてから（走査の後に動いたタブは閉じません）、"
                             "rm_check をやり直してください: " + "; ".join(closes)
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))

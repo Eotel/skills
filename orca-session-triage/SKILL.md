@@ -68,7 +68,9 @@ board's done cards; close what the user approves.
   whether its composer holds unsent text (`draft`, the same check
   `cleanup_hourly_tabs.py` makes; null when the screen was not read).
   `--cards` prints each done card, `closable` tab, and `meaningful_tabs` entry
-  on its own line, led by the worktree's name: read cards through it.
+  on its own line, led by the worktree's name: read cards through it. With
+  `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
+  that closes them. Each row records the scan's start (`scanned_at`).
   The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
   repository's main checkout is a row (`main`) while it hosts an agent. A
@@ -97,6 +99,10 @@ board's done cards; close what the user approves.
   `orca-row-classify` in this session with that directory.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted".
+- `scripts/close_tabs.py --from SCAN_JSON HANDLE ...`: closes tabs the saved
+  scan listed, and keeps each one whose worktree's transcripts, triage inbox
+  reports, or agent states in Orca changed after the scan started. Close tabs
+  through it.
 - `references/delivery.md`: batching questions, sending answers, and giving
   lanes work.
 - `references/next-step.md`: what each `stalled` worktree needs next.
