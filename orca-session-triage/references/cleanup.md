@@ -5,16 +5,18 @@ remove it without asking when `rm_check.py` reports `ok` with no `containers`,
 and report it afterwards.
 
 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
-The scan marks these rows `open_pr_cleanup: true`. HEAD matching the PR head
-proves it was pushed to that PR; `git.unpushed` may still be positive when the
-branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
+The scan marks these rows `open_pr_cleanup: true`, except a row whose Orca
+comment contains 「消さない」 or 「残す」: its reasons quote the comment instead.
+HEAD matching the PR head proves it was pushed to that PR; `git.unpushed` may
+still be positive when the branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
 them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
 changes on its host before applying the same rule; the scan leaves those git
 facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
 <host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. The process check below protects work running
-in a tab.
+in a tab. To check worktrees of several repositories in one call, give
+`rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -38,6 +40,11 @@ Run these per worktree, in order.
      is listed in `merged_by_patch`, so name it in the report. A merge commit
      outside the base still blocks, and a patch that the base later reverted
      still counts as in the base.
+     An Orca comment containing 「消さない」 or 「残す」 also blocks, naming the
+     key `remove:<path>`: hand the question to the lead, and once
+     `lead_decisions.py` holds an answer for that key, the blocker clears and
+     `notes` quote the answer. When the comment or the answers cannot be read,
+     `notes` say so and nothing blocks on that alone.
    - `review` lists ignored paths that are neither caches nor identical copies of
      the main checkout. Open each one: generated sources and test output
      (screenshots, uploaded fixtures) are regenerable; anything else (exports,
@@ -79,10 +86,12 @@ Run these per worktree, in order.
      job is left running and reported.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
-     (uncommitted changes, ignored paths to open, HEAD on no remote). When
-     they are the only thing left, run `rm_check.py` again with
-     `--detach-nested`: it removes every copy from its repository before
-     `orca worktree rm`, so no prunable record is left. It removes nothing
+     (uncommitted changes, ignored paths to open, HEAD on no remote). A tracked
+     `.mo` changed beside an unchanged `.po` is a recompiled catalog, not a
+     change: it is listed in the item's `regenerable`. When they are the only
+     thing left, run `rm_check.py` again with `--detach-nested`: it restores
+     those catalogs (`git checkout HEAD --`) and removes every copy from its
+     repository before `orca worktree rm`, so no prunable record is left. It removes nothing
      while the worktree has other blockers, paths to review, or a copy with
      blockers, since a kept worktree still needs its copies.
    - On a remote Mac whose gh cannot read the PR, `notes` give a

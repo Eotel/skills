@@ -27,6 +27,8 @@ from typing import Any
 import urllib.request
 from urllib.parse import urlsplit
 
+from worktree_notes import keep_note
+
 DEFAULT_CODEX_SESSIONS = [
     "~/Library/Application Support/orca/codex-accounts/*/home/sessions",
     "~/.codex/sessions",
@@ -1109,8 +1111,11 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
         if pr is not None and git is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
-        row = {**row, "git": git, "pr": pr}
+        row: dict[str, Any] = {**row, "git": git, "pr": pr}
         open_pr_cleanup = pr is not None and git is not None and open_pr_with_no_local_work(row, pr, git)
+        if open_pr_cleanup and (note := keep_note(row.get("comment"))):
+            row = {**row, "reasons": [*row.get("reasons", []), "Orca comment asks to keep it: " + note]}
+            open_pr_cleanup = False
         if open_pr_cleanup:
             row = {**row, "open_pr_cleanup": True}
         if pr is not None and merged_after_final_message(row, pr):

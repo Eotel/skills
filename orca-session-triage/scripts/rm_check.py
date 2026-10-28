@@ -13,6 +13,9 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+import lead_decisions
+from worktree_notes import NotesUnavailable, OrcaNotes, WorktreeNotes, keep_note
+
 # A path counts as regenerable when a tool writes it again from tracked files or installed
 # packages, with no one's input, and it holds nothing else. Two signs show that:
 # - The file format is the tool's output: CPython bytecode (.pyc) is never a source anyone
@@ -212,10 +215,15 @@ def on_remote(worktree: Path, head: str) -> bool:
 
 def nested_check(copy: Path) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
-    and HEAD on a remote. `detach` is the command that removes it."""
+    and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
     changes, _ = working_changes(copy)
+    modified = set(git(copy, "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
+    regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
+                   and (copy / rel).with_suffix(".po").is_file()
+                   and str(Path(rel).with_suffix(".po")) not in changes]
+    changes = [rel for rel in changes if rel not in regenerable]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     review, _, deeper = ignored_paths(copy, repository)
@@ -225,6 +233,8 @@ def nested_check(copy: Path) -> dict:
     if not head or not on_remote(copy, head):
         blockers.append("HEAD %s is on no remote branch" % head[:8])
     return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
+            "regenerable": regenerable,
+            "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
             "detach": ["git", "-C", repository, "worktree", "remove", "--force", str(copy)]}
 
 
@@ -424,9 +434,10 @@ def processes_in(worktree):
              "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None} for item in found]
 
 
-def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None):
+def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None,
+          *, keep_blocker: str | None = None):
     """Return the removal verdict, including containers and processes using `worktree`."""
-    blockers = []
+    blockers = [keep_blocker] if keep_blocker else []
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
     changes, bytecode = working_changes(worktree)
@@ -665,7 +676,7 @@ def compose_projects():
     return json.loads(out or "[]")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNotes()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worktree", required=True, help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
@@ -677,10 +688,12 @@ def main(argv=None):
     parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
+    parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
+                        help="the lead's answers in an append-only JSONL log (default: %(default)s)")
     parser.add_argument("--detach-nested", action="store_true",
-                        help="when nested worktrees are all that block the removal and each is clean, has nothing "
-                             "ignored to open, and has HEAD on a remote, remove them from their repositories with "
-                             "git worktree remove --force, then check again")
+                        help="when nested worktrees are all that block the removal and each has no changes beyond "
+                             "recompiled catalogs, nothing ignored to open, and HEAD on a remote, restore those "
+                             "catalogs and remove the copies with git worktree remove --force, then check again")
     parser.add_argument("--archive-scratch", action="store_true",
                         help="when %s alone keep the worktree (nothing else blocks or needs review), move them to "
                              "<archive-dir>/<worktree>-<name>-<YYYYMMDD>/, then check again; off by default, so "
@@ -701,6 +714,24 @@ def main(argv=None):
     main = str(Path(args.main or main_checkout(worktree)).resolve())
     pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
     notes = []
+    keep_blocker = None
+    try:
+        comment = keep_note(worktree_notes.comment(Path(worktree)))
+    except NotesUnavailable as error:
+        comment = None
+        notes.append("worktree note could not be read: %s" % error)
+    if comment:
+        key = "remove:" + worktree
+        answer = None
+        try:
+            answer = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())).get(key)
+        except (OSError, ValueError) as error:
+            notes.append("lead decisions could not be read: %s" % error)
+        if answer is None:
+            keep_blocker = ("Orca comment asks to keep it: %s. Remove it only after the lead answers %s"
+                            % (comment, key))
+        else:
+            notes.append("Lead answered %s: %r" % (key, answer.answer))
     if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree)
                                                          or default_base(worktree)):
         pr, lookup_error = merged_pr_at_head(worktree)
@@ -714,7 +745,8 @@ def main(argv=None):
     base = args.base or by_pr or start_base(worktree) or default_base(worktree)
     projects = [] if args.no_docker else compose_projects()
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
-    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
+    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
+                   keep_blocker=keep_blocker)
     if args.detach_nested:
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
@@ -722,9 +754,12 @@ def main(argv=None):
                   if not blocker.startswith("worktrees of other repositories")]
         removable = nested and not others and not result["review"] and not any(item["blockers"] for item in nested)
         detached = [item["path"] for item in nested if removable
+                    and (not item["restore"]
+                         or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
                     and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
         if detached:
-            result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
+            result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
+                           keep_blocker=keep_blocker)
         elif nested:
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
                          "paths to review, or a copy with blockers")
@@ -739,7 +774,8 @@ def main(argv=None):
             archived.append({"from": str(scratch), "to": str(target)})
         if archived:
             kept = {key: result[key] for key in ("detached",) if key in result}
-            result = {**check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr), **kept}
+            result = {**check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
+                             keep_blocker=keep_blocker), **kept}
         elif any((Path(worktree) / name).exists() for name in SCRATCH_DIRS):
             notes.append("--archive-scratch moved nothing: the worktree is kept for other blockers or paths to review")
         result["archived"] = archived
