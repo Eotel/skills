@@ -8,22 +8,40 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from urllib.parse import urlsplit
 
+# A path counts as regenerable when a tool writes it again from tracked files or installed
+# packages, with no one's input, and it holds nothing else. Two signs show that:
+# - The file format is the tool's output: CPython bytecode (.pyc) is never a source anyone
+#   writes, so it is regenerable even untracked. An untracked path is never judged by its
+#   name: a build/ or test-results/ the repository does not ignore may be a new source.
+# - The repository ignores the path (it declares it is not source) and the path is a known
+#   tool's output: the names below.
+# A `.gitignore` of `*` inside a directory is no sign on its own: yomiyasu writes one to
+# keep its records (.yomiyasu/inputs/) out of git.
 CACHE_PARTS = {
     "node_modules", ".venv", ".devenv", ".direnv", "__pycache__", ".pytest_cache", ".ruff_cache",
     ".mypy_cache", ".svelte-kit", "apm_modules", ".import_linter_cache", ".moon", "dist", "build",
-    "coverage", "test-results", "playwright-report",
+    "coverage", ".coverage", "test-results", ".cache",
 }
+# Playwright's HTML reporter writes to playwright-report/ or the outputFolder a config names after it.
+CACHE_PREFIXES = ("playwright-report",)
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
+BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
 # APM 0.35 binds each checkout it installs to with a random .apm-local/installation and
 # writes a new one on the next install, so a removed checkout's identity binds nothing.
-REGENERABLE_PARTS = {"__generated__"}
-REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/")
+# husky and vite-hooks write the scripts under their `_` directory on each install.
+REGENERABLE_PARTS = {"__generated__", "generated"}
+REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/",
+                        ".husky/_/", ".vite-hooks/_/")
+# Records agents keep in a worktree outside git; --archive-scratch moves them aside.
+SCRATCH_DIRS = (".yomiyasu", ".investigate")
+ARCHIVE_DIR = Path.home() / ".cache/orca-briefs/archive"
 # A per-worktree .env may move these away from its .env.example and still be written again.
 ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
 ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
@@ -38,7 +56,33 @@ def is_cache(relpath):
     parts = Path(relpath.rstrip("/")).parts
     # pip writes <name>.egg-info beside an editable install's sources again on each install.
     return (bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
-            or any(part.endswith(".egg-info") for part in parts))
+            or any(part.endswith(".egg-info") or part.startswith(CACHE_PREFIXES) for part in parts))
+
+
+def holds_only_bytecode(path: Path) -> bool:
+    """A .pyc file, or a directory whose files, in any subdirectory, are all .pyc."""
+    if path.is_symlink() or not path.is_dir():
+        return path.is_file() and not path.is_symlink() and path.suffix == BYTECODE_SUFFIX
+    files = [child for child in path.rglob("*") if child.is_symlink() or not child.is_dir()]
+    return bool(files) and all(holds_only_bytecode(child) for child in files)
+
+
+def working_changes(worktree) -> tuple[list[str], list[str]]:
+    """(uncommitted, regenerable): paths `git status` reports, split off the untracked bytecode in them."""
+    uncommitted, regenerable = [], []
+    # -z gives each path unquoted; a rename's second entry names its source and is skipped.
+    entries = iter(git(worktree, "status", "--porcelain", "-z").stdout.split("\0"))
+    for entry in entries:
+        if not entry:
+            continue
+        if set(entry[:2]) & set("RC"):
+            next(entries, None)
+        rel = entry[3:]
+        if entry.startswith("?? ") and holds_only_bytecode(Path(worktree) / rel):
+            regenerable.append(rel)
+        else:
+            uncommitted.append(rel)
+    return uncommitted, regenerable
 
 
 def is_regenerable(relpath):
@@ -165,7 +209,7 @@ def nested_check(copy: Path) -> dict:
     and HEAD on a remote. `detach` is the command that removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
-    changes = [line for line in git(copy, "status", "--porcelain").stdout.splitlines() if line]
+    changes, _ = working_changes(copy)
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     review, _, deeper = ignored_paths(copy, repository)
@@ -379,7 +423,7 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
     blockers = []
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
-    changes = [line for line in git(worktree, "status", "--porcelain").stdout.splitlines() if line]
+    changes, bytecode = working_changes(worktree)
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -436,8 +480,8 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                             "rm_check をやり直してください: " + "; ".join(closes)
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
-    return {"ok": not blockers and not review, "blockers": blockers, "review": review,
-            "regenerable": regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
+    return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
+            "regenerable": bytecode + regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
             "containers": compose_in(worktree, compose_projects), "processes": processes or []}
 
 
@@ -562,6 +606,48 @@ def pull_request(worktree, number):
         return None, str(error)
 
 
+def head_in(worktree, base) -> bool:
+    return base is not None and git(worktree, "merge-base", "--is-ancestor", "HEAD", base).returncode == 0
+
+
+def merged_pr_at_head(worktree) -> tuple[dict | None, str | None]:
+    """(pr, error): the MERGED PR of the checked-out branch whose head is HEAD, asked of gh for a GitHub origin."""
+    origin = git(worktree, "remote", "get-url", "origin")
+    branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if origin.returncode != 0 or remote_identity(origin.stdout.strip())[0] != "github.com" or not branch:
+        return None, None
+    try:
+        out = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "merged",
+                              "--json", "number,state,headRefOid,baseRefName"],
+                             cwd=worktree, capture_output=True, text=True, check=True, timeout=30).stdout
+        prs = json.loads(out)
+    except subprocess.CalledProcessError as error:
+        return None, (error.stderr or "").strip() or str(error)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        return None, str(error)
+    return next((pr for pr in prs if pr.get("headRefOid") == head), None), None
+
+
+def scratch_to_archive(worktree: Path, result: dict) -> list[Path]:
+    """The scratch directories that alone keep the worktree: every blocker is an uncommitted change
+    inside one of them, and every path to review lies in one. Empty when anything else keeps it."""
+    # A review entry is "<path> (<where>)", and <where> holds no " (".
+    paths = [*result["uncommitted"], *(entry.rpartition(" (")[0] for entry in result["review"])]
+    tops = {Path(rel).parts[0] for rel in paths}
+    others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)]
+    if others or not tops or not tops <= set(SCRATCH_DIRS):
+        return []
+    return sorted(worktree / top for top in tops)
+
+
+def archive_target(archive: Path, worktree: Path, scratch: Path, day: str) -> Path:
+    """<archive>/<worktree>-<name>-<day>/, numbered when another worktree of that name archived it that day."""
+    name = "%s-%s-%s" % (worktree.name, scratch.name.lstrip("."), day)
+    return next(target for target in (archive / name, *(archive / ("%s-%d" % (name, n)) for n in range(2, 1000)))
+                if not target.exists())
+
+
 def compose_projects():
     try:
         out = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
@@ -576,7 +662,9 @@ def main(argv=None):
     parser.add_argument("--worktree", required=True, help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
     parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD)")
-    parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit check")
+    parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit "
+                                               "check. Without it, a MERGED PR of the checked-out branch whose head is "
+                                               "HEAD (asked of gh when HEAD is not in the base) counts the same")
     parser.add_argument("--pr-head", help="full SHA of a PR head confirmed MERGED on a host with gh; HEAD may be its ancestor")
     parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
@@ -585,6 +673,12 @@ def main(argv=None):
                         help="when nested worktrees are all that block the removal and each is clean, has nothing "
                              "ignored to open, and has HEAD on a remote, remove them from their repositories with "
                              "git worktree remove --force, then check again")
+    parser.add_argument("--archive-scratch", action="store_true",
+                        help="when %s alone keep the worktree (nothing else blocks or needs review), move them to "
+                             "<archive-dir>/<worktree>-<name>-<YYYYMMDD>/, then check again; off by default, so "
+                             "move them only where the lead's rules say to" % " and ".join(SCRATCH_DIRS))
+    parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
+                        help="where --archive-scratch moves them (default: %(default)s)")
     args = parser.parse_args(argv)
     if args.pr_head and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", args.pr_head):
         parser.error("--pr-head must be a full commit SHA")
@@ -598,12 +692,21 @@ def main(argv=None):
         return 2
     main = str(Path(args.main or main_checkout(worktree)).resolve())
     pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
+    notes = []
+    if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree)
+                                                         or default_base(worktree)):
+        pr, lookup_error = merged_pr_at_head(worktree)
+        branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+        if pr:
+            notes.append("--pr was not given: PR #%s of branch %s is MERGED at HEAD, so it counts as --pr %s"
+                         % (pr.get("number"), branch, pr.get("number")))
+        elif lookup_error:
+            notes.append("looking up a merged PR of branch %s failed: %s; pass --pr" % (branch, lookup_error))
     by_pr = pr_base(worktree, pr)
     base = args.base or by_pr or start_base(worktree) or default_base(worktree)
     projects = [] if args.no_docker else compose_projects()
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr)
-    notes = []
     if args.detach_nested:
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
@@ -618,6 +721,20 @@ def main(argv=None):
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
                          "paths to review, or a copy with blockers")
         result["detached"] = detached
+    if args.archive_scratch:
+        day = datetime.now().strftime("%Y%m%d")
+        archived = []
+        for scratch in scratch_to_archive(Path(worktree), result):
+            target = archive_target(args.archive_dir, Path(worktree), scratch, day)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(scratch, target)
+            archived.append({"from": str(scratch), "to": str(target)})
+        if archived:
+            kept = {key: result[key] for key in ("detached",) if key in result}
+            result = {**check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr), **kept}
+        elif any((Path(worktree) / name).exists() for name in SCRATCH_DIRS):
+            notes.append("--archive-scratch moved nothing: the worktree is kept for other blockers or paths to review")
+        result["archived"] = archived
     elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
         if not args.pr_head:
@@ -650,7 +767,8 @@ def main(argv=None):
                      "PR head object is absent locally; compare <pr-head>...<HEAD> with gh on another host and pass its ahead_by as --head-ahead-of-pr <number>")
     pr_base_name = (pr or {}).get("baseRefName")
     if not args.base and not by_pr and pr_base_name:
-        notes.append("PR #%d base origin/%s is not fetched: fetch it or pass --base" % (args.pr, pr_base_name))
+        notes.append("PR #%s base origin/%s is not fetched: fetch it or pass --base"
+                     % ((pr or {}).get("number"), pr_base_name))
     if projects is None:
         notes.append("docker compose unavailable: containers not checked")
     if notes:

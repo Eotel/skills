@@ -140,7 +140,7 @@ def close_blockers(term, transcript, screen, min_idle_minutes, now):
         problems.append("title is spinning")
     if screen.get("source") != "screen":
         problems.append("rendered screen unavailable")
-    if screen.get("draft") not in (None, ""):
+    if scan_sessions.has_draft(screen):
         problems.append("unsent draft")
     tail = screen.get("tail") or []
     lines = tail if isinstance(tail, list) else tail.splitlines()

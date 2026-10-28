@@ -2,19 +2,31 @@
 """Read new triage inbox lines by append position, then acknowledge handled lines.
 
 `read` does not advance the cursor. After handling its output, pass the printed
-byte position to `ack`. `initialize` starts a new cursor at the current end
-only after the lead has handled all existing inbox entries.
+byte position to `ack`; only a read without --kind, --source, or --id prints it,
+so an entry a filter hid is never acknowledged. `initialize` starts a new cursor
+at the current end only after the lead has handled all existing inbox entries.
+`watch` is the lead's Monitor: it prints every new ask and done, advances its own
+cursor, and names each ask left unanswered for 15 minutes.
+
+Being read and being answered differ. `answered` records an ask (or one of its
+questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
+($TRIAGE_ASK_ANSWERS), as `send --decision --ask` does; `open-asks` lists the asks
+not answered yet, oldest first, and `questions` prints their structured questions
+(`triage-notify --kind ask --questions`) four at a time as AskUserQuestion input.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Literal, cast
 
 import hourly_runtime
@@ -22,6 +34,28 @@ import hourly_runtime
 
 ReportKind = Literal["ask", "done", "info"]
 REPORT_KINDS: frozenset[str] = frozenset(("ask", "done", "info"))
+WATCHED_KINDS = frozenset(("ask", "done"))
+CURSOR_ACTIONS = frozenset(("read", "ack", "watch"))
+ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
+REMIND_AFTER_MINUTES = 15
+# AskUserQuestion takes one to four questions per call.
+QUESTIONS_PER_BATCH = 4
+RECOMMENDED_MARK = "（推奨）"
+
+
+@dataclass(frozen=True)
+class OpenAsk:
+    report: dict
+    # Numbers of the questions still unanswered; empty for an ask without structured questions.
+    open_questions: tuple[int, ...]
+    at: datetime | None
+
+
+@dataclass(frozen=True)
+class PendingQuestion:
+    id: str
+    report: dict
+    question: dict
 
 
 @dataclass(frozen=True)
@@ -31,6 +65,10 @@ class ReadOptions:
     source: str | None = None
     summary: bool = False
     ids: frozenset[str] | None = None
+
+    @property
+    def filtered(self) -> bool:
+        return self.kinds is not None or self.source is not None or self.ids is not None
 
 
 def report_kinds(value: str) -> frozenset[ReportKind]:
@@ -53,6 +91,10 @@ def paths() -> tuple[Path, Path]:
     return inbox, cursor
 
 
+def answers_path() -> Path:
+    return Path(os.environ.get("TRIAGE_ASK_ANSWERS") or ANSWERS)
+
+
 def complete_end(data: bytes) -> int:
     return data.rfind(b"\n") + 1
 
@@ -69,6 +111,19 @@ def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
     return start, data, complete_end(data)
 
 
+def source_of(item: dict) -> str:
+    worktree = str(item.get("worktree") or "-")
+    return f"{item['repo']}/{worktree}" if item.get("repo") else worktree
+
+
+def summary_line(item: dict) -> str:
+    """`<ts> <kind> <host> <source> id=<id>  <first 160 characters>`, as `read --summary` prints an entry."""
+    label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
+    location = source_of(item) + (f" id={item['id']}" if item.get("id") else "")
+    compact = " ".join((item.get("text") or "").split())
+    return f"{label} {location}  {compact[:160]}" + ("…" if len(compact) > 160 else "")
+
+
 def read(inbox: Path, cursor: Path, options: ReadOptions) -> frozenset[str]:
     """Print the entries after the cursor; return the requested ids that none of them has."""
     start, data, complete = pending_bytes(inbox, cursor)
@@ -81,27 +136,156 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> frozenset[str]:
                 continue
             if options.ids is not None and item.get("id") not in options.ids:
                 continue
-            label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
-            worktree = str(item.get("worktree") or "-")
-            location = f"{item['repo']}/{worktree}" if item.get("repo") else worktree
-            if options.source is not None and location != options.source:
+            if options.source is not None and source_of(item) != options.source:
                 continue
             if item.get("id"):
-                location += f" id={item['id']}"
                 shown.add(str(item["id"]))
+            if options.summary and options.ids is None:
+                print(summary_line(item))
+                continue
+            label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
+            location = source_of(item) + (f" id={item['id']}" if item.get("id") else "")
             body = item.get("text") or ""
-            if options.ids is None and (options.summary or (options.brief and item.get("kind") == "info")):
+            if options.ids is None and options.brief and item.get("kind") == "info":
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
-            if options.summary and options.ids is None:
-                print(f"{label} {location}  {body}")
-            else:
-                print(f"{label} {location}\n{body}\n")
+            print(f"{label} {location}\n{body}\n")
         except (ValueError, TypeError, AttributeError):
-            if options.kinds is None and options.source is None and options.ids is None:
+            if not options.filtered:
                 print(raw.decode("utf-8", "replace"))
-    print(f"NEXT_OFFSET={end}")
+    if options.filtered:
+        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, or --id "
+              "to acknowledge", file=sys.stderr)
+    else:
+        print(f"NEXT_OFFSET={end}")
     return (options.ids or frozenset()) - shown
+
+
+def inbox_entries(inbox: Path) -> list[dict]:
+    """Every complete JSON object line of the inbox, in append order."""
+    data = inbox.read_bytes()
+    entries = []
+    for raw in data[:complete_end(data)].splitlines():
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            entries.append(item)
+    return entries
+
+
+def answered_ids(path: Path) -> frozenset[str]:
+    if not path.exists():
+        return frozenset()
+    found = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("id"), str):
+            found.add(record["id"])
+    return frozenset(found)
+
+
+def asked_at(item: dict) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(str(item.get("ts")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.astimezone()
+
+
+def questions_of(item: dict) -> list:
+    questions = item.get("questions")
+    return questions if isinstance(questions, list) else []
+
+
+def open_asks(entries: list[dict], answered: frozenset[str]) -> list[OpenAsk]:
+    """Asks with an id that no answer covers, oldest first. An answer to `<id>` covers the ask; answers
+    to every `<id>:<n>` cover an ask with structured questions."""
+    found = []
+    for item in entries:
+        if item.get("kind") != "ask" or not item.get("id") or item["id"] in answered:
+            continue
+        questions = questions_of(item)
+        left = tuple(number for number in range(1, len(questions) + 1) if f"{item['id']}:{number}" not in answered)
+        if not questions or left:
+            found.append(OpenAsk(item, left, asked_at(item)))
+    # Python's sort is stable: asks without a readable time keep their append order, after the rest.
+    return sorted(found, key=lambda ask: (ask.at is None, ask.at or datetime.min.replace(tzinfo=timezone.utc)))
+
+
+def minutes_since(when: datetime | None, now: datetime) -> int | None:
+    return None if when is None else int((now - when).total_seconds() // 60)
+
+
+def checked_answer_ids(value: str, entries: list[dict]) -> list[str]:
+    """Comma-separated `<ask id>` or `<ask id>:<question number>`, each naming an ask of the inbox."""
+    asks = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    ids = [part.strip() for part in value.split(",")]
+    for answer in ids:
+        ask_id, colon, number = answer.partition(":")
+        ask = asks.get(ask_id)
+        if ask is None or colon and not (number.isdigit() and 1 <= int(number) <= len(questions_of(ask))):
+            raise ValueError(f"no ask in the inbox has id {answer}")
+    return ids
+
+
+def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None:
+    """Append one line per answered id; triage-notify's lock keeps concurrent writers' lines whole."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    lines = "".join(json.dumps({"id": answer, "ts": stamp, "how": how, **({"note": note} if note else {})},
+                               ensure_ascii=False) + "\n" for answer in ids)
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write(lines)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def open_ask_view(ask: OpenAsk, now: datetime) -> dict:
+    report = ask.report
+    return {"id": report["id"], "ts": report.get("ts") or "", "host": report.get("host") or "",
+            "source": source_of(report), "handle": report.get("handle") or "", "text": report.get("text") or "",
+            "open_questions": list(ask.open_questions), "age_minutes": minutes_since(ask.at, now)}
+
+
+def pending_questions(asks: list[OpenAsk]) -> list[PendingQuestion]:
+    """The unanswered structured questions of the open asks, oldest ask first."""
+    return [PendingQuestion(f"{ask.report['id']}:{number}", ask.report, questions_of(ask.report)[number - 1])
+            for ask in asks for number in ask.open_questions]
+
+
+def ask_user_question(question: dict) -> dict:
+    """AskUserQuestion's question: the recommended option first and marked, the issue named after the question."""
+    recommended = question.get("recommended")
+    options = sorted(question["options"], key=lambda option: option["label"] != recommended)
+    issue = question.get("issue")
+    return {"question": question["question"] + (f"（{issue}）" if issue else ""), "header": question["header"],
+            "multiSelect": bool(question.get("multiSelect")),
+            "options": [{"label": option["label"] + (RECOMMENDED_MARK if option["label"] == recommended else ""),
+                         "description": option["description"]} for option in options]}
+
+
+def question_batch(questions: list[PendingQuestion], after: str | None = None) -> dict:
+    """The next questions after the id `after`, with where each came from and what is left after them."""
+    if after is not None:
+        ids = [question.id for question in questions]
+        if after not in ids:
+            raise ValueError(f"no unanswered question has id {after}")
+        questions = questions[ids.index(after) + 1:]
+    batch = questions[:QUESTIONS_PER_BATCH]
+    left = len(questions) - len(batch)
+    return {
+        "questions": [ask_user_question(question.question) for question in batch],
+        "items": [{"id": question.id, "source": source_of(question.report), "host": question.report.get("host") or "",
+                   "handle": question.report.get("handle") or "", "ts": question.report.get("ts") or "",
+                   "issue": question.question.get("issue") or ""} for question in batch],
+        "remaining": left, "next_after": batch[-1].id if left else None,
+    }
 
 
 def unread_asks(inbox: Path, cursor: Path) -> list[str]:
@@ -129,10 +313,40 @@ def save(cursor: Path, position: int, exclusive: bool = False) -> None:
         temporary.replace(cursor)
 
 
+def watch(inbox: Path, cursor: Path, answers: Path, once: bool, interval: float, remind_after: int) -> None:
+    """Print each new ask and done, whatever its source, then each ask unanswered `remind_after` minutes,
+    once per ask while this watch runs; advance the cursor past every entry printed or not."""
+    if not cursor.exists():
+        raise ValueError(f"watch reads only after an initialized cursor: run initialize with "
+                         f"TRIAGE_READ_OFFSET={cursor} first")
+    reminded: set[str] = set()
+    while True:
+        start, data, complete = pending_bytes(inbox, cursor)
+        for raw in data[:complete].splitlines():
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and item.get("kind") in WATCHED_KINDS:
+                print(summary_line(item), flush=True)
+        if complete:
+            save(cursor, start + complete)
+        now = datetime.now().astimezone()
+        for ask in open_asks(inbox_entries(inbox), answered_ids(answers)):
+            age = minutes_since(ask.at, now)
+            if age is not None and age >= remind_after and ask.report["id"] not in reminded:
+                reminded.add(ask.report["id"])
+                print(f"unanswered {age} min: {summary_line(ask.report)}", flush=True)
+        if once:
+            return
+        time.sleep(interval)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest="action", required=True)
-    read_command = actions.add_parser("read", help="show complete new lines without changing the cursor")
+    read_command = actions.add_parser("read", help="show complete new lines without changing the cursor; "
+                                                   "NEXT_OFFSET only without --kind, --source, and --id")
     read_command.add_argument("--brief", action="store_true", help="show only the first 160 characters of info")
     read_command.add_argument("--kind", type=report_kinds, help="filter by comma-separated ask,done,info")
     read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries)")
@@ -140,13 +354,37 @@ def main(argv: list[str] | None = None) -> int:
                               help="show one line per entry with its id and a 160-character excerpt")
     read_command.add_argument("--id", type=entry_ids, dest="ids",
                               help="show only these comma-separated entry ids, in full")
-    ack = actions.add_parser("ack", help="acknowledge the byte position printed by read")
+    watch_command = actions.add_parser(
+        "watch", help="the lead's Monitor: print every new ask and done as a summary line, advance the cursor, "
+                      "and print `unanswered <n> min: <line>` once per ask left unanswered --remind-after minutes")
+    watch_command.add_argument("--interval", type=float, default=10, help="seconds between reads (default: 10)")
+    watch_command.add_argument("--remind-after", type=int, default=REMIND_AFTER_MINUTES,
+                               help="minutes before an unanswered ask is named (default: %(default)s)")
+    watch_command.add_argument("--once", action="store_true", help="read once and exit")
+    open_command = actions.add_parser("open-asks", help="list asks not answered yet, oldest first, one summary "
+                                                        "line each after `unanswered <n> min:`")
+    open_command.add_argument("--json", action="store_true",
+                              help="print a JSON list of {id, ts, host, source, handle, text, open_questions, "
+                                   "age_minutes} instead")
+    answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
+                                                   "or no longer asked); send --decision --ask records its own")
+    answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
+    answered.add_argument("--before", help="instead, every open ask asked before this ISO time")
+    answered.add_argument("--note", default="", help="why, kept with the record")
+    questions = actions.add_parser(
+        "questions", help="print, as JSON, the next 4 unanswered structured questions: `questions` to pass to "
+                          "AskUserQuestion, `items` naming each one's id and source, `remaining`, and "
+                          "`next_after` for the following batch")
+    questions.add_argument("--after", metavar="ID", help="start after this question id (a batch's next_after)")
+    ack = actions.add_parser("ack", help="acknowledge the byte position printed by an unfiltered read")
     ack.add_argument("position", type=int)
     actions.add_parser("initialize", help="set a new cursor at the current complete end")
     args = parser.parse_args(argv)
+    if args.action == "answered" and (args.ids is None) == (args.before is None):
+        parser.error("answered takes ids or --before, not both")
     inbox, cursor = paths()
     try:
-        if (args.action != "initialize" and not os.environ.get("TRIAGE_READ_OFFSET") and
+        if (args.action in CURSOR_ACTIONS and not os.environ.get("TRIAGE_READ_OFFSET") and
                 not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
             raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
         if args.action == "read":
@@ -154,6 +392,31 @@ def main(argv: list[str] | None = None) -> int:
                 brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary, ids=args.ids))
             if missing:
                 raise ValueError("no entry after the cursor has id " + ",".join(sorted(missing)))
+            return 0
+        if args.action == "watch":
+            watch(inbox, cursor, answers_path(), args.once, args.interval, args.remind_after)
+            return 0
+        if args.action in ("open-asks", "questions", "answered"):
+            entries = inbox_entries(inbox)
+            asks = open_asks(entries, answered_ids(answers_path()))
+            now = datetime.now().astimezone()
+            if args.action == "answered":
+                if args.ids is not None:
+                    ids = checked_answer_ids(args.ids, entries)
+                else:
+                    before = datetime.fromisoformat(args.before)
+                    before = before if before.tzinfo else before.astimezone()
+                    ids = [ask.report["id"] for ask in asks if ask.at is not None and ask.at < before]
+                record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
+                print(f"answered: {len(ids)}")
+            elif args.action == "questions":
+                print(json.dumps(question_batch(pending_questions(asks), args.after), ensure_ascii=False, indent=2))
+            elif args.json:
+                print(json.dumps([open_ask_view(ask, now) for ask in asks], ensure_ascii=False, indent=2))
+            else:
+                for ask in asks:
+                    age = minutes_since(ask.at, now)
+                    print(f"unanswered {'?' if age is None else age} min: {summary_line(ask.report)}")
             return 0
         data = inbox.read_bytes()
         end = complete_end(data)
