@@ -66,6 +66,8 @@ keep their own cursor. The watch's output is in
 The Stop hook keeps the current scheduled run open while an `ask` is past the acknowledged
 cursor, including on a repeated stop. Read it, handle it or hand it to the
 appointed lead, then ack the reader's `NEXT_OFFSET` before ending the turn.
+An ask the triage workspace sent from this Mac (the run's own handoff) does not
+count.
 After these checks permit the turn to end, the same hook queues this hourly
 session's transcript. The external retrospective service skips a session the
 run's own forked retrospective already recorded and reviews one it did not.
@@ -116,7 +118,12 @@ send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
 (`--kind info` with nothing to hand off but cleanup). At the moment it sends,
 it adds every inbox report that arrived after the scan began and the lead's
 latest message and unanswered questions read again from its transcript, so the
-handoff never rests on the scan's start. Ack the NEXT_OFFSET it prints. The
+handoff never rests on the scan's start. Ack the NEXT_OFFSET it prints: it is
+past the run's own handoff entry, unless another report reached the inbox
+first, which then stays unread for this run. Each handoff it sends is kept in
+`~/.cache/orca-session-triage/handoffs/` with its kind, keys, and time;
+`handoff.py last` prints the newest, so read the previous run's handoff with it
+rather than from transcripts. The
 lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment.
 Include each 「レビューの番」 PR URL and its command, or the missing source to
@@ -131,7 +138,17 @@ later runs through `scripts/lead_decisions.py`. Give each question in the
 handoff a stable key in the form `hourly_state.py asked --decision` uses, such
 as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 `--decision` key already has an answer and prints those answers, and records
-each key it sends. Key a question about an Asana 99 value as
+each key it sends. Before writing the handoff, run `lead_decisions.py
+unanswered` without arguments: it lists, as JSON, every key any earlier run
+handed off that still has no answer, with when it was last handed off. For a
+key naming PRs (`merge:owner/repo#136`, `merge:owner/repo#12+#14`,
+`spawn:owner/repo#6303::review-fix`) it adds each PR's `state`, `updatedAt`,
+and `updated_after_handoff`, read with one GitHub query per repository; a
+repository gh cannot read leaves them null and is named on stderr. Carry each
+key still open into this handoff. When its PR changed since (merged, closed,
+or updated), check whether the question still stands: drop it, or ask under a
+new key. Do not collect keys from earlier handoffs or read PRs one at a time.
+Key a question about an Asana 99 value as
 `asana:<item>:<owner/repo>#<number>`, item one of `complete`, `priority`,
 `assignee`, `review-state`, `pr-state` (`asana:complete:example/app#12`):
 until the key has an answer, `asana99_status.py` marks that difference
@@ -140,10 +157,15 @@ until the key has an answer, `asana99_status.py` marks that difference
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
 The lead records an answer with
-`lead_decisions.py record --decision KEY --answer-file FILE`, or, when it relays
-the answer to a lane, with `send --decision <answer> --key KEY` (repeat per key,
-with `--ask <id>` for the ask it answers): the key and the ask are recorded
-answered once the send lands. Records are only appended, and a later record for
+`lead_decisions.py record --decision KEY --answer-file FILE`, and several with
+`lead_decisions.py record-many --file FILE` (or on standard input), one JSON
+object per line: `{"decision": KEY, "answer": TEXT}`, adding `"decided_at"`
+(ISO 8601 with its offset) for an earlier answer. It checks every line first,
+names each wrong one, and records nothing until all are right; do not call
+`record` in a shell loop. When the lead relays the answer to a lane, it uses
+`send --decision <answer> --key KEY` instead (repeat per key, with `--ask <id>`
+for the ask it answers): the key and the ask are recorded answered once the
+send lands. Records are only appended, and a later record for
 a key replaces its earlier answer.
 
 When this run leads, read the shared hourly state before the scan. Match the

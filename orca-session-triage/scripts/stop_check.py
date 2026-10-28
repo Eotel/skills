@@ -11,7 +11,8 @@ Orca counts the tab as working while the watch runs. A missing external inbox se
 is named when the triage automation is installed. A repeated stop
 (`stop_hook_active`) goes through for those checks, so a broken classifier cannot
 trap the session. An unread ask blocks only the latest scheduled tab until its
-inbox cursor is acked.
+inbox cursor is acked; an ask the tab's own workspace sent from this Mac (its
+handoff) does not count.
 After the checks pass, an hourly transcript path is queued for the external
 retrospective worker.
 """
@@ -68,13 +69,13 @@ def decide(hook_input, state_dir, orca="orca"):
     return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
 
 
-def unread_ask_reason(workspace, orca):
+def unread_ask_reason(workspace: str | None, orca: str) -> str | None:
     if not workspace:
         return None
     try:
         if not hourly_runtime.current_pane(orca):
             return None
-        asks = inbox_read.unread_asks(*inbox_read.paths())
+        asks = inbox_read.unread_asks(*inbox_read.paths(), mine=inbox_read.Sender.of(Path(workspace)))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return None
     if not asks:

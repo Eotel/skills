@@ -3637,6 +3637,22 @@ class StopCheckTests(unittest.TestCase):
             cursor.write_text(str(inbox.stat().st_size - len('{"kind":"ask","worktree":"partial"')))
             self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
+    def test_an_ask_the_scheduled_tab_sent_itself_is_not_unread(self):
+        inbox = self.root / "inbox.jsonl"
+        cursor = self.root / "read.offset"
+        write_jsonl(inbox, [{"kind": "ask", "host": "mac-a", "worktree": "triage", "text": "定時の引き継ぎ"}])
+        cursor.write_text("0")
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": "new-pane",
+             "workspaceId": "repo1::/w/triage"}]})
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                                     "ORCA_PANE_KEY": "new-pane", "ORCA_WORKTREE_ID": "repo1::/w/triage",
+                                     "TRIAGE_HOST": "mac-a"}):
+            self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"kind": "ask", "host": "mac-b", "worktree": "triage", "text": "別の Mac"}) + "\n")
+            self.assertEqual(self.check(active=True, cwd="/w/triage", orca=orca)["decision"], "block")
+
     def test_blocks_once_then_lets_a_repeated_stop_through(self):
         self.queue("/w/a")
         self.assertEqual(self.check()["decision"], "block")
