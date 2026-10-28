@@ -2,12 +2,14 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
+from functools import partial
 import importlib.util
 import http.client
 import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,6 +61,57 @@ def assistant(*blocks):
 
 def text(value):
     return {"type": "text", "text": value}
+
+
+def each_ref(lookup):
+    """A repository's PR lookup built from one that answers a single ref."""
+    return lambda slug, refs: {ref: lookup(slug, ref) for ref in refs}
+
+
+def pr_node(number, branch="fix", state="OPEN", updated_at="2026-10-28T00:00:00Z", **fields):
+    """A PullRequest node as scan_sessions' GraphQL query returns it."""
+    return {"number": number, "url": f"https://github.com/acme/app/pull/{number}", "state": state,
+            "updatedAt": updated_at, "isCrossRepository": False, "headRefName": branch, "headRefOid": "aaa",
+            "reviewDecision": None, "mergeStateStatus": "CLEAN", "mergedAt": None,
+            "author": {"__typename": "User", "login": "author"},
+            "reviewRequests": {"nodes": []}, "latestReviews": {"nodes": []},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-10-27T00:00:00Z",
+                                              "statusCheckRollup": None}}]}, **fields}
+
+
+class FakeGitHub:
+    """`gh` for a few repositories, keeping every call so a test can count what a run asked.
+
+    `gh api graphql` answers each alias from the repository's PR nodes, newest first; a
+    missing PR is a null alias with a NOT_FOUND error, and gh then exits 1 while the
+    other aliases keep their data. A REST read answers from `activity` by endpoint.
+    """
+
+    def __init__(self, repos, activity=None):
+        self.repos, self.activity, self.calls = repos, activity or {}, []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        if argv[:3] != ["gh", "api", "graphql"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([self.activity.get(argv[-1], [])]), "")
+        query = next(arg for arg in argv if arg.startswith("query=")).removeprefix("query=")
+        owner, name = re.search(r'repository\(owner: ("[^"]*"), name: ("[^"]*")\)', query).groups()
+        nodes = sorted(self.repos.get(json.loads(owner) + "/" + json.loads(name), []), key=lambda n: -n["number"])
+        repository, errors = {"defaultBranchRef": {"name": "main"}}, []
+        for alias, number in re.findall(r"(\w+): pullRequest\(number: (\d+)\)", query):
+            repository[alias] = next((n for n in nodes if n["number"] == int(number)), None)
+            if repository[alias] is None:
+                errors.append({"type": "NOT_FOUND", "path": ["repository", alias]})
+        for alias, branch in re.findall(r'(\w+): pullRequests\(headRefName: ("(?:[^"\\]|\\.)*")', query):
+            repository[alias] = {"nodes": [n for n in nodes if n["headRefName"] == json.loads(branch)][:5]}
+        body = {"data": {"repository": repository}, **({"errors": errors} if errors else {})}
+        return subprocess.CompletedProcess(argv, 1 if errors else 0, json.dumps(body), "")
+
+    def graphql(self):
+        return [call for call in self.calls if call[:3] == ["gh", "api", "graphql"]]
+
+    def rest(self):
+        return [call for call in self.calls if call[:3] != ["gh", "api", "graphql"]]
 
 
 class ClaudeTranscriptTests(unittest.TestCase):
@@ -941,38 +994,162 @@ class NextStepFactTests(unittest.TestCase):
                "orca_message": {"text": "PR https://github.com/acme/app/pull/42", "at": "2026-10-21T01:00:00Z"},
                "reasons": ["review pending"], "jev": {"source": "orca", "status": "blocked_on_others"}}
         pr = {"number": 42, "head_oid": "aaa", "state": "OPEN", "reply_after_last_commit": True}
-        result = scan.add_next_step_facts([row], pr_lookup=lambda slug, ref: pr)[0]
+        result = scan.add_next_step_facts([row], pr_lookup=each_ref(lambda slug, ref: pr))[0]
         self.assertEqual(result["git"]["github"], "acme/app")
         self.assertIsNone(result["pr"]["head_matches"])
         self.assertEqual(result["waits_on"], "self")
         self.assertIn("human PR response after the latest commit", result["reasons"])
 
-    def test_gh_pr_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
-        pr = subprocess.CompletedProcess([], 0, '{"number": 42, "state": "OPEN"}')
-        reviews = subprocess.CompletedProcess([], 0, json.dumps([[{
-            "user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
-            "submitted_at": "2026-10-21T02:00:00Z"}]]))
-        empty = subprocess.CompletedProcess([], 0, "[[]]")
-        with patch.object(scan.subprocess, "run", side_effect=[pr, reviews, empty, empty]) as run:
-            self.assertEqual(scan.gh_pr("acme/app", 42)["latest_human_review"]["state"],
+    def test_gh_prs_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
+        review = {"user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
+                  "submitted_at": "2026-10-21T02:00:00Z"}
+        github = FakeGitHub({"acme/app": [pr_node(42)]}, {"repos/acme/app/pulls/42/reviews": [review]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github) as run:
+            self.assertEqual(scan.gh_prs("acme/app", [42], cache_dir=Path(cache))[42]["latest_human_review"]["state"],
                              "CHANGES_REQUESTED")
             self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list],
                              [scan.GH_TIMEOUT] * 4)
             self.assertEqual(run.call_args_list[1].args[0],
                              ["gh", "api", "--paginate", "--slurp", "repos/acme/app/pulls/42/reviews"])
-        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.CompletedProcess([], 1, ""), empty, empty]):
-            self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
-        with patch.object(scan.subprocess, "run", side_effect=[pr, subprocess.TimeoutExpired("gh", 15), empty, empty]):
-            self.assertEqual(scan.gh_pr("acme/app", 42)["state"], "OPEN")
+        for failure in (subprocess.CompletedProcess([], 1, ""), subprocess.TimeoutExpired("gh", 15)):
+            def failing_reviews(argv, failure=failure, **kwargs):
+                if not argv[-1].endswith("/reviews"):
+                    return github(argv, **kwargs)
+                github.calls.append(argv)
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as cache, \
+                    patch.object(scan.subprocess, "run", side_effect=failing_reviews):
+                github.calls.clear()
+                self.assertEqual(scan.gh_prs("acme/app", [42], cache_dir=Path(cache))[42]["state"], "OPEN")
+                # A failed read is not kept, so the next run reads it again.
+                scan.gh_prs("acme/app", [42], cache_dir=Path(cache))
+                self.assertEqual(sum(call[-1].endswith("/reviews") for call in github.calls), 2)
 
     def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
-        with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
-            self.assertIsNone(scan.gh_pr("acme/app", 7))
-        with patch.object(scan.subprocess, "run", side_effect=scan.subprocess.TimeoutExpired("gh", 30)):
-            self.assertIsNone(scan.gh_pr("acme/app", 7))
-        failed = scan.subprocess.CompletedProcess([], 1, stdout="", stderr="no pull requests found")
-        with patch.object(scan.subprocess, "run", return_value=failed):
-            self.assertIsNone(scan.gh_pr("acme/app", "fix-a"))
+        with tempfile.TemporaryDirectory() as cache, redirect_stderr(io.StringIO()) as err:
+            with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
+                self.assertEqual(scan.gh_prs("acme/app", [7], cache_dir=Path(cache)), {7: None})
+            with patch.object(scan.subprocess, "run", side_effect=scan.subprocess.TimeoutExpired("gh", 30)):
+                self.assertEqual(scan.gh_prs("acme/app", [7], cache_dir=Path(cache)), {7: None})
+            limited = scan.subprocess.CompletedProcess(
+                [], 1, stdout='{"errors": [{"type": "RATE_LIMITED"}]}', stderr="API rate limit exceeded")
+            with patch.object(scan.subprocess, "run", return_value=limited):
+                self.assertEqual(scan.gh_prs("acme/app", ["fix-a"], cache_dir=Path(cache)), {"fix-a": None})
+        # The rows stay without PR facts; stderr says which repository's query failed and why.
+        self.assertIn("acme/app", err.getvalue())
+        self.assertIn("API rate limit exceeded", err.getvalue())
+
+    def test_a_run_asks_github_once_per_repository_and_rereads_activity_only_for_updated_prs(self):
+        # 2026-10-28: a `gh pr view` per PR plus three REST reads on every run used up the shared
+        # GraphQL budget. Before this change these 6 PRs in 2 repositories cost 6 + 18 calls each run.
+        refs = [("acme/app", 7), ("acme/app", 8), ("acme/app", "fix-c"),
+                ("acme/lib", 3), ("acme/lib", 4), ("acme/lib", 5)]
+        rows = [{"path": f"/w/{index}", "class": "stalled",
+                 "linked_pr": {"number": ref} if isinstance(ref, int) else None}
+                for index, (_, ref) in enumerate(refs)]
+        gits = {f"/w/{index}": {"branch": ref if isinstance(ref, str) else f"b{index}", "head": "aaa",
+                                "dirty": 0, "unpushed": 0, "github": slug}
+                for index, (slug, ref) in enumerate(refs)}
+        app = [pr_node(7), pr_node(8), pr_node(9, "fix-c")]
+        github = FakeGitHub({"acme/app": app, "acme/lib": [pr_node(3), pr_node(4), pr_node(5)]})
+        reply = {"user": {"login": "reviewer", "type": "User"}, "created_at": "2026-10-28T01:00:00Z"}
+
+        with tempfile.TemporaryDirectory() as cache:
+            def run():
+                github.calls.clear()
+                with patch.object(scan.subprocess, "run", side_effect=github):
+                    result = scan.add_next_step_facts(
+                        rows, git_lookup=gits.get, pr_lookup=partial(scan.gh_prs, cache_dir=Path(cache)))
+                return [row["pr"] for row in result], (len(github.graphql()), len(github.rest()))
+
+            first, calls = run()
+            self.assertEqual([pr["number"] for pr in first], [7, 8, 9, 3, 4, 5])
+            self.assertEqual(calls, (2, 18))
+            # Nothing changed on GitHub: the reviews and comments come from the last run.
+            self.assertEqual(run(), (first, (2, 0)))
+            # A comment moves its PR's updatedAt, so only that PR is read again.
+            app[1] = pr_node(8, updated_at="2026-10-28T01:00:00Z")
+            github.activity["repos/acme/app/issues/8/comments"] = [reply]
+            prs, calls = run()
+            self.assertEqual(calls, (2, 3))
+            self.assertEqual(prs[1]["latest_human_activity"]["at"], reply["created_at"])
+            # A damaged copy is read again, not trusted.
+            (Path(cache) / "acme/lib/3.json").write_text("{")
+            self.assertEqual(run()[1], (2, 3))
+
+    def test_a_repository_with_more_prs_than_one_query_holds_is_read_25_at_a_time(self):
+        github = FakeGitHub({"acme/app": [pr_node(number) for number in range(1, 31)]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+            found = scan.gh_prs("acme/app", list(range(1, 31)), cache_dir=Path(cache))
+        self.assertEqual(sorted(pr["number"] for pr in found.values()), list(range(1, 31)))
+        self.assertEqual([len(re.findall(r"pullRequest\(", call[-1])) for call in github.graphql()], [25, 5])
+
+    def test_a_missing_pr_leaves_the_others_in_its_query(self):
+        github = FakeGitHub({"acme/app": [pr_node(7)]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+            found = scan.gh_prs("acme/app", [7, 404], cache_dir=Path(cache))
+        self.assertEqual((found[7]["number"], found[404]), (7, None))
+        self.assertEqual((len(github.graphql()), len(github.rest())), (1, 3))
+
+    def test_a_branch_finds_its_pr_as_gh_pr_view_does(self):
+        # gh puts an open PR first and the rest newest first, skips a fork's branch of the same
+        # name, and skips a closed or merged PR whose head is the default branch.
+        github = FakeGitHub({"acme/app": [
+            pr_node(10, "fix-a", "CLOSED"), pr_node(11, "fix-a", "OPEN"), pr_node(12, "fix-a", "MERGED"),
+            pr_node(21, "fix-b", "MERGED"), pr_node(22, "fix-b", "CLOSED"),
+            pr_node(31, "fork", isCrossRepository=True), pr_node(41, "main", "MERGED")]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+            found = scan.gh_prs("acme/app", ["fix-a", "fix-b", "fork", "main"], cache_dir=Path(cache))
+        self.assertEqual({ref: pr and pr["number"] for ref, pr in found.items()},
+                         {"fix-a": 11, "fix-b": 22, "fork": None, "main": None})
+        self.assertEqual(len(github.graphql()), 1)
+
+    def test_names_are_checked_before_they_go_into_a_query(self):
+        github = FakeGitHub({"acme/app": [pr_node(5, 'say-"hi"')]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+            found = scan.gh_prs("acme/app", ['say-"hi"', "two words", "x\ny"], cache_dir=Path(cache))
+            self.assertEqual(scan.gh_prs('acme/app") { x', [7], cache_dir=Path(cache)), {7: None})
+        self.assertEqual({ref: pr and pr["number"] for ref, pr in found.items()},
+                         {'say-"hi"': 5, "two words": None, "x\ny": None})
+        [query] = github.graphql()
+        self.assertNotIn("two words", query[-1])
+
+    def test_a_pr_read_by_graphql_summarizes_as_its_gh_pr_view_json_did(self):
+        checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                  {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": None},
+                  {"__typename": "StatusContext", "state": "FAILURE"}]
+        node = pr_node(11263, "fix-a", reviewDecision="APPROVED", headRefOid="abc123",
+                       author={"__typename": "Bot", "login": "renovate"},
+                       reviewRequests={"nodes": [
+                           {"requestedReviewer": {"__typename": "User", "login": "k-mizokami"}},
+                           {"requestedReviewer": {"__typename": "Team", "name": "backend"}}]},
+                       latestReviews={"nodes": [{"author": {"login": "hdknr"}, "state": "APPROVED"},
+                                                {"author": None, "state": "COMMENTED"}]},
+                       commits={"nodes": [{"commit": {"committedDate": "2026-10-21T02:00:00Z",
+                                                      "statusCheckRollup": {"contexts": {"nodes": checks}}}}]})
+        # What `gh pr view --json` printed for the same PR: a bot author as app/<login>, and every commit.
+        view = {"number": 11263, "url": node["url"], "state": "OPEN", "author": {"is_bot": True, "login": "app/renovate"},
+                "headRefName": "fix-a", "headRefOid": "abc123", "reviewDecision": "APPROVED",
+                "reviewRequests": [{"__typename": "User", "login": "k-mizokami"},
+                                   {"__typename": "Team", "name": "backend", "slug": "backend"}],
+                "latestReviews": [{"author": {"login": "hdknr"}, "state": "APPROVED"},
+                                  {"author": None, "state": "COMMENTED"}],
+                "mergeStateStatus": "CLEAN", "mergedAt": None,
+                "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                                      {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""},
+                                      {"__typename": "StatusContext", "state": "FAILURE"}],
+                "commits": [{"committedDate": "2026-10-20T00:00:00Z"}, {"committedDate": "2026-10-21T02:00:00Z"}]}
+        # A person whose login is the bot's name is not the bot that wrote the PR.
+        comment = {"user": {"login": "renovate", "type": "User"}, "created_at": "2026-10-21T03:00:00Z",
+                   "body": "見ました"}
+        github = FakeGitHub({"acme/app": [node]}, {"repos/acme/app/issues/11263/comments": [comment]})
+        with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+            found = scan.gh_prs("acme/app", [11263], cache_dir=Path(cache))[11263]
+        self.assertEqual(found, scan.summarize_pr(view, [], [comment], []))
+        self.assertTrue(found["reply_after_last_commit"])
 
 
     def test_reads_uncommitted_and_unpushed_work_and_the_github_repo(self):
@@ -1030,7 +1207,7 @@ class NextStepFactTests(unittest.TestCase):
             return git
 
         result = {r["path"]: (r["class"], r["reasons"])
-                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=each_ref(pr_lookup))}
 
         self.assertEqual(result["/w/merged-later"], ("finished", ["PR merged after the final message"]))
         self.assertEqual(result["/w/codex-merged-later"], ("finished", ["PR merged after the final message"]))
@@ -1064,7 +1241,7 @@ class NextStepFactTests(unittest.TestCase):
                     "head_oid": heads.get(ref, "aaa")}
 
         result = {r["path"]: (r["class"], r["reasons"])
-                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+                  for r in scan.add_next_step_facts(rows, git_lookup=git_lookup, pr_lookup=each_ref(pr_lookup))}
 
         self.assertEqual(result["/w/no-session"], ("finished", ["PR merged"]))
         # Jev's "done" is a fast read: a merged row it judged waits for the careful one.
@@ -1089,7 +1266,7 @@ class NextStepFactTests(unittest.TestCase):
                     "reply_after_last_commit": ref == "human-replied"}
 
         result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
-            rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+            rows, git_lookup=git_lookup, pr_lookup=each_ref(pr_lookup))}
 
         self.assertEqual({name: (row["class"], row.get("open_pr_cleanup", False)) for name, row in result.items()},
                          {"clean": ("finished", True), "human-replied": ("finished", True),
@@ -1114,7 +1291,7 @@ class NextStepFactTests(unittest.TestCase):
             return {"number": 7, "state": "OPEN", "head_oid": "aaa"}
 
         result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
-            rows, git_lookup=git_lookup, pr_lookup=pr_lookup)}
+            rows, git_lookup=git_lookup, pr_lookup=each_ref(pr_lookup))}
 
         self.assertEqual(result["history"]["class"], "waiting")
         self.assertTrue(result["history"]["open_pr_cleanup"])
@@ -1130,7 +1307,7 @@ class NextStepFactTests(unittest.TestCase):
             [row],
             git_lookup=lambda path: {"branch": "completed", "head": "aaa", "dirty": 0,
                                      "unpushed": 1, "github": "acme/app"},
-            pr_lookup=lambda slug, ref: {"number": 7, "state": "OPEN", "head_oid": "aaa"})[0]
+            pr_lookup=each_ref(lambda slug, ref: {"number": 7, "state": "OPEN", "head_oid": "aaa"}))[0]
 
         self.assertEqual(result["class"], "finished")
         self.assertEqual(result["meaningful_tabs"], ["shell1"])
@@ -1214,7 +1391,7 @@ class NextStepFactTests(unittest.TestCase):
             asked.append((slug, ref))
             return {"number": ref, "head_oid": "aaa"}
 
-        result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
+        result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=each_ref(pr_lookup))
 
         self.assertCountEqual(asked, [("acme/app", 7), ("acme/app", "fix-b"), ("acme/app", 8)])
         self.assertEqual([(r.get("git"), r.get("pr")) for r in result], [
@@ -1224,30 +1401,31 @@ class NextStepFactTests(unittest.TestCase):
             (gits["/w/asks"], {"number": 8, "head_oid": "aaa", "head_matches": True}), (None, None)])
         self.assertNotIn("git", rows[0])
 
-    def test_pr_timeout_does_not_hold_other_rows_and_duplicate_pr_is_read_once(self):
+    def test_a_repository_timeout_does_not_hold_other_repositories_and_a_duplicate_pr_is_read_once(self):
         rows = [{"path": path, "class": "unsure", "linked_pr": {"number": number}}
                 for path, number in (("/w/slow", 7), ("/w/fast", 8), ("/w/fast-again", 8))]
-        gits = {path: {"branch": path, "head": "aaa", "github": "acme/app"}
-                for path in ("/w/slow", "/w/fast", "/w/fast-again")}
+        gits = {"/w/slow": {"branch": "a", "head": "aaa", "github": "acme/slow"},
+                "/w/fast": {"branch": "b", "head": "aaa", "github": "acme/app"},
+                "/w/fast-again": {"branch": "c", "head": "aaa", "github": "acme/app"}}
         fast_started = Event()
         calls = []
 
-        def pr_lookup(slug, ref):
-            calls.append((slug, ref))
-            if ref == 7:
+        def pr_lookup(slug, refs):
+            calls.append((slug, refs))
+            if slug == "acme/slow":
                 parallel = fast_started.wait(2)
                 if not parallel:
-                    raise AssertionError("the independent PR lookup did not start")
+                    raise AssertionError("the other repository's PR lookup did not start")
                 raise subprocess.TimeoutExpired("gh", 15)
             fast_started.set()
-            return {"number": 8, "head_oid": "aaa", "state": "OPEN"}
+            return {8: {"number": 8, "head_oid": "aaa", "state": "OPEN"}}
 
         result = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=pr_lookup)
 
         self.assertEqual([row["path"] for row in result], [row["path"] for row in rows])
         self.assertIsNone(result[0]["pr"])
         self.assertEqual([row["pr"]["number"] for row in result[1:]], [8, 8])
-        self.assertCountEqual(calls, [("acme/app", 7), ("acme/app", 8)])
+        self.assertCountEqual(calls, [("acme/slow", [7]), ("acme/app", [8])])
 
 
 class ScanCommandTests(unittest.TestCase):
@@ -1258,7 +1436,8 @@ class ScanCommandTests(unittest.TestCase):
         for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": ""}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
-                         patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json"))):
+                         patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
+                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
