@@ -72,7 +72,12 @@ read its `asana99_status.py` 「次の一手」,
 including when `--judged` hides unchanged differences. A 「レビューの番」 row
 contains the exact `review-pr` command with `--kind` and `--if-needed` when
 the PR's source is known. If the row has no command, confirm who created the
-PR before choosing `cloud` or `colleague`.
+PR before choosing `cloud` or `colleague`. A 「指摘対応担当」 row is an Open PR
+of ours with requested changes not yet addressed and no live agent in a
+workspace linked to it: it needs a lane, started with
+`spawn-lane --topic <PR URL>` so later sweeps see the lane as 「指摘対応確認」.
+A 「指摘対応確認」 row needs a check that the linked lane is working on the
+changes.
 
 In every hourly run on a Mac that has `~/.cache/orca-briefs/bin/topic`, run
 `topic check --all`. Each drift row names the record, what disagrees, and the
@@ -99,7 +104,8 @@ lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment.
 Include each 「レビューの番」 PR URL and its command, or the missing source to
 confirm, in this run's handoff to the lead. Do not start its review in the
-hourly tab while another lead is appointed.
+hourly tab while another lead is appointed. Hand each 「指摘対応担当」 PR to the
+lead the same way, as a lane for the lead to start with `spawn-lane --topic`.
 Name any Orca environment the scan could not reach in the handoff. Review
 rows from the reachable Macs in the same run.
 
@@ -137,7 +143,8 @@ that its recorded symptom is gone. Then:
   run. It skips a completed review of the same head and kind or an active
   review started with this option. If the row has no command, confirm the PR's
   source before starting. The independent review is a draft; do not submit a
-  GitHub review from this step.
+  GitHub review from this step. For 「指摘対応担当」, start the lane in this
+  run with `spawn-lane --topic <PR URL>`.
 - Record each new question as `references/hourly-state.md` says, ask with
   AskUserQuestion, and set the triage workspace's Orca comment to「要判断: …」.
   Keep the tab with that unanswered question open. A later run works through
