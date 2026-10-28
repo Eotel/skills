@@ -1562,7 +1562,7 @@ class ScanCommandTests(unittest.TestCase):
                              {"id": "ws-1", "endpoint": "ws://remote.example:6768"}]}]
         calls = []
 
-        def payload(orca, args, json_file=None):
+        def payload(orca, args, json_file=None, timeout=None):
             calls.append(args)
             if args == ["environment", "list"]:
                 return {"environments": environments}
@@ -2564,6 +2564,14 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["blockers"], ["not a git worktree"])
 
 
+NOTHING_OWED = {"needs_owner": [], "closed_issues": []}
+
+
+def gh_issue(url, number, closing_prs=()):
+    return {"number": number, "title": f"issue {number}", "url": url + str(number), "assignees": [],
+            "closedByPullRequestsReferences": [{"number": pr} for pr in closing_prs]}
+
+
 class HourlyStateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2686,16 +2694,16 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(request["owner"], "/w/slow-lane")
         self.assertIsNone(request["closed_at"])
         self.assertIsNone(request["closure_evidence"])
-        self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
+        self.assertEqual(self.call("requests-needing-owner")[1]["needs_owner"][0]["id"], request["id"])
         self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane"),
-                         (0, []))
+                         (0, NOTHING_OWED))
         self.call("request-assign", "--id", request["id"], "--owner", "/w/next-lane")
-        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane")[1][0]["id"],
+        self.assertEqual(self.call("requests-needing-owner", "--live-owner", "/w/slow-lane")[1]["needs_owner"][0]["id"],
                          request["id"])
         self.assertEqual(self.call("request-close", "--id", request["id"],
                                    "--evidence-file", evidence)[1]["closure_evidence"],
                          "実 session で direnv が止まらないことを確認")
-        self.assertEqual(self.call("requests-needing-owner"), (0, []))
+        self.assertEqual(self.call("requests-needing-owner"), (0, NOTHING_OWED))
         self.assertEqual(self.call("show")[1]["requests"][request["id"]]["symptom"],
                          "各 session の direnv が固まる")
 
@@ -2724,21 +2732,134 @@ class HourlyStateTests(unittest.TestCase):
 
         listed.assert_called_with("acme/app")
         self.assertEqual(code, 0)
-        self.assertEqual([request["source"]["url"] for request in needing], [url + "3"])
+        self.assertEqual([request["source"]["url"] for request in needing["needs_owner"]], [url + "3"])
         self.assertEqual(again[1], needing)
         owners = {request["source"]["url"]: request["owner"]
                   for request in self.call("show")[1]["requests"].values()}
         self.assertEqual(owners, {url + "1": str(local), url + "2": "mbp16::/remote/app-pr7", url + "3": None})
 
+    def test_saved_scan_names_live_owners_and_links_issues_without_reading_orca(self):
+        (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
+        url = "https://github.com/acme/app/issues/"
+        # A lane at work: its agent tab makes it a live owner, and Orca links it to issue 1.
+        lane = {**worktree("/w/lane", "working", pr={"number": 9, "url": "https://github.com/acme/app/pull/9"}),
+                "linkedIssue": 1}
+        rows = [
+            *scan.build_inventory([lane], [terminal("/w/lane", "claude")], str(self.root / "claude"), {}, "要判断",
+                                  now=NOW),
+            # A careful read finished it, though its agent tab is still open.
+            {"path": "/w/done", "environment": None, "repo": "app", "class": "unsure",
+             "verdict": {"class": "finished"}, "linked_pr": None, "terminals": [{"handle": "t2", "agent": "codex"}]},
+            # Only a shell is left in it on the other Mac.
+            {"path": "/w/shell", "environment": "mbp16", "repo": "app", "class": "working", "linked_pr": None,
+             "terminals": [{"handle": "t3", "agent": None}]},
+        ]
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps(rows))
+        original = self.source("original.txt", "直してほしい")
+        symptom = self.source("symptom.txt", "止まる")
+        for owner in ("/w/lane", "/w/done", "mbp16::/w/shell", "/w/manual"):
+            self.call("request-open", "--original-file", original, "--symptom-file", symptom, "--owner", owner)
+
+        # An Orca that cannot run: reading it would leave the issues unimported.
+        with patch.object(hourly_state, "gh_open_issues", return_value=[gh_issue(url, 1), gh_issue(url, 2)]):
+            code, report = self.call("requests-needing-owner", "--from", str(scan_json),
+                                     "--live-owner", "/w/manual", "--orca", str(self.root / "no-orca"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual([request["source"]["url"] if request.get("source") else request["owner"]
+                          for request in report["needs_owner"]], ["/w/done", "mbp16::/w/shell", url + "2"])
+
+    def test_recorded_issue_no_longer_open_is_set_apart_as_a_closure_candidate(self):
+        (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app", "acme/lib"]}))
+        app, lib = "https://github.com/acme/app/issues/", "https://github.com/acme/lib/issues/"
+        opened = {"acme/app": [gh_issue(app, 1), gh_issue(app, 2)], "acme/lib": [gh_issue(lib, 3)]}
+        with patch.object(hourly_state, "gh_open_issues", side_effect=opened.get), \
+                patch.object(hourly_state, "orca_worktrees", return_value=[]):
+            self.call("requests-needing-owner")
+
+        def later(repo):
+            if repo == "acme/lib":
+                raise subprocess.CalledProcessError(1, ["gh", "issue", "list"])
+            return [gh_issue(app, 1)]  # app#2 was closed
+
+        with patch.object(hourly_state, "gh_open_issues", side_effect=later), \
+                patch.object(hourly_state, "orca_worktrees", return_value=[]), \
+                redirect_stderr(io.StringIO()) as err:
+            code, report = self.call("requests-needing-owner")
+            with patch.object(hourly_state, "ISSUE_LIMIT", 1):
+                _, truncated = self.call("requests-needing-owner")
+
+        self.assertEqual(code, 0)
+        # acme/lib could not be read, so its request stays where it was.
+        self.assertEqual([request["source"]["url"] for request in report["needs_owner"]], [app + "1", lib + "3"])
+        self.assertEqual([request["source"]["url"] for request in report["closed_issues"]], [app + "2"])
+        self.assertIn("acme/lib", err.getvalue())
+        self.assertIsNone(self.call("show")[1]["requests"][report["closed_issues"][0]["id"]]["closed_at"])
+        # A list cut at gh's limit may leave out open issues, so it closes nothing.
+        self.assertEqual(truncated["closed_issues"], [])
+
+    def test_issue_list_is_read_once_more_after_a_failure(self):
+        (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app", "acme/lib"]}))
+        app, lib = "https://github.com/acme/app/issues/", "https://github.com/acme/lib/issues/"
+        outcomes = {"acme/app": [subprocess.CalledProcessError(1, "gh"), [gh_issue(app, 1)]],
+                    "acme/lib": [subprocess.TimeoutExpired("gh", 60), ValueError("bad JSON"), [gh_issue(lib, 2)]]}
+
+        def gh(repo):
+            outcome = outcomes[repo].pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(hourly_state, "gh_open_issues", side_effect=gh), \
+                patch.object(hourly_state, "orca_worktrees", return_value=[]), \
+                redirect_stderr(io.StringIO()) as err:
+            code, report = self.call("requests-needing-owner")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([request["source"]["url"] for request in report["needs_owner"]], [app + "1"])
+        # Each repository was asked twice; acme/lib's third answer was never requested.
+        self.assertEqual(outcomes, {"acme/app": [], "acme/lib": [[gh_issue(lib, 2)]]})
+        self.assertIn("acme/lib", err.getvalue())
+
+    def test_unreachable_paired_mac_is_given_up_on_quickly(self):
+        (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
+        url = "https://github.com/acme/app/issues/"
+        local = {"worktrees": [{"path": "/w/app", "repo": "app", "linkedIssue": 1, "linkedItems": [],
+                                "linkedPR": {"number": 4, "url": "https://github.com/acme/app/pull/4"}}],
+                 "hostScope": {"omittedHostSelectors": [
+                     {"hostId": "remote-1", "selector": "--environment office-mac-mini"}]}}
+        replies = {("worktree", "ps"): local, ("terminal", "list"): {"terminals": []},
+                   ("environment", "list"): {"environments": []}}
+        remote_waits = []
+
+        def run(cmd, **kwargs):
+            if cmd[0] == "gh":
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([gh_issue(url, 1), gh_issue(url, 2)]), "")
+            if "--environment" in cmd:
+                remote_waits.append(kwargs["timeout"])
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": replies[tuple(cmd[1:3])]}), "")
+
+        with patch.object(hourly_state.subprocess, "run", side_effect=run), \
+                redirect_stderr(io.StringIO()) as err:
+            code, report = self.call("requests-needing-owner", "--orca", "orca", "--live-owner", "/w/app")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([request["source"]["url"] for request in report["needs_owner"]], [url + "2"])
+        self.assertIn("office-mac-mini", err.getvalue())
+        self.assertTrue(remote_waits)
+        self.assertLessEqual(max(remote_waits), 15)
+
     def test_request_commands_accept_existing_state_without_requests(self):
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {}}))
-        self.assertEqual(self.call("requests-needing-owner"), (0, []))
+        self.assertEqual(self.call("requests-needing-owner"), (0, NOTHING_OWED))
         self.assertIn("requests", self.call("show")[1])
         original = self.source("original.txt", "担当を立てて直してほしい")
         symptom = self.source("symptom.txt", "direnv が止まる")
         _, request = self.call("request-open", "--original-file", original, "--symptom-file", symptom)
         self.assertIsNone(request["owner"])
-        self.assertEqual(self.call("requests-needing-owner")[1][0]["id"], request["id"])
+        self.assertEqual(self.call("requests-needing-owner")[1]["needs_owner"][0]["id"], request["id"])
 
     def test_same_path_on_another_mac_does_not_hide_an_unowned_request(self):
         original = self.source("original.txt", "動作が遅い")
@@ -2752,7 +2873,7 @@ class HourlyStateTests(unittest.TestCase):
                               "--owner", remote_owner)
         code, needs_owner = self.call("requests-needing-owner", "--live-owner", remote_owner)
         self.assertEqual(code, 0)
-        self.assertEqual([request["id"] for request in needs_owner], [local["id"]])
+        self.assertEqual([request["id"] for request in needs_owner["needs_owner"]], [local["id"]])
         self.assertNotEqual(local["owner"], remote["owner"])
 
     def test_request_owner_requires_scan_row_identity(self):
