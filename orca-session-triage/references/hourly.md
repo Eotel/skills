@@ -50,7 +50,8 @@ a cursor of its own that `initialize` starts once (watch refuses a missing one).
 It prints every new `ask` and `done`, whatever its source, as a summary line,
 and `unanswered <n> min: <line>` once per ask left unanswered for 15 minutes.
 Being read is not being answered. `send --decision <answer> --ask <id>[:<n>]`
-records the ask (or one of its questions) answered once the send lands;
+records the ask (or one of its questions) answered once the send lands (the
+id's first 8 or more characters will do, as for `read --id`);
 `scripts/inbox_read.py answered <id> --note <why>` records one answered another
 way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest, oldest first (`--json` for other tools; the board

@@ -2934,6 +2934,8 @@ class InboxReadTests(unittest.TestCase):
                  "text": "完了"},
                 {"id": "early", "ts": "2026-10-28T08:00:00+09:00", "kind": "ask", "host": "mbp16", "repo": "r",
                  "worktree": "b", "text": "判断 2 件", "questions": two},
+                {"id": "c8f79c0f-1111-4222-8333-444455556666", "ts": "2026-10-28T09:30:00+09:00", "kind": "ask",
+                 "host": "h", "worktree": "c", "text": "merge してよいか"},
             ])
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
 
@@ -2947,11 +2949,16 @@ class InboxReadTests(unittest.TestCase):
             run("answered", "late,early:1", "--note", "send --decision で答えた")
             partly = json.loads(run("open-asks", "--json")[1])
             run("answered", "early:2")
+            by_prefix = run("answered", "c8f79c0f")
             unknown = run("answered", "done1")
+            recorded = [json.loads(line)["id"] for line in (Path(root) / "answers.jsonl").read_text().splitlines()]
 
             self.assertEqual([(ask["id"], ask["source"], ask["open_questions"]) for ask in listed],
-                             [("early", "r/b", [1, 2]), ("late", "a", [])])
-            self.assertEqual([(ask["id"], ask["open_questions"]) for ask in partly], [("early", [2])])
+                             [("early", "r/b", [1, 2]), ("late", "a", []),
+                              ("c8f79c0f-1111-4222-8333-444455556666", "c", [])])
+            self.assertEqual([(ask["id"], ask["open_questions"]) for ask in partly],
+                             [("early", [2]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
+            self.assertEqual((by_prefix[0], recorded[-1]), (0, "c8f79c0f-1111-4222-8333-444455556666"))
             self.assertEqual(run("open-asks")[1], "")
             self.assertEqual(unknown[0], 1)
             self.assertIn("done1", unknown[2])

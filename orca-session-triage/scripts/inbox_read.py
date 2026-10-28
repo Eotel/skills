@@ -284,14 +284,18 @@ def minutes_since(when: datetime | None, now: datetime) -> int | None:
 
 
 def checked_answer_ids(value: str, entries: list[dict]) -> list[str]:
-    """Comma-separated `<ask id>` or `<ask id>:<question number>`, each naming an ask of the inbox."""
-    asks = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
-    ids = [part.strip() for part in value.split(",")]
-    for answer in ids:
-        ask_id, colon, number = answer.partition(":")
-        ask = asks.get(ask_id)
-        if ask is None or colon and not (number.isdigit() and 1 <= int(number) <= len(questions_of(ask))):
+    """Comma-separated `<ask id>` or `<ask id>:<question number>`, each naming one ask of the inbox, with
+    the full ask id; an ask id may be its first ID_PREFIX_MIN or more characters, as handoffs print it."""
+    asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    ids = []
+    for answer in (part.strip() for part in value.split(",")):
+        given, colon, number = answer.partition(":")
+        found = [ask_id for ask_id in asks if names(ask_id, given)]
+        if len(found) > 1:
+            raise ValueError(f"ask id {given} names {len(found)} asks; pass more of one: " + ", ".join(found))
+        if not found or colon and not (number.isdigit() and 1 <= int(number) <= len(questions_of(asks[found[0]]))):
             raise ValueError(f"no ask in the inbox has id {answer}")
+        ids.append(found[0] + (f":{number}" if colon else ""))
     return ids
 
 
