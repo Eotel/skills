@@ -411,7 +411,9 @@ def classify(row, decision_marker):
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
-    if not (row["agents"] or row["claude"] or row["codex"] or any(t["agent"] for t in row["terminals"])):
+    # Another Mac's tab may show its agent only on its screen; this Mac's transcripts are read directly.
+    screen_agent_tab = row.get("environment") and any(t["agent"] for t in row["terminals"])
+    if not (row["agents"] or row["claude"] or row["codex"] or screen_agent_tab):
         return "stalled", [NO_SESSION_REASON]
     return "stalled", [state] if state else []
 
@@ -453,6 +455,8 @@ RULE = re.compile(r"[─━]+")
 # Claude Code's reply bullet and the line it leaves when a turn ends ("✻ Baked for 3m 2s").
 CLAUDE_LINE_STARTS = re.compile(r"⏺ |✻ \S+ for ")
 CLAUDE_MODE_LINE = "⏵⏵ "
+# A ⏺ line that names a tool call ("⏺ Bash(git push)") is not a reply.
+TOOL_CALL = re.compile(r"⏺ [A-Za-z][\w.:-]*\(")
 
 
 def screen_lines(screen: dict) -> list[str]:
@@ -488,7 +492,7 @@ def screen_message(screen: dict) -> str:
     A reply whose ⏺ line scrolled off the top is read from the indented lines above the last turn-end line.
     """
     lines = screen_lines(screen)
-    starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ")]
+    starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ") and not TOOL_CALL.match(line)]
     ends = [index for index, line in enumerate(lines) if line.startswith("✻ ")]
     if starts:
         block = [lines[starts[-1]][2:]]

@@ -457,6 +457,7 @@ class ClassifyTests(unittest.TestCase):
                 "orphaned": True, "connected": True, "lastOutputAt": None}
         screen = {"source": "screen", "tail": [
             "⏺ PR #345 のレビュー指摘を直して push し、", "  coordinator に worker_done を送りました。", "",
+            "⏺ Bash(git push origin HEAD)", "  ⎿  Everything up-to-date", "",
             "✻ Baked for 5h 30m 24s · done 4:33 PM", "─" * 40, "❯", "─" * 40,
             "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]}
         # test-338's reply began above the visible screen: the lines before its turn-end line stand in.
@@ -1836,15 +1837,18 @@ class RmCheckTests(unittest.TestCase):
         (self.wt / ".husky" / "_").mkdir(parents=True)
         (self.wt / ".husky" / "_" / ".gitignore").write_text("*")
         (self.wt / ".husky" / "_" / "h").write_text("#!/usr/bin/env sh\n")
+        (self.main / ".gitignore").write_text((self.main / ".gitignore").read_text() + "reports/generated/\n")
+        git(self.main, "commit", "-q", "-am", "ignore generated reports")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
         for rel in (".vite-hooks/_/h", "playwright-report-real/index.html", "apps/api/.coverage",
-                    "src/graphql/generated/types.ts", ".cache/typecheck/state.json"):
+                    "src/graphql/generated/types.ts", ".cache/typecheck/state.json",
+                    "reports/generated/summary.html"):
             (self.wt / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.wt / rel).write_text("x")
 
         result = self.check()
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["review"], [])
+        self.assertEqual(result["review"], ["reports/generated/ (not in main checkout)"])
         self.assertEqual(sorted(result["regenerable"]), [".husky/_/.gitignore", ".husky/_/h", ".vite-hooks/_/",
                                                         "src/graphql/generated/"])
 
@@ -2911,6 +2915,9 @@ class InboxReadTests(unittest.TestCase):
             run("answered", "r1:2", "--note", "Q2 は直す")
             first = json.loads(run("questions"))
             rest = json.loads(run("questions", "--after", first["next_after"]))
+            # The lead answers the batch, then asks for the one after it.
+            run("answered", ",".join(item["id"] for item in first["items"]))
+            after_answered = json.loads(run("questions", "--after", first["next_after"]))
 
         self.assertEqual([item["id"] for item in first["items"]], ["r1:1", "r1:3", "r1:4", "r3:1"])
         self.assertEqual(first["questions"][0], {
@@ -2920,6 +2927,7 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual((first["items"][0]["source"], first["items"][0]["handle"]), ("report/decisions", "term_a"))
         self.assertEqual((first["remaining"], rest["remaining"], rest["next_after"]), (1, 0, None))
         self.assertEqual([item["id"] for item in rest["items"]], ["r3:2"])
+        self.assertEqual([item["id"] for item in after_answered["items"]], ["r3:2"])
 
     def test_open_asks_lists_unanswered_asks_oldest_first_until_answered(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2981,6 +2989,11 @@ class InboxReadTests(unittest.TestCase):
                     redirect_stderr(io.StringIO()) as refused:
                 self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
             self.assertIn("initialize", refused.getvalue())
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as shared:
+                del os.environ["TRIAGE_READ_OFFSET"]
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+            self.assertIn("TRIAGE_READ_OFFSET", shared.getvalue())
             cursor.write_text("0")
 
             def watch():

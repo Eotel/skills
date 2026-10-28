@@ -35,8 +35,10 @@ BYTECODE_SUFFIX = ".pyc"
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
 # APM 0.35 binds each checkout it installs to with a random .apm-local/installation and
 # writes a new one on the next install, so a removed checkout's identity binds nothing.
-# husky and vite-hooks write the scripts under their `_` directory on each install.
-REGENERABLE_PARTS = {"__generated__", "generated"}
+# husky and vite-hooks write the scripts under their `_` directory on each install. GraphQL codegen
+# writes graphql/generated/; a generated/ elsewhere may hold hand-made output, so it goes to review.
+REGENERABLE_PARTS = {"__generated__"}
+REGENERABLE_PART_PAIRS = {("graphql", "generated")}
 REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/",
                         ".husky/_/", ".vite-hooks/_/")
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
@@ -87,7 +89,9 @@ def working_changes(worktree) -> tuple[list[str], list[str]]:
 
 def is_regenerable(relpath):
     rel = relpath if relpath.endswith("/") else relpath + "/"
-    return bool(REGENERABLE_PARTS.intersection(Path(relpath.rstrip("/")).parts)) or rel.startswith(REGENERABLE_PREFIXES)
+    parts = Path(relpath.rstrip("/")).parts
+    return (bool(REGENERABLE_PARTS.intersection(parts)) or rel.startswith(REGENERABLE_PREFIXES)
+            or bool(REGENERABLE_PART_PAIRS.intersection(zip(parts, parts[1:]))))
 
 
 def same_tree(left, right):

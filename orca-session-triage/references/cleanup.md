@@ -52,8 +52,8 @@ Run these per worktree, in order.
      or needs review. Without the option nothing moves.
    - `regenerable` lists what a tool writes again from tracked files or
      installed packages with no one's input: untracked Python bytecode, and,
-     among ignored paths, generated sources (`__generated__/`, `generated/`,
-     `src/paraglide/`), e2e output (`e2e/screenshots/`, `e2e/.state/`,
+     among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
+     `graphql/generated/`, `src/paraglide/`), e2e output (`e2e/screenshots/`, `e2e/.state/`,
      `e2e/.auth/`), and the hook scripts husky and vite-hooks write on install
      (`.husky/_/`, `.vite-hooks/_/`). They do not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the

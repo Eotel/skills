@@ -336,13 +336,16 @@ def ask_user_question(question: dict) -> dict:
                          "description": option["description"]} for option in options]}
 
 
-def question_batch(questions: list[PendingQuestion], after: str | None = None) -> dict:
-    """The next questions after the id `after`, with where each came from and what is left after them."""
+def question_batch(questions: list[PendingQuestion], after: str | None = None,
+                   order: list[str] | None = None) -> dict:
+    """The next questions after the id `after` in `order` (every structured question, answered or not, so
+    a batch answered since it was printed still pages on), with where each came from and what is left."""
     if after is not None:
-        ids = [question.id for question in questions]
-        if after not in ids:
-            raise ValueError(f"no unanswered question has id {after}")
-        questions = questions[ids.index(after) + 1:]
+        order = order if order is not None else [question.id for question in questions]
+        if after not in order:
+            raise ValueError(f"no structured question has id {after}")
+        place = {question_id: index for index, question_id in enumerate(order)}
+        questions = [question for question in questions if place.get(question.id, -1) > place[after]]
     batch = questions[:QUESTIONS_PER_BATCH]
     left = len(questions) - len(batch)
     return {
@@ -452,6 +455,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("answered takes ids or --before, not both")
     inbox, cursor = paths()
     try:
+        # watch skips info as it advances: on the scheduled run's cursor it would hide them from that run.
+        if args.action == "watch" and not os.environ.get("TRIAGE_READ_OFFSET"):
+            raise ValueError("watch needs a cursor of its own: set TRIAGE_READ_OFFSET")
         if (args.action in CURSOR_ACTIONS and not os.environ.get("TRIAGE_READ_OFFSET") and
                 not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
             raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
@@ -477,7 +483,9 @@ def main(argv: list[str] | None = None) -> int:
                 record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
                 print(f"answered: {len(ids)}")
             elif args.action == "questions":
-                print(json.dumps(question_batch(pending_questions(asks), args.after), ensure_ascii=False, indent=2))
+                order = [question.id for question in pending_questions(open_asks(entries, frozenset()))]
+                print(json.dumps(question_batch(pending_questions(asks), args.after, order),
+                                 ensure_ascii=False, indent=2))
             elif args.json:
                 print(json.dumps([open_ask_view(ask, now) for ask in asks], ensure_ascii=False, indent=2))
             else:

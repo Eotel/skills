@@ -46,7 +46,9 @@ before answering so a later hourly handoff cannot repeat an answered question.
 The lead may read `info` and `done` for context but leaves the scheduled sweep
 to the hourly run. The lead watches new reports with a Monitor running
 `TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch`,
-a cursor of its own that `initialize` starts once (watch refuses a missing one).
+a cursor of its own that `initialize` starts once (watch refuses a missing one,
+and refuses to run without `TRIAGE_READ_OFFSET`, so it never skips `info` on the
+scheduled run's cursor).
 It prints every new `ask` and `done`, whatever its source, as a summary line,
 and `unanswered <n> min: <line>` once per ask left unanswered for 15 minutes.
 Being read is not being answered. `send --decision <answer> --ask <id>[:<n>]`
