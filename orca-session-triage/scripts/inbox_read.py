@@ -38,6 +38,7 @@ WATCHED_KINDS = frozenset(("ask", "done"))
 CURSOR_ACTIONS = frozenset(("read", "ack", "watch"))
 ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
 REMIND_AFTER_MINUTES = 15
+ID_PREFIX_MIN = 8
 # AskUserQuestion takes one to four questions per call.
 QUESTIONS_PER_BATCH = 4
 RECOMMENDED_MARK = "（推奨）"
@@ -124,41 +125,80 @@ def summary_line(item: dict) -> str:
     return f"{label} {location}  {compact[:160]}" + ("…" if len(compact) > 160 else "")
 
 
-def read(inbox: Path, cursor: Path, options: ReadOptions) -> frozenset[str]:
-    """Print the entries after the cursor; return the requested ids that none of them has."""
+def entry_header(item: dict) -> str:
+    label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
+    return f"{label} {source_of(item)}" + (f" id={item['id']}" if item.get("id") else "")
+
+
+def shown_by_filters(item: dict, options: ReadOptions) -> bool:
+    return ((options.kinds is None or item.get("kind") in options.kinds)
+            and (options.source is None or source_of(item) == options.source))
+
+
+def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
+    """Print the entries after the cursor."""
     start, data, complete = pending_bytes(inbox, cursor)
     end = start + complete
-    shown: set[str] = set()
     for raw in data[:end - start].splitlines():
         try:
             item = json.loads(raw)
-            if options.kinds is not None and item.get("kind") not in options.kinds:
+            if not shown_by_filters(item, options):
                 continue
-            if options.ids is not None and item.get("id") not in options.ids:
-                continue
-            if options.source is not None and source_of(item) != options.source:
-                continue
-            if item.get("id"):
-                shown.add(str(item["id"]))
-            if options.summary and options.ids is None:
+            if options.summary:
                 print(summary_line(item))
                 continue
-            label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
-            location = source_of(item) + (f" id={item['id']}" if item.get("id") else "")
             body = item.get("text") or ""
-            if options.ids is None and options.brief and item.get("kind") == "info":
+            if options.brief and item.get("kind") == "info":
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
-            print(f"{label} {location}\n{body}\n")
+            print(f"{entry_header(item)}\n{body}\n")
         except (ValueError, TypeError, AttributeError):
             if not options.filtered:
                 print(raw.decode("utf-8", "replace"))
     if options.filtered:
-        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, or --id "
+        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind or --source "
               "to acknowledge", file=sys.stderr)
     else:
         print(f"NEXT_OFFSET={end}")
-    return (options.ids or frozenset()) - shown
+
+
+def names(entry_id: str, wanted: str) -> bool:
+    """An exact id, or a prefix of at least ID_PREFIX_MIN characters (a handoff's "id c8f79c0f")."""
+    return entry_id == wanted or len(wanted) >= ID_PREFIX_MIN and entry_id.startswith(wanted)
+
+
+def read_ids(inbox: Path, cursor: Path, options: ReadOptions) -> None:
+    """Print in full, in inbox order, the entries the ids name, those already acknowledged marked 既読.
+
+    Nothing is printed when an id names no entry or several: the candidates are named instead.
+    """
+    acknowledged = int(cursor.read_text().strip()) if cursor.exists() else 0
+    data = inbox.read_bytes()
+    if acknowledged > len(data):
+        raise ValueError("inbox is shorter than the saved read position")
+    entries, end = [], 0
+    for raw in data[:complete_end(data)].splitlines(keepends=True):
+        end += len(raw)
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get("id") and shown_by_filters(item, options):
+            entries.append((end, item))
+    wanted = sorted(options.ids or ())
+    hits = {value: [(end, item) for end, item in entries if names(str(item["id"]), value)] for value in wanted}
+    several = {value: found for value, found in hits.items() if len({str(item["id"]) for _, item in found}) > 1}
+    if several:
+        raise ValueError("\n".join(
+            f"id {value} names {len(found)} entries; pass more of one:"
+            + "".join(f"\n  {item.get('ts') or '-'} {item.get('kind') or '-'} {source_of(item)} id={item['id']}"
+                      for _, item in found) for value, found in several.items()))
+    missing = [value for value, found in hits.items() if not found]
+    if missing:
+        raise ValueError("no entry has id " + ",".join(missing))
+    for end, item in sorted({id(item): (end, item) for found in hits.values() for end, item in found}.values(),
+                            key=lambda hit: hit[0]):
+        print(f"{entry_header(item)}{' 既読' if end <= acknowledged else ''}\n{item.get('text') or ''}\n")
 
 
 def inbox_entries(inbox: Path) -> list[dict]:
@@ -353,7 +393,9 @@ def main(argv: list[str] | None = None) -> int:
     read_command.add_argument("--summary", action="store_true",
                               help="show one line per entry with its id and a 160-character excerpt")
     read_command.add_argument("--id", type=entry_ids, dest="ids",
-                              help="show only these comma-separated entry ids, in full")
+                              help="show only these comma-separated entry ids, in full, wherever the cursor stands "
+                                   "(acknowledged ones marked 既読); an id may be its first 8 or more characters, "
+                                   "and one naming several entries lists them and prints nothing")
     watch_command = actions.add_parser(
         "watch", help="the lead's Monitor: print every new ask and done as a summary line, advance the cursor, "
                       "and print `unanswered <n> min: <line>` once per ask left unanswered --remind-after minutes")
@@ -388,10 +430,9 @@ def main(argv: list[str] | None = None) -> int:
                 not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
             raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
         if args.action == "read":
-            missing = read(inbox, cursor, ReadOptions(
-                brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary, ids=args.ids))
-            if missing:
-                raise ValueError("no entry after the cursor has id " + ",".join(sorted(missing)))
+            options = ReadOptions(brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary,
+                                  ids=args.ids)
+            (read_ids if args.ids else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":
             watch(inbox, cursor, answers_path(), args.once, args.interval, args.remind_after)

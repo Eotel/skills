@@ -3048,6 +3048,42 @@ class InboxReadTests(unittest.TestCase):
                 self.assertIn("zz", error.getvalue())
                 self.assertFalse(cursor.exists())
 
+    def test_id_reads_an_8_character_prefix_and_acknowledged_lines_without_moving_the_cursor(self):
+        # 2026-10-27 20:10: a handoff named "id c8f79c0f"; the full UUID copied by hand was mistyped.
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "read.offset"
+            handoff, twin = "beee5c90-48b7-425b-b802-568f7e486716", "beee5c90-9999-425b-b802-568f7e486716"
+            done = "c8f79c0f-1111-4222-8333-444455556666"
+            write_jsonl(inbox, [
+                {"id": handoff, "ts": "t1", "kind": "ask", "host": "h", "worktree": "a", "text": "前の回の引き継ぎ"},
+                {"id": twin, "ts": "t2", "kind": "info", "host": "h", "worktree": "b", "text": "経過"},
+                {"ts": "t0", "kind": "info", "host": "h", "worktree": "old", "text": "id の無い古い行"},
+            ])
+            acknowledged = str(inbox.stat().st_size)
+            cursor.write_text(acknowledged)
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"id": done, "ts": "t3", "kind": "done", "host": "h", "worktree": "c",
+                                         "text": "完了"}, ensure_ascii=False) + "\n")
+
+            def run(*argv):
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    return inbox_read.main(["read", *argv]), out.getvalue(), err.getvalue()
+
+            read = run("--id", "c8f79c0f,beee5c90-48b7")
+            ambiguous = run("--id", "beee5c90")
+            short = run("--id", "beee5c9")
+            position = cursor.read_text()
+
+        self.assertEqual(read, (0, f"t1 ask h a id={handoff} 既読\n前の回の引き継ぎ\n\n"
+                                   f"t3 done h c id={done}\n完了\n\n", read[2]))
+        self.assertEqual((ambiguous[0], ambiguous[1]), (1, ""))
+        self.assertIn(handoff, ambiguous[2])
+        self.assertIn(twin, ambiguous[2])
+        self.assertEqual(short[0], 1)
+        self.assertEqual(position, acknowledged)
+
     def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"

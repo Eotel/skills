@@ -14,8 +14,11 @@ shows the first 160 characters of each `info`; use `read` without it when the
 full context of an `info` is needed. Both modes leave the cursor unchanged.
 For a large inbox, `read --summary` shows each entry on one line with its
 `id=` and the first 160 characters of its text, and `read --id ID[,ID]` prints
-only those entries in full; it fails when an id is not after the cursor. Read a
-long inbox this way rather than cutting the output. `--kind ask,done` filters by type, and
+only those entries in full, wherever the cursor stands (an acknowledged one is
+marked 既読). An id may be its first 8 or more characters, as handoffs and
+`~/.cache/orca-briefs/bin/inbox` print it; one naming several entries lists them
+and prints nothing. Read a long inbox this way rather than cutting the output,
+and read past entries by time or worktree with `inbox --since`. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
 `repo/worktree` (older entries without a repo use their worktree). A read with
 `--kind`, `--source`, or `--id` prints no `NEXT_OFFSET`, so an entry the filter
