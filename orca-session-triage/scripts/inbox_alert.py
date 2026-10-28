@@ -10,7 +10,7 @@ enabling alerts never replays old questions.
 
 import argparse
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 import json
 import os
@@ -72,10 +72,13 @@ class OrcaTabs:
 
     orca: str
     local_host: str
+    # Paired server per host. A server sometimes stalls a call; asking once keeps the next asks prompt.
+    paired: dict[str, str] = field(default_factory=dict)
 
     def result(self, *args: str) -> dict[str, Any]:
+        # Calls answer in under 3 seconds; a stalled server would delay every later notification.
         out = subprocess.run([self.orca, *args, "--json"], capture_output=True, text=True,
-                             check=True, timeout=15).stdout
+                             check=True, timeout=5).stdout
         data = json.loads(out)
         return data.get("result", data)
 
@@ -83,23 +86,32 @@ class OrcaTabs:
         """Name of the paired Orca server on host; None for this Mac."""
         if not host or same_machine(host, self.local_host):
             return None
-        names = (environment["name"] for environment in self.result("environment", "list")["environments"])
-        paired = next((name for name in names if same_machine(
-            self.result("host", "name", "--environment", name)["machineName"], host)), None)
-        if paired is None:
-            raise LookupError(f"no paired Orca server runs on {host}")
-        return paired
+        machine = host.removesuffix(".local").casefold()
+        if machine not in self.paired:
+            names = (environment["name"] for environment in self.result("environment", "list")["environments"])
+            paired = next((name for name in names if same_machine(
+                self.result("host", "name", "--environment", name)["machineName"], host)), None)
+            if paired is None:
+                raise LookupError(f"no paired Orca server runs on {host}")
+            self.paired[machine] = paired
+        return self.paired[machine]
 
     def action(self, item: Item) -> ClickAction | None:
+        errors = (OSError, ValueError, KeyError, LookupError, subprocess.SubprocessError)
+        handle = item.get("handle")
         try:
             environment = self.environment(str(item.get("host") or ""))
-            target = ("--environment", environment) if environment else ()
+        except errors as exc:
+            print(f"inbox-alert: cannot find the sender's Orca: {exc}", file=sys.stderr)
+            return None
+        target = ("--environment", environment) if environment else ()
+        try:
             terminals = [terminal for terminal in self.result("terminal", "list", *target)["terminals"]
                          if terminal.get("connected")]
-        except (OSError, ValueError, KeyError, LookupError, subprocess.SubprocessError) as exc:
-            print(f"inbox-alert: cannot find the sender's tab: {exc}", file=sys.stderr)
-            return None
-        handle = item.get("handle")
+        except errors as exc:
+            # The reported tab is usually still open, so pressing it can switch there.
+            print(f"inbox-alert: cannot check the sender's tab: {exc}", file=sys.stderr)
+            return Command((self.orca, "terminal", "switch", "--terminal", str(handle), *target)) if handle else None
         if not any(terminal.get("handle") == handle for terminal in terminals):
             # The sender's tab closed; its lane may have started a new agent in the same worktree.
             lane = [terminal["handle"] for terminal in terminals if terminal.get("agentIdentity")
