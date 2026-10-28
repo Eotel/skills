@@ -36,8 +36,12 @@ board's done cards; close what the user approves.
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
+  A tab whose output or screen shows a hook Claude Code could not run for a
+  missing file (`hook error … No such file or directory`) puts it in the row's
+  `hook_errors` (`host`, `path`, `tab`) and reasons, on any Mac. The screen
+  keeps an old error until the tab runs again.
   `--summary` prints class counts, review rows, finished worktree/tab counts,
-  and open PR cleanup rows. `--rows` prints one line per row (name, the
+  open PR cleanup rows, and each hook error with its host. `--rows` prints one line per row (name, the
   verdict's class over the scan's, GitHub repo and PR, tab count, newest final
   message time, and its question, `waits_on`, `next_step`, or message start).
   `--row NAME` prints one row as JSON with fixed keys: no null strings, the

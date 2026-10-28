@@ -567,6 +567,25 @@ def done_cards(agents, terms, screens=None, environment=None):
     return [card(a) for a in agents if a.get("state") == "done"]
 
 
+# A hook Claude Code could not run because its file is gone: "PreToolUse:Bash hook error" with the shell's
+# message on the next line, or "Stop hook error: Failed with ...: /bin/sh: PATH: No such file or directory".
+HOOK_MISSING = re.compile(r"hook error\b[^\n]*?(?:\n[^\n]*?)??\s(/[^\s:]+): No such file or directory",
+                          re.IGNORECASE)
+# This Mac's name, as triage-notify records it.
+LOCAL_HOST = socket.gethostname()
+
+
+def hook_errors(terms, screens, environment):
+    """Each missing hook file a tab's output or rendered screen shows, once per tab: {host, path, tab}."""
+    host = environment or LOCAL_HOST
+    shown = ((term.get("handle"), text) for term in terms
+             for text in (term.get("preview") or "",
+                          "\n".join(screen_lines(rendered(screens.get((environment, term.get("handle")))) or {}))))
+    found = {(path, handle): {"host": host, "path": path, "tab": handle}
+             for handle, text in shown for path in HOOK_MISSING.findall(text)}
+    return list(found.values())
+
+
 def orca_said(worktree):
     """Whether Orca keeps a last message of one of the worktree's agents."""
     return any(agent.get("lastAssistantMessage") for agent in worktree.get("agents") or [])
@@ -655,6 +674,10 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
+        row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
+        # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
+        row["reasons"] = [*row["reasons"], *dict.fromkeys(
+            f"hook error on {error['host']}: {error['path']}: No such file or directory" for error in row["hook_errors"])]
         row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
@@ -1591,6 +1614,10 @@ def print_summary(rows, verdicts):
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
+    hooks = [(row, error) for row in rows for error in row.get("hook_errors") or []]
+    print(f"hook errors: {len(hooks)}")
+    for row, error in hooks:
+        print(f"  {error['host']} {error['path']} ({row_name(row)} {error.get('tab') or '-'})")
 
 
 def row_name(row: dict) -> str:
