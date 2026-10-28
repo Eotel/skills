@@ -1526,6 +1526,7 @@ class ScanCommandTests(unittest.TestCase):
             " | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
             "fix-login | waiting (scan: stalled) | closable term_2",
             "fix-login | waiting (scan: stalled) | meaningful term_1",
+            f"fix-login | waiting (scan: stalled) | close: python3 {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
             "mbp16::app | waiting | card - codex interrupted | draft unknown | - | screen: -",
         ])
 
@@ -1657,6 +1658,20 @@ class ScanCommandTests(unittest.TestCase):
         rows = {r["path"]: r["class"] for r in json.loads(out.getvalue())}
         self.assertEqual(rows, {"/w/new": "working", "/w/old": "unstarted"})
 
+
+    def test_each_row_carries_when_the_scan_started_for_the_tool_that_closes_its_tabs(self):
+        ps = self.dir / "ps.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/new", "working", agent="codex")]}}))
+        terms = self.dir / "terms.json"
+        terms.write_text(json.dumps({"result": {"terminals": [terminal("/w/new", "codex")]}}))
+        before = datetime.now().astimezone()
+
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--claude-projects",
+                       str(self.dir / "claude"), "--codex-sessions", str(self.dir / "none")])
+
+        started = datetime.fromisoformat(json.loads(out.getvalue())[0]["scanned_at"])
+        self.assertTrue(before.replace(microsecond=0) <= started <= datetime.now().astimezone())
 
     def test_writes_the_review_queue_when_asked(self):
         ps = self.dir / "ps.json"
@@ -2244,7 +2259,7 @@ class RmCheckTests(unittest.TestCase):
         tabs = {item["pid"]: (item["in_orca_tab"], item["idle_tab"], item["tab"]) for item in result["processes"]}
         self.assertEqual(tabs, {21: (True, True, None), 32: (True, False, "term_busy"), 40: (False, False, None)})
         self.assertEqual(len(result["blockers"]), 2)
-        self.assertIn("orca terminal close --terminal term_busy --json", result["blockers"][1])
+        self.assertIn(f"python3 {SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
         self.assertIn("PID 40 ", result["blockers"][0])
         self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
 
@@ -2912,7 +2927,10 @@ class HourlyTabCleanupTests(unittest.TestCase):
                                                   ("screen", ["finished", "❯"], "unsent reply", True),
                                                   ("stream", ["finished", "❯"], None, True),
                                                   ("screen", ["finished", "❯ draft reply"], None, True),
-                                                  ("screen", ["finished"], None, True)):
+                                                  ("screen", ["finished"], None, True),
+                                                  ("screen", ["Switch to gpt-6-luna?", "  2. Keep current model",
+                                                              "  enter select · esc back",
+                                                              "› Ask Codex to do anything"], None, True)):
                 with self.subTest(source=source, tail=tail, draft=draft):
                     blockers = cleanup_hourly.close_blockers(term, transcript,
                         {"source": source, "tail": tail, "draft": draft}, 5, now)
