@@ -12,7 +12,8 @@ them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
 changes on its host before applying the same rule; the scan leaves those git
-facts unknown until that check. The process check below protects work running
+facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
+<host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. The process check below protects work running
 in a tab.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
