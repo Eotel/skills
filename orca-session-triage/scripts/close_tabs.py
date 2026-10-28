@@ -52,7 +52,6 @@ class TabHost(Protocol):
 class OrcaTabs:
     def __init__(self, orca: str) -> None:
         self.orca = orca
-        self.worktrees: dict[str | None, list[dict]] = {}
 
     def run(self, environment: str | None, *args: str) -> dict:
         where = ["--environment", environment] if environment else []
@@ -67,11 +66,10 @@ class OrcaTabs:
         return payload.get("result", payload)
 
     def agent_changes(self, environment: str | None, path: str) -> list[datetime]:
-        # Orca moves updatedAt without any work (a working agent's own polling), so only state changes count.
-        if environment not in self.worktrees:
-            self.worktrees[environment] = self.run(environment, "worktree", "ps")["worktrees"]
-        agents = [agent for worktree in self.worktrees[environment] if worktree.get("path") == path
-                  for agent in worktree.get("agents") or []]
+        # Read for each tab: a worktree may start working while the tabs before it close. Orca moves
+        # updatedAt without any work (a working agent's own polling), so only state changes count.
+        agents = [agent for worktree in self.run(environment, "worktree", "ps")["worktrees"]
+                  if worktree.get("path") == path for agent in worktree.get("agents") or []]
         started = [stamp for agent in agents
                    for stamp in (agent.get("stateStartedAt"), (agent.get("mainAgent") or {}).get("stateStartedAt"))]
         return [datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
@@ -111,11 +109,11 @@ def modified(path: Path) -> datetime | None:
 
 
 def last_entry_at(path: Path) -> datetime | None:
-    """The newest timestamped entry among the transcript's last lines; untimed bookkeeping lines do not count."""
-    try:
-        lines = path.read_bytes().splitlines()[-TAIL_LINES:]
-    except OSError:
-        return None
+    """The newest timestamped entry among the transcript's last lines; untimed bookkeeping lines do not count.
+
+    A transcript written after the scan that cannot be read raises OSError, which keeps the tab.
+    """
+    lines = path.read_bytes().splitlines()[-TAIL_LINES:]
     return max((at for item in map(report, lines) if item
                 if (at := scan_sessions.parse_time(item.get("timestamp"))) is not None), default=None)
 

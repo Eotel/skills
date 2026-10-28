@@ -143,6 +143,52 @@ class CloseTabsTests(unittest.TestCase):
         self.assertEqual((code, tabs.closed), (1, []))
         self.assertIn("term_agent: KEPT -> Could not read Orca runtime metadata", out)
 
+    def test_a_transcript_written_after_the_scan_that_cannot_be_read_keeps_its_tab(self) -> None:
+        self.write_transcript({"type": "assistant", "timestamp": "2026-10-28T05:12:58.000Z"})
+        self.touch(self.transcript, SCANNED_AT + timedelta(minutes=12))
+        self.transcript.chmod(0)
+        self.addCleanup(self.transcript.chmod, 0o600)
+        tabs = FakeTabs()
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []))
+        self.assertIn("term_agent: KEPT", out)
+
+    def test_orca_is_read_again_for_each_tab_it_closes(self) -> None:
+        # A second worktree whose agent starts working while the first tab closes must not be closed with it.
+        other = self.dir / "workspaces" / "fix-header"
+        rows = json.loads(self.scan.read_text())
+        rows.append({**rows[0], "path": str(other), "claude": None,
+                     "terminals": [{"handle": "term_other", "agent": "claude", "title": "fix-header"}]})
+        self.scan.write_text(json.dumps(rows))
+        orca = self.dir / "orca"
+        state = self.dir / "orca-state"
+        before = int((SCANNED_AT - timedelta(minutes=30)).timestamp() * 1000)
+        orca.write_text(f"""#!{sys.executable}
+import json, sys, time
+from pathlib import Path
+state = Path({str(state)!r})
+if sys.argv[1:3] == ["terminal", "close"]:
+    state.write_text("closed")
+    print(json.dumps({{"ok": True, "result": {{}}}}))
+else:
+    other = int(time.time() * 1000) if state.exists() else {before}
+    print(json.dumps({{"ok": True, "result": {{"worktrees": [
+        {{"path": {str(self.worktree)!r}, "agents": [{{"stateStartedAt": {before}}}]}},
+        {{"path": {str(other)!r}, "agents": [{{"stateStartedAt": other}}]}}]}}}}))
+""")
+        orca.chmod(0o755)
+        argv = ["--from", str(self.scan), "--claude-projects", str(self.projects), "--inbox", str(self.inbox),
+                "--orca", str(orca), "term_agent", "term_other"]
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = close_tabs.main(argv)
+
+        self.assertEqual(code, 1)
+        self.assertIn("term_agent: CLOSED", out.getvalue())
+        self.assertIn("term_other: KEPT -> 走査の後に動いた（", out.getvalue())
+
     def test_a_scan_saved_without_its_start_time_closes_nothing(self) -> None:
         rows = json.loads(self.scan.read_text())
         del rows[0]["scanned_at"]
