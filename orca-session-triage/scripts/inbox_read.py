@@ -18,12 +18,15 @@ not answered yet, oldest first, and `questions` prints their structured question
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+from itertools import takewhile
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +60,22 @@ class PendingQuestion:
     id: str
     report: dict
     question: dict
+
+
+@dataclass(frozen=True)
+class Sender:
+    """Where a report came from, as triage-notify records it: the worktree's name and the Mac."""
+    worktree: str
+    host: str
+
+    @classmethod
+    def of(cls, workspace: Path) -> Sender:
+        """This Mac's sender for a workspace, named as triage-notify names it ($TRIAGE_HOST or the hostname)."""
+        return cls(worktree=workspace.name, host=os.environ.get("TRIAGE_HOST") or socket.gethostname())
+
+    def sent(self, item: dict) -> bool:
+        """Whether this sender wrote the report; an entry that records no host matches on its worktree."""
+        return item.get("worktree") == self.worktree and item.get("host") in (None, "", self.host)
 
 
 @dataclass(frozen=True)
@@ -357,18 +376,29 @@ def question_batch(questions: list[PendingQuestion], after: str | None = None,
     }
 
 
-def unread_asks(inbox: Path, cursor: Path) -> list[str]:
-    """Return lane names for complete ask records after the acknowledged position."""
+def entry(raw: bytes) -> dict | None:
+    try:
+        item = json.loads(raw)
+    except ValueError:
+        return None
+    return item if isinstance(item, dict) else None
+
+
+def end_past(inbox: Path, start: int, skip: Callable[[dict], bool]) -> int:
+    """The offset after the complete entries from `start` that `skip` accepts, up to the first it does not
+    (or a damaged line), so no other entry is passed over."""
+    data = inbox.read_bytes()
+    lines = data[start:complete_end(data)].splitlines(keepends=True)
+    return start + sum(map(len, takewhile(lambda raw: (item := entry(raw)) is not None and skip(item), lines)))
+
+
+def unread_asks(inbox: Path, cursor: Path, mine: Sender | None = None) -> list[str]:
+    """Return lane names for complete ask records after the acknowledged position, leaving out those
+    `mine` sent: a tab's own ask is not one it has to read."""
     _, data, complete = pending_bytes(inbox, cursor)
-    asks = []
-    for raw in data[:complete].splitlines():
-        try:
-            item = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(item, dict) and item.get("kind") == "ask":
-            asks.append(str(item.get("worktree") or item.get("handle") or "unknown"))
-    return asks
+    return [str(item.get("worktree") or item.get("handle") or "unknown")
+            for item in map(entry, data[:complete].splitlines())
+            if item and item.get("kind") == "ask" and not (mine and mine.sent(item))]
 
 
 def save(cursor: Path, position: int, exclusive: bool = False) -> None:
