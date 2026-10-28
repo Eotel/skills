@@ -86,10 +86,13 @@ class Activity:
 
 
 def transcripts(row: dict, projects: Path) -> Iterator[Path]:
-    """The local transcripts of the row's worktree: its Claude project directory and the rollouts the scan read."""
+    """The local transcripts of the row's worktree: its Claude project directory under `projects` and the one
+    holding the transcript the scan read (the scan may have had another root), and the rollouts the scan read."""
     if row.get("environment"):
         return
-    yield from scan_sessions.find_claude_dir(projects, row["path"]).glob("*.jsonl")
+    scanned = (row.get("claude") or {}).get("transcript")
+    directories = {scan_sessions.find_claude_dir(projects, row["path"]), *([Path(scanned).parent] if scanned else [])}
+    yield from (path for directory in directories for path in directory.glob("*.jsonl"))
     yield from (Path(rollout["rollout"]) for rollout in row.get("codex") or [] if rollout.get("rollout"))
 
 
@@ -126,10 +129,11 @@ def transcript_activity(paths: Iterable[Path], since: datetime) -> Iterator[Acti
 
 
 def inbox_activity(row: dict, inbox: Path) -> Iterator[Activity]:
-    """Every report the row's worktree sent to the triage inbox."""
+    """Every report the row's worktree sent to the triage inbox; an inbox that exists but cannot be read raises
+    OSError, which keeps the tab."""
     try:
         lines = inbox.read_bytes().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return
     ours = (item for item in map(report, lines) if item and item.get("worktree") == Path(row["path"]).name
             and item.get("repo") in (None, "", row.get("repo")))

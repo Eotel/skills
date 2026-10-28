@@ -155,6 +155,30 @@ class CloseTabsTests(unittest.TestCase):
         self.assertEqual((code, tabs.closed), (1, []))
         self.assertIn("term_agent: KEPT", out)
 
+    def test_an_inbox_that_cannot_be_read_keeps_the_tab(self) -> None:
+        self.inbox.chmod(0)
+        self.addCleanup(self.inbox.chmod, 0o600)
+        tabs = FakeTabs()
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []))
+        self.assertIn("term_agent: KEPT", out)
+
+    def test_the_transcript_the_scan_read_is_read_again_under_another_projects_root(self) -> None:
+        # The scan ran with another --claude-projects; the close command it printed does not repeat it.
+        self.write_transcript({"type": "assistant", "timestamp": "2026-10-28T05:12:58.000Z"})
+        self.touch(self.transcript, SCANNED_AT + timedelta(minutes=12))
+        tabs = FakeTabs()
+        argv = ["--from", str(self.scan), "--claude-projects", str(self.dir / "default-projects"),
+                "--inbox", str(self.inbox), "term_agent"]
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = close_tabs.main(argv, tabs)
+
+        self.assertEqual((code, tabs.closed), (1, []))
+        self.assertIn("走査の後に動いた（", out.getvalue())
+
     def test_orca_is_read_again_for_each_tab_it_closes(self) -> None:
         # A second worktree whose agent starts working while the first tab closes must not be closed with it.
         other = self.dir / "workspaces" / "fix-header"
