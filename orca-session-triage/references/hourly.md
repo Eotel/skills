@@ -141,10 +141,12 @@ that its recorded symptom is gone. Then:
   asana-pr-review skill, even when its value differences were already judged.
   For 「レビューの番」, run the row's `review-pr ... --if-needed` command in this
   run. It skips a completed review of the same head and kind or an active
-  review started with this option. If the row has no command, confirm the PR's
-  source before starting. The independent review is a draft; do not submit a
-  GitHub review from this step. For 「指摘対応担当」, start the lane in this
-  run with `spawn-lane --topic <PR URL>`.
+  review started with this option. To wait for an active review, run
+  `review-pr <repo> <N> --wait`, which prints the result's path; the `.lock`
+  file stays after the review ends, so never wait for it to disappear. If the
+  row has no command, confirm the PR's source before starting. The independent
+  review is a draft; do not submit a GitHub review from this step. For
+  「指摘対応担当」, start the lane in this run with `spawn-lane --topic <PR URL>`.
 - Record each new question as `references/hourly-state.md` says, ask with
   AskUserQuestion, and set the triage workspace's Orca comment to「要判断: …」.
   Keep the tab with that unanswered question open. A later run works through

@@ -405,6 +405,7 @@ def run_claude(prompt: str, schema: dict[str, Any], claude: str = "claude",
     if result.returncode or not isinstance(wrapper, dict) or wrapper.get("is_error"):
         # Claude reports authentication and API failures in stdout JSON, often with an empty stderr.
         detail = (f"is_error={wrapper.get('is_error')} subtype={wrapper.get('subtype')} "
+                  f"terminal_reason={wrapper.get('terminal_reason')} "
                   f"result={str(wrapper.get('result'))[:300]}" if isinstance(wrapper, dict)
                   else f"stdout={result.stdout[-300:]!r}")
         raise RuntimeError(f"claude -p exited {result.returncode}: {detail} stderr={result.stderr[-200:]!r}")
