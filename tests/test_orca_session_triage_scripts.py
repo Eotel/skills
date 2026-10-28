@@ -2578,6 +2578,10 @@ class HourlyStateTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state = self.root / "hourly.json"
+        # A host's real verdict store must never reach a test run.
+        hermetic = patch.object(hourly_state.scan_sessions, "VERDICTS_FILE", str(self.root / "no-verdicts.json"))
+        hermetic.start()
+        self.addCleanup(hermetic.stop)
 
     def source(self, name, content):
         path = self.root / name
@@ -2769,6 +2773,26 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([request["source"]["url"] if request.get("source") else request["owner"]
                           for request in report["needs_owner"]], ["/w/done", "mbp16::/w/shell", url + "2"])
+
+    def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self):
+        # The hourly run saves the scan before orca-row-classify reads its queue; that verdict lands in the store.
+        row = {"path": "/w/classed", "environment": None, "repo": "app", "class": "unsure", "linked_pr": None,
+               "claude": {"final_at": "2026-10-28T01:00:00Z"}, "codex": [],
+               "terminals": [{"handle": "t1", "agent": "claude"}]}
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([row]))
+        store = self.root / "verdicts" / "verdicts.json"
+        store.parent.mkdir()
+        store.write_text(json.dumps({"/w/classed": {"class": "finished",
+                                                    "read": hourly_state.scan_sessions.read_key(row)}}))
+        original = self.source("original.txt", "直してほしい")
+        symptom = self.source("symptom.txt", "止まる")
+        self.call("request-open", "--original-file", original, "--symptom-file", symptom, "--owner", "/w/classed")
+
+        code, report = self.call("requests-needing-owner", "--from", str(scan_json), "--verdicts", str(store))
+
+        self.assertEqual(code, 0)
+        self.assertEqual([request["owner"] for request in report["needs_owner"]], ["/w/classed"])
 
     def test_recorded_issue_no_longer_open_is_set_apart_as_a_closure_candidate(self):
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app", "acme/lib"]}))

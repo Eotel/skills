@@ -392,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
                              help="read the rows scan_sessions.py printed as JSON instead of Orca: each row with an "
                                   "agent tab whose class (the verdict's, else the scan's) is not finished is a live "
                                   "owner, added to --live-owner")
+    needs_owner.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
+                             help="with --from, the careful reads' verdict store whose verdicts the rows take, "
+                                  "including those classed after the scan was saved (default: %(default)s)")
     needs_owner.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                              help="Orca CLI executable, read without --from (default: $ORCA_CLI_COMMAND or orca); "
                                   f"a paired Mac that does not answer within {REMOTE_ORCA_TIMEOUT} s is skipped")
@@ -439,8 +442,10 @@ def main(argv: list[str] | None = None) -> int:
         live: frozenset[str] = frozenset()
         intake: Intake | None = None
         if args.action == "requests-needing-owner":
-            host: WorktreeHost = (SavedScan(scan_sessions.saved_rows(args.from_file)) if args.from_file
-                                  else OrcaHost(args.orca))
+            # A saved scan predates the verdicts orca-row-classify wrote after it; take them as scan --from does.
+            host: WorktreeHost = (SavedScan(scan_sessions.with_verdicts(
+                scan_sessions.saved_rows(args.from_file), scan_sessions.absorb_verdicts(args.verdicts, write=False)))
+                if args.from_file else OrcaHost(args.orca))
             live = frozenset(owner_name(value) for value in args.live_owner) | host.live_owners()
             intake = issue_intake(path, host)
         with (path.parent / (path.name + ".lock")).open("a+") as lock:

@@ -52,10 +52,12 @@ is imported while the worktrees are unreadable.
 
 Every hourly run reads the open requests in `show` and compares each assigned
 lane with the scan. After the scan, run `requests-needing-owner --from
-SCAN_JSON` with the JSON the scan printed, saved to a file. Each row with an
-agent tab whose class (the verdict's, else the scan's) is not `finished` is a
-live owner, and the issue links come from the same rows, so Orca is not read
-again. Add `--live-owner ROW_IDENTITY` for a lane the scan did not show that is
+SCAN_JSON` with the JSON the scan printed, saved to a file. The rows take the
+verdicts in `~/.cache/orca-session-triage/verdicts.json` as `scan_sessions.py
+--from` does, including those `orca-row-classify` wrote after the scan was
+saved. Each row with an agent tab whose class (the verdict's, else the scan's)
+is not `finished` is a live owner, and the issue links come from the same rows,
+so Orca is not read again. Add `--live-owner ROW_IDENTITY` for a lane the scan did not show that is
 still handling its assigned request. Without `--from`, the command reads Orca
 itself, skips a paired Mac that does not answer within 15 seconds, and treats
 only the `--live-owner` lanes as live.
