@@ -76,7 +76,7 @@ class OrcaTabs:
     paired: dict[str, str] = field(default_factory=dict)
 
     def result(self, *args: str) -> dict[str, Any]:
-        # Calls answer within a second; a stalled server would delay every later notification.
+        # Calls answer in under 3 seconds; a stalled server would delay every later notification.
         out = subprocess.run([self.orca, *args, "--json"], capture_output=True, text=True,
                              check=True, timeout=5).stdout
         data = json.loads(out)
