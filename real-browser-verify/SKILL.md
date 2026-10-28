@@ -35,9 +35,12 @@ functional path. A passing suite or loaded page proves a different claim.
      axes; check both.
    - For persistence-related fixes, test the with-reload and without-reload paths
      as separate scenarios.
-   - Confirm the real path is live, not a mock/fallback (real LLM key, real
-     websocket connection) — a deterministic fallback answering is a failed
-     verification.
+   - When claiming the live integration works, exercise that integration with
+     real credentials and transport; a mock or substitute response cannot prove it.
+   - When the specified behavior is an outage mode (for example, displaying a
+     saved document), exercise that mode and verify its source, visible status,
+     and reload behavior. Report it separately from provider health; test the
+     normal integration path independently.
 
 4. **Capture evidence**
    - Screenshot of the target screen post-operation (light/dark/mobile when the
