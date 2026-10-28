@@ -455,9 +455,9 @@ RULE = re.compile(r"[─━]+")
 # Claude Code's reply bullet and the line it leaves when a turn ends ("✻ Baked for 3m 2s").
 CLAUDE_LINE_STARTS = re.compile(r"⏺ |✻ \S+ for ")
 CLAUDE_MODE_LINE = "⏵⏵ "
-# A ⏺ line that names a tool call ("⏺ Bash(git push)"), sums up collapsed calls
+# A ⏺ line that names a tool call ("⏺ Bash(git push)", "⏺ serena - find_symbol (MCP)(…)"), sums up collapsed calls
 # ("… (ctrl+o to expand)"), or is followed by a tool result (⎿) is not a reply.
-TOOL_CALL = re.compile(r"⏺ [A-Za-z][\w.:-]*\(")
+TOOL_CALL = re.compile(r"⏺ (?:[A-Za-z][\w.:-]*\(|.*\(MCP\))")
 COLLAPSED_CALLS = "(ctrl+o to expand)"
 TOOL_RESULT = "⎿"
 
