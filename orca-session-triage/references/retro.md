@@ -49,7 +49,10 @@ arguments, defaults, checks, or output could enforce also becomes a `script`
 proposal. A fact that names a script in Eotel/skills or
 `~/.cache/orca-briefs/bin` is never adopted automatically. An adopted
 `script` or `upstream` proposal is not written as a note: the worker records
-one `handed_off` execution, and the lane that ships it records `applied`. The
+one `handed_off` execution, and the lane that ships it records `applied`.
+spawn-lane and send record the lane's own `handed_off` when its brief or
+message names the proposal ID; the worker's `handed_off` alone means no lane
+holds it yet. The
 adoption board tells the triage lead about adoptions made there; whoever
 adopts from the ledger command directs the lane.
 
