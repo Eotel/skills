@@ -458,6 +458,8 @@ class ClassifyTests(unittest.TestCase):
         screen = {"source": "screen", "tail": [
             "⏺ PR #345 のレビュー指摘を直して push し、", "  coordinator に worker_done を送りました。", "",
             "⏺ Bash(git push origin HEAD)", "  ⎿  Everything up-to-date", "",
+            "⏺ serena - find_symbol (MCP)(name_path: \"main\")", "  ⎿  {\"result\": []}", "",
+            "⏺ Searched for 2 patterns, read 3 files (ctrl+o to expand)", "",
             "✻ Baked for 5h 30m 24s · done 4:33 PM", "─" * 40, "❯", "─" * 40,
             "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]}
         # test-338's reply began above the visible screen: the lines before its turn-end line stand in.

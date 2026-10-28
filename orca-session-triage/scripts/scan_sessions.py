@@ -455,8 +455,11 @@ RULE = re.compile(r"[─━]+")
 # Claude Code's reply bullet and the line it leaves when a turn ends ("✻ Baked for 3m 2s").
 CLAUDE_LINE_STARTS = re.compile(r"⏺ |✻ \S+ for ")
 CLAUDE_MODE_LINE = "⏵⏵ "
-# A ⏺ line that names a tool call ("⏺ Bash(git push)") is not a reply.
+# A ⏺ line that names a tool call ("⏺ Bash(git push)"), sums up collapsed calls
+# ("… (ctrl+o to expand)"), or is followed by a tool result (⎿) is not a reply.
 TOOL_CALL = re.compile(r"⏺ [A-Za-z][\w.:-]*\(")
+COLLAPSED_CALLS = "(ctrl+o to expand)"
+TOOL_RESULT = "⎿"
 
 
 def screen_lines(screen: dict) -> list[str]:
@@ -492,7 +495,12 @@ def screen_message(screen: dict) -> str:
     A reply whose ⏺ line scrolled off the top is read from the indented lines above the last turn-end line.
     """
     lines = screen_lines(screen)
-    starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ") and not TOOL_CALL.match(line)]
+    def tool_call(index):
+        following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        return (TOOL_CALL.match(lines[index]) or lines[index].rstrip().endswith(COLLAPSED_CALLS)
+                or following.startswith(TOOL_RESULT))
+
+    starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ") and not tool_call(index)]
     ends = [index for index, line in enumerate(lines) if line.startswith("✻ ")]
     if starts:
         block = [lines[starts[-1]][2:]]
