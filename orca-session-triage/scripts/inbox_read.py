@@ -13,6 +13,8 @@ questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
 ($TRIAGE_ASK_ANSWERS), as `send --decision --ask` does; `open-asks` lists the asks
 not answered yet, oldest first, and `questions` prints their structured questions
 (`triage-notify --kind ask --questions`) four at a time as AskUserQuestion input.
+`answered --before` marks only the asks an answer covers (answer_evidence.py: the
+lead's decisions and AskUserQuestion answers) and names the rest without marking them.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import sys
 import time
 from typing import Literal, cast
 
+import answer_evidence
 import hourly_runtime
 
 
@@ -472,6 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
     answered.add_argument("--before", help="instead, every open ask asked before this ISO time")
     answered.add_argument("--note", default="", help="why, kept with the record")
+    answer_evidence.add_arguments(answered)
     questions = actions.add_parser(
         "questions", help="print, as JSON, the next 4 unanswered structured questions: `questions` to pass to "
                           "AskUserQuestion, `items` naming each one's id and source, `remaining`, and "
@@ -506,12 +510,23 @@ def main(argv: list[str] | None = None) -> int:
             if args.action == "answered":
                 if args.ids is not None:
                     ids = checked_answer_ids(args.ids, entries)
+                    refused = []
                 else:
                     before = datetime.fromisoformat(args.before)
                     before = before if before.tzinfo else before.astimezone()
-                    ids = [ask.report["id"] for ask in asks if ask.at is not None and ask.at < before]
+                    earlier = [ask for ask in asks if ask.at is not None and ask.at < before]
+                    found = answer_evidence.from_arguments(args, answers_path())
+                    ids = [ask.report["id"] for ask in earlier if answer_evidence.answer_to(ask.report, found)]
+                    refused = [ask for ask in earlier if ask.report["id"] not in ids]
                 record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
                 print(f"answered: {len(ids)}")
+                for ask in refused:
+                    print(f"not marked, no lead decision or AskUserQuestion answer names it after it was asked: "
+                          f"{summary_line(ask.report)}", file=sys.stderr)
+                if refused:
+                    print("inbox-read: confirm each one was answered, then mark it with `answered <id> --note <where>`",
+                          file=sys.stderr)
+                    return 1
             elif args.action == "questions":
                 order = [question.id for question in pending_questions(open_asks(entries, frozenset()))]
                 print(json.dumps(question_batch(pending_questions(asks), args.after, order),

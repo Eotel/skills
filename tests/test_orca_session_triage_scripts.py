@@ -3155,6 +3155,46 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([request["source"]["url"] if request.get("source") else request["owner"]
                           for request in report["needs_owner"]], ["/w/done", "mbp16::/w/shell", url + "2"])
 
+    def test_stale_asks_names_waiting_rows_whose_question_is_unasked_unanswered_or_answered_and_left(self):
+        # 2026-10-29: a choice sent as info waited 14 hours, and an ask marked answered without an answer 25 hours.
+        def waiting(name, asked_at, said_at):
+            return {"path": f"/w/{name}", "environment": None, "repo": "app", "class": "waiting", "codex": [],
+                    "claude": {"last_user_at": asked_at, "final_at": said_at, "final_text": "返事を待ちます"},
+                    "terminals": [{"handle": f"term_{name}", "agent": "claude"}]}
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([
+            waiting("orca-deeplink-pr", "2026-10-28T10:55:00Z", "2026-10-28T11:02:30Z"),
+            waiting("report-decisions", "2026-10-28T00:10:00Z", "2026-10-28T00:19:00Z"),
+            waiting("fix-login", "2026-10-28T00:55:00Z", "2026-10-28T01:01:00Z"),
+            {**waiting("unrelated", "2026-10-28T00:55:00Z", "2026-10-28T01:01:00Z"), "class": "working"},
+        ]))
+        inbox, answers, log = (self.root / name for name in ("inbox.jsonl", "answers.jsonl", "decisions.jsonl"))
+        write_jsonl(inbox, [
+            {"id": "897047e0-0000", "ts": "2026-10-28T20:02:05+0900", "kind": "info", "worktree": "orca-deeplink-pr",
+             "text": "写真を上げられなかった。進め方はどちらか。\n1. ログインする\n2. 貼る"},
+            {"id": "4bd9cae3-0000", "ts": "2026-10-28T09:18:41+0900", "kind": "ask", "worktree": "report-decisions",
+             "text": "c1 の全文です"},
+            {"id": "aa110000-0000", "ts": "2026-10-28T10:00:00+0900", "kind": "ask", "worktree": "fix-login",
+             "text": "merge してよいか"},
+        ])
+        write_jsonl(answers, [{"id": "4bd9cae3-0000", "ts": "2026-10-29T06:23:48+09:00",
+                               "how": "inbox_read.py answered", "note": "まとめて印"}])
+        write_jsonl(log, [{"id": "1", "decision": "answer:fix-login::merge", "answer": "merge してよい",
+                           "decided_at": "2026-10-28T02:00:00+00:00"}])
+
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}):
+            code, stale = self.call("stale-asks", "--from", str(scan_json), "--decisions-file", str(log),
+                                    "--claude-projects", str(self.root / "projects"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual([(item["row"], item["state"], item["since"]) for item in stale], [
+            ("/w/report-decisions", "unanswered", "2026-10-28T09:18:41+0900"),
+            ("/w/fix-login", "stopped_after_answer", "2026-10-28T02:00:00+00:00"),
+            ("/w/orca-deeplink-pr", "unasked", "2026-10-28T11:02:30Z")])
+        self.assertTrue(stale[0]["ask"]["marked"])
+        self.assertEqual([info["id"] for info in stale[2]["choices_in_info"]], ["897047e0-0000"])
+        self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
+
     def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self):
         # The hourly run saves the scan before orca-row-classify reads its queue; that verdict lands in the store.
         row = {"path": "/w/classed", "environment": None, "repo": "app", "class": "unsure", "linked_pr": None,
@@ -3681,6 +3721,45 @@ class InboxReadTests(unittest.TestCase):
             self.assertEqual(run("open-asks")[1], "")
             self.assertEqual(unknown[0], 1)
             self.assertIn("done1", unknown[2])
+
+    def test_answered_before_marks_only_asks_an_answer_names_after_they_were_asked(self):
+        # 2026-10-29: a bulk mark took an unanswered ask out of open-asks, and it waited 25 hours.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, answers, log = (Path(root) / name for name in ("inbox.jsonl", "answers.jsonl", "decisions.jsonl"))
+            write_jsonl(inbox, [
+                {"id": "4bd9cae3-0000", "ts": "2026-10-28T09:18:41+0900", "kind": "ask", "worktree": "report-decisions",
+                 "text": "c1 の全文と投稿先の案です"},
+                {"id": "bc7e1884-0000", "ts": "2026-10-28T20:02:05+0900", "kind": "ask", "worktree": "orca-deeplink-pr",
+                 "text": "#34651 に写真を足す進め方はどちらか"},
+                {"id": "77aa0001-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "fix-login",
+                 "text": "merge してよいか"},
+            ])
+            write_jsonl(log, [
+                {"id": "1", "decision": "answer:report-decisions::c1", "answer": "この全文で出す",
+                 "decided_at": "2026-10-28T10:00:00+00:00"},
+                {"id": "2", "decision": "merge:fix-login", "answer": "前の PR は merge してよい",
+                 "decided_at": "2026-10-28T02:00:00+00:00"},
+                {"id": "3", "decision": "remove:local::/w/fix-login", "answer": "消してよい",
+                 "decided_at": "2026-10-28T04:00:00+00:00"},
+            ])
+            lead = Path(root) / "triage-lead"
+            transcript = scan.claude_project_dir(Path(root) / "projects", str(lead)) / "lead.jsonl"
+            transcript.parent.mkdir(parents=True)
+            write_jsonl(transcript, [{"type": "user", "timestamp": "2026-10-29T01:21:00Z", "toolUseResult": {
+                "questions": [{"question": "#34651 の写真をどう足しますか？"}],
+                "answers": {"#34651 の写真をどう足しますか？": "写真なしで進める"}}}])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}
+
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
+                    redirect_stderr(io.StringIO()) as err:
+                code = inbox_read.main(["answered", "--before", "2026-10-29T12:00:00+09:00", "--note", "答え済み",
+                                        "--decisions-file", str(log), "--asked-in", str(lead),
+                                        "--claude-projects", str(Path(root) / "projects")])
+
+            marked = [json.loads(line)["id"] for line in answers.read_text().splitlines()]
+            self.assertEqual((code, out.getvalue()), (1, "answered: 2\n"))
+            self.assertEqual(sorted(marked), ["4bd9cae3-0000", "bc7e1884-0000"])
+            self.assertIn("77aa0001-0000", err.getvalue())
 
     def test_watch_shows_every_ask_and_done_and_reminds_of_asks_left_unanswered(self):
         with tempfile.TemporaryDirectory() as root:
