@@ -531,10 +531,11 @@ def composer_empty(screen: dict) -> bool | None:
     return None
 
 
-# Claude Code's permission selector: "Do you want to make this edit to …?", then "❯ 1. Yes", "2. No", ….
+# Claude Code's permission selector: "Do you want to make this edit to …?", then "❯ 1. Yes", "2. No", …,
+# with ❯ on whichever choice the user has moved to.
 PERMISSION_QUESTION = "Do you want to"
-PERMISSION_FIRST_CHOICE = "❯ 1. Yes"
 CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
+FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 # What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
 LOST_WAITS = "background shell command tasks didn't finish before the previous session ended"
 
@@ -543,11 +544,12 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     """The permission question a rendered screen waits on, with its numbered choices."""
     lines = [line.strip() for line in screen_lines(screen) if line.strip()]
     asked = [index for index, line in enumerate(lines) if line.startswith(PERMISSION_QUESTION)]
-    if not asked or PERMISSION_FIRST_CHOICE not in lines[asked[-1]:]:
+    after = lines[asked[-1] + 1:] if asked else []
+    first = next((index for index, line in enumerate(after) if FIRST_CHOICE.fullmatch(line)), None)
+    choices = list(takewhile(CHOICE.fullmatch, after[first:])) if first is not None else []
+    if not any(line.startswith("❯") for line in choices):
         return None
-    first = lines.index(PERMISSION_FIRST_CHOICE, asked[-1])
-    return {"tab": tab, "question": lines[asked[-1]],
-            "choices": [CHOICE.sub(r"\1", line) for line in takewhile(CHOICE.fullmatch, lines[first:])]}
+    return {"tab": tab, "question": lines[asked[-1]], "choices": [CHOICE.sub(r"\1", line) for line in choices]}
 
 
 def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screens,

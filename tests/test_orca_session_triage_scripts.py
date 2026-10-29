@@ -400,6 +400,8 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((rows[0]["class"], rows[0]["closable"]), ("waiting", []))
         self.assertEqual(scan.review_queue(rows)[0]["prompt_waiting"],
                          {"tab": "term_prompt", "question": question, "choices": ["1. Yes", "2. No"]})
+        moved = {"source": "screen", "tail": [question, "  1. Yes", "❯ 2. No"]}
+        self.assertEqual(scan.permission_prompt(moved, "term_prompt")["choices"], ["1. Yes", "2. No"])
 
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
