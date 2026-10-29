@@ -1,6 +1,7 @@
 """Offline behavior tests for the hourly handoff that adds what changed after the scan."""
 
 import importlib.util
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -41,13 +42,14 @@ class HandoffTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def run_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_tool(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "send", "--inbox", str(self.inbox),
                                "--decisions-file", str(self.decisions), "--handed-off-file", str(self.handed_off),
                                "--claude-projects", str(self.projects), "--handoffs-dir", str(self.handoffs),
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True,
-                              env={**os.environ, "ORCA_WORKTREE_ID": "repo1::/w/triage", "TRIAGE_HOST": "mac-a"})
+                              env={**os.environ, "ORCA_WORKTREE_ID": "repo1::/w/triage", "TRIAGE_HOST": "mac-a",
+                                   "CLAUDE_CONFIG_DIR": str(self.root), "CLAUDE_PID": "86520", **(env or {})})
 
     def last(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "last", "--handoffs-dir", str(self.handoffs)],
@@ -102,6 +104,31 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("消してよい", result.stderr)
         self.assertFalse(self.sent.exists())
         self.assertFalse(self.handed_off.exists())
+
+    def test_send_signs_the_end_with_the_session_name_and_start_time_in_place_of_the_body_signature(self) -> None:
+        self.inbox.write_text("")
+        (self.root / "sessions").mkdir()
+        started = datetime(2026, 10, 28, 18, 0, tzinfo=timezone.utc)
+        (self.root / "sessions/86520.json").write_text(json.dumps({
+            "name": "triage-hourly-0f", "startedAt": int(started.timestamp() * 1000)}))
+        self.body.write_text("引き継ぎ本文\n\ntriage-hourly（03:00 の定時）\n")
+
+        result = self.run_tool("--since", "0", env={"TZ": "Asia/Tokyo"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = json.loads(self.sent.read_text())[-1]
+        self.assertTrue(sent.endswith("\n\ntriage-hourly-0f（03:00 の定時）"), sent)
+        self.assertNotIn("triage-hourly（", sent)
+
+    def test_without_the_session_record_the_body_goes_as_written(self) -> None:
+        self.inbox.write_text("")
+        self.body.write_text("引き継ぎ本文\n\ntriage-hourly（03:00 の定時）\n")
+
+        result = self.run_tool("--since", "0")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("triage-hourly（03:00 の定時）\n\n——", json.loads(self.sent.read_text())[-1])
+        self.assertIn("without the run's signature", result.stderr)
 
     def test_records_each_key_it_hands_off_for_tools_that_must_wait_for_the_answer(self) -> None:
         self.inbox.write_text("")

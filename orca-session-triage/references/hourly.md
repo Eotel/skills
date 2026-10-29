@@ -119,7 +119,11 @@ send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
 (`--kind info` with nothing to hand off but cleanup). At the moment it sends,
 it adds every inbox report that arrived after the scan began and the lead's
 latest message and unanswered questions read again from its transcript, so the
-handoff never rests on the scan's start. Ack the NEXT_OFFSET it prints: it is
+handoff never rests on the scan's start. Do not sign the body: it ends the
+text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and
+the session's start time, and replaces a signature the body ends with. When it
+says on stderr that it sent without one, the handoff went unsigned. Ack the
+NEXT_OFFSET it prints: it is
 past the run's own handoff entry, unless another report reached the inbox
 first, which then stays unread for this run. Each handoff it sends is kept in
 `~/.cache/orca-session-triage/handoffs/` with its kind, keys, and time;

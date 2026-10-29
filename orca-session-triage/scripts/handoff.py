@@ -12,6 +12,10 @@ ack the NEXT_OFFSET it prints: every inbox entry before it is in the handoff, an
 this run's own handoff entry unless another report reached the inbox first.
 Each sent handoff is kept in --handoffs-dir, one file per send named by its UTC time, with
 the exact text, kind, keys, time, and NEXT_OFFSET; `last` prints the newest.
+`send` ends the text with the run's signature, <session name>（HH:MM の定時）: the name ListAgents
+prints first and the local time the session started, from $CLAUDE_CONFIG_DIR/sessions/$CLAUDE_PID.json
+(~/.claude by default). A signature the body ends with is replaced. When the record cannot be read, it
+sends the body as written and says so on stderr.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Protocol
@@ -34,6 +39,7 @@ NOTIFY = "~/.cache/orca-briefs/bin/triage-notify"
 INBOX = "~/.cache/orca-briefs/triage-inbox.jsonl"
 HANDOFFS = Path("~/.cache/orca-session-triage/handoffs")
 EXCERPT = 160
+SIGNATURE_LINE = re.compile(r"\n[^\n]+（\d{1,2}:\d{2} の定時）$")
 
 
 class Deliver(Protocol):
@@ -119,6 +125,22 @@ def lead_state(projects: Path, worktree: str) -> str:
             f"最後の発言 {claude.get('final_at') or '-'}: {said[:200]}" + ("…" if len(said) > 200 else ""))
 
 
+def session_signature() -> str | None:
+    """<session name>（HH:MM の定時） from this Claude Code session's record; None, said on stderr, when it
+    cannot be read: the name is never guessed."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
+    record = config / "sessions" / f"{os.environ.get('CLAUDE_PID', '')}.json"
+    try:
+        session = json.loads(record.read_text(encoding="utf-8"))
+        name, started = session["name"].strip(), datetime.fromtimestamp(session["startedAt"] / 1000)
+        if not name:
+            raise ValueError("the session has no name")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
+        print(f"handoff: sending without the run's signature: {record}: {error!r}", file=sys.stderr)
+        return None
+    return f"{name}（{started:%H:%M} の定時）"
+
+
 def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) -> int:
     answered = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
     keys = list(dict.fromkeys(args.decision))
@@ -138,7 +160,9 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
         facts.append(lead_state(args.claude_projects.expanduser(), args.lead_worktree))
     if keys:
         lead_decisions.append(args.handed_off_file.expanduser(), *map(lead_decisions.HandOff.now, keys))
-    text = "\n\n".join([body, "\n".join(facts)])
+    signature = session_signature()
+    text = "\n\n".join([SIGNATURE_LINE.sub("", body).rstrip() if signature else body, "\n".join(facts),
+                         *([signature] if signature else [])])
     deliver(args.kind, text)
     sent = datetime.now(timezone.utc)
     try:
@@ -164,7 +188,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="where each sent handoff is kept (default: %(default)s)")
     commands = parser.add_subparsers(dest="action", required=True)
     send_command = commands.add_parser("send", parents=[kept],
-                                       help="add the reports and lead state of the moment, then send")
+                                       help="add the reports and lead state of the moment and the run's signature, "
+                                            "then send")
     send_command.add_argument("--body-file", type=Path, required=True, help="UTF-8 file with the handoff the run wrote")
     send_command.add_argument("--since", type=int, required=True,
                               help="the NEXT_OFFSET of the inbox read at the start of the run")
