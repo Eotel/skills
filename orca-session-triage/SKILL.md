@@ -115,8 +115,8 @@ board's done cards; close what the user approves.
   an agent's own "done" or "uncommitted".
 - `scripts/close_tabs.py --from SCAN_JSON HANDLE ...`: closes tabs the saved
   scan listed, and keeps each one whose worktree's transcripts, triage inbox
-  reports, or agent states in Orca changed after the scan started. Close tabs
-  through it.
+  reports, or agent states in Orca, other than the calling session's own,
+  changed after the scan started. Close tabs through it.
 - `references/delivery.md`: batching questions, sending answers, and giving
   lanes work.
 - `references/next-step.md`: what each `stalled` worktree needs next.

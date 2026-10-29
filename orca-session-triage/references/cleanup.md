@@ -147,7 +147,8 @@ follow "Clearing done cards".
    handles and the scan that listed them (`--cards` with `--from` prints this
    command for each row's `closable` tabs). Just before closing, it reads the
    worktree's transcripts, its triage inbox reports, and its agents' state in
-   Orca again; a tab whose worktree moved after the scan stays, printed as
+   Orca again, leaving out the calling session's own transcript, pane, and
+   reports; a tab whose worktree moved after the scan stays, printed as
    `KEPT -> 走査の後に動いた（time what）`. Scan again and read that row
    before deciding again. Never close a listed tab with a bare
    `orca terminal close`: it closed a lane that deployed after the scan
