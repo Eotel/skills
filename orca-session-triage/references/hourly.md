@@ -59,6 +59,11 @@ way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest, oldest first (`--json` for other tools; the board
 reads it). Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
+It marks only the asks an answer after them proves answered: a lead decision
+or an AskUserQuestion answer (in the transcripts of the current directory's
+worktree and each `--asked-in` worktree) that names the ask's id or quotes each
+open question, or a delivered answer. It names the rest with the answers that
+mention only the lane or its PR numbers: confirm each one, then mark it by id.
 A report pulled late from another Mac is still shown even
 if its original timestamp is old. The watch and notification services each
 keep their own cursor. The watch's output is in
@@ -106,9 +111,10 @@ without a live writer goes to the lead.
 
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
-`requests-needing-owner --from SCAN_JSON` as described in
-`references/hourly-state.md` and include every `needs_owner` request, and each
-`closed_issues` request to close, in the handoff to the lead on every run. A
+`requests-needing-owner --from SCAN_JSON` and `stale-asks --from SCAN_JSON` as
+described in `references/hourly-state.md` and include every `needs_owner`
+request, each `closed_issues` request to close, and each `stale-asks` entry, in
+the handoff to the lead on every run. A
 lane's `done` leaves the user's request open until the lead verifies the
 original symptom is gone. Then do only the
 cleanup allowed before a user choice by the Boundary and `cleanup.md`. Write the
@@ -182,7 +188,8 @@ saved left rows to their newest final messages, retain pending questions, and
 check promised handoffs and open requests. After the scan, run
 `requests-needing-owner --from SCAN_JSON`, assign a live lane to each
 `needs_owner` request or raise the needed decision, and close each
-`closed_issues` request with `request-close`. Keep every other request open
+`closed_issues` request with `request-close`. Run `stale-asks --from
+SCAN_JSON` and handle each entry as `references/hourly-state.md` says. Keep every other request open
 until the lead observes that its recorded symptom is gone. Then:
 
 - Run the `backlog-watch` skill and include new notices and issues awaiting your reply in the hourly report.

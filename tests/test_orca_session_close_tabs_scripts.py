@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -26,12 +27,13 @@ SCANNED_AT = datetime(2026, 10, 28, 5, 1, tzinfo=timezone.utc)
 class FakeTabs:
     """Orca as close_tabs.py sees it: agent state changes per worktree, and the tabs it was asked to close."""
 
-    def __init__(self, updates: dict[tuple[str | None, str], list[datetime]] | None = None) -> None:
+    def __init__(self, updates: dict[tuple[str | None, str], list] | None = None) -> None:
         self.updates = updates or {}
         self.closed: list[tuple[str | None, str]] = []
 
-    def agent_changes(self, environment: str | None, path: str) -> list[datetime]:
-        return self.updates.get((environment, path), [])
+    def agent_changes(self, environment: str | None, path: str) -> list:
+        return [change if isinstance(change, close_tabs.AgentChange) else close_tabs.AgentChange(None, change)
+                for change in self.updates.get((environment, path), [])]
 
     def close(self, environment: str | None, handle: str) -> None:
         self.closed.append((environment, handle))
@@ -212,6 +214,25 @@ else:
         self.assertEqual(code, 1)
         self.assertIn("term_agent: CLOSED", out.getvalue())
         self.assertIn("term_other: KEPT -> 走査の後に動いた（", out.getvalue())
+
+    def test_the_callers_own_session_in_the_worktree_does_not_keep_the_tab(self) -> None:
+        # 2026-10-29: an hourly run closing the previous hourly tab of its own workspace kept it, citing the run's
+        # own transcript; its own agent state and its own inbox reports move after the scan the same way.
+        caller = self.transcript.with_name("75c2227b.jsonl")
+        caller.write_text(json.dumps({"type": "assistant", "timestamp": "2026-10-28T05:12:58.000Z"}) + "\n")
+        self.touch(caller, SCANNED_AT + timedelta(minutes=12))
+        self.inbox.write_text(json.dumps({"ts": "2026-10-28T14:12:40+0900", "kind": "info", "worktree": "fix-login",
+                                          "repo": "web", "handle": "term_caller"}) + "\n")
+        tabs = FakeTabs({(None, str(self.worktree)): [
+            close_tabs.AgentChange("tab-caller:leaf", SCANNED_AT + timedelta(minutes=5)),
+            close_tabs.AgentChange("tab-agent:leaf", SCANNED_AT - timedelta(minutes=40))]})
+        environment = {"CLAUDE_CODE_SESSION_ID": "75c2227b", "ORCA_PANE_KEY": "tab-caller:leaf",
+                       "ORCA_TERMINAL_HANDLE": "term_caller"}
+
+        with patch.dict(os.environ, environment):
+            code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (0, [(None, "term_agent")]), out)
 
     def test_a_scan_saved_without_its_start_time_closes_nothing(self) -> None:
         rows = json.loads(self.scan.read_text())

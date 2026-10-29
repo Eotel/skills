@@ -115,9 +115,12 @@ Run these per worktree, in order.
 3. `orca worktree rm --worktree path:<path> --json`. Orca also deletes the
    checked-out local branch when it can prove it merged; a detached HEAD leaves
    the branch, so name it in the report.
-4. Confirm the path is gone from `orca worktree ps --json` and from disk. The
-   removal answers `removing: true` and finishes in the background, so poll for
-   up to a minute before reporting it stuck.
+4. `scripts/rm_check.py --worktree <path> --confirm-gone` confirms the path
+   is gone from `orca worktree ps --json` and from disk, reading again for up
+   to a minute: the removal answers `removing: true` and finishes in the
+   background. Exit 1 (`gone: false`) is a stuck removal to report. Do not
+   search the JSON for the name: a row's `preview` holds its tabs' output,
+   which may still name a removed worktree (2026-10-29).
    `orca terminal show` keeps answering for the removed terminals with
    `orphaned: true, connected: false`: that is a stale record, not a live PTY.
 5. When the lane reported to a lead in another tab, send the lead one line
@@ -147,7 +150,8 @@ follow "Clearing done cards".
    handles and the scan that listed them (`--cards` with `--from` prints this
    command for each row's `closable` tabs). Just before closing, it reads the
    worktree's transcripts, its triage inbox reports, and its agents' state in
-   Orca again; a tab whose worktree moved after the scan stays, printed as
+   Orca again, leaving out the calling session's own transcript, pane, and
+   reports; a tab whose worktree moved after the scan stays, printed as
    `KEPT -> 走査の後に動いた（time what）`. Scan again and read that row
    before deciding again. Never close a listed tab with a bare
    `orca terminal close`: it closed a lane that deployed after the scan

@@ -3,6 +3,9 @@
 
 Use --state-file for an isolated copy. Mutations lock beside the file and replace
 it atomically, so a waiting session and a new run cannot lose each other's edits.
+
+`stale-asks --from SCAN_JSON` reads no state: it sets each waiting row of a saved scan against the lane's inbox
+reports and the answers answer_evidence.py finds, and names the questions left in front of no one.
 """
 
 import argparse
@@ -12,6 +15,7 @@ import fcntl
 from functools import cached_property
 import hashlib
 import json
+from operator import itemgetter
 import os
 from pathlib import Path
 import re
@@ -21,6 +25,8 @@ import tempfile
 from typing import Protocol
 import uuid
 
+import answer_evidence
+import inbox_read
 import scan_sessions
 
 DEFAULT_STATE = "~/.cache/orca-session-triage/hourly-state.json"
@@ -34,6 +40,9 @@ GH_TIMEOUT = 60
 # Orca itself still ends well inside the 300 seconds before the next hourly run.
 REMOTE_ORCA_TIMEOUT = 15
 READ_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError)
+# A lane's info that offers the user a choice; open-asks never lists one (2026-10-29: 14 hours unseen).
+CHOICE = re.compile(r"【要(?:判断|承認|確認)】|どちら|どれに|選択肢|選んで|(?:ます|です|でしょう)か[。？?]")
+EXCERPT = 160
 
 
 @dataclass(frozen=True)
@@ -239,6 +248,81 @@ def owner_report(data: dict, live: frozenset[str], intake: Intake | None) -> dic
     }
 
 
+def excerpt(text: object) -> str:
+    compact = " ".join(str(text or "").split())
+    return compact[:EXCERPT] + ("…" if len(compact) > EXCERPT else "")
+
+
+def report_view(item: dict) -> dict:
+    return {"id": item.get("id") or "", "ts": item.get("ts") or "", "text": excerpt(item.get("text"))}
+
+
+def answer_view(answer: answer_evidence.Answer) -> dict:
+    return {"at": answer.at.isoformat(), "source": answer.source, "text": excerpt(answer.text)}
+
+
+def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
+               answers: list[answer_evidence.Answer], now: datetime) -> list[dict]:
+    """Each waiting row, longest waiting first, with where its question stands. The lane's asks that count are
+    those still open and those it sent in its last turn:
+    - `unanswered`: one of them has no answer that proves it answered (answer_evidence.py), whether it is open
+      or was marked answered; the oldest is `ask`;
+    - `stopped_after_answer`: they are answered, one after the lane's last message, and the lane has not spoken
+      since; `answer` is the newest such answer, `since` the first;
+    - `unasked`: they were answered before the lane's last message, or it has none, so open-asks does not show
+      its question; `choices_in_info` lists choices it sent as info since its last turn began.
+    `candidates` holds the newest answers that name only the lane or its PR numbers, for the lead to check: the
+    lead may ask the user a waiting row's question itself.
+    """
+    found = []
+    shared = answer_evidence.shared_questions(entries)
+    for row in rows:
+        if ((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting":
+            continue
+        final = scan_sessions.final_message(row)
+        said_at = scan_sessions.parse_time(final["at"])
+        began = (scan_sessions.parse_time((row.get("claude") or {}).get("last_user_at"))
+                 if final["source"] == "claude" else None) or said_at
+        name = Path(row["path"]).name
+        lane = [(at, item) for item in entries if item.get("worktree") == name
+                and item.get("repo") in (None, "", row.get("repo"))
+                and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
+        counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
+                   if item.get("kind") == "ask" and item.get("id")
+                   and (item["id"] in open_ids or began is not None and at >= began)]
+        view = {"row": scan_sessions.row_identity(row), "name": scan_sessions.row_name(row),
+                "question": excerpt((row.get("verdict") or {}).get("question") or final["text"]),
+                "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
+        unanswered = [(at, item) for at, item, proof in counted if not proof]
+        if unanswered:
+            asked_at, ask = min(unanswered, key=itemgetter(0))
+            found.append((asked_at, {
+                **view, "state": "unanswered", "since": ask.get("ts"),
+                "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
+                "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
+            continue
+        later = [(answer, item) for _, item, proof in counted for answer in proof
+                 if said_at is None or answer.at > said_at]
+        if later:
+            first = min(answer.at for answer, _ in later)
+            answer, ask = max(later, key=lambda pair: pair[0].at)
+            found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
+                                  "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
+                                  "answer": answer_view(answer)}))
+            continue
+        since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
+        asked_directly = answer_evidence.related_to(
+            {"worktree": name, "ts": final["at"], "text": f"{view['question']}\n{final['text']}"},
+            answers) if said_at else []
+        choices = [report_view(item) for at, item in lane if item.get("kind") == "info" and began and at >= began
+                   and CHOICE.search(str(item.get("text") or ""))]
+        found.append((since, {**view, "state": "unasked", "since": final["at"] or since.isoformat(),
+                              "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
+                              "choices_in_info": choices}))
+    found.sort(key=itemgetter(0))
+    return [{**item, "age_minutes": int((now - at).total_seconds() // 60)} for at, item in found]
+
+
 def read(path):
     if not path.exists():
         return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}}
@@ -398,6 +482,17 @@ def main(argv: list[str] | None = None) -> int:
     needs_owner.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                              help="Orca CLI executable, read without --from (default: $ORCA_CLI_COMMAND or orca); "
                                   f"a paired Mac that does not answer within {REMOTE_ORCA_TIMEOUT} s is skipped")
+    stale = commands.add_parser(
+        "stale-asks", help="print, longest waiting first, each waiting row of a saved scan whose question is unasked "
+                           "(not in open-asks; choices it sent as info are listed), unanswered (an open or last-turn "
+                           "ask without an answer that proves it, marked or not), or stopped_after_answer (answered "
+                           "after its last message), with the lane's ask, the answer, candidates that name only the "
+                           "lane or its PR numbers, and age_minutes")
+    stale.add_argument("--from", dest="from_file", metavar="SCAN_JSON", required=True,
+                       help="the rows scan_sessions.py printed as JSON")
+    stale.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
+                       help="the careful reads' verdict store whose verdicts the rows take (default: %(default)s)")
+    answer_evidence.add_arguments(stale)
     request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
     request_open.add_argument("--original-file", required=True)
     request_open.add_argument("--symptom-file", required=True)
@@ -437,6 +532,21 @@ def main(argv: list[str] | None = None) -> int:
     delivered.add_argument("--delivery", required=True, choices=("queued", "turn_started"))
     args = parser.parse_args(argv)
     path = Path(args.state_file).expanduser()
+    if args.action == "stale-asks":
+        try:
+            rows = scan_sessions.with_verdicts(scan_sessions.saved_rows(args.from_file),
+                                               scan_sessions.absorb_verdicts(args.verdicts, write=False))
+            entries = inbox_read.inbox_entries(inbox_read.paths()[0])
+            answers_log = inbox_read.answers_path()
+            open_ids = frozenset(ask.report["id"] for ask in
+                                 inbox_read.open_asks(entries, inbox_read.answered_ids(answers_log)))
+            result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
+                                datetime.now(timezone.utc))
+        except READ_ERRORS as error:
+            print(f"hourly state: {error}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         live: frozenset[str] = frozenset()
