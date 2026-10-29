@@ -26,7 +26,8 @@ judge each row from its own facts.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
   Orca keeps no time for it.
 - `inbox`: the newest `done` and `ask` the worktree sent to the triage inbox
-  (`at`, `text`), when it sent any. `newest_report` names which came last of
+  (`at`, `text`), when it sent any; an ask the user answered carries
+  `answered` (`at`, `note`). `newest_report` names which came last of
   the final message, that `done`, and that `ask` (`source`: `final_message`,
   `inbox_done`, or `inbox_ask`).
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
@@ -37,6 +38,8 @@ judge each row from its own facts.
   inspected there. An open PR whose head matches HEAD has that commit even if
   `unpushed` is positive because the branch tracks the PR's base.
 - `reasons`, `jev`: why the scan could not settle the row.
+- `prompt_waiting`: a permission question the tab's screen shows now (`tab`,
+  `question`, `choices`), or null.
 - `open_pr_cleanup: true`: the checkout may be removed without asking after
   `rm_check.py` clears it. This does not settle a historical transcript's
   question or the PR's review.
@@ -57,6 +60,8 @@ judge each row from its own facts.
    when that `done` reports the work finished, a comment still saying 待ち or
    作業中 is stale. Class the row from the report and say in `evidence` that
    the comment should be rewritten.
+   An `inbox.ask` with `answered` is settled: leave it out of `question` and
+   do not class the row `waiting` for it.
    `pr.reply_after_last_commit` and `waits_on: self` mean a human added a
    review, PR comment, or line comment after the latest commit date. Read it
    and give the lane `in_progress` if it can respond now. GitHub does not
@@ -69,6 +74,8 @@ judge each row from its own facts.
      a choice offered to them), or a kind (b) leftover below is left. Put the
      ask in `question`: verbatim when the message asks it, in a few words of
      your own when it is a (b) item the message only lists.
+     A `prompt_waiting` makes the row `waiting` with its `question` and
+     `choices` as `question`, however finished the message sounds.
    - `blocked`: the next move belongs to someone else: a reviewer, a customer, a
      tester, another lane, a deploy, or an environment or access someone must
      provide (a production connection). A question the agent sent to that person

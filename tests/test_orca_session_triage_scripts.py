@@ -373,6 +373,45 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/a"], ["term_shell", "term_setup"])
 
+    def test_another_macs_shells_without_output_close_when_their_screen_ends_at_a_bare_prompt(self) -> None:
+        # MBP16 lists 23 of its 24 shell tabs with neither preview nor output time.
+        remote = {**worktree("/remote/shells", "working"), "_environment": "macbook-pro-16"}
+        terms = [{**terminal(remote["path"], None, handle), "_environment": "macbook-pro-16", "lastOutputAt": None}
+                 for handle in ("idle", "busy")]
+        screens = {("macbook-pro-16", "idle"): {"source": "screen", "tail": ["direnv: loading .envrc", "➜", ""]},
+                   ("macbook-pro-16", "busy"): {"source": "screen", "tail": ["➜", "Receiving objects: 42%"]}}
+
+        row = scan.build_inventory([remote], terms, self.projects, {}, "要判断", now=NOW, screens=screens)[0]
+
+        self.assertEqual((row["closable"], row["meaningful_tabs"]), (["idle"], ["busy"]))
+
+    def test_a_permission_prompt_on_screen_keeps_a_memory_save_reply_waiting(self) -> None:
+        self.claude_says("/w/prompt", user("go"), assistant(text("Saved the session memory.")))
+        tree = {**worktree("/w/prompt", "waiting", status="completed"),
+                "agents": [{**done_agent("claude", "tab1:leaf1"), "state": "waiting"}]}
+        term = in_pane(terminal(tree["path"], "claude", "term_prompt"), "tab1:leaf1")
+        question = "Do you want to make this edit to settings.py?"
+        screen = {"source": "screen", "tail": ["Saved the session memory.", question,
+                                                "  ❯ 1. Yes", "    2. No", "Esc to cancel"]}
+
+        rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, judge=judging({}),
+                                    screens={(None, term["handle"]): screen})
+
+        self.assertEqual((rows[0]["class"], rows[0]["closable"]), ("waiting", []))
+        self.assertEqual(scan.review_queue(rows)[0]["prompt_waiting"],
+                         {"tab": "term_prompt", "question": question, "choices": ["1. Yes", "2. No"]})
+
+    def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
+        line = "3 background shell command tasks didn't finish before the previous session ended"
+        tree = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
+        term = in_pane(terminal(tree["path"], "claude", "term_lost"), "tab1:leaf1")
+
+        row = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW,
+                                   screens={(None, "term_lost"): {"source": "screen", "tail": [line]}})[0]
+
+        self.assertIn("background waits lost when the session was replaced (tab term_lost, agent state since "
+                      "2027-01-15T08:00:00Z): " + line, row["reasons"])
+
     def test_a_stalled_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
         self.claude_says("/w/b", user("go"), assistant(text("PR #2 is open for review.")))
         result = self.closable(
@@ -453,7 +492,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["meaningful_tabs"], ["term_visible", "term_agent"])
 
-    def test_each_agent_orca_marks_done_is_a_done_card_with_the_tab_that_closes_it(self):
+    def test_each_agent_orca_marks_done_is_a_done_card_with_the_tab_that_closes_it(self) -> None:
         rows = self.inventory(
             [{**worktree("/w/d"), "agents": [
                 done_agent("codex", "tab1:leaf1", said="PR #5 is open for review.", asked="fix #4",
@@ -465,7 +504,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(rows[0]["done_cards"], [
             {"agent": "codex", "handle": "term_codex", "done_at": "2027-01-15T06:00:00Z",
              "interrupted": False, "prompt": "fix #4", "last_message": "PR #5 is open for review.",
-             "screen_tail": [], "draft": None}])
+             "screen_tail": [], "draft": None, "draft_text": None, "composer_empty": None}])
 
     def test_a_done_card_whose_tab_sleeps_has_no_handle(self):
         rows = self.inventory(
@@ -498,7 +537,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["path"], r["main"], [c["handle"] for c in r["done_cards"]]) for r in rows],
                          [("/repo/hosting", True, ["term_main"]), ("/w/t", False, [])])
 
-    def test_done_cards_carry_the_screen_end_and_whether_the_composer_holds_a_draft(self):
+    def test_done_cards_carry_the_screen_end_and_whether_the_composer_holds_a_draft(self) -> None:
         screen = {"source": "screen", "draft": "あとで送る返事", "tail": [
             "⏺ PR #5 を出しました。", "", "✻ Baked for 3m 2s", "─" * 40, "❯", "─" * 40,
             "  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]}
@@ -512,6 +551,12 @@ class ClassifyTests(unittest.TestCase):
             ("term_claude", True, ["⏺ PR #5 を出しました。", "✻ Baked for 3m 2s", "❯",
                                    "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"]),
             (None, None, [])])
+        self.assertEqual([(c["draft_text"], c["composer_empty"]) for c in cards], [("あとで送る返事", True), (None, None)])
+        screen["tail"][4] = "❯ スマホのメニューボタンも流れないように直して"
+        [card] = scan.done_cards([done_agent("claude", "tab1:leaf1")],
+                                 [in_pane(terminal("/w/d", "claude", "term_claude"), "tab1:leaf1")],
+                                 {(None, "term_claude"): screen})
+        self.assertFalse(card["composer_empty"])
 
     def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self):
         # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
@@ -1364,10 +1409,11 @@ class NextStepFactTests(unittest.TestCase):
         self.assertTrue(result["open_pr_cleanup"])
         self.assertTrue(result["pr"]["head_matches"])
 
-    def test_the_review_queue_holds_every_row_a_reader_must_class(self):
+    def test_the_review_queue_holds_every_row_a_reader_must_class(self) -> None:
         # Jev reads fast and shallow: every row it judged from a final message gets
         # one careful read, and the verdict is kept until that message changes.
-        def row(path, cls, pr=None, jev=True, final_at="t1", **extra):
+        def row(path: str, cls: str, pr: dict | None = None, jev: bool = True, final_at: str = "t1",
+                **extra: object) -> dict:
             return {"path": path, "repo": "app", "class": cls, "reasons": ["r"], "comment": "c",
                     "jev": {"asks": 0.5} if jev else None, "pr": pr, "git": {"dirty": 0},
                     "claude": {"last_user": "u", "final_text": "f", "final_at": final_at, "transcript": "/x.jsonl"},
@@ -1396,12 +1442,12 @@ class NextStepFactTests(unittest.TestCase):
             "path": "/w/unsure", "repo": "app", "environment": None, "class": "unsure", "reasons": ["r"],
             "waits_on": None, "comment": "c",
             "jev": {"asks": 0.5}, "pr": None, "git": {"dirty": 0},
-            "orca_message": None,
+            "orca_message": None, "prompt_waiting": None,
             "claude": {"last_user": "u", "final_text": "f", "final_at": "t1", "transcript": "/x.jsonl"},
             "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
             "final_at": "t1", "read": scan.read_key(rows[0])})
 
-    def test_a_queued_row_carries_its_newest_inbox_reports_and_which_report_came_last(self):
+    def test_a_queued_row_carries_its_newest_inbox_reports_and_which_report_came_last(self) -> None:
         # The Orca comment has no time; a done report newer than the final message must reach the reader.
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
@@ -1412,7 +1458,7 @@ class NextStepFactTests(unittest.TestCase):
                 {"ts": "2026-10-27T13:20:00+0900", "kind": "info", "repo": "app", "worktree": "qa", "text": "経過"},
                 {"ts": "2026-10-27T13:30:00+0900", "kind": "done", "repo": "other", "worktree": "qa", "text": "別の repo"},
             ])
-            reports = scan.inbox_reports(inbox)
+            reports = scan.inbox_reports(inbox, Path(root) / "no-answers.jsonl")
         row = {"path": "/w/app/qa", "repo": "app", "class": "stalled", "reasons": ["r"], "jev": {"asks": 0.1},
                "comment": "一時RDS の利用可能待ち", "pr": None, "git": {"dirty": 0}, "codex": [],
                "claude": {"final_text": "RDS の作成を待っています", "final_at": "2026-10-27T03:00:00Z"}}
@@ -1479,11 +1525,12 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         # A host's real Jev key and verdict store must never reach a test run.
-        for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": ""}),
+        for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": "",
+                                                "TRIAGE_ASK_ANSWERS": str(self.dir / "no-answers.jsonl")}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
@@ -1578,19 +1625,48 @@ class ScanCommandTests(unittest.TestCase):
             "mbp16::fix-login | working | - | tabs 0 | - | ",
         ])
 
-    def test_cards_print_each_done_card_and_tab_on_its_own_line_named_by_the_worktree(self):
+    def test_cards_print_each_done_card_and_tab_on_its_own_line_named_by_the_worktree(self) -> None:
         saved, _ = self.saved_scan()
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--cards"]), 0)
 
         self.assertEqual(out.getvalue().splitlines(), [
-            "fix-login | waiting (scan: stalled) | card term_1 claude | draft no"
+            "fix-login | waiting (scan: stalled) | card term_1 claude | draft - | composer unknown"
             " | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
             "fix-login | waiting (scan: stalled) | closable term_2",
             "fix-login | waiting (scan: stalled) | meaningful term_1",
             f"fix-login | waiting (scan: stalled) | close: python3 {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
-            "mbp16::app | waiting | card - codex interrupted | draft unknown | - | screen: -",
+            "mbp16::app | waiting | card - codex interrupted | draft unknown | composer unknown | - | screen: -",
         ])
+
+    def test_cards_show_the_start_of_the_draft_beside_whether_the_screen_composer_is_empty(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        suggestion = "The next step isn't obvious, so I'll leave this one blank. " + "x" * 20
+        rows[0]["done_cards"] = [{"handle": "suggestion", "draft": True, "draft_text": suggestion, "composer_empty": True}]
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--cards"]), 0)
+
+        self.assertIn("draft " + suggestion[:60] + "… | composer empty", out.getvalue().splitlines()[0])
+
+    def test_waiting_worktrees_and_remote_shells_missing_output_get_screens(self) -> None:
+        waiting = worktree("/w/waiting", "waiting")
+        working = worktree("/w/working", "working")
+        remote = {**worktree("/remote/working", "working"), "_environment": "macbook-pro-16"}
+        remote["agents"][0]["lastAssistantMessage"] = "Saved session memory."
+        terms = [terminal(waiting["path"], "claude", "waiting"),
+                 terminal(working["path"], "claude", "working"),
+                 terminal(working["path"], None, "local_shell"),
+                 {**terminal(remote["path"], None, "remote_shell"), "lastOutputAt": None,
+                  "_environment": "macbook-pro-16"},
+                 {**terminal(remote["path"], None, "remote_preview", preview=PROMPT), "lastOutputAt": None,
+                  "_environment": "macbook-pro-16"},
+                 {**terminal(remote["path"], "claude", "remote_agent"), "lastOutputAt": None,
+                  "_environment": "macbook-pro-16"}]
+
+        self.assertEqual([term["handle"] for term in scan.screen_targets([waiting, working, remote], terms)],
+                         ["waiting", "remote_shell"])
 
     def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self):
         saved, checkout = self.saved_scan()
@@ -4099,6 +4175,38 @@ class VerdictStoreTests(unittest.TestCase):
         self.assertNotIn("verdict", scan.with_verdicts([self.row("/w/none", final_at=None)], verdicts)[0])
         self.assertNotIn("verdict", scan.with_verdicts([{**read, "class": "working"}], verdicts)[0])
         self.assertEqual(scan.with_verdicts([read], verdicts)[0]["verdict"]["class"], "blocked")
+
+    def test_an_inbox_ask_carries_its_answer_once_every_question_has_one(self) -> None:
+        # masters-ui-17: three questions answered at 20:30 came back as the row's question.
+        inbox, answers = self.root / "inbox.jsonl", self.root / "answers.jsonl"
+        write_jsonl(inbox, [{"id": "ask-1", "ts": "2026-10-28T20:00:00+09:00", "kind": "ask",
+                            "repo": "app", "worktree": "ask", "text": "Two choices", "questions": [{}, {}]}])
+        first = {"id": "ask-1:1", "ts": "2026-10-28T20:30:00+09:00", "note": "問い1 このまま入れる"}
+        write_jsonl(answers, [first])
+        partial = scan.inbox_reports(inbox, answers)[("app", "ask")]["ask"]
+        write_jsonl(answers, [first, {"id": "ask-1:2", "ts": "2026-10-28T20:31:00+09:00", "note": "問い2 先に出す"}])
+        complete = scan.inbox_reports(inbox, answers)[("app", "ask")]["ask"]
+
+        self.assertNotIn("answered", partial)
+        self.assertEqual(complete["answered"], {"at": "2026-10-28T20:31:00+09:00", "note": "問い2 先に出す"})
+        row = {**self.row("/w/app/ask"), "repo": "app"}
+        self.assertNotEqual(scan.read_key({**row, "inbox": {"ask": partial}}),
+                            scan.read_key({**row, "inbox": {"ask": complete}}))
+
+    def test_a_remote_screen_reply_without_a_time_keeps_its_verdict_in_saved_views(self) -> None:
+        # MBP16's test-338 and test-339 were classed, yet --rows kept them unsure: their queue rows had read null.
+        row = {**self.row("/remote/test-338", final_at=None, cls="unsure"), "environment": "macbook-pro-16",
+               "orca_message": {"text": "Reported completion to the coordinator.", "at": None, "from": "screen"}}
+        [queued] = scan.review_queue([row])
+        self.write_session("screen-read", "g1", [queued], "g1", [
+            {"path": row["path"], "identity": queued["identity"], "class": "blocked"}])
+        scan.absorb_verdicts(self.store)
+        saved = self.root / "scan.json"
+        saved.write_text(json.dumps([row]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--verdicts", str(self.store), "--rows"]), 0)
+
+        self.assertIn("blocked (scan: unsure)", out.getvalue())
 
     def test_a_new_human_review_returns_a_row_to_the_review_queue(self):
         pr = {"state": "OPEN", "number": 42, "head_oid": "a",

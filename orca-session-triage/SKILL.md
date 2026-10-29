@@ -34,6 +34,11 @@ board's done cards; close what the user approves.
   out (it does on some reads), and the last ⏺ reply, or the indented lines
   above the turn-end line when the ⏺ scrolled off, is the row's
   `orca_message` (`from: screen`).
+  It also reads the tabs of worktrees with a done or waiting agent, and
+  another Mac's shell tabs Orca lists without output: a permission selector
+  makes the row `waiting` with `prompt_waiting` (`tab`, `question`,
+  `choices`), a notice that a restart dropped background jobs adds a reason,
+  and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
@@ -70,10 +75,11 @@ board's done cards; close what the user approves.
   no live tab can be assigned to it uniquely),
   whether the user `interrupted` it, the `prompt` it last got, Orca's copy
   of its last message, the last lines of its tab's screen (`screen_tail`), and
-  whether its composer holds unsent text (`draft`, the same check
-  `cleanup_hourly_tabs.py` makes; null when the screen was not read).
-  `--cards` prints each done card, `closable` tab, and `meaningful_tabs` entry
-  on its own line, led by the worktree's name: read cards through it. With
+  Orca's `draft` (whether it holds one) and its text (`draft_text`), and
+  whether the screen's input line is empty (`composer_empty`); null when the
+  screen was not read. `--cards` prints each done card (its draft's first 60
+  characters), `closable` tab, and `meaningful_tabs` entry on its own line,
+  led by the worktree's name: read cards through it. With
   `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
   that closes them. Each row records the scan's start (`scanned_at`).
   The board keeps a card in Done until its tab closes.
@@ -96,9 +102,12 @@ board's done cards; close what the user approves.
   `finished` goes to `cleanup.md`. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
   `verdict` until its final message, PR, latest review or comment from a person other than
-  the PR author, tree, or newest `done` or `ask` in the triage inbox changes;
+  the PR author, tree, permission prompt, or newest `done` or `ask` in the
+  triage inbox or that ask's answer changes (a reply read from another Mac's
+  screen has no time, so its text stands for it);
   act on it the same way in every run. Each queued row carries those inbox
-  reports and which report came last, since the Orca comment has no time. A Stop
+  reports and which report came last, since the Orca comment has no time; an
+  answered ask carries `answered` (`at`, `note`) from `ask-answers.jsonl`. A Stop
   hook keeps the turn open while a queued row has no verdict.
   Codex ignores the fork, the model, and the hook: there, follow
   `orca-row-classify` in this session with that directory.
