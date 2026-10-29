@@ -2285,6 +2285,52 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(changed["review"], [".env (differs from main checkout)",
                                              "out/ (not in main checkout)"])
 
+    def test_ignored_tool_output_is_regenerable_only_while_it_holds_no_other_work(self) -> None:
+        (self.main / ".git" / "info" / "exclude").write_text("site/\nweb/var/\nweb/test_*.sqlite3\n")
+        (self.wt / "mkdocs.yaml").write_text("site_name: docs\n")
+        git(self.wt, "add", "mkdocs.yaml")
+        git(self.wt, "commit", "-q", "-m", "docs config")
+        git(self.main, "merge", "-q", "feature")
+        for rel in ("site/index.html", "web/var/test-storage/upload.png", "web/test_db_masters.sqlite3"):
+            path = self.wt / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("generated\n")
+        (self.wt / "web/var/empty").write_text("")
+
+        generated = self.check()
+        (self.wt / "web/var/notes.txt").write_text("keep these notes\n")
+        mixed = self.check()
+        git(self.wt, "mv", "mkdocs.yaml", "other.yaml")
+        no_config = self.check()
+
+        self.assertEqual(generated["review"], [])
+        self.assertEqual(set(generated["regenerable"]), {"site/", "web/var/", "web/test_db_masters.sqlite3"})
+        self.assertEqual(mixed["review"], ["web/var/ (not in main checkout)"])
+        self.assertIn("site/ (not in main checkout)", no_config["review"])
+
+    def test_ignored_directory_is_copied_when_main_holds_all_its_files_and_more(self) -> None:
+        (self.main / ".git" / "info" / "exclude").write_text(".claude/reviews/\n")
+        for checkout in (self.main, self.wt):
+            (checkout / ".claude/reviews").mkdir(parents=True)
+            (checkout / ".claude/reviews/review.md").write_text("saved review\n")
+        (self.main / ".claude/reviews/other.md").write_text("another review\n")
+
+        copied = self.check()
+        # A main-side link back into the worktree is no copy of what it points at.
+        (self.wt / ".claude/reviews/run").mkdir()
+        (self.wt / ".claude/reviews/run/notes.md").write_text("only here\n")
+        (self.main / ".claude/reviews/run").symlink_to(self.wt / ".claude/reviews/run")
+        linked = self.check()
+        (self.main / ".claude/reviews/run").unlink()
+        (self.wt / ".claude/reviews/run/notes.md").unlink()
+        (self.wt / ".claude/reviews/run").rmdir()
+        (self.wt / ".claude/reviews/review.md").write_text("new review\n")
+        changed = self.check()
+
+        self.assertEqual(copied["review"], [])
+        self.assertEqual(linked["review"], [".claude/reviews/ (differs from main checkout)"])
+        self.assertEqual(changed["review"], [".claude/reviews/ (differs from main checkout)"])
+
     def test_an_env_is_regenerable_when_it_moves_only_ports_from_its_example(self):
         (self.main / ".env.example").write_text("# local\nDB_HOST_PORT=5432\nAPI_KEY=\nDEBUG=1\n")
         git(self.main, "add", ".env.example")
@@ -2323,6 +2369,29 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["containers"], [{"project": "app-wt", "status": "running(2)"}])
+
+    def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:
+        real_run = subprocess.run
+
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "docker":
+                raise subprocess.TimeoutExpired(cmd, rmcheck.DOCKER_TIMEOUT)
+            return real_run(cmd, **kwargs)
+
+        (self.wt / "node_modules/package").mkdir(parents=True)
+        (self.wt / "node_modules/package/compose.yaml").write_text("services: {}\n")
+        with patch.object(rmcheck.subprocess, "run", side_effect=fake_run):
+            without = self.run_main(docker=True)
+            (self.wt / "ops").mkdir()
+            (self.wt / "ops/compose.dev.yml").write_text("services: {}\n")
+            git(self.wt, "add", "ops")
+            git(self.wt, "commit", "-q", "-m", "compose")
+            git(self.main, "merge", "-q", "feature")
+            with_compose = self.run_main(docker=True)
+
+        self.assertEqual((without[0], without[1]["blockers"]), (0, []))
+        self.assertEqual(with_compose[0], 1)
+        self.assertIn("docker が 20 秒応答しません", " ".join(with_compose[1]["blockers"]))
 
     def test_a_dangling_symlink_is_reported_instead_of_crashing(self):
         (self.main / "uploads").mkdir()
@@ -2597,7 +2666,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(blocked_code, 1)
         self.assertIn("ahead of merged PR head", " ".join(blocked["blockers"]))
 
-    def test_stale_origin_fetch_is_reported_from_shared_git_state(self):
+    def test_stale_origin_fetch_is_reported_from_shared_git_state(self) -> None:
         bare = Path(self.tmp.name) / "remote.git"
         bare.mkdir()
         git(bare, "init", "--bare", "-q")
@@ -2613,19 +2682,24 @@ class RmCheckTests(unittest.TestCase):
         os.utime(fetched, (old, old))
 
         _, stale = self.run_main_without_base()
+        pr = {"number": 7, "state": "MERGED", "headRefOid": git(self.wt, "rev-parse", "HEAD")}
+        _, with_pr = self.run_main_without_base("--pr", "7", pr=pr)
         git(self.main, "remote", "set-url", "origin", str(bare))
         git(self.wt, "fetch", "-q", "origin", "main")
         _, fresh = self.run_main_without_base()
 
         self.assertEqual(stale["base"], "origin/main")
         self.assertIn("origin の参照は 2020-01-02T00:00:00Z の fetch のまま", " ".join(stale["notes"]))
-        self.assertIn("--pr-head", " ".join(stale["notes"]))
+        self.assertNotIn("--pr-head", " ".join(stale["notes"]))
+        self.assertIn("--pr-head", " ".join(with_pr["notes"]))
         self.assertNotIn("origin の参照は", " ".join(fresh.get("notes", [])))
 
-    def run_main(self, *argv: str, notes: FakeWorktreeNotes | None = None) -> tuple[int, dict]:
+    def run_main(self, *argv: str, notes: FakeWorktreeNotes | None = None,
+                 docker: bool = False) -> tuple[int, dict]:
         out = io.StringIO()
         with redirect_stdout(out):
-            code = rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--no-docker", *argv],
+            code = rmcheck.main(["--worktree", str(self.wt), "--base", "main",
+                                 *([] if docker else ["--no-docker"]), *argv],
                                 worktree_notes=notes or FakeWorktreeNotes())
         return code, json.loads(out.getvalue())
 
@@ -2688,14 +2762,15 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["base"], result["blockers"]), (0, "origin/develop", []))
 
-    def test_a_branch_started_from_its_own_remote_branch_is_not_its_base(self):
-        # `git worktree add -b topic <path> origin/topic`: pushed work is on the remote, not merged.
+    def test_a_branch_started_from_its_own_remote_branch_uses_its_upstream_without_a_pr(self) -> None:
+        git(self.main, "remote", "add", "origin", "https://git.example.invalid/team/app.git")
         first = git(self.main, "rev-parse", "main")
         for ref in ("refs/remotes/origin/main", "refs/remotes/origin/topic"):
             git(self.main, "update-ref", ref, first)
         git(self.main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
         self.wt = Path(self.tmp.name) / "topic"
         git(self.main, "worktree", "add", "-q", "-b", "topic", str(self.wt), "refs/remotes/origin/topic")
+        git(self.wt, "branch", "--set-upstream-to", "origin/topic")
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "work in progress")
         head = git(self.wt, "rev-parse", "HEAD")
@@ -2703,8 +2778,25 @@ class RmCheckTests(unittest.TestCase):
 
         code, result = self.run_main_without_base()
 
-        self.assertEqual((code, result["base"], result["blockers"]),
-                         (1, "origin/HEAD", ["HEAD %s is not in origin/HEAD" % head[:8]]))
+        self.assertEqual((code, result["base"], result["blockers"]), (0, "origin/topic", []))
+        self.assertIn("origin/topic", " ".join(result["notes"]))
+        self.assertNotIn("--pr-head", " ".join(result["notes"]))
+
+    def test_an_unpushed_head_keeps_the_default_base_without_pr_head_advice(self) -> None:
+        head = self.remote_default_and_working_base()
+        git(self.main, "remote", "add", "origin", "https://git.example.invalid/team/app.git")
+        git(self.main, "update-ref", "refs/remotes/origin/release/masters-0026", head)
+        git(self.wt, "branch", "--set-upstream-to", "origin/release/masters-0026")
+        (self.wt / "app.txt").write_text("unpushed\n")
+        git(self.wt, "commit", "-q", "-am", "unpushed work")
+        code, result = self.run_main_without_base()
+        git(self.main, "branch", "local-copy", git(self.wt, "rev-parse", "HEAD"))
+        git(self.wt, "branch", "--set-upstream-to", "local-copy")
+        local_code, local = self.run_main_without_base()
+
+        self.assertEqual((code, result["base"]), (1, "origin/HEAD"))
+        self.assertNotIn("--pr-head", " ".join(result.get("notes", [])))
+        self.assertEqual((local_code, local["base"]), (1, "origin/HEAD"))
 
     def test_command_finds_the_main_checkout_and_fails_when_blocked(self):
         (self.main / ".env").write_text("A=1\n")

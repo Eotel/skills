@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 import lead_decisions
@@ -41,7 +42,7 @@ BYTECODE_SUFFIX = ".pyc"
 # husky and vite-hooks write the scripts under their `_` directory on each install. GraphQL codegen
 # writes graphql/generated/; a generated/ elsewhere may hold hand-made output, so it goes to review.
 REGENERABLE_PARTS = {"__generated__"}
-REGENERABLE_PART_PAIRS = {("graphql", "generated")}
+REGENERABLE_PART_PAIRS = {("graphql", "generated"), ("var", "test-storage")}
 REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/",
                         ".husky/_/", ".vite-hooks/_/")
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
@@ -99,7 +100,8 @@ def is_regenerable(relpath):
             or bool(REGENERABLE_PART_PAIRS.intersection(zip(parts, parts[1:]))))
 
 
-def same_tree(left, right):
+def same_tree(left: Path, right: Path) -> bool:
+    """Every file on the left is copied on the right; the right may hold more files."""
     if left.is_symlink() or right.is_symlink():
         # Path.readlink() normalizes trailing slashes and '/.' in a link target.
         return left.is_symlink() and right.is_symlink() and os.readlink(left) == os.readlink(right)  # noqa: PTH115
@@ -107,8 +109,8 @@ def same_tree(left, right):
         return right.is_file() and filecmp.cmp(left, right, shallow=False)
     if not (left.is_dir() and right.is_dir()):
         return False
-    names = {p.name for p in left.iterdir()} | {p.name for p in right.iterdir()}
-    return all(same_tree(left / n, right / n) for n in names)
+    # Level by level, so a symlinked directory on either side is compared as a link.
+    return all(same_tree(child, right / child.name) for child in left.iterdir())
 
 
 def holds_nothing(path):
@@ -118,6 +120,22 @@ def holds_nothing(path):
     if path.is_file():
         return path.stat().st_size == 0
     return path.is_dir() and all(holds_nothing(child) for child in path.iterdir())
+
+
+def holds_only_regenerable(path: Path, worktree: Path) -> bool:
+    """An ignored tool output, or a directory holding only tool output and empty files."""
+    rel = str(path.relative_to(worktree))
+    if is_cache(rel) or is_regenerable(rel):
+        return True
+    if path.is_symlink():
+        return False
+    if path.is_file():
+        return path.match("test_*.sqlite3")
+    if not path.is_dir():
+        return False
+    if path.name == "site" and any((path.parent / name).is_file() for name in ("mkdocs.yml", "mkdocs.yaml")):
+        return True
+    return all(holds_nothing(child) or holds_only_regenerable(child, worktree) for child in path.iterdir())
 
 
 def env_values(path):
@@ -165,7 +183,7 @@ def nested_worktrees(source: Path) -> list[Path]:
     return sorted(child for child in source.iterdir() if (child / ".git").is_file())
 
 
-def ignored_paths(worktree, main):
+def ignored_paths(worktree: str | Path, main: str | Path) -> tuple[list[str], list[str], list[Path]]:
     """(review, regenerable, nested): ignored paths that hold something and are neither caches nor
     copies of the main checkout, split into those to open and those a setup or test run writes again,
     and the worktrees of other repositories found at them (such as `local-deps/<repo>`).
@@ -180,13 +198,13 @@ def ignored_paths(worktree, main):
             continue
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
-        if holds_nothing(source) or (copy.exists() and same_tree(source, copy)):
+        if holds_nothing(source) or same_tree(source, copy):
             continue
         found = nested_worktrees(source)
         if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
             nested.extend(found)
             continue
-        if is_regenerable(rel):
+        if holds_only_regenerable(source, Path(worktree)):
             regenerable.append(rel)
             continue
         where = "not in main checkout" if not copy.exists() else "differs from main checkout"
@@ -435,9 +453,12 @@ def processes_in(worktree):
 
 
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None,
-          *, keep_blocker: str | None = None):
-    """Return the removal verdict, including containers and processes using `worktree`."""
-    blockers = [keep_blocker] if keep_blocker else []
+          *, decided: tuple[str, ...] = ()):
+    """Return the removal verdict, including containers and processes using `worktree`.
+
+    `decided` are blockers main found before the check: an Orca comment to keep it, an unanswered docker.
+    """
+    blockers = list(decided)
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
     changes, bytecode = working_changes(worktree)
@@ -539,7 +560,7 @@ def remote_identity(url):
     return host.lower(), path.strip("/").removesuffix(".git")
 
 
-def stale_fetch_note(worktree, base, pr_head):
+def stale_fetch_note(worktree: str | Path, base: str | None, pr_head: str | None, has_pr: bool) -> str | None:
     """Warn when no worktree has fetched the base remote in the last day."""
     ref = (base or "").removeprefix("refs/remotes/")
     remote, separator, _ = ref.partition("/")
@@ -570,15 +591,18 @@ def stale_fetch_note(worktree, base, pr_head):
     note = "%s の参照は %s の fetch のままです。" % (remote, when)
     if pr_head:
         return note + "渡された --pr-head を使って判定しました。"
+    if not has_pr:
+        return note + "新しい参照を fetch してから判定し直してください。"
     return note + "merge 済み PR の head を別の Mac で確認し、--pr-head <sha> を渡してください。"
 
 
-def start_base(worktree):
+def start_base(worktree: str | Path) -> str | None:
     """The remote branch the checked-out branch was created from, read from its reflog, or None.
 
     Orca and `git worktree add -b` record "branch: Created from origin/<base>", which names
     where the work merges when that is not the remote's default branch. A branch started
-    from its own remote branch (origin/<same name>) holds pushed work, not merged work.
+    from its own remote branch (origin/<same name>) is skipped here; when no PR is known
+    and HEAD is outside the chosen base, main uses the branch's upstream if it holds HEAD.
     """
     branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
@@ -667,10 +691,29 @@ def archive_target(archive: Path, worktree: Path, scratch: Path, day: str) -> Pa
                 if not target.exists())
 
 
-def compose_projects():
+# OrbStack has stopped answering `docker compose ls` for 20 minutes; a removal check must not wait on it.
+DOCKER_TIMEOUT = 20
+
+
+class ComposeProject(TypedDict, total=False):
+    Name: str
+    Status: str
+    ConfigFiles: str
+
+
+def has_compose_definition(worktree: Path) -> bool:
+    """Whether a compose file outside tool caches is in the worktree, tracked, untracked, or ignored."""
+    paths = git(worktree, "ls-files", "-z", "--cached", "--others",
+                *("--exclude=%s/" % part for part in sorted(CACHE_PARTS)), "--",
+                ":(glob)**/compose*.y*ml", ":(glob)**/docker-compose*.y*ml").stdout.split("\0")
+    return any(rel and not is_cache(rel) and (worktree / rel).is_file() for rel in paths)
+
+
+def compose_projects() -> list[ComposeProject] | None:
+    """Compose projects docker knows, or None without docker; raises TimeoutExpired when docker does not answer."""
     try:
         out = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
-                             capture_output=True, text=True, check=True).stdout
+                             capture_output=True, text=True, check=True, timeout=DOCKER_TIMEOUT).stdout
     except (OSError, subprocess.CalledProcessError):
         return None
     return json.loads(out or "[]")
@@ -680,7 +723,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worktree", required=True, help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
-    parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD)")
+    parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD; without a PR, use the branch's upstream if only it holds HEAD)")
     parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit "
                                                "check. Without it, a MERGED PR of the checked-out branch whose head is "
                                                "HEAD (asked of gh when HEAD is not in the base) counts the same")
@@ -743,10 +786,26 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             notes.append("looking up a merged PR of branch %s failed: %s; pass --pr" % (branch, lookup_error))
     by_pr = pr_base(worktree, pr)
     base = args.base or by_pr or start_base(worktree) or default_base(worktree)
-    projects = [] if args.no_docker else compose_projects()
+    if not (args.base or args.pr or args.pr_head or pr or head_in(worktree, base)):
+        # A branch can track a local branch (branch.<name>.remote=.), which proves nothing was pushed.
+        upstream = git(worktree, "rev-parse", "--symbolic-full-name", "@{upstream}").stdout.strip()
+        if upstream.startswith("refs/remotes/") and head_in(worktree, upstream):
+            base = upstream.removeprefix("refs/remotes/")
+            notes.append("Using %s as base: HEAD is pushed to the branch it tracks, and no PR was given or found"
+                         % base)
+    decided = [keep_blocker] if keep_blocker else []
+    try:
+        projects = [] if args.no_docker else compose_projects()
+    except subprocess.TimeoutExpired:
+        projects = []
+        if has_compose_definition(Path(worktree)):
+            decided.append("docker が %d 秒応答しません。作業場に compose の定義があり、動いているコンテナを確かめられないので、"
+                        "OrbStack か Docker が応答してから rm_check をやり直してください。" % DOCKER_TIMEOUT)
+        else:
+            notes.append("docker compose ls did not answer in %d seconds; the worktree defines no compose project"
+                         % DOCKER_TIMEOUT)
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
-    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                   keep_blocker=keep_blocker)
+    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr, decided=tuple(decided))
     if args.detach_nested:
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
@@ -759,7 +818,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
         if detached:
             result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                           keep_blocker=keep_blocker)
+                           decided=tuple(decided))
         elif nested:
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
                          "paths to review, or a copy with blockers")
@@ -775,7 +834,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         if archived:
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                             keep_blocker=keep_blocker), **kept}
+                             decided=tuple(decided)), **kept}
         elif any((Path(worktree) / name).exists() for name in SCRATCH_DIRS):
             notes.append("--archive-scratch moved nothing: the worktree is kept for other blockers or paths to review")
         result["archived"] = archived
@@ -796,12 +855,14 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if args.fetch_failed:
         if args.pr_head:
             notes.append("git fetch failed; remote refs may be stale. Using the supplied merged PR head")
-        else:
+        elif args.pr or pr:
             notes.append("git fetch failed; remote refs may be stale. Confirm the PR is MERGED on a host with gh and pass --pr-head <sha>")
-    stale_note = stale_fetch_note(worktree, base, args.pr_head)
+        else:
+            notes.append("git fetch failed; remote refs may be stale. Fetch again before checking the worktree")
+    stale_note = stale_fetch_note(worktree, base, args.pr_head, bool(args.pr or pr))
     if stale_note:
         notes.append(stale_note)
-    if (not stale_note and not args.pr_head and (not pr or pr.get("state") == "MERGED")
+    if (not stale_note and not args.pr_head and (args.pr or pr) and (not pr or pr.get("state") == "MERGED")
             and any(blocker.startswith("HEAD ") or blocker.startswith("no base ref")
                     for blocker in result["blockers"])):
         notes.append("For a merged PR, confirm its head on a host with gh and pass --pr-head <sha>")

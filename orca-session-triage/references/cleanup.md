@@ -31,7 +31,10 @@ Run these per worktree, in order.
    remote branch the worktree started from, else the remote's default branch,
    and when HEAD is not in that base, gh is asked for a MERGED PR of the
    checked-out branch whose head is HEAD: one found counts as `--pr` (`notes`
-   names it). Pass `--base` when the output's `base` is not where the work merges.
+   names it). With no PR given or found, HEAD outside that base, and HEAD in
+   the branch's upstream (a pushed `release/…` branch with no PR), that upstream
+   is the base and `notes` say so; such a row gets no `--pr-head` advice.
+   Pass `--base` when the output's `base` is not where the work merges.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
      `uncommitted` lists the paths of the changes. Report them and leave the
      worktree. Untracked Python bytecode (`__pycache__/` of `.pyc` files) is
@@ -45,8 +48,10 @@ Run these per worktree, in order.
      `lead_decisions.py` holds an answer for that key, the blocker clears and
      `notes` quote the answer. When the comment or the answers cannot be read,
      `notes` say so and nothing blocks on that alone.
-   - `review` lists ignored paths that are neither caches nor identical copies of
-     the main checkout. Open each one: generated sources and test output
+   - `review` lists ignored paths that are neither caches nor copies in the
+     main checkout: a directory is copied when each of its files is there with
+     the same content, whatever else the main checkout holds there. Open each
+     one: generated sources and test output
      (screenshots, uploaded fixtures) are regenerable; anything else (exports,
      reports, hand-written notes) goes back to the user before removal. A `.env`
      entry names the keys whose values its `.env.example` lacks, never the
@@ -63,7 +68,10 @@ Run these per worktree, in order.
      among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
      `graphql/generated/`, `src/paraglide/`), e2e output (`e2e/screenshots/`, `e2e/.state/`,
      `e2e/.auth/`), and the hook scripts husky and vite-hooks write on install
-     (`.husky/_/`, `.vite-hooks/_/`). They do not hold up the removal. Neither
+     (`.husky/_/`, `.vite-hooks/_/`), MkDocs' `site/` beside `mkdocs.yml`,
+     Django's test databases (`test_*.sqlite3`) and `var/test-storage/`, and an
+     ignored directory holding only these and empty files (`web/var/`). They do
+     not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
      at the worktree root: its random installation identity binds only that
@@ -74,6 +82,9 @@ Run these per worktree, in order.
      `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its
      records.
    - `containers` lists docker compose projects defined inside the worktree.
+     When docker does not answer in 20 seconds, a worktree with a compose file
+     (`compose*.y*ml`, `docker-compose*.y*ml`) is blocked until it does; one
+     without gets a note and its verdict.
    - `processes` lists commands or current directories using the path. Each
      says whether it runs in an Orca tab (`in_orca_tab`), the tab's `handle`
      when the system shows it (`tab`), and whether that tab runs nothing but
