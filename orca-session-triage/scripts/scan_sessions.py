@@ -12,6 +12,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
+from itertools import takewhile
+import hashlib
 import http.client
 import json
 import os
@@ -23,10 +25,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 import urllib.request
 from urllib.parse import urlsplit
 
+import inbox_read
 from worktree_notes import keep_note
 
 DEFAULT_CODEX_SESSIONS = [
@@ -42,6 +45,26 @@ CLAUDE_DIR_LIMIT = 200
 # $ or %. Prompts that carry text, such as `app=#` or `42%`, may belong to a
 # running program, so they never count.
 BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
+Screens = dict[tuple[str | None, str], dict]
+
+
+class PromptWaiting(TypedDict):
+    tab: str
+    question: str
+    choices: list[str]
+
+
+class DoneCard(TypedDict):
+    agent: str | None
+    handle: str | None
+    done_at: str | None
+    interrupted: bool
+    prompt: str
+    last_message: str
+    screen_tail: list[str]
+    draft: bool | None
+    draft_text: str | None
+    composer_empty: bool | None
 
 
 def claude_project_dir(projects_root, worktree_path):
@@ -355,8 +378,10 @@ STATE_REASONS = {
 }
 
 
-def waiting_reasons(row, decision_marker):
+def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     reasons = []
+    if prompt := row.get("prompt_waiting"):
+        reasons.append("permission prompt on screen: " + prompt["question"])
     claude = row["claude"] or {}
     jev = row.get("jev") or {}
     asks = jev.get("asks")
@@ -431,10 +456,13 @@ def classify(row, decision_marker):
     return "stalled", [state] if state else []
 
 
-def shell_is_idle(term, now, idle_minutes):
-    """A shell whose screen ends at a bare prompt and that printed nothing for idle_minutes."""
-    lines = [line.strip() for line in (term.get("preview") or "").splitlines() if line.strip()]
+def shell_is_idle(term: dict, now: float, idle_minutes: float, screen: dict | None = None) -> bool:
+    """A quiet shell at a bare prompt; remote shells without output metadata use their rendered screen."""
     last_output = term.get("lastOutputAt")
+    if term.get("_environment") and not term.get("preview") and last_output is None:
+        lines = [line.strip() for line in screen_lines(rendered(screen) or {}) if line.strip()]
+        return bool(lines) and lines[-1] in BARE_PROMPTS
+    lines = [line.strip() for line in (term.get("preview") or "").splitlines() if line.strip()]
     quiet = last_output is not None and now - last_output / 1000 >= idle_minutes * 60
     return bool(lines) and lines[-1] in BARE_PROMPTS and quiet
 
@@ -451,10 +479,12 @@ def agents_done(row):
     return row["class"] in ("finished", "stalled") and not still_working and not to_wake
 
 
-def closable_terminals(agents_closable, terms, now, idle_minutes):
+def closable_terminals(agents_closable: bool, terms: list[dict], now: float, idle_minutes: float,
+                       screens: Screens) -> list[str]:
     """Handles to close in a kept worktree: idle shells, plus agents once nothing is pending."""
     return [t["handle"] for t in terms if t.get("handle")
-            and (agents_closable if t.get("agentIdentity") else shell_is_idle(t, now, idle_minutes))]
+            and (agents_closable if t.get("agentIdentity") else shell_is_idle(
+                t, now, idle_minutes, screens.get((t.get("_environment"), t["handle"]))))]
 
 
 def iso_time(epoch_ms):
@@ -486,8 +516,64 @@ def rendered(screen: dict | None) -> dict | None:
 
 
 def has_draft(screen: dict) -> bool:
-    """Whether the composer holds unsent text; Orca reports it as `draft`, apart from the screen's tail."""
+    """Whether Orca reports a nonempty `draft`, which can also be Claude's suggestion."""
     return screen.get("draft") not in (None, "")
+
+
+# Enough of an unsent draft to tell Claude's suggestion from the user's instruction; the rest is the user's
+# private text and stays out of the scan and every saved copy of it.
+DRAFT_EXCERPT = 60
+
+
+def draft_excerpt(screen: dict) -> str:
+    """The start of Orca's draft, whitespace collapsed, with … when cut."""
+    said = " ".join((screen.get("draft") or "").split())
+    return said[:DRAFT_EXCERPT] + ("…" if len(said) > DRAFT_EXCERPT else "")
+
+
+def composer_empty(screen: dict) -> bool | None:
+    """Whether Claude's last input line between rules is bare; None when no composer is visible."""
+    lines = [line.strip() for line in screen_lines(screen)]
+    rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
+    for top, bottom in reversed(list(zip(rules, rules[1:]))):
+        box = [line for line in lines[top + 1:bottom] if line]
+        prompt = next((index for index, line in enumerate(box) if line.startswith("❯")), None)
+        if prompt is not None:
+            # A draft that starts with a newline leaves the ❯ line bare and its text on the lines below.
+            return box[prompt:] == ["❯"]
+    return None
+
+
+# Claude Code's permission selector: "Do you want to make this edit to …?", then "❯ 1. Yes", "2. No", …,
+# with ❯ on whichever choice the user has moved to.
+PERMISSION_QUESTION = "Do you want to"
+CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
+FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
+# What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
+LOST_WAITS = "background shell command tasks didn't finish before the previous session ended"
+
+
+def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
+    """The permission question a rendered screen waits on, with its numbered choices."""
+    lines = [line.strip() for line in screen_lines(screen) if line.strip()]
+    asked = [index for index, line in enumerate(lines) if line.startswith(PERMISSION_QUESTION)]
+    after = lines[asked[-1] + 1:] if asked else []
+    first = next((index for index, line in enumerate(after) if FIRST_CHOICE.fullmatch(line)), None)
+    choices = list(takewhile(CHOICE.fullmatch, after[first:])) if first is not None else []
+    if not any(line.startswith("❯") for line in choices):
+        return None
+    return {"tab": tab, "question": lines[asked[-1]], "choices": [CHOICE.sub(r"\1", line) for line in choices]}
+
+
+def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screens,
+                          environment: str | None) -> list[str]:
+    """A reason per screen line saying a restart dropped background waits, timed by its pane's agent when known."""
+    since = {agent["paneKey"]: iso_time(agent.get("stateStartedAt")) for agent in agents if agent.get("paneKey")}
+    return [f"background waits lost when the session was replaced (tab {term.get('handle')}"
+            + (f", agent state since {at}" if (at := since.get(f"{term.get('tabId')}:{term.get('leafId')}")) else "")
+            + f"): {line.strip()}"
+            for term in terms for line in screen_lines(rendered(screens.get((environment, term.get("handle")))) or {})
+            if LOST_WAITS in line]
 
 
 def screen_tail(screen: dict) -> list[str]:
@@ -531,7 +617,8 @@ def screen_message(screen: dict) -> str:
     return "\n".join(line[2:] if line.startswith("  ") else line.strip() for line in block).strip()
 
 
-def done_cards(agents, terms, screens=None, environment=None):
+def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = None,
+               environment: str | None = None) -> list[DoneCard]:
     """One card per agent Orca shows as done, with the live tab that closes it.
 
     A tab Orca reopened carries a new pane id, so a card whose pane is gone
@@ -539,8 +626,9 @@ def done_cards(agents, terms, screens=None, environment=None):
     while the tab sleeps, or when several tabs could be its own.
     `last_message` is what Orca kept of the agent's last word and can be empty;
     the row's transcripts hold the rest. `screen_tail` is the end of the tab's
-    rendered screen (`screens` maps (environment, handle) to it) and `draft`
-    whether its composer holds unsent text; [] and None when it was not read.
+    rendered screen (`screens` maps (environment, handle) to it). `draft` and
+    `draft_text` hold Orca's draft, while `composer_empty` reads Claude's input
+    line between rules; [] and None when the screen was not read.
     """
     screens = screens or {}
     by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terms}
@@ -550,14 +638,14 @@ def done_cards(agents, terms, screens=None, environment=None):
         if t.get("handle") and f"{t.get('tabId')}:{t.get('leafId')}" not in panes:
             unclaimed.setdefault(t.get("agentIdentity"), []).append(t["handle"])
 
-    def handle_of(agent):
+    def handle_of(agent: dict) -> str | None:
         own = by_pane.get(agent.get("paneKey"))
         spare = unclaimed.get(agent.get("agentType"), [])
         alone = sum(1 for a in agents if a.get("agentType") == agent.get("agentType")
                     and by_pane.get(a.get("paneKey")) is None) == 1
         return own or (spare[0] if len(spare) == 1 and alone else None)
 
-    def card(agent):
+    def card(agent: dict) -> DoneCard:
         handle = handle_of(agent)
         screen = rendered(screens.get((environment, handle))) if handle else None
         return {
@@ -565,6 +653,8 @@ def done_cards(agents, terms, screens=None, environment=None):
             "done_at": iso_time(agent.get("stateStartedAt")), "interrupted": bool(agent.get("interrupted")),
             "prompt": agent.get("prompt") or "", "last_message": agent.get("lastAssistantMessage") or "",
             "screen_tail": screen_tail(screen) if screen else [], "draft": has_draft(screen) if screen else None,
+            "draft_text": draft_excerpt(screen) if screen else None,
+            "composer_empty": composer_empty(screen) if screen else None,
         }
 
     return [card(a) for a in agents if a.get("state") == "done"]
@@ -609,15 +699,19 @@ def with_screen_agents(terms, screens, environment):
     return found, message
 
 
-def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_marker,
-                    now=None, shell_idle_minutes=30, judge=lambda message: None, mail=None, screens=None):
+def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: str | Path,
+                    codex_by_cwd: dict[str, list[dict]], decision_marker: str, now: float | None = None,
+                    shell_idle_minutes: float = 30, judge: Callable[[str], dict | None] = lambda message: None,
+                    mail: dict | None = None, screens: Screens | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
     `asks`, `status`, and `confidence` (see jev_judge), or None when it failed.
     `mail` maps a lead's terminal handle to its unread worker mail (see
     unread_worker_mail). `screens` maps (environment, handle) to a tab's
-    rendered screen (see read_screens): done cards show its end, and another
+    rendered screen (see read_screens): done cards show its draft and composer,
+    permission prompts wait, lost background waits are named, remote shells
+    without output metadata use their last line, and another
     Mac's worktree whose agents Orca keeps no message of takes the agent and
     last reply its tabs show.
     A repository's main checkout is read only while it hosts an agent (`main`).
@@ -662,6 +756,9 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
             "codex_screen_error": next((error for t in terms if t.get("agentIdentity") == "codex"
                                         if (error := api_failure(t.get("preview")))), None),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
+            "prompt_waiting": next((prompt for term in terms if term.get("handle")
+                                    if (screen := rendered(screens.get((w.get("_environment"), term["handle"]))))
+                                    if (prompt := permission_prompt(screen, term["handle"]))), None),
             "claude": None if remote else read_claude(claude_root, w["path"]),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
@@ -681,7 +778,8 @@ def build_inventory(worktrees, terminals, claude_root, codex_by_cwd, decision_ma
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
         row["reasons"] = [*row["reasons"], *dict.fromkeys(
             f"hook error on {error['host']}: {error['path']}: No such file or directory" for error in row["hook_errors"])]
-        row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes)
+        row["reasons"].extend(lost_background_waits(w.get("agents") or [], terms, screens, w.get("_environment")))
+        row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
@@ -1134,12 +1232,28 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
 
 
 QUEUE_FIELDS = ("path", "repo", "environment", "class", "reasons", "waits_on", "comment",
-                "jev", "pr", "git", "claude", "orca_message")
+                "jev", "pr", "git", "claude", "orca_message", "prompt_waiting")
 INBOX_FILE = "~/.cache/orca-briefs/triage-inbox.jsonl"
 INBOX_KINDS = ("done", "ask")
 VERDICTS_FILE = "~/.cache/orca-session-triage/verdicts.json"
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
 READ_CLASSES = ("unsure", "stalled", "waiting")
+
+
+class AnsweredAsk(TypedDict):
+    at: str
+    note: str
+
+
+class InboxReport(TypedDict):
+    at: str
+    host: str | None
+    text: str
+    id: NotRequired[str]
+    answered: NotRequired[AnsweredAsk]
+
+
+InboxReports = dict[tuple[str, str], dict[str, InboxReport]]
 
 
 def row_final_at(row):
@@ -1151,16 +1265,39 @@ def row_final_at(row):
     return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
 
 
-def inbox_reports(path: Path) -> dict[tuple[str, str], dict[str, dict]]:
+def ask_answers(path: Path) -> dict[str, AnsweredAsk]:
+    """The latest answer to each ask id, or `<ask id>:<n>` question, that inbox_read.py recorded."""
+    try:
+        records = load_jsonl(path)
+    except (OSError, UnicodeDecodeError):
+        return {}
+    timed = sorted((record for record in records if isinstance(record.get("id"), str) and parse_time(record.get("ts"))),
+                   key=lambda record: parse_time(record["ts"]))
+    return {record["id"]: {"at": record["ts"], "note": record.get("note") or ""} for record in timed}
+
+
+def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | None:
+    """The answer that settled an ask: its own, or the latest of its questions' once every one has one
+    (inbox_read.open_asks's rule)."""
+    questions = [f"{item['id']}:{number}" for number in range(1, len(inbox_read.questions_of(item)) + 1)]
+    covering = ([item["id"]] if item["id"] in answers
+                else questions if questions and all(question in answers for question in questions) else [])
+    settled = [answers[key] for key in covering]
+    return max(settled, key=lambda answer: parse_time(answer["at"])) if settled else None
+
+
+def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
     """The newest `done` and `ask` each worktree sent to the triage inbox, by (repo, worktree name).
 
     An entry from before reports named their repository is keyed by ("", name).
+    Each ask keeps its id and, once covered, its latest answer's time and note.
     """
     try:
         lines = path.read_bytes().splitlines()
     except OSError:
         return {}
-    reports: dict[tuple[str, str], dict[str, dict]] = {}
+    answers = ask_answers(answers_file or inbox_read.answers_path().expanduser())
+    reports: InboxReports = {}
     for raw in lines:
         try:
             item = json.loads(raw)
@@ -1174,10 +1311,14 @@ def inbox_reports(path: Path) -> dict[tuple[str, str], dict[str, dict]]:
         if older is None or parse_time(item["ts"]) >= parse_time(older["at"]):
             held[item["kind"]] = {"at": item["ts"], "host": item.get("host"),
                                   "text": (item.get("text") or "")[-JEV_MAX_CHARS:]}
+            if item["kind"] == "ask" and item.get("id"):
+                held["ask"]["id"] = item["id"]
+                if answered := ask_answer(item, answers):
+                    held["ask"]["answered"] = answered
     return reports
 
 
-def with_inbox(rows: list[dict], reports: dict[tuple[str, str], dict[str, dict]]) -> list[dict]:
+def with_inbox(rows: list[dict], reports: InboxReports) -> list[dict]:
     """Rows carry `inbox`: the newest done and ask their worktree reported, when it reported any."""
     def newest(row: dict) -> dict:
         name = Path(row["path"]).name
@@ -1198,20 +1339,25 @@ def newest_report(row: dict) -> dict | None:
     return {"source": source, "at": at}
 
 
-def read_key(row):
-    """What a careful read saw: final message, PR, latest human review, tree, and inbox reports.
+def read_key(row: dict) -> str | None:
+    """What a careful read saw: final message, PR, human activity, tree, inbox reports, and permission prompt.
     None without a message.
 
-    A verdict holds only while this key is unchanged.
+    A timeless message uses a text digest. An inbox answer changes the key,
+    and a verdict holds only while the key is unchanged.
     """
     final_at = row_final_at(row)
     if final_at is None:
-        return None
+        text = final_message(row)["text"]
+        if not text.strip():
+            return None
+        final_at = "text:" + hashlib.sha256(text.encode()).hexdigest()[:16]
     pr, git = row.get("pr") or {}, row.get("git") or {}
-    inbox = [report["at"] for _, report in sorted((row.get("inbox") or {}).items())]
+    inbox = [[report["at"], report["answered"]["at"]] if report.get("answered") else report["at"]
+             for _, report in sorted((row.get("inbox") or {}).items())]
     return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
                        pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty"),
-                       *([inbox] if inbox else [])])
+                       *([inbox] if inbox else []), *([row["prompt_waiting"]] if row.get("prompt_waiting") else [])])
 
 
 def row_identity(row):
@@ -1454,15 +1600,17 @@ def collect_worktrees_and_terminals(orca: str, ps_json: str | None = None, termi
 ORCA_TIMEOUT = 60
 
 
-def screen_targets(worktrees, terminals):
-    """Tabs whose screens the scan reads: those of a worktree with a done agent, for its done cards, and
-    those of another Mac's worktree Orca holds no agent message for, for the agent and reply they show."""
-    done = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
-            if any(a.get("state") == "done" for a in w.get("agents") or [])}
+def screen_targets(worktrees: list[dict], terminals: list[dict]) -> list[dict]:
+    """Tabs of done or waiting worktrees, remote worktrees with no agent message, and remote shells
+    without output metadata: read their cards, permission prompts, final replies, and bare prompts."""
+    idle = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
+            if any(a.get("state") in ("done", "waiting") for a in w.get("agents") or [])}
     bare = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if w.get("_environment") and not orca_said(w)}
     return [t for t in terminals if t.get("handle") and (
-        (key := (t.get("_environment"), t.get("worktreeId"))) in done or key in bare)]
+        (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
+        or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
+            and t.get("lastOutputAt") is None))]
 
 
 def read_screens(orca, terms):
@@ -1553,7 +1701,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="worktree comment prefix that marks a pending human decision (default: 要判断)")
     parser.add_argument("--shell-idle-minutes", type=float, default=30,
                         help="a shell at its prompt counts as closable after this long without output "
-                             "(default: 30)")
+                             "(default: 30); remote shells without output metadata use their rendered last line")
     parser.add_argument("--jev-key-file", default=JEV_KEY_FILE,
                         help="Jev (TypeSafe) API key file, read when TYPESAFE_API_KEY is unset "
                              "(default: %(default)s)")
@@ -1570,8 +1718,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "repo#PR state | tab count | newest final message time | question, waits_on, "
                             "next_step, or the final message's start")
     views.add_argument("--cards", action="store_true",
-                       help="print one line per done card (handle, agent, interrupted, whether its composer holds a "
-                            "draft, Orca's copy of its last message, and the end of its screen), closable tab, and "
+                       help="print one line per done card (handle, agent, interrupted, first 60 draft characters, "
+                            "whether its screen composer is empty, Orca's last message, and screen end), closable tab, and "
                             "meaningful tab, each led by the worktree's name and class as in --rows")
     views.add_argument("--row", metavar="NAME",
                        help="print one row as JSON with fixed keys: strings are never null, `final` is the newest "
@@ -1583,6 +1731,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
                         help="triage inbox whose newest done and ask per worktree go into the review queue "
                              "(default: $TRIAGE_INBOX or %(default)s)")
+    parser.add_argument("--ask-answers", default=str(inbox_read.answers_path()),
+                        help="answer records for inbox asks (default: $TRIAGE_ASK_ANSWERS or %(default)s)")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
                         help="where orca-row-classify verdicts are kept per worktree (default: %(default)s)")
     parser.add_argument("--pr-cache", default=PR_ACTIVITY_DIR,
@@ -1674,6 +1824,7 @@ def row_view(row: dict) -> dict:
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
         "final": final, "last_user": asked or "",
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
+        "prompt_waiting": row.get("prompt_waiting"),
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
         "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
@@ -1711,9 +1862,12 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
         said = " ".join((card.get("last_message") or "").split())
         who = f"card {card.get('handle') or '-'} {card.get('agent') or '-'}" + (
             " interrupted" if card.get("interrupted") else "")
-        draft = {True: "yes", False: "no"}.get(card.get("draft"), "unknown")
+        # A scan saved before cards kept the draft's start has only `draft`.
+        draft = ("unknown" if card.get("draft") is None
+                 else card.get("draft_text") or ("yes" if card["draft"] else "-"))
+        composer = {True: "empty", False: "has text"}.get(card.get("composer_empty"), "unknown")
         excerpt = (said[:160] + ("…" if len(said) > 160 else "")) or "-"
-        lines.append(f"{lead} | {who} | draft {draft} | {excerpt} | screen: "
+        lines.append(f"{lead} | {who} | draft {draft} | composer {composer} | {excerpt} | screen: "
                      + (" ⏎ ".join(card.get("screen_tail") or []) or "-"))
     lines.extend(f"{lead} | closable {handle}" for handle in row.get("closable") or [])
     lines.extend(f"{lead} | meaningful {handle}" for handle in row.get("meaningful_tabs") or [])
@@ -1772,7 +1926,7 @@ def main(argv: list[str] | None = None) -> int:
                                                mail=read_mail(args), screens=screens),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
     rows = [{**row, "scanned_at": scanned_at}
-            for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser()))]
+            for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)
     if args.review_out:

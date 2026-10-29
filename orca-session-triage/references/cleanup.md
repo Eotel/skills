@@ -133,8 +133,10 @@ then `gh api -X DELETE repos/<owner>/<repo>/git/refs/heads/<branch>`.
 
 A worktree's `closable` list names the tabs it can lose while the checkout stays:
 shells whose last line is a bare prompt (`❯`, `➜`, `✗`, `$`, `%`) with no
-output for `--shell-idle-minutes` (a finished `Setup` tab, a spare shell), and, once the
-worktree is `finished` or `stalled`, its agent sessions, unless the final
+output for `--shell-idle-minutes` (a finished `Setup` tab, a spare shell; on
+another Mac, where Orca lists most shells without output or its time, a
+rendered screen ending at a bare prompt, whatever direnv printed above it),
+and, once the worktree is `finished` or `stalled`, its agent sessions, unless the final
 message says work continues: a background job may still run in that tab. A
 helper agent in a `working` or `waiting` worktree stays: its lead may send it
 the next round. An `unsure` worktree keeps its agents until you have read the
@@ -160,8 +162,12 @@ Closing drops Orca's resume record, not the transcript: `claude --resume
 
 A row's `done_cards` are the agents whose turn ended; the board keeps each one
 in Done until its tab closes. `scan_sessions.py --cards` prints each card with
-its tab, its `draft` (whether the composer holds unsent text), Orca's copy of
-its last message, and the end of its screen. Read the card's final message (the
+its tab, the first 60 characters of Orca's draft (`-` when none, `unknown`
+when the screen was not read), whether the screen's input line is empty
+(`composer empty` / `has text`), Orca's copy of its last message, and the end
+of its screen. Orca's draft can be Claude's suggestion rather than the user's
+unsent text (on 2026-10-29 one came with `composer empty`): read its text. Read
+the card's final message (the
 row's transcript; the card's `last_message` when none was read; its
 `screen_tail` when both are empty), then:
 
@@ -179,9 +185,9 @@ row's transcript; the card's `last_message` when none was read; its
   worktree, its files, and the transcript stay; when the review
   or deploy arrives, a later sweep reopens the session there (`claude --resume
   <session-id>` or `codex resume <session-id>`) or carries the step itself.
-- A lead whose helper still works, and a session with the user's draft in its
-  composer (`draft: true`), stay: report each with that reason. A card whose
-  `draft` is null was not read: read its screen before closing it.
+- A lead whose helper still works, and a session holding the user's unsent
+  text, stay: report each with that reason.
+  A card whose `draft` is null was not read: read its screen before closing it.
 
 A null `handle` means the tab is asleep or no live tab can be assigned to the
 card uniquely. Check the worktree's agent terminals and transcript before
