@@ -3166,6 +3166,7 @@ class HourlyStateTests(unittest.TestCase):
             waiting("orca-deeplink-pr", "2026-10-28T10:55:00Z", "2026-10-28T11:02:30Z"),
             waiting("report-decisions", "2026-10-28T00:10:00Z", "2026-10-28T00:19:00Z"),
             waiting("fix-login", "2026-10-28T00:55:00Z", "2026-10-28T01:01:00Z"),
+            waiting("rpt-ui-bugs", "2026-10-28T05:00:00Z", "2026-10-28T05:10:00Z"),
             {**waiting("unrelated", "2026-10-28T00:55:00Z", "2026-10-28T01:01:00Z"), "class": "working"},
         ]))
         inbox, answers, log = (self.root / name for name in ("inbox.jsonl", "answers.jsonl", "decisions.jsonl"))
@@ -3174,13 +3175,32 @@ class HourlyStateTests(unittest.TestCase):
              "text": "写真を上げられなかった。進め方はどちらか。\n1. ログインする\n2. 貼る"},
             {"id": "4bd9cae3-0000", "ts": "2026-10-28T09:18:41+0900", "kind": "ask", "worktree": "report-decisions",
              "text": "c1 の全文です"},
-            {"id": "aa110000-0000", "ts": "2026-10-28T10:00:00+0900", "kind": "ask", "worktree": "fix-login",
-             "text": "merge してよいか"},
+            {"id": "aa110000-0000", "ts": "2026-10-28T09:58:00+0900", "kind": "ask", "worktree": "fix-login",
+             "text": "deploy してよいか"},
+            # An open ask of the previous turn, and one of the last turn answered before the lane's last message.
+            {"id": "qq110000-0000", "ts": "2026-10-28T08:00:00+0900", "kind": "ask", "worktree": "rpt-ui-bugs",
+             "text": "Q1"},
+            {"id": "qq220000-0000", "ts": "2026-10-28T14:05:00+0900", "kind": "ask", "worktree": "rpt-ui-bugs",
+             "text": "Q2"},
         ])
         write_jsonl(answers, [{"id": "4bd9cae3-0000", "ts": "2026-10-29T06:23:48+09:00",
-                               "how": "inbox_read.py answered", "note": "まとめて印"}])
-        write_jsonl(log, [{"id": "1", "decision": "answer:fix-login::merge", "answer": "merge してよい",
-                           "decided_at": "2026-10-28T02:00:00+00:00"}])
+                               "how": "inbox_read.py answered", "note": "まとめて印"},
+                              {"id": "qq220000-0000", "ts": "2026-10-28T14:08:00+09:00",
+                               "how": "inbox_read.py answered", "note": "答えた"}])
+        write_jsonl(log, [
+            {"id": "1", "decision": "answer:report-decisions::figma-3", "answer": "Figma の件は写しで確かめる",
+             "decided_at": "2026-10-28T05:36:53+00:00"},
+            {"id": "2", "decision": "answer:fix-login::wait", "answer": "ask aa110000 はまず待つ",
+             "decided_at": "2026-10-28T00:59:00+00:00"},
+            {"id": "3", "decision": "answer:fix-login::deploy", "answer": "ask aa110000 は deploy しない",
+             "decided_at": "2026-10-28T02:00:00+00:00"},
+            {"id": "4", "decision": "answer:fix-login::deploy", "answer": "ask aa110000 は deploy してよい",
+             "decided_at": "2026-10-28T03:00:00+00:00"},
+            {"id": "5", "decision": "answer:rpt-ui-bugs::q2", "answer": "ask qq220000 は B",
+             "decided_at": "2026-10-28T05:07:00+00:00"},
+            {"id": "6", "decision": "answer:orca-deeplink-pr::photos", "answer": "写真なしで進める",
+             "decided_at": "2026-10-29T01:21:00+00:00"},
+        ])
 
         with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}):
             code, stale = self.call("stale-asks", "--from", str(scan_json), "--decisions-file", str(log),
@@ -3188,11 +3208,17 @@ class HourlyStateTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual([(item["row"], item["state"], item["since"]) for item in stale], [
+            ("/w/rpt-ui-bugs", "unanswered", "2026-10-28T08:00:00+0900"),
             ("/w/report-decisions", "unanswered", "2026-10-28T09:18:41+0900"),
-            ("/w/fix-login", "stopped_after_answer", "2026-10-28T02:00:00+00:00"),
+            ("/w/fix-login", "stopped_after_answer", "2026-10-28T03:00:00+00:00"),
             ("/w/orca-deeplink-pr", "unasked", "2026-10-28T11:02:30Z")])
-        self.assertTrue(stale[0]["ask"]["marked"])
-        self.assertEqual([info["id"] for info in stale[2]["choices_in_info"]], ["897047e0-0000"])
+        rpt_ui, report, fix_login, deeplink = stale
+        self.assertEqual((report["ask"]["marked"], [answer["source"] for answer in report["candidates"]]),
+                         (True, ["lead_decisions answer:report-decisions::figma-3"]))
+        self.assertIn("deploy してよい", fix_login["answer"]["text"])
+        self.assertEqual([info["id"] for info in deeplink["choices_in_info"]], ["897047e0-0000"])
+        self.assertEqual([answer["source"] for answer in deeplink["candidates"]],
+                         ["lead_decisions answer:orca-deeplink-pr::photos"])
         self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
 
     def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self):
@@ -3722,32 +3748,43 @@ class InboxReadTests(unittest.TestCase):
             self.assertEqual(unknown[0], 1)
             self.assertIn("done1", unknown[2])
 
-    def test_answered_before_marks_only_asks_an_answer_names_after_they_were_asked(self):
+    def test_answered_before_marks_only_asks_an_answer_proves_and_names_the_rest(self):
         # 2026-10-29: a bulk mark took an unanswered ask out of open-asks, and it waited 25 hours.
+        two = [{"question": f"Q{n} をどうしますか？", "header": f"Q{n}", "recommended": "A",
+                "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]} for n in (1, 2)]
         with tempfile.TemporaryDirectory() as root:
             inbox, answers, log = (Path(root) / name for name in ("inbox.jsonl", "answers.jsonl", "decisions.jsonl"))
             write_jsonl(inbox, [
-                {"id": "4bd9cae3-0000", "ts": "2026-10-28T09:18:41+0900", "kind": "ask", "worktree": "report-decisions",
-                 "text": "c1 の全文と投稿先の案です"},
-                {"id": "bc7e1884-0000", "ts": "2026-10-28T20:02:05+0900", "kind": "ask", "worktree": "orca-deeplink-pr",
-                 "text": "#34651 に写真を足す進め方はどちらか"},
+                {"id": "4bd9cae3-a6d6-4835", "ts": "2026-10-28T09:18:41+0900", "kind": "ask",
+                 "worktree": "report-decisions", "text": "c1 の全文と投稿先の案です"},
+                {"id": "bc7e1884-0000", "ts": "2026-10-28T20:02:05+0900", "kind": "ask", "worktree": "deeplink",
+                 "text": "写真の進め方", "questions": two},
                 {"id": "77aa0001-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "fix-login",
-                 "text": "merge してよいか"},
+                 "text": "acme/app#4512 を merge してよいか"},
+                {"id": "cc330000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "est-177",
+                 "text": "2 つの判断", "questions": [{**question, "question": "est の" + question["question"]}
+                                                    for question in two]},
             ])
+            # Q1 of the last ask was answered through send --decision; its Q2 is still open.
+            write_jsonl(answers, [{"id": "cc330000-0000:1", "ts": "2026-10-28T13:00:00+09:00",
+                                   "how": "send --decision", "note": "A"}])
             write_jsonl(log, [
-                {"id": "1", "decision": "answer:report-decisions::c1", "answer": "この全文で出す",
+                {"id": "1", "decision": "answer:report-decisions::c1", "answer": "ask 4bd9cae3-a6d6-4835 はこの全文で出す",
                  "decided_at": "2026-10-28T10:00:00+00:00"},
-                {"id": "2", "decision": "merge:fix-login", "answer": "前の PR は merge してよい",
-                 "decided_at": "2026-10-28T02:00:00+00:00"},
-                {"id": "3", "decision": "remove:local::/w/fix-login", "answer": "消してよい",
+                # Only the worktree or the PR: another of its questions may be the one answered.
+                {"id": "2", "decision": "answer:fix-login::other", "answer": "別の件",
                  "decided_at": "2026-10-28T04:00:00+00:00"},
+                {"id": "3", "decision": "merge:acme/app#4512", "answer": "merge してよい",
+                 "decided_at": "2026-10-28T04:10:00+00:00"},
+                {"id": "4", "decision": "remove:local::/w/fix-login", "answer": "消してよい",
+                 "decided_at": "2026-10-28T04:20:00+00:00"},
             ])
             lead = Path(root) / "triage-lead"
             transcript = scan.claude_project_dir(Path(root) / "projects", str(lead)) / "lead.jsonl"
             transcript.parent.mkdir(parents=True)
             write_jsonl(transcript, [{"type": "user", "timestamp": "2026-10-29T01:21:00Z", "toolUseResult": {
-                "questions": [{"question": "#34651 の写真をどう足しますか？"}],
-                "answers": {"#34651 の写真をどう足しますか？": "写真なしで進める"}}}])
+                "questions": [{"question": question["question"]} for question in two],
+                "answers": {question["question"]: "A" for question in two}}}])
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}
 
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
@@ -3756,10 +3793,16 @@ class InboxReadTests(unittest.TestCase):
                                         "--decisions-file", str(log), "--asked-in", str(lead),
                                         "--claude-projects", str(Path(root) / "projects")])
 
-            marked = [json.loads(line)["id"] for line in answers.read_text().splitlines()]
+            marked = [record["id"] for record in map(json.loads, answers.read_text().splitlines())
+                      if record["how"] == "inbox_read.py answered"]
             self.assertEqual((code, out.getvalue()), (1, "answered: 2\n"))
-            self.assertEqual(sorted(marked), ["4bd9cae3-0000", "bc7e1884-0000"])
-            self.assertIn("77aa0001-0000", err.getvalue())
+            self.assertEqual(sorted(marked), ["4bd9cae3-a6d6-4835", "bc7e1884-0000"])
+            refused = err.getvalue()
+            self.assertIn("id=77aa0001-0000", refused)
+            self.assertIn("id=cc330000-0000", refused)
+            self.assertIn("lead_decisions answer:fix-login::other", refused)
+            self.assertIn("lead_decisions merge:acme/app#4512", refused)
+            self.assertNotIn("remove:", refused)
 
     def test_watch_shows_every_ask_and_done_and_reminds_of_asks_left_unanswered(self):
         with tempfile.TemporaryDirectory() as root:

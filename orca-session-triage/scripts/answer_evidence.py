@@ -1,16 +1,18 @@
 """What shows that an inbox ask was answered, for tools that must not take a mark for an answer.
 
 An answer is one of:
-- a decision the lead recorded with lead_decisions.py;
+- a decision the lead recorded with lead_decisions.py, the latest one per key (a later record replaces the earlier);
 - an AskUserQuestion answer in the Claude transcripts of the worktrees that ask the user (the lead's, and the
   hourly runs' triage workspace);
-- an answer `send --decision --ask <id>` delivered (`send --decision` in ask-answers.jsonl), which names its ask.
+- an answer `send --decision --ask <id>[:<n>]` delivered (`send --decision` in ask-answers.jsonl).
 
-A decision or an AskUserQuestion answer covers an ask when it came after the ask and names it: the ask's id (its
-first 8 or more characters), the asking worktree's name, a PR number of 3 or more digits from the ask's text, or
-one of its structured questions. A mark `inbox_read.py answered` wrote is not an answer: on 2026-10-29 an ask
-marked answered in bulk waited 25 hours with no answer anywhere. inbox_read.py `answered --before` refuses to mark
-an ask no answer covers, and hourly_state.py `stale-asks` reads the waiting rows of a scan against them.
+Only an answer that came after the ask and names it is proof: one delivered to it, or for an ask without
+structured questions one naming its id (in full or its first 8 or more characters), and for an ask with them one
+per question, delivered to `<id>:<n>` or quoting the question. An answer that names only the asking worktree or a
+PR number of the ask (`#1234`, `owner/repo#1234`) is related: a lane asks more than once, so it is a candidate to
+check, never proof. A mark `inbox_read.py answered` wrote is not an answer: on 2026-10-29 an ask marked answered
+in bulk waited 25 hours with no answer anywhere. inbox_read.py `answered --before` refuses to mark an ask without
+proof, and hourly_state.py `stale-asks` reads the waiting rows of a scan against them.
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ import scan_sessions
 DELIVERED = "send --decision"
 # A worktree name this short ("main", "web") appears in unrelated answers.
 NAME_MIN = 4
-PR_NUMBER = re.compile(r"(?<![\w#])#(\d{3,})(?!\d)")
+# `#1234` or `owner/repo#1234`; shorter numbers are too common to name a PR.
+PR_NUMBER = re.compile(r"(?<![#\d])#(\d{3,})(?!\d)")
 ID_PREFIX = 8
 # rm_check.py asks the lead `remove:<path>` about a worktree's keep note: an answer about the worktree, not to its ask.
 NOT_ANSWERS = ("remove:",)
@@ -42,33 +45,68 @@ class Answer:
     at: datetime
     source: str
     text: str
-    ask_id: str | None = None  # the ask (or `<id>:<n>`) a delivered answer names exactly
-
-    def covers(self, ask: dict, asked_at: datetime) -> bool:
-        if self.ask_id is not None:
-            return self.ask_id.partition(":")[0] == ask.get("id")
-        return self.at >= asked_at and any(pattern.search(self.text) for pattern in names_of(ask))
+    ask_id: str | None = None  # the `<id>` or `<id>:<n>` a delivered answer names exactly
 
 
-def token(value: str) -> re.Pattern[str]:
-    return re.compile(rf"(?<![\w-]){re.escape(value)}(?![\w-])")
+def questions_of(ask: dict) -> list[str]:
+    return [str(question.get("question") or "").strip() if isinstance(question, dict) else ""
+            for question in ask.get("questions") or []]
 
 
-def names_of(ask: dict) -> list[re.Pattern[str]]:
-    """What an answer to `ask` would name: its id, its worktree, its PR numbers, and its structured questions."""
+def names_id(text: str, ask_id: str) -> bool:
+    """Whether `text` holds the id in full or one of its prefixes of ID_PREFIX or more characters."""
+    found = re.finditer(rf"(?<![\w-]){re.escape(ask_id[:ID_PREFIX])}[\w-]*", text)
+    return len(ask_id) >= ID_PREFIX and any(ask_id.startswith(match.group(0)) for match in found)
+
+
+def proves(answer: Answer, ask: dict, number: int | None) -> bool:
+    """Whether the answer names the ask (number None) or its structured question `number` exactly."""
+    ask_id = str(ask.get("id") or "")
+    if answer.ask_id is not None:
+        return answer.ask_id in (ask_id, f"{ask_id}:{number}")
+    if number is None:
+        return bool(ask_id) and names_id(answer.text, ask_id)
+    question = questions_of(ask)[number - 1]
+    return bool(question) and question in answer.text
+
+
+def relates(answer: Answer, ask: dict) -> bool:
     worktree = str(ask.get("worktree") or "")
-    questions = [str(question.get("question")).strip() for question in ask.get("questions") or []
-                 if isinstance(question, dict) and question.get("question")]
-    return [*([token(str(ask["id"])[:ID_PREFIX])] if ask.get("id") else []),
-            *([token(worktree)] if len(worktree) >= NAME_MIN else []),
-            *(re.compile(rf"(?<![\w#])#{number}(?!\d)")
-              for number in dict.fromkeys(PR_NUMBER.findall(str(ask.get("text") or "")))),
-            *(re.compile(re.escape(question)) for question in questions)]
+    numbers = dict.fromkeys(PR_NUMBER.findall(str(ask.get("text") or "")))
+    return ((len(worktree) >= NAME_MIN
+             and re.search(rf"(?<![\w-]){re.escape(worktree)}(?![\w-])", answer.text) is not None)
+            or any(re.search(rf"(?<![#\d])#{number}(?!\d)", answer.text) for number in numbers))
+
+
+def after_ask(ask: dict, answers: Sequence[Answer]) -> list[Answer]:
+    asked_at = scan_sessions.parse_time(ask.get("ts"))
+    return [] if asked_at is None else sorted((answer for answer in answers if answer.at >= asked_at),
+                                              key=attrgetter("at"))
+
+
+def answers_to(ask: dict, answers: Sequence[Answer], questions: Iterable[int] | None = None) -> list[Answer]:
+    """The answers that prove the ask answered, earliest first; [] while one of `questions` (default: all of its
+    structured questions) has none, or for an ask without a readable time."""
+    later = after_ask(ask, answers)
+    if not ask.get("questions"):
+        return [answer for answer in later if proves(answer, ask, None)]
+    numbers = list(range(1, len(questions_of(ask)) + 1) if questions is None else questions)
+    per_question = [[answer for answer in later if proves(answer, ask, number)] for number in numbers]
+    if not all(per_question):
+        return []
+    return sorted({id(answer): answer for found in per_question for answer in found}.values(),
+                  key=attrgetter("at"))
+
+
+def related_to(ask: dict, answers: Sequence[Answer]) -> list[Answer]:
+    """Answers after the ask that name only its worktree or PR numbers, earliest first: candidates to check."""
+    return [answer for answer in after_ask(ask, answers) if relates(answer, ask)]
 
 
 def decisions(log: Path) -> Iterator[Answer]:
     yield from (Answer(at, f"lead_decisions {item.decision}", f"{item.decision}\n{item.answer}")
-                for item in lead_decisions.records(log) if not item.decision.startswith(NOT_ANSWERS)
+                for item in lead_decisions.latest(lead_decisions.records(log)).values()
+                if not item.decision.startswith(NOT_ANSWERS)
                 if (at := scan_sessions.parse_time(item.decided_at)) is not None)
 
 
@@ -104,15 +142,6 @@ def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:
 def transcripts_of(projects: Path, worktrees: Iterable[Path]) -> Iterator[Path]:
     for worktree in dict.fromkeys(worktrees):
         yield from sorted(scan_sessions.find_claude_dir(projects, str(worktree)).glob("*.jsonl"))
-
-
-def answer_to(ask: dict, answers: Sequence[Answer]) -> Answer | None:
-    """The earliest answer that covers the ask; None for an ask without a readable time."""
-    asked_at = scan_sessions.parse_time(ask.get("ts"))
-    if asked_at is None:
-        return None
-    covering = [answer for answer in answers if answer.covers(ask, asked_at)]
-    return min(covering, key=attrgetter("at")) if covering else None
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:

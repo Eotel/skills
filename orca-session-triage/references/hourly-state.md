@@ -86,18 +86,22 @@ test, or merged PR alone is not evidence that the symptom disappeared.
 After the scan, run `stale-asks --from SCAN_JSON --asked-in <the lead's
 worktree> --asked-in <the triage workspace>`. It reads no state: it sets each
 `waiting` row (the verdict's class, else the scan's) against its lane's inbox
-reports and the answers `scripts/answer_evidence.py` finds (the lead's
-decisions, AskUserQuestion answers in those worktrees' transcripts, and
+reports and the answers `scripts/answer_evidence.py` finds (the lead's latest
+decision per key, AskUserQuestion answers in those worktrees' transcripts, and
 `send --decision`), and prints them longest waiting first with `since` and
-`age_minutes`:
+`age_minutes`. An answer proves an ask only when it names the ask's id, quotes
+each of its structured questions, or was delivered to it; one naming only the
+lane or a PR number of the ask is listed in `candidates` for you to check.
 
-- `unasked`: no ask of the lane is open or was sent in its last turn, so
-  `open-asks` does not show the question. `choices_in_info` lists choices the
-  lane sent as `info`. Put the question in front of the user or the lead.
-- `unanswered`: its ask has no answer. `ask.marked: true` means it was marked
-  answered anyway and left `open-asks`: ask it again.
+- `unanswered`: an ask of the lane that is open, or was sent in its last turn,
+  has no proof. `ask.marked: true` means it was marked answered anyway and
+  left `open-asks`: check `candidates`, then ask it again or record the answer.
 - `stopped_after_answer`: an answer came after the lane's last message and the
-  lane has not spoken since. Relay `answer` to the lane.
+  lane has not spoken since. Relay `answer` (the newest) to the lane.
+- `unasked`: those asks were answered before the lane's last message, or it
+  has none, so `open-asks` does not show its question. `choices_in_info` lists
+  choices the lane sent as `info`, and `candidates` answers that may have
+  settled it. Put the question in front of the user or the lead.
 
 `show` retains full final messages, asked times, answers, handoff terms, and
 requests with their owners and closure evidence. `pending` lists only what is

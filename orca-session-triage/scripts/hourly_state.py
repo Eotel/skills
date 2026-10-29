@@ -257,16 +257,22 @@ def report_view(item: dict) -> dict:
     return {"id": item.get("id") or "", "ts": item.get("ts") or "", "text": excerpt(item.get("text"))}
 
 
+def answer_view(answer: answer_evidence.Answer) -> dict:
+    return {"at": answer.at.isoformat(), "source": answer.source, "text": excerpt(answer.text)}
+
+
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime) -> list[dict]:
-    """Each waiting row, longest waiting first, with where its question stands:
-    - `unasked`: no ask of the lane is open or was sent in its last turn, so open-asks does not show the question
-      (choices it sent as info are listed);
-    - `unanswered`: the lane's ask has no answer, whether open or marked answered, or is open with no answer
-      after the lane's last message;
-    - `stopped_after_answer`: an answer came after the lane's last message, which it has not answered since: an
-      answer to its ask, or one that names the lane or its question's PR numbers (the lead may ask the user
-      itself, as a scan's waiting row shows the question).
+    """Each waiting row, longest waiting first, with where its question stands. The lane's asks that count are
+    those still open and those it sent in its last turn:
+    - `unanswered`: one of them has no answer that proves it answered (answer_evidence.py), whether it is open
+      or was marked answered; the oldest is `ask`;
+    - `stopped_after_answer`: they are answered, one after the lane's last message, and the lane has not spoken
+      since; `answer` is the newest such answer, `since` the first;
+    - `unasked`: they were answered before the lane's last message, or it has none, so open-asks does not show
+      its question; `choices_in_info` lists choices it sent as info since its last turn began.
+    `candidates` holds the newest answers that name only the lane or its PR numbers, for the lead to check: the
+    lead may ask the user a waiting row's question itself.
     """
     found = []
     for row in rows:
@@ -276,42 +282,43 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         said_at = scan_sessions.parse_time(final["at"])
         began = (scan_sessions.parse_time((row.get("claude") or {}).get("last_user_at"))
                  if final["source"] == "claude" else None) or said_at
-        lane = [(at, item) for item in entries if item.get("worktree") == Path(row["path"]).name
+        name = Path(row["path"]).name
+        lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
-        asks = [(at, item) for at, item in lane if item.get("kind") == "ask" and item.get("id")]
-        current = [(at, item) for at, item in asks if began and at >= began] or \
-                  [(at, item) for at, item in asks if item["id"] in open_ids]
+        counted = [(at, item, answer_evidence.answers_to(item, answers)) for at, item in lane
+                   if item.get("kind") == "ask" and item.get("id")
+                   and (item["id"] in open_ids or began is not None and at >= began)]
         view = {"row": scan_sessions.row_identity(row), "name": scan_sessions.row_name(row),
                 "question": excerpt((row.get("verdict") or {}).get("question") or final["text"]),
-                "ask": None, "answer": None, "choices_in_info": []}
-        answer = None
-        if current:
-            asked_at, ask = max(current, key=itemgetter(0))
-            view["ask"] = {**report_view(ask), "marked": ask["id"] not in open_ids}
-            answer = answer_evidence.answer_to(ask, answers)
-            # The lane spoke after this answer, so its wait is about something newer.
-            spoken_since = answer is not None and said_at is not None and answer.at <= said_at
-            if answer is None or spoken_since and ask["id"] in open_ids:
-                found.append((asked_at, {**view, "state": "unanswered", "since": ask.get("ts")}))
-                continue
-            answer = None if spoken_since else answer
-        if answer is None and said_at is not None:
-            # The lead may ask the user a waiting row's question itself: the answer names the lane, not an ask.
-            answer = answer_evidence.answer_to(
-                {"worktree": Path(row["path"]).name, "ts": final["at"], "text": f"{view['question']}\n{final['text']}"},
-                answers)
-        if answer is not None:
-            found.append((answer.at, {**view, "state": "stopped_after_answer", "since": answer.at.isoformat(),
-                                      "answer": {"at": answer.at.isoformat(), "source": answer.source,
-                                                 "text": excerpt(answer.text)}}))
+                "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
+        unanswered = [(at, item) for at, item, proof in counted if not proof]
+        if unanswered:
+            asked_at, ask = min(unanswered, key=itemgetter(0))
+            found.append((asked_at, {
+                **view, "state": "unanswered", "since": ask.get("ts"),
+                "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
+                "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
+            continue
+        later = [(answer, item) for _, item, proof in counted for answer in proof
+                 if said_at is None or answer.at > said_at]
+        if later:
+            first = min(answer.at for answer, _ in later)
+            answer, ask = max(later, key=lambda pair: pair[0].at)
+            found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
+                                  "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
+                                  "answer": answer_view(answer)}))
             continue
         since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
+        asked_directly = answer_evidence.related_to(
+            {"worktree": name, "ts": final["at"], "text": f"{view['question']}\n{final['text']}"},
+            answers) if said_at else []
         choices = [report_view(item) for at, item in lane if item.get("kind") == "info" and began and at >= began
                    and CHOICE.search(str(item.get("text") or ""))]
         found.append((since, {**view, "state": "unasked", "since": final["at"] or since.isoformat(),
+                              "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
-    found.sort(key=lambda pair: pair[0])
+    found.sort(key=itemgetter(0))
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60)} for at, item in found]
 
 
@@ -476,9 +483,10 @@ def main(argv: list[str] | None = None) -> int:
                                   f"a paired Mac that does not answer within {REMOTE_ORCA_TIMEOUT} s is skipped")
     stale = commands.add_parser(
         "stale-asks", help="print, longest waiting first, each waiting row of a saved scan whose question is unasked "
-                           "(not in open-asks; choices it sent as info are listed), unanswered (open or marked "
-                           "answered, with no answer), or stopped_after_answer (answered after its last message), "
-                           "with the lane's ask, the answer found, and age_minutes")
+                           "(not in open-asks; choices it sent as info are listed), unanswered (an open or last-turn "
+                           "ask without an answer that proves it, marked or not), or stopped_after_answer (answered "
+                           "after its last message), with the lane's ask, the answer, candidates that name only the "
+                           "lane or its PR numbers, and age_minutes")
     stale.add_argument("--from", dest="from_file", metavar="SCAN_JSON", required=True,
                        help="the rows scan_sessions.py printed as JSON")
     stale.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,

@@ -13,8 +13,9 @@ questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
 ($TRIAGE_ASK_ANSWERS), as `send --decision --ask` does; `open-asks` lists the asks
 not answered yet, oldest first, and `questions` prints their structured questions
 (`triage-notify --kind ask --questions`) four at a time as AskUserQuestion input.
-`answered --before` marks only the asks an answer covers (answer_evidence.py: the
-lead's decisions and AskUserQuestion answers) and names the rest without marking them.
+`answered --before` marks only the asks an answer proves answered, every open question
+of them (answer_evidence.py: the lead's decisions, AskUserQuestion answers, delivered
+answers), and names the rest with the related answers to check, without marking them.
 """
 
 from __future__ import annotations
@@ -516,13 +517,17 @@ def main(argv: list[str] | None = None) -> int:
                     before = before if before.tzinfo else before.astimezone()
                     earlier = [ask for ask in asks if ask.at is not None and ask.at < before]
                     found = answer_evidence.from_arguments(args, answers_path())
-                    ids = [ask.report["id"] for ask in earlier if answer_evidence.answer_to(ask.report, found)]
+                    ids = [ask.report["id"] for ask in earlier
+                           if answer_evidence.answers_to(ask.report, found, ask.open_questions)]
                     refused = [ask for ask in earlier if ask.report["id"] not in ids]
                 record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
                 print(f"answered: {len(ids)}")
                 for ask in refused:
-                    print(f"not marked, no lead decision or AskUserQuestion answer names it after it was asked: "
+                    print(f"not marked, no answer after it names this ask or each open question: "
                           f"{summary_line(ask.report)}", file=sys.stderr)
+                    for answer in answer_evidence.related_to(ask.report, found)[-3:]:
+                        print(f"  to check: {answer.at.astimezone():%m/%d %H:%M} {answer.source}  "
+                              f"{' '.join(answer.text.split())[:100]}", file=sys.stderr)
                 if refused:
                     print("inbox-read: confirm each one was answered, then mark it with `answered <id> --note <where>`",
                           file=sys.stderr)

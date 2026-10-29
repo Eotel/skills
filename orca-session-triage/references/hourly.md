@@ -59,10 +59,11 @@ way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest, oldest first (`--json` for other tools; the board
 reads it). Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
-It marks only the asks a lead decision or an AskUserQuestion answer (in the
-transcripts of the current directory's worktree and each `--asked-in`
-worktree) names after they were asked, and names the rest: confirm each one,
-then mark it by id.
+It marks only the asks an answer after them proves answered: a lead decision
+or an AskUserQuestion answer (in the transcripts of the current directory's
+worktree and each `--asked-in` worktree) that names the ask's id or quotes each
+open question, or a delivered answer. It names the rest with the answers that
+mention only the lane or its PR numbers: confirm each one, then mark it by id.
 A report pulled late from another Mac is still shown even
 if its original timestamp is old. The watch and notification services each
 keep their own cursor. The watch's output is in
