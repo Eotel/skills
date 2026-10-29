@@ -75,7 +75,7 @@ board's done cards; close what the user approves.
   no live tab can be assigned to it uniquely),
   whether the user `interrupted` it, the `prompt` it last got, Orca's copy
   of its last message, the last lines of its tab's screen (`screen_tail`), and
-  Orca's `draft` (whether it holds one) and its text (`draft_text`), and
+  Orca's `draft` (whether it holds one) and its first 60 characters (`draft_text`), and
   whether the screen's input line is empty (`composer_empty`); null when the
   screen was not read. `--cards` prints each done card (its draft's first 60
   characters), `closable` tab, and `meaningful_tabs` entry on its own line,

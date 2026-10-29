@@ -520,6 +520,17 @@ def has_draft(screen: dict) -> bool:
     return screen.get("draft") not in (None, "")
 
 
+# Enough of an unsent draft to tell Claude's suggestion from the user's instruction; the rest is the user's
+# private text and stays out of the scan and every saved copy of it.
+DRAFT_EXCERPT = 60
+
+
+def draft_excerpt(screen: dict) -> str:
+    """The start of Orca's draft, whitespace collapsed, with … when cut."""
+    said = " ".join((screen.get("draft") or "").split())
+    return said[:DRAFT_EXCERPT] + ("…" if len(said) > DRAFT_EXCERPT else "")
+
+
 def composer_empty(screen: dict) -> bool | None:
     """Whether Claude's last input line between rules is bare; None when no composer is visible."""
     lines = [line.strip() for line in screen_lines(screen)]
@@ -642,7 +653,7 @@ def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = 
             "done_at": iso_time(agent.get("stateStartedAt")), "interrupted": bool(agent.get("interrupted")),
             "prompt": agent.get("prompt") or "", "last_message": agent.get("lastAssistantMessage") or "",
             "screen_tail": screen_tail(screen) if screen else [], "draft": has_draft(screen) if screen else None,
-            "draft_text": (screen.get("draft") or "") if screen else None,
+            "draft_text": draft_excerpt(screen) if screen else None,
             "composer_empty": composer_empty(screen) if screen else None,
         }
 
@@ -1851,10 +1862,9 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
         said = " ".join((card.get("last_message") or "").split())
         who = f"card {card.get('handle') or '-'} {card.get('agent') or '-'}" + (
             " interrupted" if card.get("interrupted") else "")
-        typed = " ".join((card.get("draft_text") or "").split())
-        # A scan saved before cards kept the draft's text has only `draft`.
+        # A scan saved before cards kept the draft's start has only `draft`.
         draft = ("unknown" if card.get("draft") is None
-                 else typed[:60] + ("…" if len(typed) > 60 else "") or ("yes" if card["draft"] else "-"))
+                 else card.get("draft_text") or ("yes" if card["draft"] else "-"))
         composer = {True: "empty", False: "has text"}.get(card.get("composer_empty"), "unknown")
         excerpt = (said[:160] + ("…" if len(said) > 160 else "")) or "-"
         lines.append(f"{lead} | {who} | draft {draft} | composer {composer} | {excerpt} | screen: "

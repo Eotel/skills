@@ -1644,13 +1644,15 @@ class ScanCommandTests(unittest.TestCase):
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
         suggestion = "The next step isn't obvious, so I'll leave this one blank. " + "x" * 20
-        rows[0]["done_cards"] = [{"handle": "suggestion", "draft": True, "draft_text": suggestion, "composer_empty": True},
+        excerpt = scan.draft_excerpt({"draft": suggestion})
+        rows[0]["done_cards"] = [{"handle": "suggestion", "draft": True, "draft_text": excerpt, "composer_empty": True},
                                  {"handle": "saved-before", "draft": True}]
         saved.write_text(json.dumps(rows))
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--cards"]), 0)
 
-        self.assertIn("draft " + suggestion[:60] + "… | composer empty", out.getvalue().splitlines()[0])
+        self.assertEqual(excerpt, suggestion[:60] + "…")
+        self.assertIn("draft " + excerpt + " | composer empty", out.getvalue().splitlines()[0])
         self.assertIn("draft yes | composer unknown", out.getvalue().splitlines()[1])
 
     def test_waiting_worktrees_and_remote_shells_missing_output_get_screens(self) -> None:
