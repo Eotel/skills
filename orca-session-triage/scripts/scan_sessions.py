@@ -1848,7 +1848,9 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
         who = f"card {card.get('handle') or '-'} {card.get('agent') or '-'}" + (
             " interrupted" if card.get("interrupted") else "")
         typed = " ".join((card.get("draft_text") or "").split())
-        draft = "unknown" if card.get("draft") is None else typed[:60] + ("…" if len(typed) > 60 else "") or "-"
+        # A scan saved before cards kept the draft's text has only `draft`.
+        draft = ("unknown" if card.get("draft") is None
+                 else typed[:60] + ("…" if len(typed) > 60 else "") or ("yes" if card["draft"] else "-"))
         composer = {True: "empty", False: "has text"}.get(card.get("composer_empty"), "unknown")
         excerpt = (said[:160] + ("…" if len(said) > 160 else "")) or "-"
         lines.append(f"{lead} | {who} | draft {draft} | composer {composer} | {excerpt} | screen: "
