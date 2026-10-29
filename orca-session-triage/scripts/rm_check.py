@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from typing import TypedDict
 from urllib.parse import urlsplit
 
@@ -54,6 +55,9 @@ CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
 ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# `orca worktree rm` answers `removing: true` and finishes in the background within about a minute.
+GONE_WAIT_SECONDS = 60
+GONE_POLL_SECONDS = 2
 
 
 def git(cwd, *args):
@@ -719,6 +723,34 @@ def compose_projects() -> list[ComposeProject] | None:
     return json.loads(out or "[]")
 
 
+def listed_in_orca(orca: str, worktree: Path) -> bool | None:
+    """Whether a row of this Mac's `orca worktree ps` has `worktree` as its path; None when Orca cannot be read or
+    cut the list short. Only the path counts: a row's preview of its tabs' output may name a removed worktree."""
+    try:
+        done = subprocess.run([orca, "worktree", "ps", "--json"], capture_output=True, text=True, timeout=30,
+                              check=True)
+        payload = json.loads(done.stdout)
+        result = payload.get("result", payload)
+        if any(Path(row["path"]).resolve() == worktree for row in result["worktrees"] if row.get("path")):
+            return True
+        return None if result.get("truncated") else False
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def confirm_gone(worktree: Path, orca: str, wait: float) -> dict:
+    """Read Orca and the disk until neither has the worktree, for up to `wait` seconds."""
+    started = time.monotonic()
+    while True:
+        in_orca = listed_in_orca(orca, worktree)
+        on_disk = worktree.exists() or worktree.is_symlink()
+        waited = time.monotonic() - started
+        if (in_orca is False and not on_disk) or waited >= wait:
+            return {"worktree": str(worktree), "gone": in_orca is False and not on_disk, "in_orca": in_orca,
+                    "on_disk": on_disk, "waited_seconds": round(waited)}
+        time.sleep(GONE_POLL_SECONDS)
+
+
 def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNotes()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worktree", required=True, help="worktree path to check")
@@ -743,7 +775,19 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "move them only where the lead's rules say to" % " and ".join(SCRATCH_DIRS))
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
                         help="where --archive-scratch moves them (default: %(default)s)")
+    parser.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
+                        help="instead of checking, confirm after `orca worktree rm` that no row of this Mac's "
+                             "`orca worktree ps` has the path and the disk lacks it, reading again for up to SECONDS "
+                             "(default: %(const)s); print {worktree, gone, in_orca (null when Orca could not be "
+                             "read or cut its list short), on_disk, waited_seconds} and exit 1 while it stays")
+    parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                        help="Orca CLI executable for --confirm-gone (default: $ORCA_CLI_COMMAND or orca)")
     args = parser.parse_args(argv)
+    if args.confirm_gone is not None:
+        gone = confirm_gone(Path(args.worktree).resolve(), args.orca, args.confirm_gone)
+        json.dump(gone, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0 if gone["gone"] else 1
     if args.pr_head and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", args.pr_head):
         parser.error("--pr-head must be a full commit SHA")
     if args.head_ahead_of_pr is not None and (not args.pr_head or args.head_ahead_of_pr < 0):

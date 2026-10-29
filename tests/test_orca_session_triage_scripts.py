@@ -2911,6 +2911,40 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["blockers"], ["not a git worktree"])
 
 
+class RmCheckConfirmGoneTests(unittest.TestCase):
+    """--confirm-gone after `orca worktree rm`: gone only when no Orca row's path names it and the disk lacks it."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name).resolve()
+        self.removed = self.dir / "workspaces" / "fix-login"
+
+    def run_confirm(self, *rows: dict) -> tuple[int, dict]:
+        orca = self.dir / "orca"
+        payload = {"ok": True, "result": {"worktrees": list(rows), "truncated": False}}
+        orca.write_text(f"#!{sys.executable}\nprint({json.dumps(json.dumps(payload))})\n")
+        orca.chmod(0o755)
+        with redirect_stdout(io.StringIO()) as out:
+            code = rmcheck.main(["--worktree", str(self.removed), "--confirm-gone", "0", "--orca", str(orca)])
+        return code, json.loads(out.getvalue())
+
+    def test_a_removed_worktree_named_only_in_another_rows_tab_output_is_gone(self) -> None:
+        # 2026-10-29: matching the name anywhere in `orca worktree ps --json` called a removed worktree present.
+        other = {"path": str(self.dir / "workspaces" / "triage"), "preview": f"removed {self.removed}"}
+
+        code, result = self.run_confirm(other)
+
+        self.assertEqual((code, result["gone"], result["in_orca"], result["on_disk"]), (0, True, False, False))
+
+    def test_a_worktree_orca_still_lists_is_reported_stuck(self) -> None:
+        self.removed.mkdir(parents=True)
+
+        code, result = self.run_confirm({"path": str(self.removed)})
+
+        self.assertEqual((code, result["gone"], result["in_orca"], result["on_disk"]), (1, False, True, True))
+
+
 NOTHING_OWED = {"needs_owner": [], "closed_issues": []}
 
 
