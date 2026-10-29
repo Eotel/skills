@@ -2789,11 +2789,14 @@ class RmCheckTests(unittest.TestCase):
         git(self.wt, "branch", "--set-upstream-to", "origin/release/masters-0026")
         (self.wt / "app.txt").write_text("unpushed\n")
         git(self.wt, "commit", "-q", "-am", "unpushed work")
-
         code, result = self.run_main_without_base()
+        git(self.main, "branch", "local-copy", git(self.wt, "rev-parse", "HEAD"))
+        git(self.wt, "branch", "--set-upstream-to", "local-copy")
+        local_code, local = self.run_main_without_base()
 
         self.assertEqual((code, result["base"]), (1, "origin/HEAD"))
         self.assertNotIn("--pr-head", " ".join(result.get("notes", [])))
+        self.assertEqual((local_code, local["base"]), (1, "origin/HEAD"))
 
     def test_command_finds_the_main_checkout_and_fails_when_blocked(self):
         (self.main / ".env").write_text("A=1\n")

@@ -787,9 +787,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     by_pr = pr_base(worktree, pr)
     base = args.base or by_pr or start_base(worktree) or default_base(worktree)
     if not (args.base or args.pr or args.pr_head or pr or head_in(worktree, base)):
-        upstream = git(worktree, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}").stdout.strip()
-        if head_in(worktree, upstream or None):
-            base = upstream
+        # A branch can track a local branch (branch.<name>.remote=.), which proves nothing was pushed.
+        upstream = git(worktree, "rev-parse", "--symbolic-full-name", "@{upstream}").stdout.strip()
+        if upstream.startswith("refs/remotes/") and head_in(worktree, upstream):
+            base = upstream.removeprefix("refs/remotes/")
             notes.append("Using %s as base: HEAD is pushed to the branch it tracks, and no PR was given or found"
                          % base)
     decided = [keep_blocker] if keep_blocker else []
