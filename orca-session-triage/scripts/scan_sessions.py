@@ -525,9 +525,11 @@ def composer_empty(screen: dict) -> bool | None:
     lines = [line.strip() for line in screen_lines(screen)]
     rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
     for top, bottom in reversed(list(zip(rules, rules[1:]))):
-        prompt = next((line for line in lines[top + 1:bottom] if line.startswith("❯")), None)
+        box = [line for line in lines[top + 1:bottom] if line]
+        prompt = next((index for index, line in enumerate(box) if line.startswith("❯")), None)
         if prompt is not None:
-            return prompt == "❯"
+            # A draft that starts with a newline leaves the ❯ line bare and its text on the lines below.
+            return box[prompt:] == ["❯"]
     return None
 
 

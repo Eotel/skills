@@ -555,10 +555,9 @@ class ClassifyTests(unittest.TestCase):
             (None, None, [])])
         self.assertEqual([(c["draft_text"], c["composer_empty"]) for c in cards], [("あとで送る返事", True), (None, None)])
         screen["tail"][4] = "❯ スマホのメニューボタンも流れないように直して"
-        [card] = scan.done_cards([done_agent("claude", "tab1:leaf1")],
-                                 [in_pane(terminal("/w/d", "claude", "term_claude"), "tab1:leaf1")],
-                                 {(None, "term_claude"): screen})
-        self.assertFalse(card["composer_empty"])
+        self.assertFalse(scan.composer_empty(screen))
+        screen["tail"][4:5] = ["❯", "  2 行目から書いた指示"]
+        self.assertFalse(scan.composer_empty(screen))
 
     def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self):
         # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
