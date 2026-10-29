@@ -3750,8 +3750,12 @@ class InboxReadTests(unittest.TestCase):
 
     def test_answered_before_marks_only_asks_an_answer_proves_and_names_the_rest(self):
         # 2026-10-29: a bulk mark took an unanswered ask out of open-asks, and it waited 25 hours.
-        two = [{"question": f"Q{n} をどうしますか？", "header": f"Q{n}", "recommended": "A",
-                "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]} for n in (1, 2)]
+        options = [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]
+        # JSON escapes the quotes and the line break; the question is read from the parsed answers.
+        two = [{"question": text, "header": f"Q{n}", "recommended": "A", "options": options}
+               for n, text in enumerate(('"dry-run" で進めてよいですか？', "2 行に\nわたる質問ですか？"), 1)]
+        merge = {"question": "この PR を merge してよいですか？", "header": "merge", "recommended": "A", "options": options}
+        alike = {**merge, "question": "同じ問いですか？"}
         with tempfile.TemporaryDirectory() as root:
             inbox, answers, log = (Path(root) / name for name in ("inbox.jsonl", "answers.jsonl", "decisions.jsonl"))
             write_jsonl(inbox, [
@@ -3764,6 +3768,16 @@ class InboxReadTests(unittest.TestCase):
                 {"id": "cc330000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "est-177",
                  "text": "2 つの判断", "questions": [{**question, "question": "est の" + question["question"]}
                                                     for question in two]},
+                # The same question about two PRs, told apart by the issue the user saw beside it.
+                {"id": "ee440000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "pr-123",
+                 "text": "merge", "questions": [{**merge, "issue": "acme/app#123"}]},
+                {"id": "ff550000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "pr-124",
+                 "text": "merge", "questions": [{**merge, "issue": "acme/app#124"}]},
+                # Two asks show the same question: an answer to it cannot tell which one it answers.
+                {"id": "aa660000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "lane-a",
+                 "text": "問い", "questions": [alike]},
+                {"id": "bb770000-0000", "ts": "2026-10-28T12:00:00+0900", "kind": "ask", "worktree": "lane-b",
+                 "text": "問い", "questions": [alike]},
             ])
             # Q1 of the last ask was answered through send --decision; its Q2 is still open.
             write_jsonl(answers, [{"id": "cc330000-0000:1", "ts": "2026-10-28T13:00:00+09:00",
@@ -3782,9 +3796,9 @@ class InboxReadTests(unittest.TestCase):
             lead = Path(root) / "triage-lead"
             transcript = scan.claude_project_dir(Path(root) / "projects", str(lead)) / "lead.jsonl"
             transcript.parent.mkdir(parents=True)
+            asked = [*two, {**merge, "question": merge["question"] + "（acme/app#123）"}, alike]
             write_jsonl(transcript, [{"type": "user", "timestamp": "2026-10-29T01:21:00Z", "toolUseResult": {
-                "questions": [{"question": question["question"]} for question in two],
-                "answers": {question["question"]: "A" for question in two}}}])
+                "questions": asked, "answers": {question["question"]: "A" for question in asked}}}])
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}
 
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
@@ -3795,11 +3809,11 @@ class InboxReadTests(unittest.TestCase):
 
             marked = [record["id"] for record in map(json.loads, answers.read_text().splitlines())
                       if record["how"] == "inbox_read.py answered"]
-            self.assertEqual((code, out.getvalue()), (1, "answered: 2\n"))
-            self.assertEqual(sorted(marked), ["4bd9cae3-a6d6-4835", "bc7e1884-0000"])
+            self.assertEqual((code, out.getvalue()), (1, "answered: 3\n"))
+            self.assertEqual(sorted(marked), ["4bd9cae3-a6d6-4835", "bc7e1884-0000", "ee440000-0000"])
             refused = err.getvalue()
-            self.assertIn("id=77aa0001-0000", refused)
-            self.assertIn("id=cc330000-0000", refused)
+            for ask_id in ("77aa0001-0000", "cc330000-0000", "ff550000-0000", "aa660000-0000", "bb770000-0000"):
+                self.assertIn(f"id={ask_id}", refused)
             self.assertIn("lead_decisions answer:fix-login::other", refused)
             self.assertIn("lead_decisions merge:acme/app#4512", refused)
             self.assertNotIn("remove:", refused)

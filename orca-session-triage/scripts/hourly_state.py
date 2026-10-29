@@ -275,6 +275,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     lead may ask the user a waiting row's question itself.
     """
     found = []
+    shared = answer_evidence.shared_questions(entries)
     for row in rows:
         if ((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting":
             continue
@@ -286,7 +287,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
-        counted = [(at, item, answer_evidence.answers_to(item, answers)) for at, item in lane
+        counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or began is not None and at >= began)]
         view = {"row": scan_sessions.row_identity(row), "name": scan_sessions.row_name(row),

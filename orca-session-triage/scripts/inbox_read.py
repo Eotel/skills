@@ -517,8 +517,9 @@ def main(argv: list[str] | None = None) -> int:
                     before = before if before.tzinfo else before.astimezone()
                     earlier = [ask for ask in asks if ask.at is not None and ask.at < before]
                     found = answer_evidence.from_arguments(args, answers_path())
+                    shared = answer_evidence.shared_questions(entries)
                     ids = [ask.report["id"] for ask in earlier
-                           if answer_evidence.answers_to(ask.report, found, ask.open_questions)]
+                           if answer_evidence.answers_to(ask.report, found, ask.open_questions, shared)]
                     refused = [ask for ask in earlier if ask.report["id"] not in ids]
                 record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
                 print(f"answered: {len(ids)}")
