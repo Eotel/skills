@@ -109,8 +109,8 @@ def same_tree(left: Path, right: Path) -> bool:
         return right.is_file() and filecmp.cmp(left, right, shallow=False)
     if not (left.is_dir() and right.is_dir()):
         return False
-    return all(same_tree(child, right / child.relative_to(left)) for child in left.rglob("*")
-               if child.is_symlink() or not child.is_dir())
+    # Level by level, so a symlinked directory on either side is compared as a link.
+    return all(same_tree(child, right / child.name) for child in left.iterdir())
 
 
 def holds_nothing(path):

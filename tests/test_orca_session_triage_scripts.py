@@ -2316,10 +2316,19 @@ class RmCheckTests(unittest.TestCase):
         (self.main / ".claude/reviews/other.md").write_text("another review\n")
 
         copied = self.check()
+        # A main-side link back into the worktree is no copy of what it points at.
+        (self.wt / ".claude/reviews/run").mkdir()
+        (self.wt / ".claude/reviews/run/notes.md").write_text("only here\n")
+        (self.main / ".claude/reviews/run").symlink_to(self.wt / ".claude/reviews/run")
+        linked = self.check()
+        (self.main / ".claude/reviews/run").unlink()
+        (self.wt / ".claude/reviews/run/notes.md").unlink()
+        (self.wt / ".claude/reviews/run").rmdir()
         (self.wt / ".claude/reviews/review.md").write_text("new review\n")
         changed = self.check()
 
         self.assertEqual(copied["review"], [])
+        self.assertEqual(linked["review"], [".claude/reviews/ (differs from main checkout)"])
         self.assertEqual(changed["review"], [".claude/reviews/ (differs from main checkout)"])
 
     def test_an_env_is_regenerable_when_it_moves_only_ports_from_its_example(self):
