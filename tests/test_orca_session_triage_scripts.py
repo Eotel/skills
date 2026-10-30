@@ -626,8 +626,8 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(([t["handle"] for t in rows[0]["terminals"]], rows[0]["done_cards"][0]["handle"]),
                          (["term_detached"], "term_detached"))
 
-    def test_detached_tabs_close_the_cards_of_their_recorded_panes(self):
-        def detached(handle, pane):
+    def test_detached_tabs_close_the_cards_of_their_recorded_panes(self) -> None:
+        def detached(handle: str, pane: str) -> dict[str, object]:
             return {**terminal("/w/u", "claude", handle), "orphaned": True, "connected": True,
                     "tabId": f"pty:{handle}", "leafId": f"pty:{handle}", "recordedPaneKey": pane}
         rows = self.inventory([{**worktree("/w/u"), "agents": [done_agent("claude", "tab1:leaf1"),
