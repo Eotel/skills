@@ -29,6 +29,7 @@ from typing import Any, NotRequired, TypedDict
 import urllib.request
 from urllib.parse import urlsplit
 
+import hourly_runtime
 import inbox_read
 from worktree_notes import keep_note
 
@@ -570,7 +571,7 @@ def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screen
     """A reason per screen line saying a restart dropped background waits, timed by its pane's agent when known."""
     since = {agent["paneKey"]: iso_time(agent.get("stateStartedAt")) for agent in agents if agent.get("paneKey")}
     return [f"background waits lost when the session was replaced (tab {term.get('handle')}"
-            + (f", agent state since {at}" if (at := since.get(f"{term.get('tabId')}:{term.get('leafId')}")) else "")
+            + (f", agent state since {at}" if (at := since.get(hourly_runtime.pane_key(term))) else "")
             + f"): {line.strip()}"
             for term in terms for line in screen_lines(rendered(screens.get((environment, term.get("handle")))) or {})
             if LOST_WAITS in line]
@@ -631,11 +632,11 @@ def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = 
     line between rules; [] and None when the screen was not read.
     """
     screens = screens or {}
-    by_pane = {f"{t.get('tabId')}:{t.get('leafId')}": t.get("handle") for t in terms}
+    by_pane = {hourly_runtime.pane_key(t): t.get("handle") for t in terms}
     panes = {a.get("paneKey") for a in agents}
     unclaimed = {}
     for t in terms:
-        if t.get("handle") and f"{t.get('tabId')}:{t.get('leafId')}" not in panes:
+        if t.get("handle") and hourly_runtime.pane_key(t) not in panes:
             unclaimed.setdefault(t.get("agentIdentity"), []).append(t["handle"])
 
     def handle_of(agent: dict) -> str | None:
