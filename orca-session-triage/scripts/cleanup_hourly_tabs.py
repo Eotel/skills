@@ -28,7 +28,7 @@ QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回�
 
 def prior_tabs(runs, terminals, agents, workspace, current_pane):
     """Only completed scheduled runs with an idle, owned terminal can be closed."""
-    terms = {f"{term.get('tabId')}:{term.get('leafId')}": term for term in terminals
+    terms = {hourly_runtime.pane_key(term): term for term in terminals
              if hourly_runtime.workspace_path(term.get("worktreeId")) == os.path.realpath(workspace)}
     for run in runs:
         pane = run.get("terminalPaneKey")

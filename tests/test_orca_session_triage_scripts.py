@@ -626,6 +626,16 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(([t["handle"] for t in rows[0]["terminals"]], rows[0]["done_cards"][0]["handle"]),
                          (["term_detached"], "term_detached"))
 
+    def test_detached_tabs_close_the_cards_of_their_recorded_panes(self) -> None:
+        def detached(handle: str, pane: str) -> dict[str, object]:
+            return {**terminal("/w/u", "claude", handle), "orphaned": True, "connected": True,
+                    "tabId": f"pty:{handle}", "leafId": f"pty:{handle}", "recordedPaneKey": pane}
+        rows = self.inventory([{**worktree("/w/u"), "agents": [done_agent("claude", "tab1:leaf1"),
+                                                               done_agent("claude", "tab2:leaf2")]}],
+                              [detached("term_one", "tab1:leaf1"), detached("term_two", "tab2:leaf2")])
+
+        self.assertEqual([c["handle"] for c in rows[0]["done_cards"]], ["term_one", "term_two"])
+
     def test_waiting_comes_from_transcripts_and_the_decision_marker(self):
         self.claude_says("/w/a", user("go"), assistant(
             {"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}))
@@ -4010,7 +4020,9 @@ class InboxReadTests(unittest.TestCase):
             cursor.write_text("0")
             runs = [{"status": "dispatch_failed", "terminalPaneKey": "tab15:leaf"},
                     {"status": "completed", "terminalPaneKey": "tab14:leaf"}]
-            terminals = [{"tabId": "tab15", "leafId": "leaf", "connected": True, "orphaned": True},
+            # A detached tab is listed under its pty id and keeps its pane only as recordedPaneKey.
+            terminals = [{"tabId": "pty:w@@15", "leafId": "pty:w@@15", "recordedPaneKey": "tab15:leaf",
+                          "connected": True, "orphaned": True},
                          {"tabId": "tab14", "leafId": "leaf", "connected": True}]
             env = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": "",
                    "ORCA_WORKTREE_ID": "repo::/w/triage", "ORCA_PANE_KEY": "tab14:leaf"}
