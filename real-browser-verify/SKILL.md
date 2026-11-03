@@ -28,6 +28,9 @@ functional path. A passing suite or loaded page proves a different claim.
    - An unauthenticated `curl` 401 proves nothing about the feature.
 
 3. **Reach the actual target screen and operate it**
+   - Before a multi-step check, consult existing scenario tests and the action
+     guards; establish the starting state and include required confirmations
+     before performing writes.
    - Navigate to the specific screen the change affects, not the top page.
    - Exercise the functional path: click the button, submit the form, run the
      search — reproduce the originally-reported symptom's scenario and confirm it
@@ -43,6 +46,9 @@ functional path. A passing suite or loaded page proves a different claim.
      normal integration path independently.
 
 4. **Capture evidence**
+   - After navigation or reload, assert screen-specific rendered content before
+     capture, such as a result heading or settled empty state. A URL match or
+     API response alone does not establish that the target screen is ready.
    - Screenshot of the target screen post-operation (light/dark/mobile when the
      change is visual; forced colors when changing a native control indicator).
    - Console errors and relevant network failures captured, not just eyeballed.
