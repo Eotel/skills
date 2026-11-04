@@ -317,6 +317,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     lead may ask the user a waiting row's question itself.
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
+    comments: dict[str, str] = {}
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
     shared = answer_evidence.shared_questions(entries)
     for row in rows:
@@ -344,8 +345,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        comments[identity] = row.get("comment") or ""
         view = {"row": identity, "name": scan_sessions.row_name(row),
                 "question": excerpt(row_question(row, final)),
+                "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         if blocked_by_user(row):
             view["pr"] = prs.get(identity, {"state": (row.get("pr") or {}).get("state"), "updatedAt": None})
@@ -387,6 +390,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                               "choices_in_info": choices}))
     found.sort(key=itemgetter(0))
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60),
+             "merge_question": scan_sessions.asks_merge(item["question"], comments[item["row"]]),
              **({"answer_age_minutes": int((now - scan_sessions.parse_time(item["answer"]["at"])).total_seconds() // 60)}
                 if item["answer"] else {})} for at, item in found]
 
@@ -612,6 +616,11 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                 for proof in item["evidence"])
         if item.get("pr"):
             line += f" | PR {item['pr'].get('state') or '-'}@{item['pr'].get('updatedAt') or '-'}"
+        if item.get("merge_question"):
+            line += " | merge の問い"
+        if review := item.get("review"):
+            line += (f" | review {review['head']}{'（今の head ではない）' if review['head_matches'] is False else ''}: "
+                     f"{review['verdict'][:60]}")
         if item.get("answer_age_minutes") is not None:
             line += f" | answer_age_minutes={item['answer_age_minutes']}"
         if item.get("withdrawal_reason"):

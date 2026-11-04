@@ -3807,6 +3807,37 @@ class HourlyStateTests(unittest.TestCase):
                          ["lead_decisions answer:orca-deeplink-pr::photos"])
         self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
 
+    def test_stale_asks_shows_the_pr_review_beside_its_merge_question(self) -> None:
+        review_dir = self.root / "review"
+        review_dir.mkdir()
+        result = review_dir / "acme-app-12.md"
+        result.write_text("**判定：直してから（Request changes）**\n", encoding="utf-8")
+        (review_dir / "acme-app-12.reviewed.json").write_text(json.dumps(
+            {"head": "abc123def", "sha256": hashlib.sha256(result.read_bytes()).hexdigest()}))
+        (self.root / "inbox.jsonl").write_text("")
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{
+            "path": "/w/app-pr12", "environment": None, "repo": "app", "class": "waiting", "codex": [],
+            "github": "acme/app", "pr": {"number": 12, "url": "https://github.com/acme/app/pull/12",
+                                          "head_oid": "abc123def4567"},
+            "claude": {"last_user_at": "2026-10-28T00:10:00Z", "final_at": "2026-10-28T00:19:00Z",
+                       "final_text": "PR #12 を merge してよいですか"},
+            "terminals": [{"handle": "term_app", "agent": "claude"}]}]))
+
+        with patch.dict(os.environ, {"TRIAGE_REVIEW_DIR": str(review_dir)}):
+            code, stale = self.call("stale-asks", "--from", str(scan_json), "--claude-projects",
+                                    str(self.root / "projects"))
+            out = io.StringIO()
+            with redirect_stdout(out):
+                hourly_state.main(["--state-file", str(self.state), "stale-asks", "--from", str(scan_json),
+                                   "--claude-projects", str(self.root / "projects"), "--summary"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual((stale[0]["merge_question"], stale[0]["review"]["changes_requested"],
+                          stale[0]["review"]["path"]), (True, True, str(result)))
+        self.assertIn("merge の問い", out.getvalue())
+        self.assertIn("直してから", out.getvalue())
+
     def test_stale_asks_excludes_its_own_row_left_messages_and_handoffs_and_fills_questions(self) -> None:
         message = self.source("message.txt", "Leave this message.")
         self.call("leave", "--row", "/w/left", "--final-message-file", message)

@@ -2042,6 +2042,11 @@ class Transcripts(TypedDict):
     codex: list[str]
 
 
+def asks_merge(question: str, comment: str) -> bool:
+    """Whether a question, or a 要判断 in the worktree's Orca comment, asks about a merge."""
+    return bool(MERGE.search(question) or ("要判断" in comment and MERGE.search(comment)))
+
+
 def review_result(row: dict, github: str) -> ReviewResult | None:
     """The completed review of this PR, with whether it still describes the current PR head."""
     pr = row.get("pr") or row.get("linked_pr") or {}
@@ -2076,8 +2081,7 @@ def row_view(row: dict) -> dict:
              "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     github = github_of(row)
     question = (row.get("prompt_waiting") or {}).get("question") or verdict.get("question") or ""
-    merge_question = bool(MERGE.search(question) or (
-        "要判断" in (row.get("comment") or "") and MERGE.search(row["comment"])))
+    merge_question = asks_merge(question, row.get("comment") or "")
     transcripts: Transcripts = {
         "claude": [path] if (path := (row.get("claude") or {}).get("transcript")) else [],
         "codex": [rollout["rollout"] for rollout in row.get("codex") or [] if rollout.get("rollout")],
