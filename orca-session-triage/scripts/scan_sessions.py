@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
-from itertools import takewhile
+from itertools import dropwhile, takewhile
 import hashlib
 import http.client
 import json
@@ -134,12 +134,139 @@ def is_real_user_message(entry):
     return bool(value) and not value.lstrip().startswith("<")
 
 
-def read_claude(projects_root, worktree_path):
-    """Summarize the newest Claude transcript for a worktree, or None when there is none."""
+# Claude Code keeps <config dir>/sessions/<pid>.json for each running session, with its sessionId and current
+# cwd; Orca runs Claude under one config dir per profile.
+CLAUDE_SESSION_DIRS = (".claude/sessions", "Library/Application Support/orca/claude-profiles/*/home/sessions")
+
+
+def claude_session_dirs() -> list[Path]:
+    return [path for pattern in CLAUDE_SESSION_DIRS for path in Path.home().glob(pattern) if path.is_dir()]
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    """Each process's parent and command name, from ps; empty when ps fails."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True,
+                             timeout=ORCA_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in out.splitlines():
+        pid, ppid, command = [*line.split(None, 2), "", "", ""][:3]
+        if pid.isdigit() and ppid.isdigit():
+            table[int(pid)] = (int(ppid), command)
+    return table
+
+
+def process_cwds(pids: list[int]) -> dict[int, str]:
+    """Each process's working directory from one lsof call; one lsof cannot read is left out."""
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", ",".join(map(str, pids)), "-Fpn"],
+                             capture_output=True, text=True, timeout=ORCA_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def ancestry(pid: int, processes: dict[int, tuple[int, str]]) -> list[int]:
+    """The process and its ancestors, nearest first."""
+    chain = []
+    while pid in processes and pid not in chain:
+        chain.append(pid)
+        pid = processes[pid][0]
+    return chain
+
+
+def session_transcript(session_id: str, cwd: str, roots: Sequence[Path]) -> Path | None:
+    """The transcript of a session under its cwd's project directory, or under any one after its cwd moved."""
+    name = session_id + ".jsonl"
+    roots = list(dict.fromkeys(roots))
+    exact = (path for root in roots if (path := find_claude_dir(root, cwd) / name).is_file())
+    moved = (path for root in roots if root.is_dir() for path in root.glob("*/" + name))
+    return next(exact, None) or next(moved, None)
+
+
+def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequence[Path], projects_root: str | Path,
+                               processes: dict[int, tuple[int, str]],
+                               cwds: Callable[[list[int]], dict[int, str]]) -> dict[str, list[Path]]:
+    """The transcripts of running Claude sessions by the worktree each runs under.
+
+    A session can move its cwd out of the worktree (into a worktree under .claude/worktrees, or as a
+    background session its tab's Claude started), and its transcript then lands in another project
+    directory. Its worktree is the first of the process and its ancestors whose cwd, from its session file or
+    else from lsof, is inside one.
+    """
+    live = {}
+    for directory in session_dirs:
+        for path in directory.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            pid, session_id, cwd = record.get("pid"), record.get("sessionId"), record.get("cwd")
+            if (isinstance(pid, int) and "claude" in processes.get(pid, (0, ""))[1] and isinstance(cwd, str)
+                    and isinstance(session_id, str) and re.fullmatch(r"[\w-]+", session_id)):
+                live[pid] = (session_id, cwd, directory.parent / "projects")
+    chains = {pid: ancestry(pid, processes) for pid in live}
+    known = {pid: cwd for pid, (_, cwd, _) in live.items()}
+    where = {**cwds(sorted({member for chain in chains.values() for member in chain} - known.keys())), **known}
+
+    def worktree_of(cwd: str) -> str | None:
+        return max((path for path in worktree_paths if cwd == path or cwd.startswith(path.rstrip("/") + "/")),
+                   key=len, default=None)
+
+    found: dict[str, set[Path]] = {}
+    for pid, (session_id, cwd, own_projects) in live.items():
+        worktree = next((path for member in chains[pid] if (path := worktree_of(where.get(member, "")))), None)
+        transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects])
+        if worktree and transcript:
+            found.setdefault(worktree, set()).add(transcript)
+    return {worktree: sorted(paths) for worktree, paths in found.items()}
+
+
+# Lines read from the end of a transcript for its newest entry.
+TAIL_LINES = 400
+EPOCH = datetime.fromtimestamp(0, timezone.utc)
+
+
+def last_entry_at(path: Path) -> datetime | None:
+    """The newest timestamped entry among a transcript's last lines. Claude Code also rewrites an idle session's
+    transcript with untimed lines (bridge-session, cost-state), which do not count. An unreadable file raises OSError.
+    """
+    times = []
+    for line in path.read_bytes().splitlines()[-TAIL_LINES:]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and (at := parse_time(entry.get("timestamp"))) is not None:
+            times.append(at)
+    return max(times, default=None)
+
+
+def read_claude(projects_root, worktree_path, running=()):
+    """Summarize the newest Claude transcript for a worktree, or None when there is none.
+
+    `running` adds transcripts of Claude sessions running under it that live in other project directories.
+    """
     candidates = list(find_claude_dir(projects_root, worktree_path).glob("*.jsonl"))
-    if not candidates:
+    if not candidates and not running:
         return None
-    path = max(candidates, key=lambda p: p.stat().st_mtime)
+    path = max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+    if running:
+        # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
+        path = max(dict.fromkeys([*running, *([path] if path else [])]),
+                   key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error = [], None, {}, set(), None
@@ -382,7 +509,8 @@ STATE_REASONS = {
 def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     reasons = []
     if prompt := row.get("prompt_waiting"):
-        reasons.append("permission prompt on screen: " + prompt["question"])
+        kind = "permission prompt" if prompt["question"].startswith(PERMISSION_QUESTION) else "question"
+        reasons.append(f"{kind} on screen: " + prompt["question"])
     claude = row["claude"] or {}
     jev = row.get("jev") or {}
     asks = jev.get("asks")
@@ -577,6 +705,40 @@ def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screen
             if LOST_WAITS in line]
 
 
+# Claude Code's AskUserQuestion: a row of question tabs ("☐ 範囲  ☒ 期限  ✔ Submit"), the current question, its
+# numbered choices with their descriptions, and a footer saying how to answer.
+SELECTOR_FOOTER = re.compile(r"Enter to select · .*to navigate")
+QUESTION_TABS = re.compile(r"[☐☒]")
+
+
+def unwrapped(lines: list[str]) -> str:
+    """Lines the screen wrapped, joined with a space only between two ASCII characters: Japanese wraps anywhere."""
+    text = ""
+    for line in lines:
+        text += (" " if text[-1:].isascii() and text and line[:1].isascii() else "") + line
+    return text
+
+
+def question_prompt(screen: dict, tab: str) -> PromptWaiting | None:
+    """The question an AskUserQuestion selector at the end of a rendered screen waits on, with its numbered choices."""
+    lines = [line.strip() for line in screen_lines(screen)]
+    shown = [index for index, line in enumerate(lines) if line]
+    footer = next((index for index in reversed(shown[-3:]) if SELECTOR_FOOTER.search(lines[index])), None)
+    first = max((index for index in range(footer) if FIRST_CHOICE.fullmatch(lines[index])), default=None) \
+        if footer is not None else None
+    if first is None:
+        return None
+    choices = [line for line in lines[first:footer] if CHOICE.fullmatch(line)]
+    if not any(line.startswith("❯") for line in choices):
+        return None
+    above = [line.lstrip("│").strip() for line in lines[:first]]
+    frame = max((index for index, line in enumerate(above) if RULE.fullmatch(line) or QUESTION_TABS.search(line)),
+                default=None)
+    asked = ([line for line in above[frame + 1:] if line] if frame is not None
+             else list(takewhile(bool, dropwhile(lambda line: not line, reversed(above))))[::-1])
+    return {"tab": tab, "question": unwrapped(asked), "choices": [CHOICE.sub(r"\1", line) for line in choices]}
+
+
 def screen_tail(screen: dict) -> list[str]:
     """The last lines a rendered screen shows, without blank lines and rules."""
     shown = [line.strip() for line in screen_lines(screen) if line.strip() and not RULE.fullmatch(line.strip())]
@@ -703,7 +865,8 @@ def with_screen_agents(terms, screens, environment):
 def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: str | Path,
                     codex_by_cwd: dict[str, list[dict]], decision_marker: str, now: float | None = None,
                     shell_idle_minutes: float = 30, judge: Callable[[str], dict | None] = lambda message: None,
-                    mail: dict | None = None, screens: Screens | None = None) -> list[dict]:
+                    mail: dict | None = None, screens: Screens | None = None,
+                    live_transcripts: dict[str, list[Path]] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -711,10 +874,11 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     `mail` maps a lead's terminal handle to its unread worker mail (see
     unread_worker_mail). `screens` maps (environment, handle) to a tab's
     rendered screen (see read_screens): done cards show its draft and composer,
-    permission prompts wait, lost background waits are named, remote shells
+    permission prompts and question selectors wait, lost background waits are named, remote shells
     without output metadata use their last line, and another
     Mac's worktree whose agents Orca keeps no message of takes the agent and
-    last reply its tabs show.
+    last reply its tabs show. `live_transcripts` maps a local worktree to the transcripts of Claude sessions
+    running under it elsewhere (see running_claude_transcripts).
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     screens = screens or {}
@@ -759,8 +923,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": next((prompt for term in terms if term.get("handle")
                                     if (screen := rendered(screens.get((w.get("_environment"), term["handle"]))))
-                                    if (prompt := permission_prompt(screen, term["handle"]))), None),
-            "claude": None if remote else read_claude(claude_root, w["path"]),
+                                    if (prompt := permission_prompt(screen, term["handle"])
+                                        or question_prompt(screen, term["handle"]))), None),
+            "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
         if remote:
@@ -1485,7 +1650,9 @@ def absorb_verdicts(store_path, write=True):
 def with_verdicts(rows, verdicts):
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row):
-        verdict = current_verdict(row, verdicts) if row["class"] in READ_CLASSES else None
+        # A prompt on the tab's screen is the state now, whatever a reader saved before.
+        verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES and not row.get("prompt_waiting")
+                   else None)
         return {**row, "verdict": verdict} if verdict else row
     return [marked(row) for row in rows]
 
@@ -1604,14 +1771,17 @@ ORCA_TIMEOUT = 60
 
 
 def screen_targets(worktrees: list[dict], terminals: list[dict]) -> list[dict]:
-    """Tabs of done or waiting worktrees, remote worktrees with no agent message, and remote shells
-    without output metadata: read their cards, permission prompts, final replies, and bare prompts."""
+    """Tabs of done or waiting worktrees, agent tabs of worktrees Orca keeps no agent for (a background
+    session's hooks do not reach it), remote worktrees with no agent message, and remote shells without
+    output metadata: read their cards, permission prompts, questions, final replies, and bare prompts."""
     idle = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if any(a.get("state") in ("done", "waiting") for a in w.get("agents") or [])}
+    untracked = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees if not w.get("agents")}
     bare = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if w.get("_environment") and not orca_said(w)}
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
+        or (key in untracked and t.get("agentIdentity"))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
             and t.get("lastOutputAt") is None))]
 
@@ -1905,7 +2075,7 @@ def row_view(row: dict) -> dict:
     asked = {"claude": (row.get("claude") or {}).get("last_user"),
              "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     github = github_of(row)
-    question = verdict.get("question") or ""
+    question = (row.get("prompt_waiting") or {}).get("question") or verdict.get("question") or ""
     merge_question = bool(MERGE.search(question) or (
         "要判断" in (row.get("comment") or "") and MERGE.search(row["comment"])))
     transcripts: Transcripts = {
@@ -2057,10 +2227,14 @@ def main(argv: list[str] | None = None) -> int:
     judge = jev_judge(key) if key else (lambda message: None)
     # Orca state read from files has no live tabs to read.
     screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals))
-    rows = add_next_step_facts(build_inventory(worktrees, terminals, str(Path(args.claude_projects).expanduser()),
+    claude_root = str(Path(args.claude_projects).expanduser())
+    live = {} if args.ps_json else running_claude_transcripts(
+        [w["path"] for w in worktrees if not w.get("_environment")], claude_session_dirs(), claude_root,
+        process_table(), process_cwds)
+    rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
-                                               mail=read_mail(args), screens=screens),
+                                               mail=read_mail(args), screens=screens, live_transcripts=live),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]

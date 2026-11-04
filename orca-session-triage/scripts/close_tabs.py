@@ -40,10 +40,6 @@ from typing import Protocol
 import scan_sessions
 
 
-# Lines read from the end of a transcript for its newest entry.
-TAIL_LINES = 400
-
-
 @dataclass(frozen=True)
 class AgentChange:
     pane: str | None  # Orca's paneKey (tabId:leafId) of the agent's tab
@@ -137,21 +133,12 @@ def modified(path: Path) -> datetime | None:
         return None
 
 
-def last_entry_at(path: Path) -> datetime | None:
-    """The newest timestamped entry among the transcript's last lines; untimed bookkeeping lines do not count.
-
-    A transcript written after the scan that cannot be read raises OSError, which keeps the tab.
-    """
-    lines = path.read_bytes().splitlines()[-TAIL_LINES:]
-    return max((at for item in map(report, lines) if item
-                if (at := scan_sessions.parse_time(item.get("timestamp"))) is not None), default=None)
-
-
 def transcript_activity(paths: Iterable[Path], since: datetime) -> Iterator[Activity]:
-    """Each transcript written since `since`, at its newest entry. Claude Code also rewrites an idle session's
-    transcript with untimed lines (bridge-session, cost-state), so the file time alone only picks what to read."""
+    """Each transcript written since `since`, at its newest entry (see scan_sessions.last_entry_at): the file time
+    alone only picks what to read. One written after the scan that cannot be read raises OSError, keeping the tab."""
     touched = (path for path in paths if (at := modified(path)) is not None and at > since)
-    yield from (Activity(at, f"会話記録 {path.name}") for path in touched if (at := last_entry_at(path)) is not None)
+    yield from (Activity(at, f"会話記録 {path.name}") for path in touched
+                if (at := scan_sessions.last_entry_at(path)) is not None)
 
 
 def inbox_activity(row: dict, inbox: Path, caller: Caller) -> Iterator[Activity]:

@@ -39,11 +39,17 @@ board's done cards; close what the user approves.
   out (it does on some reads), and the last ⏺ reply, or the indented lines
   above the turn-end line when the ⏺ scrolled off, is the row's
   `orca_message` (`from: screen`).
-  It also reads the tabs of worktrees with a done or waiting agent, and
-  another Mac's shell tabs Orca lists without output: a permission selector
-  makes the row `waiting` with `prompt_waiting` (`tab`, `question`,
-  `choices`), a notice that a restart dropped background jobs adds a reason,
+  It also reads the tabs of worktrees with a done or waiting agent, the agent
+  tabs of worktrees Orca keeps no agent for, and another Mac's shell tabs Orca
+  lists without output: a permission selector or an AskUserQuestion selector
+  (`Enter to select`) makes the row `waiting` with `prompt_waiting` (`tab`,
+  `question`, `choices`) whatever verdict was saved, and its question is the
+  row's `question`; a notice that a restart dropped background jobs adds a reason,
   and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
+  A local row also reads the transcript of each Claude session running under
+  it (its `sessions/<pid>.json`, matched by the first of the process and its
+  ancestors whose cwd is inside the worktree), even after the session moved its
+  cwd elsewhere; among those it takes the transcript with the newest entry.
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
