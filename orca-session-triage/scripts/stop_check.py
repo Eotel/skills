@@ -54,9 +54,21 @@ def read_json(path):
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
 
 
-def question_decision(hook_input: dict[str, Any], orca: str,
+JAPANESE = ("HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
+            "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
+
+
+def in_japanese(question: dict[str, Any]) -> bool:
+    """Whether the question, its option labels, or their descriptions hold kana or kanji."""
+    texts = [question.get("question", ""), *(value for option in question.get("options") or []
+                                             for value in (option.get("label", ""), option.get("description", "")))]
+    return any(unicodedata.name(char, "").startswith(JAPANESE) for text in texts for char in text)
+
+
+def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
                       handoffs_dir: Path | None = None) -> dict[str, Any] | None:
-    """Deny an hourly workspace's question until it is in Japanese and its handoff was sent."""
+    """Deny an hourly workspace's question until each one is in Japanese and, while another tab is appointed
+    lead (hourly_state.py appoint-lead), until this run sent its handoff; with no lead the run asks itself."""
     if hook_input.get("tool_name") != "AskUserQuestion" or not hook_input.get("cwd"):
         return None
     workspace = hook_input["cwd"]
@@ -71,16 +83,12 @@ def question_decision(hook_input: dict[str, Any], orca: str,
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
-    texts = []
-    for question in questions:
-        texts.append(question.get("question", ""))
-        texts.extend(value for option in question.get("options") or []
-                     for value in (option.get("label", ""), option.get("description", "")))
     reasons = []
-    if not any(unicodedata.name(char, "").startswith((
-            "HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
-            "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")) for value in texts for char in value):
-        reasons.append("問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
+    if not all(in_japanese(question) for question in questions):
+        reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
+    state = read_json(state_dir / "hourly-state.json")
+    if not (isinstance(state, dict) and (state.get("lead") or {}).get("worktree")):
+        return deny(reasons)
     pane = os.environ.get("ORCA_PANE_KEY")
     started = next((run.get("startedAt") for run in runs
                     if pane and run.get("terminalPaneKey") == pane), None)
@@ -98,6 +106,10 @@ def question_decision(hook_input: dict[str, Any], orca: str,
             reasons.append("最後の引き継ぎはこの回の開始前です。質問の前に handoff.py send で引き継ぎを送ってください。")
     except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
         reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
+    return deny(reasons)
+
+
+def deny(reasons: list[str]) -> dict[str, Any] | None:
     if not reasons:
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -266,7 +278,7 @@ def main(handoffs_dir: Path | None = None) -> int:
         return 0
     orca = os.environ.get("ORCA_CLI_COMMAND", "orca")
     if hook_input.get("hook_event_name") == "PreToolUse":
-        decision = question_decision(hook_input, orca, handoffs_dir)
+        decision = question_decision(hook_input, orca, Path(STATE_DIR).expanduser(), handoffs_dir)
         if decision:
             json.dump(decision, sys.stdout, ensure_ascii=False)
         return 0

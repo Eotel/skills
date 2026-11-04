@@ -4735,8 +4735,7 @@ class StopCheckTests(unittest.TestCase):
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
             {"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current",
              "workspaceId": "repo1::/w/triage", "startedAt": 1793005200000}]})
-        sent = datetime.fromisoformat("2026-10-26T09:00:00+00:00")
-        stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], sent.isoformat(), 0).save(self.root, sent)
+        japanese = {"question": "公開しますか？", "options": [{"label": "公開", "description": "今日出します"}]}
         question = {"question": "Which option?", "header": "方針",
                     "options": [{"label": "Keep", "description": "Leave it as it is"}]}
         for field in (None, "description"):
@@ -4745,8 +4744,9 @@ class StopCheckTests(unittest.TestCase):
                 if field:
                     asked["options"][0][field] = "今のままにします"
                 hook = {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
-                        "cwd": "/w/triage", "tool_input": {"questions": [asked]}}
+                        "cwd": "/w/triage", "tool_input": {"questions": [japanese, asked]}}
                 with patch.dict(os.environ, {"ORCA_PANE_KEY": "current", "ORCA_CLI_COMMAND": orca}), \
+                        patch.object(stopcheck, "STATE_DIR", str(self.root)), \
                         patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), \
                         redirect_stdout(io.StringIO()) as out:
                     self.assertEqual(stopcheck.main(self.root), 0)
@@ -4767,18 +4767,23 @@ class StopCheckTests(unittest.TestCase):
         hook = {"tool_name": "AskUserQuestion", "session_id": "s1", "cwd": "/w/triage",
                 "tool_input": {"questions": [{"question": "どうしますか？",
                     "options": [{"label": "残す", "description": "今のままにします"}]}]}}
+        state = self.root / "state"
+        state.mkdir()
         with patch.dict(os.environ, {"ORCA_PANE_KEY": "current"}):
-            self.assertEqual(stopcheck.question_decision(hook, orca, self.root)["hookSpecificOutput"]
+            # With no lead appointed, the run asks the user itself.
+            self.assertIsNone(stopcheck.question_decision(hook, orca, state, self.root))
+            (state / "hourly-state.json").write_text(json.dumps({"lead": {"worktree": "/w/lead"}}))
+            self.assertEqual(stopcheck.question_decision(hook, orca, state, self.root)["hookSpecificOutput"]
                              ["permissionDecision"], "deny")
             for stamp in ("2026-10-26T08:59:59+00:00", "2026-10-26T09:00:00+00:00",
                           "2026-10-26T09:00:01+00:00"):
                 with self.subTest(stamp=stamp):
                     sent = datetime.fromisoformat(stamp)
                     stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], stamp, 0).save(self.root, sent)
-                    decision = stopcheck.question_decision(hook, orca, self.root)
+                    decision = stopcheck.question_decision(hook, orca, state, self.root)
                     self.assertEqual(decision is None, sent.hour >= 9)
-            self.assertIsNone(stopcheck.question_decision({**hook, "tool_name": "Bash"}, orca, self.root))
-            self.assertIsNone(stopcheck.question_decision({**hook, "cwd": "/w/other"}, orca, self.root))
+            self.assertIsNone(stopcheck.question_decision({**hook, "tool_name": "Bash"}, orca, state, self.root))
+            self.assertIsNone(stopcheck.question_decision({**hook, "cwd": "/w/other"}, orca, state, self.root))
 
     def test_hourly_question_hook_uses_session_start_when_the_run_has_no_pane(self) -> None:
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
@@ -4790,13 +4795,14 @@ class StopCheckTests(unittest.TestCase):
         hook = {"tool_name": "AskUserQuestion", "session_id": "s1", "cwd": "/w/triage",
                 "tool_input": {"questions": [{"question": "保存しますか？",
                     "options": [{"label": "保存", "description": "ファイルを保存します"}]}]}}
+        (config / "hourly-state.json").write_text(json.dumps({"lead": {"worktree": "/w/lead"}}))
         with patch.dict(os.environ, {"ORCA_PANE_KEY": "current", "CLAUDE_CONFIG_DIR": str(config),
                                      "CLAUDE_PID": "123"}):
             for stamp in ("2026-10-26T08:59:59+00:00", "2026-10-26T09:00:00+00:00"):
                 with self.subTest(stamp=stamp):
                     sent = datetime.fromisoformat(stamp)
                     stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], stamp, 0).save(self.root, sent)
-                    decision = stopcheck.question_decision(hook, orca, self.root)
+                    decision = stopcheck.question_decision(hook, orca, config, self.root)
                     self.assertEqual(decision is None, sent.hour == 9)
 
     def test_blocks_while_queued_rows_are_not_classed(self):

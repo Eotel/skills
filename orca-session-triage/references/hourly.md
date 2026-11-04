@@ -80,9 +80,11 @@ session's transcript. The external retrospective service skips a session the
 run's own forked retrospective already recorded and reviews one it did not.
 See `references/retro.md` for both and for reviewing their proposals.
 Before AskUserQuestion in the hourly workspace, a PreToolUse hook in the same
-script refuses a question whose text, options and descriptions hold no kana or
-kanji, and one asked before this run sent its handoff (`handoff.py last` older
-than the run's start): a question stops the turn, so send the handoff first.
+script refuses the call when any question's text, options and descriptions hold
+no kana or kanji. While another tab is appointed lead (`hourly_state.py
+appoint-lead`), it also refuses a question asked before this run sent its
+handoff (`handoff.py last` older than the run's start): a question stops the
+turn, so send the handoff first. With no lead, the run asks the user itself.
 
 ## In the run
 
