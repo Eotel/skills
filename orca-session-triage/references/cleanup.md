@@ -7,6 +7,9 @@ and report it afterwards.
 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」
 The scan marks these rows `open_pr_cleanup: true`, except a row whose Orca
 comment contains 「消さない」 or 「残す」: its reasons quote the comment instead.
+A HEAD commit or review-pr log (`~/.cache/orca-briefs/review/out/<owner>-<repo>-<PR>.log`) under
+thirty minutes old also keeps it, with the reason 「別の担当が使用中（時刻）」: another lane works there
+without an agent in its tabs.
 HEAD matching the PR head proves it was pushed to that PR; `git.unpushed` may
 still be positive when the branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
 them, even when their class is `waiting` or a readable shell tab remains. Relay

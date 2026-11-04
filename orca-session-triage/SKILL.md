@@ -29,7 +29,8 @@ board's done cards; close what the user approves.
   `--pr-cache`, `~/.cache/orca-session-triage/pr-activity/`).
   `open_pr_cleanup` marks a checkout with no current agent, no local changes,
   and HEAD at its open PR head for removal without asking, unless its Orca
-  comment contains 「消さない」 or 「残す」; a historical
+  comment contains 「消さない」 or 「残す」, or its HEAD commit or review-pr log is
+  under thirty minutes old (reason 「別の担当が使用中（時刻）」); a historical
   transcript's question still gets its usual class and must be relayed.
   It reads the paired Orca environments listed by this Mac. A remote row
   carries `environment` and uses Orca's last agent message when its transcript
