@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from functools import partial
+import hashlib
 import importlib.util
 import http.client
 import io
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,7 @@ inbox_read = load_script("inbox_read")
 cleanup_hourly = load_script("cleanup_hourly_tabs")
 hourly_runs = load_script("hourly_runs")
 inbox_alert = load_script("inbox_alert")
+close_tabs = importlib.import_module("close_tabs")
 
 
 def write_jsonl(path, rows):
@@ -1541,6 +1544,7 @@ class ScanCommandTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         # A host's real Jev key and verdict store must never reach a test run.
         for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": "",
+                                                "TRIAGE_REVIEW_DIR": str(self.dir / "reviews"),
                                                 "TRIAGE_ASK_ANSWERS": str(self.dir / "no-answers.jsonl")}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
@@ -1630,11 +1634,29 @@ class ScanCommandTests(unittest.TestCase):
 
         self.assertEqual(out.getvalue().splitlines(), [
             "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T01:00:00Z"
-            " | PR #10 を merge するか",
-            f"dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました",
-            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか",
-            "mbp16::fix-login | working | - | tabs 0 | - | ",
+            " | PR #10 を merge するか | reasons final message | git.dirty null | git.unpushed null",
+            "dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました"
+            " | reasons - | git.dirty null | git.unpushed null",
+            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか"
+            " | reasons - | git.dirty null | git.unpushed null",
+            "mbp16::fix-login | working | - | tabs 0 | - | "
+            " | reasons - | git.dirty null | git.unpushed null",
         ])
+
+    def test_rows_class_filter_uses_the_verdict_and_keeps_dirty_and_unpushed_values(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        rows[0]["git"].update({"dirty": 0, "unpushed": 0})
+        rows[2]["git"] = {"dirty": 2, "unpushed": 3}
+        rows[2]["reasons"] = ["a question\non screen", "needs a reply"]
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rows", "--class", "waiting"]), 0)
+
+        lines = out.getvalue().splitlines()
+        self.assertEqual([line.split(" | ")[0] for line in lines], ["fix-login", "mbp16::app"])
+        self.assertIn("git.dirty 0 | git.unpushed 0", lines[0])
+        self.assertIn("reasons a question on screen; needs a reply | git.dirty 2 | git.unpushed 3", lines[1])
 
     def test_cards_print_each_done_card_and_tab_on_its_own_line_named_by_the_worktree(self) -> None:
         saved, _ = self.saved_scan()
@@ -1693,6 +1715,12 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T02:00:00Z",
                                         "text": "設定を反映しました"})
         self.assertEqual(row["last_user"], "設定を反映して")
+        self.assertEqual(row["transcripts"], {"claude": [], "codex": []})
+        with redirect_stdout(io.StringIO()) as help_text, self.assertRaises(SystemExit) as stopped:
+            scan.parse_args(["--help"])
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertTrue(set(row).issubset(set(re.findall(r"\b\w+\b", help_text.getvalue()))))
+        self.assertNotIn("row_identity", row)
 
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
@@ -1705,6 +1733,107 @@ class ScanCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
             self.assertEqual(scan.main(["--from", str(saved), "--row", "nothing"]), 1)
         self.assertIn("nothing", err.getvalue())
+        self.assertIn("mbp16::app", err.getvalue())
+
+    def test_row_accepts_summary_names_and_unique_remote_names_and_lists_ambiguous_candidates(self) -> None:
+        saved, checkout = self.saved_scan()
+        for name, path, environment in (("dotfiles/dotfiles-73", str(checkout), ""),
+                                         ("app", "/remote/w/app", "mbp16"),
+                                         ("mbp16::app/fix-login", "/w/app/fix-login", "mbp16")):
+            with self.subTest(name=name), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--row", name]), 0)
+                shown = json.loads(out.getvalue())
+                self.assertEqual((shown["path"], shown["environment"]), (path, environment))
+        for name in ("fix-login", "app/fix-login"):
+            with self.subTest(name=name), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(scan.main(["--from", str(saved), "--row", name]), 1)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn("mbp16::fix-login", err.getvalue())
+                self.assertIn("candidates:", err.getvalue())
+
+    def test_row_lists_both_agents_transcript_paths(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        claude = self.dir / "claude.jsonl"
+        rollouts = [self.dir / "rollout-1.jsonl", self.dir / "rollout-2.jsonl"]
+        rows[0]["claude"]["transcript"] = str(claude)
+        rows[0]["codex"] = [{"rollout": str(path)} for path in rollouts]
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["transcripts"],
+                         {"claude": [str(claude)], "codex": [str(path) for path in rollouts]})
+
+    def test_row_shows_the_completed_pr_review_beside_the_merge_question(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        rows[0]["pr"]["head_oid"] = "abcdef123" + "0" * 31
+        saved.write_text(json.dumps(rows))
+        directory = self.dir / "reviews"
+        directory.mkdir()
+        review = directory / "Eotel-app-10.md"
+        stamp = review.with_suffix(".reviewed.json")
+        verdicts = ["**判定：merge 可（Approve）**", "**直してから（Request changes）**。対象 head abcdef123"]
+        for verdict in verdicts:
+            for head in ("abcdef123", "987654321"):
+                with self.subTest(verdict=verdict, head=head):
+                    review.write_text("\n\n" + verdict + "\n\n本文\n")
+                    stamp.write_text(json.dumps({"head": head, "kind": "cloud",
+                                                 "sha256": hashlib.sha256(review.read_bytes()).hexdigest()}))
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
+                    row = json.loads(out.getvalue())
+                    self.assertTrue(row["merge_question"])
+                    self.assertEqual(row["review"], {"head": head, "verdict": verdict, "path": str(review),
+                                                     "head_matches": head == "abcdef123",
+                                                     "changes_requested": head == "abcdef123" and "直してから" in verdict})
+
+        rows[0]["linked_pr"] = rows[0].pop("pr")
+        rows[0]["linked_pr"].pop("head_oid")
+        rows[0].pop("verdict")
+        rows[0]["comment"] = "要判断: PR #10をmergeするか"
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
+        row = json.loads(out.getvalue())
+        self.assertTrue(row["merge_question"])
+        self.assertIsNone(row["review"]["head_matches"])
+        self.assertFalse(row["review"]["changes_requested"])
+
+        review.write_text("**判定：直してから（Request changes）**\n書きかけ")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
+        self.assertIsNone(json.loads(out.getvalue())["review"])
+
+    def test_cleanup_views_print_rm_specs_and_executable_rm_checks_using_verdicts_by_path(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        rows[0]["open_pr_cleanup"] = True
+        rows[1]["class"] = "unsure"
+        rows[1]["meaningful_tabs"] = ["keep"]
+        rows[2]["class"] = "finished"
+        rows[2]["meaningful_tabs"] = []
+        rows[3]["class"] = "unsure"
+        rows[3]["orca_message"] = {"text": "finished on another Mac", "at": "2026-10-27T04:00:00Z"}
+        rows[3]["linked_pr"] = {"number": 12}
+        rows[3]["meaningful_tabs"] = []
+        saved.write_text(json.dumps(rows))
+        store = Path(scan.VERDICTS_FILE)
+        store.write_text(json.dumps({
+            rows[1]["path"]: {"class": "finished", "read": scan.read_key(rows[1])},
+            scan.row_identity(rows[3]): {"class": "finished", "read": scan.read_key(rows[3])}}))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/fix-login 10", "/remote/w/app -", "/w/app/fix-login 12"])
+
+        for view in ("--summary", "--cards"):
+            with self.subTest(view=view), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), view]), 0)
+                for row in rows:
+                    expected = ["python3", str(SCRIPTS / "rm_check.py"), "--worktree", row["path"]]
+                    if number := (row.get("pr") or row.get("linked_pr") or {}).get("number"):
+                        expected += ["--pr", str(number)]
+                    self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
         local = {"worktrees": [worktree("/local/w", "done")],
@@ -1847,6 +1976,28 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(written["rows"][0]["claude"]["final_text"], "PR を出しました。")
         self.assertTrue(written["generated_at"])
 
+    def test_only_scans_one_worktree_and_queues_it_even_when_working(self) -> None:
+        selected, other = "/w/selected", "/w/other"
+        ps, terms = self.dir / "ps.json", self.dir / "terms.json"
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree(selected, "working"),
+                                                           worktree(other, "done")]}}))
+        terms.write_text(json.dumps({"result": {"terminals": [terminal(selected, "claude", "selected_tab"),
+                                                               terminal(other, "claude", "other_tab")]}}))
+        projects = self.dir / "claude"
+        write_jsonl(scan.claude_project_dir(projects, selected) / "s.jsonl",
+                    [user("go"), {**assistant(text("working")), "timestamp": "2026-10-27T01:00:00Z"}])
+        queue = self.dir / "triage" / "review-queue.json"
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms),
+                                        "--claude-projects", str(projects), "--codex-sessions", str(self.dir / "none"),
+                                        "--only", "app/selected", "--review-out", str(queue)]), 0)
+
+        rows = json.loads(out.getvalue())
+        self.assertEqual([(row["path"], row["class"]) for row in rows], [(selected, "working")])
+        self.assertEqual([tab["handle"] for tab in rows[0]["terminals"]], ["selected_tab"])
+        self.assertEqual([(row["path"], row["class"]) for row in json.loads(queue.read_text())["rows"]],
+                         [(selected, "working")])
+
     def test_summary_lists_review_rows_and_finished_worktree_tabs(self):
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [
@@ -1983,6 +2134,49 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(scan.jev_key({}, key), "from-file")
         self.assertIsNone(scan.jev_key({}, self.dir / "missing"))
         self.assertIsNone(scan.jev_key({}, garbled))
+
+
+class CloseTabsRowCommandTests(unittest.TestCase):
+    def test_rows_combine_all_handles_and_keep_a_row_that_moved_after_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saved = root / "scan.json"
+            saved.write_text(json.dumps([
+                {"path": "/w/idle", "repo": "app", "scanned_at": "2026-10-27T01:00:00Z",
+                 "terminals": [], "closable": ["shell", "card"], "meaningful_tabs": ["agent", "(no handle) sleeping"],
+                 "done_cards": [{"handle": "card"}, {"handle": "card_only"}, {"handle": None}]},
+                {"path": "/w/moved", "repo": "app", "scanned_at": "2026-10-27T01:00:00Z",
+                 "terminals": [{"handle": "keep"}], "closable": ["keep"]},
+                {"path": "/remote/idle", "repo": "app", "environment": "mbp16",
+                 "scanned_at": "2026-10-27T01:00:00Z", "terminals": [], "meaningful_tabs": ["shell"]},
+            ]))
+            closed: list[tuple[str | None, str]] = []
+
+            def orca(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                environment = argv[argv.index("--environment") + 1] if "--environment" in argv else None
+                if argv[1:3] == ["worktree", "ps"]:
+                    stamp = scan.parse_time("2026-10-27T01:01:00Z").timestamp() * 1000
+                    result = {"worktrees": [{"path": "/w/moved", "agents": [{"stateStartedAt": stamp}]}]}
+                else:
+                    self.assertEqual(argv[1:3], ["terminal", "close"])
+                    closed.append((environment, argv[argv.index("--terminal") + 1]))
+                    result = {}
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"result": result}), "")
+
+            with patch.object(close_tabs.subprocess, "run", side_effect=orca), redirect_stdout(io.StringIO()) as out:
+                code = close_tabs.main(["--from", str(saved), "--claude-projects", str(root / "projects"),
+                                        "--inbox", str(root / "inbox"), "--row", "/w/idle",
+                                        "--row", "mbp16::idle", "--row", "app/moved"])
+
+            self.assertEqual(code, 1)
+            self.assertEqual(closed, [(None, "shell"), (None, "card"), (None, "agent"), (None, "card_only"),
+                                      ("mbp16", "shell")])
+            self.assertIn("keep: KEPT", out.getvalue())
+
+            with patch.object(close_tabs.subprocess, "run", side_effect=AssertionError("must not close")), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(close_tabs.main(["--from", str(saved), "--row", "/w/idle", "--row", "idle"]), 1)
+            self.assertIn("mbp16::idle", err.getvalue())
 
 
 def git(cwd, *args):
