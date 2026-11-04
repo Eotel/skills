@@ -36,8 +36,10 @@ Mac) reads with
 on both `read` and `ack`. When appointing a lead, hand over the unresolved
 decisions first, then initialize that cursor once with the same environment
 variable and `scripts/inbox_read.py initialize`. The command refuses to replace
-an existing cursor; never reset it to skip unread entries. Neither tab
-advances the other's cursor. Both see every
+an existing cursor; never reset it to skip unread entries. Record the appointed
+worktree with `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_state.py
+appoint-lead --worktree <the lead's worktree>`.
+Neither tab advances the other's cursor. Both see every
 entry, but the lead owns answers to `ask` and directions to lanes. The hourly
 run uses `info` and `done` for its sweep and sends unanswered `ask` entries
 from other lanes to the lead in one handoff. It does not reforward its own
@@ -318,7 +320,10 @@ orca automations create --name "session triage" --trigger hourly \
   `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_runs.py` lists
   the workspace's scheduled runs, newest first: scheduled and start time,
   status, the precheck's reason for a skipped run, the tab pane, and the
-  Claude transcript (`--json` for a list). Read runs and their transcripts
+  Claude transcript (`--json` for a list). `--tail` adds each run's last
+  utterance and whether an AskUserQuestion still has no result; `--questions`
+  adds each AskUserQuestion with its answer and times, so a run cut short
+  leaves its answers to the next. Read runs and their transcripts
   through it rather than from the automation's JSON or a shell loop over
   transcript paths, which contain spaces. A manual `orca automations run`
   does not run the precheck.

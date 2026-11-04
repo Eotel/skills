@@ -21,8 +21,9 @@ For `asked --decision`, use the same subject and action across runs, such as
 | Decision | Before moving on |
 | --- | --- |
 | User says to leave a row | `leave --row ROW --final-message-file MESSAGE_FILE`. On later runs, `left-now --row ROW --final-message-file MESSAGE_FILE` exits 0 while the stored final message exactly matches; exit 1 makes it eligible again. |
-| Ask a question | Check `show` for the same decision, including a differently worded version. If already recorded, do not ask it again; check whether its answer still applies. Otherwise record with `asked --row ROW --decision SUBJECT_AND_ACTION --final-message-file MESSAGE_FILE --question-file QUESTION_FILE` **immediately before** AskUserQuestion and keep its returned `id`. The script records the Orca pane that asked, so another run can leave that tab open while closing unrelated idle tabs. If presenting it fails, resolve that failed delivery before another run treats it as asked. |
-| User answers | Record the exact answer with `answered --id ID --answer-file ANSWER_FILE` before relaying it or acting on it. A pending question has `answer: null`; the old tab stays open, but the next hourly run continues with other rows and does not repeat that question. If the answer arrived in another tab, relay it to the waiting tab and mark it answered before closing that tab. |
+| Ask a question | Check `show` for the same decision, including a differently worded version. If already recorded, do not ask it again; check whether its answer still applies. Otherwise record with `asked --row ROW --decision SUBJECT_AND_ACTION --final-message-file MESSAGE_FILE --question-file QUESTION_FILE` **immediately before** AskUserQuestion and keep its returned `id`. Add `--covers KEY` per lead decision key the question settles. The script records the Orca pane that asked, so another run can leave that tab open while closing unrelated idle tabs. When every `#number` in the question is CLOSED in the row's origin, it records nothing and prints the evidence. If presenting it fails, resolve that failed delivery before another run treats it as asked. |
+| User answers | Record the exact answer with `answered --id ID --answer-file ANSWER_FILE` before relaying it or acting on it. It records the tab (or worktree) that recorded it; a different answer already recorded is refused with that answer, its time, and the tab. A pending question has `answer: null`; the old tab stays open, but the next hourly run continues with other rows and does not repeat that question. If the answer arrived in another tab, relay it to the waiting tab and mark it answered before closing that tab. |
+| Nothing will answer it | `withdraw --id ID --reason-file FILE` closes a question no answer will settle, keeping the reason and time; it is not the user's answer. |
 | User promises “when A settles, give B the task” | Record `promise --from-row A --to-row B --condition CONDITION --task TASK`. Every run checks undelivered promises against the latest A result. When the condition holds, send B the task as the Boundary permits. Record `delivered --id ID --delivery queued` or `--delivery turn_started` once that delivery is confirmed. |
 
 ## User requests and their symptoms
@@ -84,17 +85,23 @@ test, or merged PR alone is not evidence that the symptom disappeared.
 ## Questions left in front of no one
 
 After the scan, run `stale-asks --from SCAN_JSON --asked-in <the lead's
-worktree> --asked-in <the triage workspace>`. It reads no state: it sets each
-`waiting` row (the verdict's class, else the scan's) against its lane's inbox
+worktree> --asked-in <the triage workspace>`; without `--asked-in` it reads the
+worktree `appoint-lead` recorded. It leaves out the calling tab's own row and a
+left row whose final message is unchanged. It reads shared state and sets each
+eligible `waiting` row (the verdict's class, else the scan's), each row blocked on Miura,
+and each row named by an unanswered handed-off ask key against its lane's inbox
 reports and the answers `scripts/answer_evidence.py` finds (the lead's latest
-decision per key, AskUserQuestion answers in those worktrees' transcripts, and
-`send --decision`), and prints them longest waiting first with `since` and
-`age_minutes`. An answer proves an ask only when it names the ask's id, quotes
-each of its structured questions, or was delivered to it; one naming only the
-lane or a PR number of the ask is listed in `candidates` for you to check.
+decision per key, AskUserQuestion answers and ordinary user messages in those
+worktrees' transcripts, and `send --decision`), and prints them longest waiting first with `since` and
+`age_minutes`. An answer proves only the ask named by its decision key, or,
+without such a key, one whose id it names, whose structured questions it quotes
+in full, or to which it was delivered; one naming only the
+lane or a PR number of the ask, or a user message containing a word from the
+question, is listed in `candidates` for you to check.
 
 - `unanswered`: an ask of the lane that is open, or was sent in its last turn,
-  has no proof. `ask.marked: true` means it was marked answered anyway and
+  has no proof, or its handed-off key is still unanswered. `ask.marked: true`
+  means it was marked answered anyway and
   left `open-asks`: check `candidates`, then ask it again or record the answer.
 - `stopped_after_answer`: an answer came after the lane's last message and the
   lane has not spoken since. Relay `answer` (the newest) to the lane.
@@ -104,10 +111,17 @@ lane or a PR number of the ask is listed in `candidates` for you to check.
   settled it. Put the question in front of the user or the lead.
 
 `show` retains full final messages, asked times, answers, handoff terms, and
-requests with their owners and closure evidence. `pending` lists only what is
+requests with their owners and closure evidence. `pending` lists what is
 still open (unanswered questions, undelivered handoffs, open requests, and left
-rows), each as a list entry carrying its `id` (`row` for a left row); read the
-open items with it rather than walking `show`'s dictionaries by hand. It
+rows), plus settled questions with evidence and unrecorded transcript answers,
+each as a list entry carrying its `id` (`row` for a left row); read the
+open items with it rather than walking `show`'s dictionaries by hand, and
+`get --id ID` for one entry. A question is settled when it was withdrawn, every
+`--covers` key has a lead answer after it was asked, or every `#number` in it is
+CLOSED; an unanswered one lists the answers to the same question found in the
+recorded worktrees' transcripts as `unrecorded_answers`. `pending --summary` and
+`stale-asks --summary` print one line per item: name, state, since,
+age_minutes, the ask id (or the entry's id), and the question's start. It
 does not infer a user's answer from a tab closing or from a later verdict.
 Consult the actual answer and update the state. A waiting tab is not an
 invitation to ask the same question in the new session.
