@@ -3821,7 +3821,7 @@ class HourlyStateTests(unittest.TestCase):
             "github": "acme/app", "pr": {"number": 12, "url": "https://github.com/acme/app/pull/12",
                                           "head_oid": "abc123def4567"},
             "claude": {"last_user_at": "2026-10-28T00:10:00Z", "final_at": "2026-10-28T00:19:00Z",
-                       "final_text": "PR #12 を merge してよいですか"},
+                       "final_text": "直した内容です。" * 30 + "PR #12 を merge してよいですか"},
             "terminals": [{"handle": "term_app", "agent": "claude"}]}]))
 
         with patch.dict(os.environ, {"TRIAGE_REVIEW_DIR": str(review_dir)}):

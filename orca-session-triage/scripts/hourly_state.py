@@ -317,7 +317,6 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     lead may ask the user a waiting row's question itself.
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
-    comments: dict[str, str] = {}
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
     shared = answer_evidence.shared_questions(entries)
     for row in rows:
@@ -345,9 +344,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
-        comments[identity] = row.get("comment") or ""
+        comment = row.get("comment") or ""
+        question = row_question(row, final)
         view = {"row": identity, "name": scan_sessions.row_name(row),
-                "question": excerpt(row_question(row, final)),
+                "question": excerpt(question), "merge_question": scan_sessions.asks_merge(question, comment),
                 "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         if blocked_by_user(row):
@@ -361,9 +361,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             for asked_at, ask in unanswered:
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
+                asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
-                    "question": excerpt("\n".join(answer_evidence.questions_of(ask)) or ask.get("text")) or view["question"],
+                    "question": excerpt(asked) or view["question"],
+                    "merge_question": scan_sessions.asks_merge(asked or question, comment),
                     "decisions": keys.get(ask["id"], []),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
@@ -373,9 +375,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if later:
             first = min(answer.at for answer, _ in later)
             answer, ask = max(later, key=lambda pair: pair[0].at)
+            asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
             found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
-                                  "question": excerpt("\n".join(answer_evidence.questions_of(ask)) or ask.get("text"))
-                                              or view["question"],
+                                  "question": excerpt(asked) or view["question"],
+                                  "merge_question": scan_sessions.asks_merge(asked or question, comment),
                                   "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                                   "answer": answer_view(answer)}))
             continue
@@ -390,7 +393,6 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                               "choices_in_info": choices}))
     found.sort(key=itemgetter(0))
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60),
-             "merge_question": scan_sessions.asks_merge(item["question"], comments[item["row"]]),
              **({"answer_age_minutes": int((now - scan_sessions.parse_time(item["answer"]["at"])).total_seconds() // 60)}
                 if item["answer"] else {})} for at, item in found]
 
