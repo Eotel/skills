@@ -159,7 +159,10 @@ def lead_details(projects: Path, worktree: str, orca: str) -> dict[str, object]:
     queued = []
     if claude:
         transcript = Path(claude["transcript"])
-        for entry in scan_sessions.load_jsonl(transcript):
+        entries = scan_sessions.load_jsonl(transcript)
+        # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
+        last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
+        for entry in entries[last + 1:]:
             content = scan_sessions.message_of(entry).get("content")
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):

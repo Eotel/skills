@@ -3590,6 +3590,8 @@ class HandoffProposalTests(unittest.TestCase):
         question = {"questions": [{"question": "Merge?", "options": [{"label": "Yes"}, {"label": "Wait"}]}]}
         write_jsonl(self.projects / "-w-lead" / "old.jsonl", [assistant(text("old"))])
         write_jsonl(self.projects / "-w-lead" / "new.jsonl", [
+            # A question the user moved on from is not pending any more.
+            assistant({"type": "tool_use", "id": "abandoned", "name": "AskUserQuestion", "input": question}),
             user("go"), {**assistant(text("latest")), "timestamp": "2026-10-01T01:00:00Z"},
             assistant({"type": "tool_use", "id": "answered", "name": "AskUserQuestion", "input": question}),
             user([{"type": "tool_result", "tool_use_id": "answered", "content": "yes"}]),
