@@ -2,7 +2,7 @@
 """Read new triage inbox lines by append position, then acknowledge handled lines.
 
 `read` does not advance the cursor. After handling its output, pass the printed
-byte position to `ack`; only a read without --kind, --source, or --id prints it,
+byte position to `ack`; only a read without --kind, --source, --id, or --since prints it,
 so an entry a filter hid is never acknowledged. `initialize` starts a new cursor
 at the current end only after the lead has handled all existing inbox entries.
 `watch` is the lead's Monitor: it prints every new ask and done, advances its own
@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 from itertools import takewhile
 import json
@@ -42,7 +42,6 @@ import hourly_runtime
 ReportKind = Literal["ask", "done", "info"]
 REPORT_KINDS: frozenset[str] = frozenset(("ask", "done", "info"))
 WATCHED_KINDS = frozenset(("ask", "done"))
-CURSOR_ACTIONS = frozenset(("read", "ack", "watch"))
 ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
 REMIND_AFTER_MINUTES = 15
 ID_PREFIX_MIN = 8
@@ -89,10 +88,12 @@ class ReadOptions:
     source: str | None = None
     summary: bool = False
     ids: frozenset[str] | None = None
+    since: datetime | None = None
 
     @property
     def filtered(self) -> bool:
-        return self.kinds is not None or self.source is not None or self.ids is not None
+        return (self.kinds is not None or self.source is not None or self.ids is not None
+                or self.since is not None)
 
 
 def report_kinds(value: str) -> frozenset[ReportKind]:
@@ -107,6 +108,20 @@ def entry_ids(value: str) -> frozenset[str]:
     if "" in ids:
         raise argparse.ArgumentTypeError("--id must be comma-separated entry ids")
     return ids
+
+
+def since_time(value: str) -> datetime:
+    """An ISO time or the most recent local HH:MM, as `inbox --since` accepts."""
+    now = datetime.now().astimezone()
+    try:
+        if len(value) == 5 and value[2] == ":":
+            hour, minute = (int(part) for part in value.split(":"))
+            when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return when - timedelta(days=1) if when > now else when
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return when if when.tzinfo else when.astimezone()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--since must be HH:MM or an ISO time") from exc
 
 
 def paths() -> tuple[Path, Path]:
@@ -177,13 +192,19 @@ def entry_header(item: dict) -> str:
 
 def shown_by_filters(item: dict, options: ReadOptions) -> bool:
     return ((options.kinds is None or item.get("kind") in options.kinds)
-            and (options.source is None or source_of(item) == options.source))
+            and (options.source is None or source_of(item) == options.source)
+            and (options.since is None or (when := asked_at(item)) is not None and when >= options.since))
 
 
 def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
-    """Print the entries after the cursor."""
-    start, data, complete = pending_bytes(inbox, cursor)
+    """Print entries after the cursor, or since a time regardless of the cursor."""
+    if options.since is None:
+        start, data, complete = pending_bytes(inbox, cursor)
+    else:
+        start, data = 0, inbox.read_bytes()
+        complete = complete_end(data)
     end = start + complete
+    shown = 0
     for raw in data[:end - start].splitlines():
         try:
             item = json.loads(raw)
@@ -191,17 +212,26 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
                 continue
             if options.summary:
                 print(summary_line(item))
+                shown += 1
                 continue
             body = full_text(item)
             if options.brief and item.get("kind") == "info":
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
             print(f"{entry_header(item)}\n{body}\n")
+            shown += 1
         except (ValueError, TypeError, AttributeError):
             if not options.filtered:
                 print(raw.decode("utf-8", "replace"))
+    if not shown and (options.kinds is not None or options.source is not None):
+        earlier = [item for raw in inbox.read_bytes()[:start].splitlines()
+                   if (item := entry(raw)) is not None and shown_by_filters(item, options)]
+        latest = max(reversed(earlier), key=lambda item: asked_at(item) or datetime.min.replace(tzinfo=timezone.utc),
+                     default={})
+        print(f"inbox-read: no matching entries after the cursor; before the cursor: {len(earlier)} matching entries; "
+              f"latest id={latest.get('id') or '-'} ts={latest.get('ts') or '-'}", file=sys.stderr)
     if options.filtered:
-        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind or --source "
+        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, --id, or --since "
               "to acknowledge", file=sys.stderr)
     else:
         print(f"NEXT_OFFSET={end}")
@@ -287,12 +317,18 @@ def questions_of(item: dict) -> list:
     return questions if isinstance(questions, list) else []
 
 
+def is_handoff(item: dict) -> bool:
+    """The facts separator handoff.py adds to every handoff, even without a session signature."""
+    return "—— 送る直前に道具が足した事実 ——" in str(item.get("text") or "").splitlines()
+
+
 def open_asks(entries: list[dict], answered: frozenset[str]) -> list[OpenAsk]:
-    """Asks with an id that no answer covers, oldest first. An answer to `<id>` covers the ask; answers
+    """Asks with an id that no answer covers, oldest first, leaving handoffs to lead_decisions.
+    An answer to `<id>` covers the ask; answers
     to every `<id>:<n>` cover an ask with structured questions."""
     found = []
     for item in entries:
-        if item.get("kind") != "ask" or not item.get("id") or item["id"] in answered:
+        if item.get("kind") != "ask" or not item.get("id") or item["id"] in answered or is_handoff(item):
             continue
         questions = questions_of(item)
         left = tuple(number for number in range(1, len(questions) + 1) if f"{item['id']}:{number}" not in answered)
@@ -339,7 +375,8 @@ def open_ask_view(ask: OpenAsk, now: datetime) -> dict:
     report = ask.report
     return {"id": report["id"], "ts": report.get("ts") or "", "host": report.get("host") or "",
             "source": source_of(report), "handle": report.get("handle") or "", "text": report.get("text") or "",
-            "open_questions": list(ask.open_questions), "age_minutes": minutes_since(ask.at, now)}
+            "open_questions": [{**questions_of(report)[number - 1], "number": number} for number in ask.open_questions],
+            "age_minutes": minutes_since(ask.at, now)}
 
 
 def pending_questions(asks: list[OpenAsk]) -> list[PendingQuestion]:
@@ -449,10 +486,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest="action", required=True)
     read_command = actions.add_parser("read", help="show complete new lines without changing the cursor; "
-                                                   "NEXT_OFFSET only without --kind, --source, and --id")
+                                                   "NEXT_OFFSET only without --kind, --source, --id, and --since")
     read_command.add_argument("--brief", action="store_true", help="show only the first 160 characters of info")
     read_command.add_argument("--kind", type=report_kinds, help="filter by comma-separated ask,done,info")
     read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries)")
+    read_command.add_argument("--since", type=since_time, metavar="HH:MM|ISO",
+                              help="read entries at or after this time, including acknowledged ones; "
+                                   "HH:MM means its most recent local occurrence; prints no NEXT_OFFSET")
     read_command.add_argument("--summary", action="store_true",
                               help="show one line per entry with its id and a 160-character excerpt")
     read_command.add_argument("--id", type=entry_ids, dest="ids",
@@ -470,7 +510,8 @@ def main(argv: list[str] | None = None) -> int:
                                                         "line each after `unanswered <n> min:`")
     open_command.add_argument("--json", action="store_true",
                               help="print a JSON list of {id, ts, host, source, handle, text, open_questions, "
-                                   "age_minutes} instead")
+                                   "age_minutes} instead; open_questions holds each unanswered question's "
+                                   "number, header, question, options, and recommended")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
                                                    "or no longer asked); send --decision --ask records its own")
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
@@ -493,12 +534,14 @@ def main(argv: list[str] | None = None) -> int:
         # watch skips info as it advances: on the scheduled run's cursor it would hide them from that run.
         if args.action == "watch" and not os.environ.get("TRIAGE_READ_OFFSET"):
             raise ValueError("watch needs a cursor of its own: set TRIAGE_READ_OFFSET")
-        if (args.action in CURSOR_ACTIONS and not os.environ.get("TRIAGE_READ_OFFSET") and
+        if (args.action == "ack" and not os.environ.get("TRIAGE_READ_OFFSET") and
                 not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
-            raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab")
+            raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab; read without "
+                             "it: ~/.cache/orca-briefs/bin/inbox --since HH:MM --wt NAME (HH:MM: when this run "
+                             "began; NAME: the worktree whose reports to read), or read --since HH:MM")
         if args.action == "read":
             options = ReadOptions(brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary,
-                                  ids=args.ids)
+                                  ids=args.ids, since=args.since)
             (read_ids if args.ids else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":
