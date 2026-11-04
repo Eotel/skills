@@ -60,8 +60,9 @@ board's done cards; close what the user approves.
   needs no `ENVIRONMENT::`), the path, or the row identity; with no single
   match it lists candidates on stderr and exits 1. `--from SCAN_JSON` reads a saved scan
   instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
-  `rm-check-batch`: open PR cleanup rows and finished rows without meaningful
-  tabs. `--only NAME` scans one worktree and queues it in `--review-out` even
+  `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
+  meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
+  commands). `--only NAME` scans one worktree and queues it in `--review-out` even
   when it would not need a careful read. Read rows through these rather than parsing the
   scan's JSON by hand. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)

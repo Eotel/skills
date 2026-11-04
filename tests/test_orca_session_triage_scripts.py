@@ -1822,18 +1822,21 @@ class ScanCommandTests(unittest.TestCase):
         store.write_text(json.dumps({
             rows[1]["path"]: {"class": "finished", "read": scan.read_key(rows[1])},
             scan.row_identity(rows[3]): {"class": "finished", "read": scan.read_key(rows[3])}}))
-        with redirect_stdout(io.StringIO()) as out:
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
             self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
-        self.assertEqual(out.getvalue().splitlines(), ["/w/app/fix-login 10", "/remote/w/app -", "/w/app/fix-login 12"])
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/fix-login 10"])
+        self.assertIn("2 rows on another Mac left out", err.getvalue())
 
         for view in ("--summary", "--cards"):
             with self.subTest(view=view), redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
                 for row in rows:
-                    expected = ["python3", str(SCRIPTS / "rm_check.py"), "--worktree", row["path"]]
-                    if number := (row.get("pr") or row.get("linked_pr") or {}).get("number"):
-                        expected += ["--pr", str(number)]
-                    expected += ["--from", str(saved.absolute())]
+                    number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
+                    if row.get("environment"):
+                        expected = [str(scan.RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {number or '-'}"]
+                    else:
+                        expected = ["python3", str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
+                                    *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):

@@ -1737,8 +1737,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
                             "or " + REVIEW_DIR)
     views.add_argument("--rm-specs", action="store_true",
-                       help="with --from, print <path> <PR|-> for open_pr_cleanup rows and finished rows "
-                            "without meaningful tabs, for rm-check-batch")
+                       help="with --from, print <path> <PR|-> for this Mac's open_pr_cleanup rows and finished "
+                            "rows without meaningful tabs, for rm-check-batch; another Mac's rows are counted on "
+                            "stderr, and --summary prints their rm-check-batch --host commands")
     parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                         help="read the rows a previous scan printed as JSON instead of scanning again")
     parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
@@ -1951,6 +1952,8 @@ def row_line(view: dict) -> str:
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
+# Runs rm_check.py on another Mac over ssh; see references/cleanup.md.
+RM_CHECK_BATCH = Path.home() / ".cache/orca-briefs/bin/rm-check-batch"
 
 
 def pr_number(row: dict) -> int | None:
@@ -1958,8 +1961,11 @@ def pr_number(row: dict) -> int | None:
 
 
 def rm_check_command(row: dict, scan_file: Path | None = None) -> str:
-    """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it."""
+    """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it.
+    Another Mac's row is checked on that Mac through rm-check-batch --host."""
     pr = pr_number(row)
+    if row.get("environment"):
+        return shlex.join([str(RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {pr or '-'}"])
     return shlex.join(["python3", str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
                        *(["--from", str(scan_file)] if scan_file else [])])
 
@@ -2073,10 +2079,17 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
             if not args.classes or ((row.get("verdict") or {}).get("class") or row["class"]) in args.classes:
                 print(row_line(row_view(row)))
     elif args.rm_specs:
+        remote = 0
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
             if row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
-                print(f"{row['path']} {pr_number(row) or '-'}")
+                if row.get("environment"):
+                    remote += 1
+                else:
+                    print(f"{row['path']} {pr_number(row) or '-'}")
+        if remote:
+            print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
+                  file=sys.stderr)
     elif args.cards:
         scan_file = Path(args.from_file).expanduser().absolute() if args.from_file else None
         for row in rows:
