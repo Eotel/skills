@@ -382,7 +382,8 @@ def summarize_rollout(path):
         elif kind == "message" and payload.get("role") == "user":
             value = message_text(payload)
             if value and not value.lstrip().startswith(("<", "# AGENTS.md instructions")):
-                last_user, last_role = (row.get("timestamp"), value), "user"
+                # A new request starts a turn the earlier failure did not end.
+                last_user, last_role, api_error = (row.get("timestamp"), value), "user", None
         elif kind == "message" and payload.get("role") == "assistant":
             value = message_text(payload)
             if value:
@@ -529,9 +530,14 @@ def cut_off(row):
 
 
 # The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
-API_ENDED = re.compile(r"(?:API Error:|You['’]ve hit your \w+ limit|Login expired)")
-USAGE_LIMIT = re.compile(r"hit your \w+ limit|usage limit", re.IGNORECASE)
-LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in", re.IGNORECASE)
+API_ENDED = re.compile(r"(?:API Error:|You['’]ve hit your [\w ]+ limit|Login expired|Not logged in|Please run /login|"
+                       r"Failed to authenticate)")
+USAGE_LIMIT = re.compile(r"hit your [\w ]+ limit|usage limit", re.IGNORECASE)
+LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in|Failed to authenticate", re.IGNORECASE)
+# Without Claude Code's tag (Codex, Orca's copy), the text names an error a retry repeats: a safeguard flag, or a
+# request the API refused (a 4xx other than a rate limit).
+NOT_RETRYABLE = re.compile(r"safeguards flagged|invalid_request|API Error: 4(?!29)\d\d|prompt is too long|"
+                           r"credit balance", re.IGNORECASE)
 RESETS = re.compile(r"(?:resets|try again at)\s+(.+?)\.?$")
 
 
@@ -561,7 +567,7 @@ def stop_reason(row: dict) -> StopReason | None:
                 "resets": resets[1] if resets else None}
     if tag == "authentication_failed" or LOGIN_EXPIRED.search(error):
         return {"kind": "login", "action": "human", "agent": agent, "error": error, "resets": None}
-    if tag not in (None, "server_error"):
+    if tag not in (None, "server_error") or tag is None and NOT_RETRYABLE.search(error):
         return {"kind": "other", "action": "human", "agent": agent, "error": error, "resets": None}
     return {"kind": "connection", "action": "wake", "agent": agent, "error": error, "resets": None}
 

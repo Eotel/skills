@@ -314,6 +314,11 @@ class CodexRolloutTests(unittest.TestCase):
         stop = scan.stop_reason({"claude": None, "codex": [scan.summarize_rollout(path)[1]]})
         self.assertEqual((stop["kind"], stop["action"], stop["resets"]), ("usage_limit", "wait", "Nov 4th, 2026 3:35 PM"))
 
+        # A request after the reset starts a turn the limit did not end.
+        with Path(path).open("a") as handle:
+            handle.write(json.dumps(codex_user("2026-11-04T07:00:00Z", "continue")) + "\n")
+        self.assertIsNone(scan.stop_reason({"claude": None, "codex": [scan.summarize_rollout(path)[1]]}))
+
 
 def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress",
              turn=None):
@@ -1044,6 +1049,19 @@ class ClassifyTests(unittest.TestCase):
             "/w/dns": ("stalled", "connection", "wake", None),
             "/w/flagged": ("stalled", "other", "human", None)})
         self.assertEqual(rows["/w/limit"]["reasons"], ["usage limit; resets Nov 7 at 8pm (Asia/Tokyo)"])
+
+    def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self):
+        # Orca's copy of a remote lane's last message carries no Claude Code error tag.
+        def stop(line):
+            found = scan.stop_reason({"claude": None, "codex": [], "orca_message": {"text": line}})
+            return found and (found["kind"], found["action"], found["resets"])
+
+        self.assertEqual(stop("API Error: Opus 5.5's safeguards flagged this session"), ("other", "human", None))
+        self.assertEqual(stop("Not logged in · Please run /login"), ("login", "human", None))
+        self.assertEqual(stop("You've hit your monthly spend limit · raise it at claude.ai/settings/usage · "
+                              "your session limit resets 2pm (Asia/Tokyo)"), ("usage_limit", "wait", "2pm (Asia/Tokyo)"))
+        self.assertEqual(stop("API Error: Connection lost mid-response. The response above may be incomplete."),
+                         ("connection", "wake", None))
 
     def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self):
         failure = "■ Selected model is at capacity"
