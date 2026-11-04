@@ -302,6 +302,18 @@ class CodexRolloutTests(unittest.TestCase):
             handle.write(json.dumps(codex_assistant("2026-10-01T01:02:00Z", "Recovered.")) + "\n")
         self.assertIsNone(scan.summarize_rollout(path)[1]["api_error"])
 
+    def test_a_codex_task_the_usage_limit_ended_waits_for_the_reset(self):
+        limit = ("You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits "
+                 "or try again at Nov 4th, 2026 3:35 PM.")
+        path = self.rollout("rollout-limit.jsonl", "/w/cut", [
+            codex_user("2026-11-03T05:40:00Z", "finish the work"),
+            codex_assistant("2026-11-03T05:50:00Z", "Checking CI."),
+            codex_row("2026-11-03T05:51:58Z", "event_msg", {
+                "type": "task_complete", "last_agent_message": None, "error": {"message": limit}}),
+        ])
+        stop = scan.stop_reason({"claude": None, "codex": [scan.summarize_rollout(path)[1]]})
+        self.assertEqual((stop["kind"], stop["action"], stop["resets"]), ("usage_limit", "wait", "Nov 4th, 2026 3:35 PM"))
+
 
 def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress",
              turn=None):
@@ -1007,6 +1019,31 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/merged"], ("stalled", ["turn ended with an API error: " + cut], []))
         self.assertEqual(result["/w/resumed"][0], "finished")
         self.assertEqual(judged, ["Merged."])
+
+    def test_a_turn_the_api_ended_says_whether_to_wake_it_wait_for_the_reset_or_ask_a_person(self):
+        # 2026-11-04: an EPM lane hit its weekly limit at 15:26 while Orca still showed it working; a DNS outage and
+        # an expired login stopped other lanes, and every one was woken the same way.
+        def ended(path, line, kind):
+            self.claude_says(path, user("go"), {**assistant(text(line)), "isApiErrorMessage": True, "error": kind})
+        ended("/w/limit", "You've hit your weekly limit · resets Nov 7 at 8pm (Asia/Tokyo)", "rate_limit")
+        ended("/w/login", "Login expired · Please run /login", "authentication_failed")
+        ended("/w/dns", "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+              "server_error")
+        ended("/w/flagged", "API Error: Opus 5.5's safeguards flagged this session", "invalid_request")
+
+        rows = {r["path"]: r for r in self.inventory(
+            [worktree("/w/limit", "working"), worktree("/w/login", "done"), worktree("/w/dns", "done"),
+             worktree("/w/flagged", "done")],
+            [terminal("/w/limit", "claude", "term_l"), terminal("/w/login", "claude", "term_g"),
+             terminal("/w/dns", "claude", "term_d"), terminal("/w/flagged", "claude", "term_f")])}
+
+        self.assertEqual({path: (row["class"], row["stop"]["kind"], row["stop"]["action"], row["stop"]["resets"])
+                          for path, row in rows.items()}, {
+            "/w/limit": ("stalled", "usage_limit", "wait", "Nov 7 at 8pm (Asia/Tokyo)"),
+            "/w/login": ("stalled", "login", "human", None),
+            "/w/dns": ("stalled", "connection", "wake", None),
+            "/w/flagged": ("stalled", "other", "human", None)})
+        self.assertEqual(rows["/w/limit"]["reasons"], ["usage limit; resets Nov 7 at 8pm (Asia/Tokyo)"])
 
     def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self):
         failure = "■ Selected model is at capacity"
@@ -1717,6 +1754,29 @@ class ScanCommandTests(unittest.TestCase):
         path = self.dir / "scan.json"
         path.write_text(json.dumps(rows, ensure_ascii=False))
         return path, checkout
+
+    def test_wake_names_each_lane_the_api_stopped_with_its_tab_and_what_it_needs(self):
+        def stopped(path, environment, handle, kind, action, error, resets=None):
+            return {"path": path, "repo": "app", "environment": environment, "class": "stalled", "reasons": [],
+                    "comment": "", "claude": None, "codex": [], "terminals": [{"handle": handle, "agent": "claude"}],
+                    "stop": {"kind": kind, "action": action, "agent": "claude", "error": error, "resets": resets}}
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([
+            stopped("/w/app/limit", None, "term_l", "usage_limit", "wait", "You've hit your weekly limit",
+                    "Nov 7 at 8pm (Asia/Tokyo)"),
+            stopped("/w/app/dns", None, "term_d", "connection", "wake", "API Error: Can't reach the API server"),
+            stopped("/w/app/login", "mbp16", "term_g", "login", "human", "Login expired · Please run /login"),
+            {"path": "/w/app/done", "repo": "app", "environment": None, "class": "finished", "reasons": [],
+             "comment": "", "claude": None, "codex": [], "terminals": []},
+        ], ensure_ascii=False))
+
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+
+        self.assertEqual(out.getvalue().splitlines(), [
+            "limit | term_l | 利用上限: Nov 7 at 8pm (Asia/Tokyo) まで待つ | You've hit your weekly limit",
+            "dns | term_d | 通信断: 起こす | API Error: Can't reach the API server",
+            "mbp16::login | term_g | ログイン切れ: 人が /login する | Login expired · Please run /login"])
 
     def test_summary_names_each_missing_hook_file_with_its_host(self):
         saved, _ = self.saved_scan()

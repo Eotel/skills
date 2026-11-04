@@ -305,7 +305,7 @@ def read_claude(projects_root, worktree_path, running=()):
                    key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
-    texts, final_at, asked, answered, api_error = [], None, {}, set(), None
+    texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None
     for entry in rows[last + 1:]:
         content = message_of(entry).get("content")
         if not isinstance(content, list):
@@ -318,6 +318,7 @@ def read_claude(projects_root, worktree_path, running=()):
                 texts.append(block["text"])
                 final_at = entry.get("timestamp")
                 api_error = block["text"] if entry.get("isApiErrorMessage") else None
+                api_error_kind = entry.get("error") if api_error else None
             elif kind == "tool_use" and block.get("name") == "AskUserQuestion":
                 asked[block.get("id")] = block.get("input")
             elif kind == "tool_result":
@@ -330,6 +331,7 @@ def read_claude(projects_root, worktree_path, running=()):
         "final_at": final_at,
         "pending_questions": [q for i, q in asked.items() if i not in answered],
         "api_error": api_error,
+        "api_error_kind": api_error_kind,
     }
 
 
@@ -338,7 +340,7 @@ def message_text(payload):
 
 
 API_FAILURE = re.compile(
-    r"(?:Selected model is at capacity|API Error:|rate limit(?:ed| exceeded)?|"
+    r"(?:Selected model is at capacity|API Error:|rate limit(?:ed| exceeded)?|usage limit|"
     r"request failed|connection error|stream error|server error)", re.IGNORECASE)
 
 
@@ -365,6 +367,10 @@ def summarize_rollout(path):
             message = payload.get("message") or payload.get("error")
             if isinstance(message, str) and API_FAILURE.search(message):
                 api_error = message.strip()
+        # A task the service ended (a usage limit) completes with its error and no message.
+        if row.get("type") == "event_msg" and kind == "task_complete" and isinstance(payload.get("error"), dict):
+            message = payload["error"].get("message")
+            api_error = message.strip() if isinstance(message, str) and message.strip() else api_error
         if kind in ("function_call", "custom_tool_call") and "user_input" in (payload.get("name") or ""):
             try:
                 questions = json.loads(payload.get("arguments") or "{}").get("questions")
@@ -516,8 +522,58 @@ def cut_off(row):
     Orca at working, so only the transcript shows the agent stopped mid-task.
     """
     codex = row["codex"][-1] if row["codex"] else {}
+    orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
     return (row.get("codex_screen_error") or codex.get("api_error")
-            or (row["claude"] or {}).get("api_error"))
+            or (row["claude"] or {}).get("api_error")
+            or (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None))
+
+
+# The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
+API_ENDED = re.compile(r"(?:API Error:|You['’]ve hit your \w+ limit|Login expired)")
+USAGE_LIMIT = re.compile(r"hit your \w+ limit|usage limit", re.IGNORECASE)
+LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in", re.IGNORECASE)
+RESETS = re.compile(r"(?:resets|try again at)\s+(.+?)\.?$")
+
+
+class StopReason(TypedDict):
+    kind: str  # connection, usage_limit, login, or other
+    action: str  # wake, wait (until resets), or human
+    agent: str | None
+    error: str
+    resets: str | None
+
+
+def stop_reason(row: dict) -> StopReason | None:
+    """Why an API failure ended the last turn: a lost connection to wake from, a usage limit to wait out, an
+    expired login a person has to renew, or another error a person reads (a safeguard flag, an invalid request),
+    which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
+    `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
+    error = cut_off(row)
+    if not error:
+        return None
+    claude = row.get("claude") or {}
+    tag = claude.get("api_error_kind") if error == claude.get("api_error") else None
+    agent = "claude" if error == claude.get("api_error") else "codex" if row.get("codex") or row.get(
+        "codex_screen_error") else None
+    if tag == "rate_limit" or USAGE_LIMIT.search(error):
+        resets = RESETS.search(error)
+        return {"kind": "usage_limit", "action": "wait", "agent": agent, "error": error,
+                "resets": resets[1] if resets else None}
+    if tag == "authentication_failed" or LOGIN_EXPIRED.search(error):
+        return {"kind": "login", "action": "human", "agent": agent, "error": error, "resets": None}
+    if tag not in (None, "server_error"):
+        return {"kind": "other", "action": "human", "agent": agent, "error": error, "resets": None}
+    return {"kind": "connection", "action": "wake", "agent": agent, "error": error, "resets": None}
+
+
+def stop_line(stop: StopReason) -> str:
+    if stop["kind"] == "usage_limit":
+        return "usage limit; resets " + stop["resets"] if stop["resets"] else "usage limit: " + stop["error"]
+    if stop["kind"] == "login":
+        return "login expired; a person has to log in again: " + stop["error"]
+    if stop["kind"] == "other":
+        return "turn ended with an API error waking does not fix: " + stop["error"]
+    return "turn ended with an API error: " + stop["error"]
 
 
 def is_sure_ask(asks):
@@ -582,8 +638,11 @@ def classify(row, decision_marker):
     job is read too: a question makes it waiting or unsure, and it never
     finishes while the job runs. A turn an API error cut off, or a lead that
     left its workers' mail unread, is stalled even then; unread mail is also
-    named on a waiting row.
+    named on a waiting row. A turn an API failure ended is stalled first, even while Orca still shows it working:
+    its reason says to wake it, wait until a usage limit resets, or have a person log in.
     """
+    if stop := stop_reason(row):
+        return "stalled", [stop_line(stop)]
     reasons = waiting_reasons(row, decision_marker)
     mail = [mail_reason(row["unread_mail"])] if row.get("unread_mail") else []
     if reasons:
@@ -597,8 +656,6 @@ def classify(row, decision_marker):
     jev = row.get("jev")
     if turn_runs(row):
         return "working", []
-    if cut_off(row):
-        return "stalled", ["turn ended with an API error: " + cut_off(row)]
     if mail:
         return "stalled", mail
     if is_working(row):
@@ -977,6 +1034,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
         latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
+        row["stop"] = stop_reason(row)
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
@@ -1948,6 +2006,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="with --from, print <path> <PR|-> for this Mac's open_pr_cleanup rows and finished "
                             "rows without meaningful tabs, for rm-check-batch; another Mac's rows are counted on "
                             "stderr, and --summary prints their rm-check-batch --host commands")
+    views.add_argument("--wake", action="store_true",
+                       help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
+                            "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
+                            "logs in, その他: a person reads it) | the error's first 200 characters")
     parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                         help="read the rows a previous scan printed as JSON instead of scanning again")
     parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
@@ -1965,6 +2027,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--review-out needs a live scan; drop --from")
     if args.rm_specs and not args.from_file:
         parser.error("--rm-specs needs --from")
+    if args.wake and not args.from_file:
+        parser.error("--wake needs --from")
     if args.classes and not args.rows:
         parser.error("--class needs --rows")
     return args
@@ -2062,9 +2126,9 @@ def github_of(row: dict) -> str:
 REVIEW_DIR = "~/.cache/orca-briefs/review/out"
 MERGE = re.compile(r"(?<![A-Za-z])merge(?![A-Za-z])|マージ", re.IGNORECASE)
 ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class", "scan_class", "reasons",
-            "question", "merge_question", "review", "waits_on", "next_step", "verdict", "final", "last_user",
-            "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "tabs", "closable",
-            "meaningful_tabs", "open_pr_cleanup")
+            "question", "merge_question", "review", "stop", "waits_on", "next_step", "verdict", "final",
+            "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "tabs",
+            "closable", "meaningful_tabs", "open_pr_cleanup")
 
 
 class ReviewResult(TypedDict):
@@ -2130,6 +2194,7 @@ def row_view(row: dict) -> dict:
         "class": verdict.get("class") or row["class"], "scan_class": row["class"],
         "reasons": row.get("reasons") if isinstance(row.get("reasons"), list) else [],
         "question": question, "merge_question": merge_question, "review": review_result(row, github),
+        "stop": row.get("stop"),
         "waits_on": verdict.get("waits_on") or row.get("waits_on") or "",
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
         "final": final, "last_user": asked or "", "transcripts": transcripts,
@@ -2287,6 +2352,19 @@ def main(argv: list[str] | None = None) -> int:
     return print_rows(args, rows, verdicts)
 
 
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する", "other": "その他: 人が読む"}
+
+
+def wake_line(row: dict, stop: StopReason) -> str:
+    """name | the stopped agent's tab | what it needs | the error."""
+    tab = next((t.get("handle") for t in row.get("terminals") or [] if t.get("handle")
+                and (stop["agent"] is None or t.get("agent") == stop["agent"])), None)
+    action = (f"利用上限: {stop['resets'] or '戻る時刻は不明'} まで待つ" if stop["kind"] == "usage_limit"
+              else WAKE_ACTIONS[stop["kind"]])
+    error = " ".join(stop["error"].split())
+    return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
+
+
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
     if args.row:
         return print_row(rows, args.row)
@@ -2306,6 +2384,10 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
                   file=sys.stderr)
+    elif args.wake:
+        for row in rows:
+            if stop := row.get("stop"):
+                print(wake_line(row, stop))
     elif args.cards:
         scan_file = Path(args.from_file).expanduser().absolute() if args.from_file else None
         for row in rows:

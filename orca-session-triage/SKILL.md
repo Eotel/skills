@@ -111,7 +111,13 @@ board's done cards; close what the user approves.
   Claude or Codex turn an API error cut off, and a lead whose
   workers' reports, questions, or escalations sit unread since its last turn
   began (`unread_mail`, from Orca's orchestration mailbox), are `stalled` with
-  that reason; the mail reason is also added to a `waiting` row.
+  that reason; the mail reason is also added to a `waiting` row. The API error
+  wins even while Orca shows the agent working, and the row's `stop` says
+  which: a lost connection (`connection`, wake it), a usage limit
+  (`usage_limit`, with the time it `resets`), an expired login (`login`, a
+  person logs in), or another error waking would repeat (`other`, such as a
+  safeguard flag; a person reads it). `--from SCAN_JSON --wake` prints each
+  such row with its agent's tab and what it needs.
 - **Review queue**: run the scan with
   `--review-out ~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}/review-queue.json`.
   It queues every row Jev judged from a final message (`unsure`, `stalled`,
@@ -180,8 +186,10 @@ permitted cleanup, and any handoff in `references/hourly.md`.
   - A done card that leaves the user nothing to do has its tab closed.
   - A previous scheduled-run tab that `references/hourly.md` verifies as
     finished, idle, and free of unanswered questions is closed at the next run.
-  - A row stalled by an API error or by unread worker mail gets one line that
-    wakes it to continue its own work.
+  - A row stalled by a lost connection or by unread worker mail gets one line
+    that wakes it to continue its own work; a row stopped by a usage limit gets
+    it once the reset time has passed, and an expired login or another API
+    error is reported.
   - A task the user approved as the follow-up of another lane's result ("when
     A settles it, give B the task") goes to B once A reports it.
   - A lane confirmation in the user's standing approvals is answered once it
