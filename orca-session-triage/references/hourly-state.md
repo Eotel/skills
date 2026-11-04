@@ -97,7 +97,11 @@ worktrees' transcripts, and `send --decision`), and prints them longest waiting 
 without such a key, one whose id it names, whose structured questions it quotes
 in full, or to which it was delivered; one naming only the
 lane or a PR number of the ask, or a user message containing a word from the
-question, is listed in `candidates` for you to check.
+question, is listed in `candidates` for you to check. Each item also carries
+the row PR's completed independent review (`review`: head, verdict, path,
+`head_matches`, `changes_requested`, as `scan_sessions.py --row` gives it) and
+whether its question asks about a merge (`merge_question`); `--summary` prints
+both on the item's line.
 
 - `unanswered`: an ask of the lane that is open, or was sent in its last turn,
   has no proof, or its handed-off key is still unanswered. `ask.marked: true`

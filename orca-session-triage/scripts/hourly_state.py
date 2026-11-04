@@ -344,8 +344,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        comment = row.get("comment") or ""
+        question = row_question(row, final)
         view = {"row": identity, "name": scan_sessions.row_name(row),
-                "question": excerpt(row_question(row, final)),
+                "question": excerpt(question), "merge_question": scan_sessions.asks_merge(question, comment),
+                "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         if blocked_by_user(row):
             view["pr"] = prs.get(identity, {"state": (row.get("pr") or {}).get("state"), "updatedAt": None})
@@ -358,9 +361,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             for asked_at, ask in unanswered:
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
+                asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
-                    "question": excerpt("\n".join(answer_evidence.questions_of(ask)) or ask.get("text")) or view["question"],
+                    "question": excerpt(asked) or view["question"],
+                    "merge_question": scan_sessions.asks_merge(asked or question, comment),
                     "decisions": keys.get(ask["id"], []),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
@@ -370,9 +375,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if later:
             first = min(answer.at for answer, _ in later)
             answer, ask = max(later, key=lambda pair: pair[0].at)
+            asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
             found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
-                                  "question": excerpt("\n".join(answer_evidence.questions_of(ask)) or ask.get("text"))
-                                              or view["question"],
+                                  "question": excerpt(asked) or view["question"],
+                                  "merge_question": scan_sessions.asks_merge(asked or question, comment),
                                   "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                                   "answer": answer_view(answer)}))
             continue
@@ -612,6 +618,11 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                 for proof in item["evidence"])
         if item.get("pr"):
             line += f" | PR {item['pr'].get('state') or '-'}@{item['pr'].get('updatedAt') or '-'}"
+        if item.get("merge_question"):
+            line += " | merge の問い"
+        if review := item.get("review"):
+            line += (f" | review {review['head']}{'（今の head ではない）' if review['head_matches'] is False else ''}: "
+                     f"{review['verdict'][:60]}")
         if item.get("answer_age_minutes") is not None:
             line += f" | answer_age_minutes={item['answer_age_minutes']}"
         if item.get("withdrawal_reason"):
