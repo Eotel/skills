@@ -2116,6 +2116,18 @@ class RmCheckTests(unittest.TestCase):
         result = json.loads(completed.stdout)
         self.assertEqual((result["ok"], result["processes"]), (True, []), completed.stderr)
 
+    def test_a_worker_beside_the_reader_of_its_output_still_blocks(self) -> None:
+        # The reader writes to /dev/null, which a worker in the same process group reads.
+        out = Path(self.tmp.name) / "out.json"
+        command = (f"(cd {self.wt} && exec sleep 30 < /dev/null) & sleep 1; "
+                   f"{sys.executable} {rmcheck.__file__} {self.wt} - --base main --no-docker "
+                   f"| tee {out} > /dev/null; kill $!")
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+
+        result = json.loads(out.read_text())
+        self.assertFalse(result["ok"], completed.stderr)
+        self.assertEqual(len(result["processes"]), 1)
+
     def test_check_does_not_count_itself_or_its_shell(self):
         binary = Path(self.tmp.name) / "bin/orca"
         binary.parent.mkdir()

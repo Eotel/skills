@@ -461,7 +461,8 @@ def runs_nothing(root, members, table):
 
 def pipe_ends() -> dict[int, tuple[str | None, str | None]]:
     """{pid: (stdin pipe, stdout pipe's other end)} for this check's process group, the pipes named
-    alike on both ends: /proc's pipe:[inode] on Linux, lsof's pipe addresses on macOS."""
+    alike on both ends: /proc's pipe:[inode] on Linux, lsof's pipe addresses on macOS. A descriptor
+    that is not a pipe (/dev/null, a file, a socket) is None, so it links no reader."""
     group = os.getpgrp()
     if sys.platform.startswith("linux") and Path("/proc").is_dir():
         ends = {}
@@ -469,27 +470,32 @@ def pipe_ends() -> dict[int, tuple[str | None, str | None]]:
             try:
                 if os.getpgid(int(proc.name)) != group:
                     continue
-                ends[int(proc.name)] = (str((proc / "fd/0").readlink()), str((proc / "fd/1").readlink()))
+                stdin, stdout = (str((proc / "fd" / fd).readlink()) for fd in ("0", "1"))
+                ends[int(proc.name)] = tuple(end if end.startswith("pipe:") else None for end in (stdin, stdout))
             except (OSError, ValueError):
                 continue
         return ends
     try:
-        output = subprocess.run(["lsof", "-n", "-P", "-a", "-g", str(group), "-d", "0,1", "-F", "pfdn"],
+        output = subprocess.run(["lsof", "-n", "-P", "-a", "-g", str(group), "-d", "0,1", "-F", "pftdn"],
                                 capture_output=True, text=True).stdout
     except OSError:
         return {}
     ends: dict[int, tuple[str | None, str | None]] = {}
-    pid = fd = None
+    pid = fd = kind_of_file = None
     for line in output.splitlines():
         kind, value = line[:1], line[1:]
         if kind == "p":
             pid, fd = int(value), None
             ends.setdefault(pid, (None, None))
         elif kind == "f":
-            fd = value
-        elif pid is not None and fd == "0" and kind == "d":
+            fd, kind_of_file = value, None
+        elif kind == "t":
+            kind_of_file = value
+        elif pid is None or kind_of_file != "PIPE":
+            continue
+        elif fd == "0" and kind == "d":
             ends[pid] = (value, ends[pid][1])
-        elif pid is not None and fd == "1" and kind == "n" and value.startswith("->"):
+        elif fd == "1" and kind == "n" and value.startswith("->"):
             ends[pid] = (ends[pid][0], value[2:])
     return ends
 
