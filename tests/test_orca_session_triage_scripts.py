@@ -1,7 +1,7 @@
 """Offline behavior tests for the orca-session-triage command line tools."""
 
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 import hashlib
 import importlib.util
@@ -1367,6 +1367,7 @@ class NextStepFactTests(unittest.TestCase):
 
             self.assertEqual(scan.git_state(str(work)),
                              {"branch": "main", "head": git(work, "rev-parse", "HEAD"),
+                              "head_at": git(work, "log", "-1", "--format=%cI"),
                               "dirty": 1, "unpushed": 1, "github": "acme/app"})
             self.assertIsNone(scan.git_state(str(Path(tmp) / "missing")))
 
@@ -1469,6 +1470,33 @@ class NextStepFactTests(unittest.TestCase):
                          {"clean": ("finished", True), "human-replied": ("finished", True),
                           "dirty": ("stalled", False), "unpushed": ("finished", True),
                           "other-head": ("stalled", False), "unknown-unpushed": ("finished", True)})
+
+    def test_open_pr_cleanup_keeps_a_checkout_another_lane_committed_or_reviewed_in_lately(self) -> None:
+        now = datetime.now(timezone.utc)
+        hours_ago = (now - timedelta(hours=2)).isoformat()
+        head_at = {"committed": (now - timedelta(minutes=5)).isoformat(), "reviewed": hours_ago, "idle": hours_ago}
+        rows = [{"path": "/w/" + name, "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
+                 "linked_pr": None, "claude": None, "codex": []} for name in head_at]
+        numbers = {name: index for index, name in enumerate(head_at, 1)}
+
+        with tempfile.TemporaryDirectory() as reviews, patch.dict(os.environ, {"TRIAGE_REVIEW_DIR": reviews}):
+            for name in ("reviewed", "idle"):
+                log = Path(reviews) / f"acme-app-{numbers[name]}.log"
+                log.write_text("codex review\n")
+                if name == "idle":
+                    os.utime(log, (now.timestamp() - 7200,) * 2)
+            result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
+                rows,
+                git_lookup=lambda path: {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
+                                         "unpushed": 0, "github": "acme/app",
+                                         "head_at": head_at[path.rsplit("/", 1)[-1]]},
+                pr_lookup=each_ref(lambda slug, ref: {"number": numbers[ref], "state": "OPEN", "head_oid": "aaa"}))}
+
+        self.assertEqual({name: row.get("open_pr_cleanup", False) for name, row in result.items()},
+                         {"committed": False, "reviewed": False, "idle": True})
+        for name in ("committed", "reviewed"):
+            self.assertNotEqual(result[name]["class"], "finished")
+            self.assertTrue(any(reason.startswith("別の担当が使用中（") for reason in result[name]["reasons"]))
 
     def test_open_pr_cleanup_keeps_worktrees_with_keep_notes(self) -> None:
         comments = ("parallel-tests-b6: PR #3568 のレビュー対応中（消さないでください）",

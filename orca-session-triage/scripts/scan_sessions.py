@@ -1028,12 +1028,12 @@ def git_state(path):
             return None
         ahead = run("rev-list", "--count", "@{u}..HEAD")
         branch = run("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or None
-        head = run("rev-parse", "HEAD").stdout.strip() or None
+        head, _, head_at = run("log", "-1", "--format=%H %cI").stdout.strip().partition(" ")
         origin = run("remote", "get-url", "origin").stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return None
     return {
-        "branch": branch, "head": head,
+        "branch": branch, "head": head or None, "head_at": head_at or None,
         "dirty": len(status.stdout.splitlines()),
         "unpushed": int(ahead.stdout) if ahead.returncode == 0 else None,
         "github": github_slug(origin),
@@ -1364,6 +1364,28 @@ def open_pr_with_no_local_work(row, pr, git):
             and git.get("dirty") == 0)
 
 
+IN_USE_SECONDS = 30 * 60
+
+
+def checkout_in_use(git: dict, pr: dict) -> str | None:
+    """The local time of a HEAD commit or review-pr log written in the last thirty minutes.
+
+    Either one means another lane is working in the checkout though no agent shows in its tabs.
+    """
+    times = [committed.timestamp()] if (committed := parse_time(git.get("head_at"))) else []
+    if SLUG.fullmatch(git.get("github") or "") and pr.get("number"):
+        log = (Path(os.environ.get("TRIAGE_REVIEW_DIR") or REVIEW_DIR).expanduser()
+               / f"{git['github'].replace('/', '-')}-{pr['number']}.log")
+        try:
+            times.append(log.stat().st_mtime)
+        except OSError:
+            pass
+    latest = max(times, default=None)
+    if latest is None or time.time() - latest > IN_USE_SECONDS:
+        return None
+    return datetime.fromtimestamp(latest).astimezone().strftime("%m/%d %H:%M")
+
+
 def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | None] = git_state,
                         pr_lookup: PrLookup = gh_prs) -> list[dict]:
     """Add git and PR facts to rows needing review or completed rows with no current agent.
@@ -1415,6 +1437,9 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
         row: dict[str, Any] = {**row, "git": git, "pr": pr}
         open_pr_cleanup = pr is not None and git is not None and open_pr_with_no_local_work(row, pr, git)
+        if open_pr_cleanup and git is not None and pr is not None and (used_at := checkout_in_use(git, pr)):
+            row = {**row, "reasons": [*row.get("reasons", []), f"別の担当が使用中（{used_at}）"]}
+            open_pr_cleanup = False
         if open_pr_cleanup and (note := keep_note(row.get("comment"))):
             row = {**row, "reasons": [*row.get("reasons", []), "Orca comment asks to keep it: " + note]}
             open_pr_cleanup = False
