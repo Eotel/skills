@@ -39,7 +39,8 @@ class LeadDecisionsTests(unittest.TestCase):
         self.gh_log = self.root / "gh.log"
         self.gh_prs = self.root / "prs.json"
         self.env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-                    "FAKE_GH_LOG": str(self.gh_log), "FAKE_GH_PRS": str(self.gh_prs)}
+                    "FAKE_GH_LOG": str(self.gh_log), "FAKE_GH_PRS": str(self.gh_prs),
+                    "TRIAGE_INBOX": str(self.root / "inbox.jsonl"), "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -62,7 +63,11 @@ class LeadDecisionsTests(unittest.TestCase):
                                "--decision", "keep-uncommitted:/Users/eotel/orca/workspaces/y/z")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), ["keep-uncommitted:/Users/eotel/orca/workspaces/y/z"])
+        shown = json.loads(result.stdout)
+        self.assertEqual([item["decision"] for item in shown["unanswered"]],
+                         ["keep-uncommitted:/Users/eotel/orca/workspaces/y/z"])
+        self.assertEqual([item["decision"] for item in shown["settled"]],
+                         ["remove:macbook-pro-16::/Users/eotel/orca/workspaces/x/fix"])
 
     def test_a_later_answer_wins_and_earlier_lines_stay_as_written(self) -> None:
         self.record("merge:Eotel/skills#80", "待つ")
@@ -112,16 +117,22 @@ class LeadDecisionsTests(unittest.TestCase):
         result = self.run_tool("unanswered", "--handed-off-file", str(self.handed_off))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), [
-            {"decision": "merge:Eotel/orca-board#12+#14", "handed_off_at": "2026-10-28T01:00:00+00:00", "prs": [
+        shown = json.loads(result.stdout)
+        self.assertEqual([item["decision"] for item in shown["settled"]], ["remove:mac::/w/a"])
+        self.assertEqual(shown["unanswered"], [
+            {"decision": "merge:Eotel/orca-board#12+#14", "handed_off_at": "2026-10-28T01:00:00+00:00",
+             "first_handed_off_at": "2026-10-27T01:00:00+00:00", "handoff_count": 2,
+             "reports": {"before": [], "after": []}, "prs": [
                 {"repo": "Eotel/orca-board", "number": 12, "state": "MERGED", "updatedAt": "2026-10-28T02:00:00Z",
                  "updated_after_handoff": True},
                 {"repo": "Eotel/orca-board", "number": 14, "state": "OPEN", "updatedAt": "2026-10-27T23:00:00Z",
                  "updated_after_handoff": False}]},
             {"decision": "spawn:acme/web#6303::review-fix", "handed_off_at": "2026-10-27T02:00:00+00:00",
-             "prs": [{"repo": "acme/web", "number": 6303, "state": None, "updatedAt": None,
+             "first_handed_off_at": "2026-10-27T02:00:00+00:00", "handoff_count": 1,
+             "reports": {"before": [], "after": []}, "prs": [{"repo": "acme/web", "number": 6303, "state": None, "updatedAt": None,
                       "updated_after_handoff": None}]},
-            {"decision": "keep-uncommitted:/w/b", "handed_off_at": "2026-10-28T01:00:00+00:00", "prs": []}])
+            {"decision": "keep-uncommitted:/w/b", "handed_off_at": "2026-10-28T01:00:00+00:00",
+             "first_handed_off_at": "2026-10-28T01:00:00+00:00", "handoff_count": 1, "prs": []}])
         self.assertIn("acme/web", result.stderr)
         self.assertEqual(sorted(self.gh_log.read_text().split()), ["Eotel/orca-board", "acme/web"])
 

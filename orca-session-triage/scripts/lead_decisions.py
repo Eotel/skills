@@ -8,9 +8,12 @@ Every hourly run reads the log, drops answered questions from its handoff, and f
 Records are only appended; a later record for the same decision replaces the earlier answer.
 handoff.py appends each key it hands off to a second log; `handed_off` reads it, so a tool that
 writes what a question decides (asana_pr.py) can hold the write while the key has no answer.
-`unanswered` without --decision lists every handed-off key with no answer and when it was last
-handed off; for a key naming PRs (`merge:owner/repo#12+#14`) it adds each PR's state, updatedAt,
-and whether it was updated after that hand-off, read with one GitHub query per repository.
+`unanswered` prints open keys and settled keys with their answer records. Open keys carry their
+first and last hand-off times and count; a bound inbox ask's answer also settles a key.
+For a key naming PRs (`merge:owner/repo#12+#14`) it adds each PR's state, updatedAt, whether it
+was updated after that hand-off, named inbox reports, and values from --asana-status when given.
+GitHub is read with one query per repository. `show --match` and `--since-last-handoff` print
+one line per matching answer, newest first in JST, marking remove keys whose paths still exist.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 from pathlib import Path
@@ -27,11 +30,15 @@ import sys
 from typing import Protocol
 import uuid
 
+import inbox_read
+
 DEFAULT_LOG = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
 HANDED_OFF_LOG = Path("~/.cache/orca-session-triage/handed-off.jsonl")
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at"))
+JST = timezone(timedelta(hours=9))
+EXCERPT = 160
 
 
 @dataclass(frozen=True)
@@ -55,18 +62,21 @@ class Decision:
 class HandOff:
     decision: str
     handed_off_at: str
+    ask_id: str | None = None
 
     @classmethod
     def parse(cls, raw: str, where: str) -> HandOff:
         try:
             item = json.loads(raw)
-            return cls(decision=str(item["decision"]), handed_off_at=str(item["handed_off_at"]))
+            return cls(decision=str(item["decision"]), handed_off_at=str(item["handed_off_at"]),
+                       ask_id=item.get("ask_id"))
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged handoff record at {where}: {error}") from error
 
     @classmethod
-    def now(cls, decision: str) -> HandOff:
-        return cls(decision=decision, handed_off_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    def now(cls, decision: str, ask_id: str | None = None) -> HandOff:
+        return cls(decision=decision, handed_off_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   ask_id=ask_id)
 
 
 @dataclass(frozen=True)
@@ -222,18 +232,109 @@ def pr_view(pr: PullRequest, states: Mapping[int, PrState] | None, handed_off_at
             "updated_after_handoff": updated > handed if updated and handed else None}
 
 
-def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision],
-                  read_prs: PrStates) -> list[dict[str, object]]:
-    """Every handed-off key without an answer, in the order first handed off, with its last hand-off time
-    and the PRs it names."""
-    last = {item.decision: item for item in handed if item.decision not in answered}
+def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None,
+                     entries: list[dict]) -> dict[str, list[dict]]:
+    names = [key, *(f"{pr.repo}#{pr.number}" for pr in prs),
+             *(f"https://github.com/{pr.repo}/pull/{pr.number}" for pr in prs)]
+    pattern = re.compile(r"(?<![A-Za-z0-9_/.-])(?:" + "|".join(map(re.escape, names)) + r")(?![A-Za-z0-9_/#])")
+    reports: dict[str, list[dict]] = {"before": [], "after": []}
+    handed = moment(handed_off_at)
+    for item in entries:
+        text = str(item.get("text") or "")
+        if not pattern.search(text):
+            continue
+        when = moment(item.get("ts"))
+        side = "after" if when and handed and when >= handed else "before"
+        reports[side].append({**{field: item.get(field) for field in ("id", "ts", "kind", "worktree")},
+                              "text": " ".join(text.split())[:EXCERPT]})
+    return reports
+
+
+def ask_answers(path: Path) -> dict[str, dict]:
+    """The same answered ids open-asks uses, with their complete answer records."""
+    ids = inbox_read.answered_ids(path)
+    found = {}
+    if ids:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"] in ids:
+                found[item["id"]] = item
+    return found
+
+
+def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
+    """The answer covering an ask as open-asks reads it: a record for `<id>` (for `<id>:<n>`, also one for the whole
+    ask), or one for every question of a structured ask."""
+    whole, _, number = ask_id.partition(":")
+    if found := answers.get(ask_id) or (answers.get(whole) if number else None):
+        return found
+    questions = inbox_read.questions_of(asks.get(ask_id) or {})
+    parts = [answers.get(f"{ask_id}:{index}") for index in range(1, len(questions) + 1)]
+    return {"id": ask_id, "answers": parts} if questions and all(parts) else None
+
+
+def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
+                  answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
+                  decisions: list[str] | None = None) -> dict[str, list[dict]]:
+    """Open keys with their hand-off history and PR facts, and settled keys with the answering record."""
+    history: dict[str, list[HandOff]] = {}
+    for item in handed:
+        history.setdefault(item.decision, []).append(item)
+    keys = list(dict.fromkeys(decisions)) if decisions else list(history)
+    asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    settled = []
+    last = {}
+    for key in keys:
+        item = history[key][-1] if key in history else None
+        answer = (asdict(answered[key]) if key in answered else
+                  next((found for entry in reversed(history.get(key, []))
+                        if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
+        if answer is not None:
+            settled.append({"decision": key, "answer": answer})
+        else:
+            last[key] = item
     named = {key: pull_requests(key) for key in last}
     prs = list(dict.fromkeys(pr for found in named.values() for pr in found))
     wanted = {repo: [pr.number for pr in prs if pr.repo == repo] for repo in dict.fromkeys(pr.repo for pr in prs)}
     states = {repo: read_prs(repo, numbers) for repo, numbers in wanted.items()}
-    return [{"decision": key, "handed_off_at": item.handed_off_at,
-             "prs": [pr_view(pr, states[pr.repo], item.handed_off_at) for pr in named[key]]}
-            for key, item in last.items()]
+    unanswered = []
+    for key, item in last.items():
+        at = item.handed_off_at if item else None
+        views = [pr_view(pr, states[pr.repo], at or "") for pr in named[key]]
+        for pr, view in zip(named[key], views):
+            url = f"https://github.com/{pr.repo}/pull/{pr.number}"
+            if url in asana:
+                view["asana"] = asana[url]
+        row = {"decision": key, "handed_off_at": at,
+               "first_handed_off_at": history[key][0].handed_off_at if item else None,
+               "handoff_count": len(history.get(key, [])), "prs": views}
+        if named[key]:
+            row["reports"] = decision_reports(key, named[key], at, entries)
+        unanswered.append(row)
+    return {"unanswered": unanswered, "settled": settled}
+
+
+def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None) -> list[str]:
+    """One line per matching answer, newest first, with times in JST."""
+    selected = []
+    for item in items:
+        when = moment(item.decided_at)
+        if words and not any(word.casefold() in item.decision.casefold() or word.casefold() in item.answer.casefold()
+                             for word in words):
+            continue
+        if since is None or (when is not None and when >= since):
+            selected.append((when, item))
+    selected.sort(key=lambda pair: pair[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    shown = []
+    for when, item in selected:
+        stamp = when.astimezone(JST).isoformat(timespec="seconds") if when else item.decided_at
+        path = item.decision.removeprefix("remove:").split("::", 1)[-1]
+        pending = " 未実行" if item.decision.startswith("remove:") and Path(path).expanduser().exists() else ""
+        shown.append(f"{stamp} {item.decision}{pending}  {' '.join(item.answer.split())[:EXCERPT]}")
+    return shown
 
 
 def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -> int:
@@ -249,13 +350,21 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
         "record-many", help='append several answers from JSON Lines of {"decision": KEY, "answer": TEXT, '
                             '"decided_at": ISO time with offset (optional)}; a wrong line writes nothing')
     many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
-    commands.add_parser("show", help="print the latest answer for each decision")
+    show = commands.add_parser("show", help="print the latest answer for each decision")
+    show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
+    show.add_argument("--since-last-handoff", action="store_true",
+                      help="answers since the newest saved handoff, newest first in JST")
+    # Imported here so log readers need not load the handoff or scan modules.
+    import handoff
+    show.add_argument("--handoffs-dir", type=Path, default=handoff.HANDOFFS,
+                      help="saved handoffs for --since-last-handoff (default: %(default)s)")
     unanswered = commands.add_parser(
-        "unanswered", help="print the given decisions that have no answer; without --decision, every handed-off "
-                           "key with no answer, when it was last handed off, and the state of the PRs it names")
+        "unanswered", help="print unanswered keys with hand-off history and PR facts, and settled keys with answers; "
+                           "without --decision, include every handed-off key")
     unanswered.add_argument("--decision", action="append", help="repeat once per question")
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")
+    unanswered.add_argument("--asana-status", type=Path, help="OUT_JSON already written by asana99_status.py")
     args = parser.parse_args(argv)
     log = args.decisions_file.expanduser()
     try:
@@ -275,13 +384,25 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
             append(log, *given)
             result = [asdict(entry) for entry in given]
         elif args.action == "show":
-            result = [asdict(item) for item in latest(records(log)).values()]
-        elif args.decision:
-            answered = latest(records(log))
-            result = [key for key in dict.fromkeys(args.decision) if key not in answered]
+            items = latest(records(log)).values()
+            if args.match or args.since_last_handoff:
+                since = None
+                if args.since_last_handoff:
+                    _, saved = handoff.SavedHandoff.newest(args.handoffs_dir.expanduser())
+                    since = moment(saved.sent_at)
+                    if since is None:
+                        raise ValueError(f"invalid handoff sent_at: {saved.sent_at}")
+                print("\n".join(show_answers(items, args.match, since)))
+                return 0
+            result = [asdict(item) for item in items]
         else:
-            result = open_handoffs(handed_off(args.handed_off_file.expanduser()), latest(records(log)), read_prs)
-    except (OSError, ValueError) as error:
+            inbox = inbox_read.paths()[0].expanduser()
+            entries = inbox_read.inbox_entries(inbox) if inbox.exists() else []
+            asana = ({item["url"]: item["asana"] for item in
+                      json.loads(args.asana_status.expanduser().read_text(encoding="utf-8"))} if args.asana_status else {})
+            result = open_handoffs(handed_off(args.handed_off_file.expanduser()), latest(records(log)), read_prs,
+                                   ask_answers(inbox_read.answers_path().expanduser()), entries, asana, args.decision)
+    except (OSError, ValueError, LookupError) as error:
         print(f"lead decisions: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))

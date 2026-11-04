@@ -116,6 +116,36 @@ def message_of(entry):
     return message if isinstance(message, dict) else {}
 
 
+class QueuedInput(TypedDict):
+    text: str
+    enqueued_at: str | None
+    minutes: int | None
+
+
+def queued_input(transcript: Path, now: datetime | None = None) -> list[QueuedInput]:
+    """Instructions still queued after replaying the transcript's queue operations."""
+    now = now or datetime.now(timezone.utc)
+    pending: list[QueuedInput] = []
+    for entry in load_jsonl(transcript):
+        if entry.get("type") != "queue-operation":
+            continue
+        operation, content = entry.get("operation"), entry.get("content")
+        if operation == "enqueue" and isinstance(content, str):
+            stamp = entry.get("timestamp")
+            when = parse_time(stamp)
+            pending.append({"text": content, "enqueued_at": stamp,
+                            "minutes": int((now - when).total_seconds() // 60) if when else None})
+        elif operation == "dequeue" and pending:
+            pending.pop(0)
+        elif operation == "remove":
+            index = next((i for i, item in enumerate(pending) if item["text"] == content), None)
+            if index is not None:
+                pending.pop(index)
+        elif operation == "popAll":
+            pending.clear()
+    return pending
+
+
 def user_text(entry):
     content = message_of(entry).get("content")
     if isinstance(content, str):
@@ -934,6 +964,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
+        row["queued_input"] = (queued_input(Path(row["claude"]["transcript"]),
+                                            datetime.fromtimestamp(now, timezone.utc)) if row["claude"] else [])
         if remote:
             spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
             if spoken:
@@ -2031,8 +2063,8 @@ REVIEW_DIR = "~/.cache/orca-briefs/review/out"
 MERGE = re.compile(r"(?<![A-Za-z])merge(?![A-Za-z])|マージ", re.IGNORECASE)
 ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class", "scan_class", "reasons",
             "question", "merge_question", "review", "waits_on", "next_step", "verdict", "final", "last_user",
-            "transcripts", "comment", "pr", "git", "prompt_waiting", "tabs", "closable", "meaningful_tabs",
-            "open_pr_cleanup")
+            "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "tabs", "closable",
+            "meaningful_tabs", "open_pr_cleanup")
 
 
 class ReviewResult(TypedDict):
@@ -2102,7 +2134,7 @@ def row_view(row: dict) -> dict:
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
         "final": final, "last_user": asked or "", "transcripts": transcripts,
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
-        "prompt_waiting": row.get("prompt_waiting"),
+        "prompt_waiting": row.get("prompt_waiting"), "queued_input": row.get("queued_input") or [],
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
         "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
