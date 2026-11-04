@@ -868,7 +868,8 @@ def holds_only_records(result: dict) -> bool:
 def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str, str]]:
     """Copy each record under RECORD_DIRS in a path to review that the main checkout also ignores and does
     not have yet to the same place in main, keeping the copy only when cmp finds it identical; a later check
-    then finds the path in main. Files main has and symlinks stay for review."""
+    then finds the path in main. Files main has, symlinks, and records whose directory in main is a symlink
+    stay for review."""
     copied = []
     for entry in review:
         rel = entry.rpartition(" (")[0]
@@ -878,9 +879,11 @@ def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str
             continue
         files = [source] if source.is_file() else [child for child in source.rglob("*") if child.is_file()]
         for file in sorted(files):
-            target = main / file.relative_to(worktree)
-            if (not file.relative_to(worktree).as_posix().startswith(RECORD_DIRS) or file.is_symlink()
-                    or target.exists() or target.is_symlink()):
+            rel_file = file.relative_to(worktree)
+            target = main / rel_file
+            if (not rel_file.as_posix().startswith(RECORD_DIRS) or file.is_symlink()
+                    or target.exists() or target.is_symlink()
+                    or any((main / parent).is_symlink() for parent in rel_file.parents)):
                 continue
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -1060,7 +1063,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                             % (comment, key))
         else:
             notes.append("Lead answered %s: %r" % (key, answer.answer))
-    fetch_note = fetch_when_stale(worktree, args.base or default_base(worktree))
+    fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or default_base(worktree))
     if fetch_note:
         notes.append(fetch_note)
     if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree)

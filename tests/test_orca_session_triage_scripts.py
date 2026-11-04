@@ -2359,6 +2359,11 @@ class RmCheckTests(unittest.TestCase):
         (self.main / ".claude/reviews/topic").write_text("a file in main\n")
         (self.wt / ".claude/reviews/topic").mkdir()
         (self.wt / ".claude/reviews/topic/more.md").write_text("needs a directory main has as a file\n")
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (self.main / ".claude/reviews/linked").symlink_to(outside)
+        (self.wt / ".claude/reviews/linked").mkdir()
+        (self.wt / ".claude/reviews/linked/away.md").write_text("main links this directory elsewhere\n")
 
         code, result = self.run_main("--archive-scratch")
 
@@ -2366,6 +2371,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual([Path(item["to"]).name for item in result["copied_to_main"]], ["new.md"])
         self.assertEqual(code, 1)
         self.assertFalse((self.main / ".claude/settings.local.json").exists())
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_archive_scratch_copies_nothing_while_other_blockers_keep_the_worktree(self) -> None:
         self.ignore_review_records()
@@ -3030,6 +3036,25 @@ class RmCheckTests(unittest.TestCase):
         git(other, "fetch", "-q", str(self.wt), "feature")
         git(other, "merge", "-q", "--ff-only", "FETCH_HEAD")
         git(other, "push", "-q", "origin", "main")
+        fetched = Path(git(self.wt, "rev-parse", "--git-common-dir")) / "FETCH_HEAD"
+        old = (datetime.now() - timedelta(hours=2)).timestamp()
+        os.utime(fetched, (old, old))
+
+        code, result = self.run_main_without_base()
+
+        self.assertEqual((code, result["blockers"]), (0, []))
+
+    def test_the_remote_the_branch_started_from_is_fetched_before_judging(self) -> None:
+        bare = Path(self.tmp.name) / "upstream.git"
+        git(Path(self.tmp.name), "init", "--bare", "-q", "-b", "main", str(bare))
+        git(self.main, "remote", "add", "upstream", str(bare))
+        git(self.main, "push", "-q", "upstream", "main")
+        git(self.main, "fetch", "-q", "upstream")
+        self.wt = Path(self.tmp.name) / "from-upstream"
+        git(self.main, "worktree", "add", "-q", "-b", "fork-work", str(self.wt), "upstream/main")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        git(self.wt, "push", "-q", str(bare), "fork-work:main")
         fetched = Path(git(self.wt, "rev-parse", "--git-common-dir")) / "FETCH_HEAD"
         old = (datetime.now() - timedelta(hours=2)).timestamp()
         os.utime(fetched, (old, old))
