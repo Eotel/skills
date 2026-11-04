@@ -2,6 +2,11 @@
 name: orca-session-triage
 description: Sweep Orca agent sessions, relay batched answers and next steps, clear the board's done cards, and close finished tabs and worktrees. Use when the user asks which Orca sessions are finished, stalled, or waiting on them, wants their pending questions answered in one pass, wants done cards, finished sessions, tabs, or worktrees closed, or wants the sweep scheduled.
 hooks:
+  PreToolUse:
+    - matcher: AskUserQuestion
+      hooks:
+        - type: command
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -f "$f" ] && python3 "$f" || true'
   Stop:
     - hooks:
         - type: command

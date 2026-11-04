@@ -3714,6 +3714,67 @@ class PrecheckTests(unittest.TestCase):
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
+    def test_detached_scheduled_tabs_match_recorded_panes_and_transcripts(self) -> None:
+        for run_pane in ("old:leaf", None):
+            for final in ("作業を終えました。", "どちらの案にしますか？"):
+                with self.subTest(run_pane=run_pane, final=final), tempfile.TemporaryDirectory() as root:
+                    home = Path(root)
+                    transcript = home / "profile/projects/-w-triage/session-1.jsonl"
+                    write_jsonl(transcript, [
+                        {**user("/orca-session-triage hourly"), "timestamp": "2026-10-26T09:00:10Z"},
+                        {**assistant(text(final)), "timestamp": "2026-10-26T09:02:00Z"}])
+                    runs = [{"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current:leaf",
+                             "workspaceId": "repo::/w/triage", "startedAt": 1793008800000},
+                            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": run_pane,
+                             "workspaceId": "repo::/w/triage", "startedAt": 1793005200000}]
+                    terms = [{"worktreeId": "repo::/w/triage", "tabId": "current", "leafId": "leaf",
+                              "handle": "current-handle", "connected": True},
+                             {"worktreeId": "repo::/w/triage", "tabId": "pty:old", "leafId": "pty:old",
+                              "recordedPaneKey": "old:leaf", "handle": "old-handle",
+                              "connected": True, "orphaned": True, "title": "Claude Code"},
+                             {"worktreeId": "repo::/w/triage", "tabId": "pty:other", "leafId": "pty:other",
+                              "recordedPaneKey": "other:leaf", "handle": "other-handle",
+                              "connected": True, "orphaned": True}]
+                    status = home / "last-status.json"
+                    status.write_text(json.dumps({"version": 2, "entries": {"old:leaf": {
+                        "worktreeId": "repo::/w/triage", "paneKey": "old:leaf",
+                        "providerSession": {"id": "session-1", "transcriptPath": str(transcript)},
+                        "payload": {"state": "done", "mainAgent": {"state": "done"}}}}}))
+
+                    def orca(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                        args = command[1:-1]
+                        if args == ["automations", "list"]:
+                            result = {"automations": [triage_automation("a1", "/w/triage")]}
+                        elif args == ["automations", "runs", "--id", "a1"]:
+                            result = {"runs": runs}
+                        elif args == ["terminal", "list"]:
+                            result = {"terminals": terms}
+                        elif args == ["worktree", "ps"]:
+                            result = {"worktrees": [{"path": "/w/triage", "agents": []}]}
+                        elif args == ["terminal", "read", "--terminal", "old-handle", "--screen"]:
+                            result = {"source": "screen", "tail": ["finished", "❯"]}
+                        elif args == ["terminal", "close", "--terminal", "old-handle"]:
+                            result = {}
+                        else:
+                            self.fail(f"unexpected Orca call: {command}")
+                        return subprocess.CompletedProcess(command, 0, json.dumps({"result": result}))
+
+                    with patch.object(cleanup_hourly.subprocess, "run", side_effect=orca) as calls, \
+                            redirect_stdout(io.StringIO()) as out:
+                        code = cleanup_hourly.main(["--workspace", "/w/triage", "--orca", "test-orca",
+                                                    "--agent-status-file", str(status),
+                                                    "--state-file", str(home / "state.json")])
+                    self.assertEqual(code, 0)
+                    closed = [call.args[0] for call in calls.call_args_list if call.args[0][1:3] ==
+                              ["terminal", "close"]]
+                    self.assertEqual(closed, [] if "？" in final else [
+                        ["test-orca", "terminal", "close", "--terminal", "old-handle", "--json"]])
+                    lines = out.getvalue().splitlines()
+                    self.assertEqual(len(lines), 2)
+                    self.assertIn("other-handle: no unique scheduled run and transcript", lines[1])
+                    self.assertIn("keep: old-handle: unanswered conversation question" if "？" in final else
+                                  "closed: old-handle: completed scheduled run", lines[0])
+
     def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self):
         with tempfile.TemporaryDirectory() as root:
             home = Path(root)
@@ -4669,6 +4730,74 @@ class StopCheckTests(unittest.TestCase):
         self.assertIsNone(self.check())
         self.queue()
         self.assertIsNone(self.check())
+
+    def test_hourly_question_hook_rejects_questions_without_kana_or_kanji(self) -> None:
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            {"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current",
+             "workspaceId": "repo1::/w/triage", "startedAt": 1793005200000}]})
+        sent = datetime.fromisoformat("2026-10-26T09:00:00+00:00")
+        stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], sent.isoformat(), 0).save(self.root, sent)
+        question = {"question": "Which option?", "header": "方針",
+                    "options": [{"label": "Keep", "description": "Leave it as it is"}]}
+        for field in (None, "description"):
+            with self.subTest(field=field):
+                asked = json.loads(json.dumps(question))
+                if field:
+                    asked["options"][0][field] = "今のままにします"
+                hook = {"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
+                        "cwd": "/w/triage", "tool_input": {"questions": [asked]}}
+                with patch.dict(os.environ, {"ORCA_PANE_KEY": "current", "ORCA_CLI_COMMAND": orca}), \
+                        patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), \
+                        redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(stopcheck.main(self.root), 0)
+                if field is None:
+                    decision = json.loads(out.getvalue())["hookSpecificOutput"]
+                    self.assertEqual((decision["hookEventName"], decision["permissionDecision"]),
+                                     ("PreToolUse", "deny"))
+                    self.assertIn("日本語", decision["permissionDecisionReason"])
+                else:
+                    self.assertEqual(out.getvalue(), "")
+
+    def test_hourly_question_hook_requires_a_handoff_from_this_run(self) -> None:
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": "older",
+             "workspaceId": "repo1::/w/triage", "startedAt": 1793001600000},
+            {"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current",
+             "workspaceId": "repo1::/w/triage", "startedAt": 1793005200000}]})
+        hook = {"tool_name": "AskUserQuestion", "session_id": "s1", "cwd": "/w/triage",
+                "tool_input": {"questions": [{"question": "どうしますか？",
+                    "options": [{"label": "残す", "description": "今のままにします"}]}]}}
+        with patch.dict(os.environ, {"ORCA_PANE_KEY": "current"}):
+            self.assertEqual(stopcheck.question_decision(hook, orca, self.root)["hookSpecificOutput"]
+                             ["permissionDecision"], "deny")
+            for stamp in ("2026-10-26T08:59:59+00:00", "2026-10-26T09:00:00+00:00",
+                          "2026-10-26T09:00:01+00:00"):
+                with self.subTest(stamp=stamp):
+                    sent = datetime.fromisoformat(stamp)
+                    stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], stamp, 0).save(self.root, sent)
+                    decision = stopcheck.question_decision(hook, orca, self.root)
+                    self.assertEqual(decision is None, sent.hour >= 9)
+            self.assertIsNone(stopcheck.question_decision({**hook, "tool_name": "Bash"}, orca, self.root))
+            self.assertIsNone(stopcheck.question_decision({**hook, "cwd": "/w/other"}, orca, self.root))
+
+    def test_hourly_question_hook_uses_session_start_when_the_run_has_no_pane(self) -> None:
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": None,
+             "workspaceId": "repo1::/w/triage", "startedAt": 1793001600000}]})
+        config = self.root / "claude"
+        (config / "sessions").mkdir(parents=True)
+        (config / "sessions/123.json").write_text(json.dumps({"sessionId": "s1", "startedAt": 1793005200000}))
+        hook = {"tool_name": "AskUserQuestion", "session_id": "s1", "cwd": "/w/triage",
+                "tool_input": {"questions": [{"question": "保存しますか？",
+                    "options": [{"label": "保存", "description": "ファイルを保存します"}]}]}}
+        with patch.dict(os.environ, {"ORCA_PANE_KEY": "current", "CLAUDE_CONFIG_DIR": str(config),
+                                     "CLAUDE_PID": "123"}):
+            for stamp in ("2026-10-26T08:59:59+00:00", "2026-10-26T09:00:00+00:00"):
+                with self.subTest(stamp=stamp):
+                    sent = datetime.fromisoformat(stamp)
+                    stopcheck.handoff.SavedHandoff("引き継ぎ", "ask", [], stamp, 0).save(self.root, sent)
+                    decision = stopcheck.question_decision(hook, orca, self.root)
+                    self.assertEqual(decision is None, sent.hour == 9)
 
     def test_blocks_while_queued_rows_are_not_classed(self):
         self.queue("/w/a", "/w/b")

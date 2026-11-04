@@ -15,15 +15,21 @@ inbox cursor is acked; an ask the tab's own workspace sent from this Mac (its
 handoff) does not count.
 After the checks pass, an hourly transcript path is queued for the external
 retrospective worker.
+Before AskUserQuestion in the hourly workspace, the PreToolUse hook checks for
+kana or kanji in the questions, options and descriptions, and a handoff sent during this run.
 """
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import Any
+import unicodedata
 
+import handoff
 import inbox_read
 import hourly_runtime
 import retro
@@ -46,6 +52,56 @@ def read_json(path):
 
 
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
+
+
+def question_decision(hook_input: dict[str, Any], orca: str,
+                      handoffs_dir: Path | None = None) -> dict[str, Any] | None:
+    """Deny an hourly workspace's question until it is in Japanese and its handoff was sent."""
+    if hook_input.get("tool_name") != "AskUserQuestion" or not hook_input.get("cwd"):
+        return None
+    workspace = hook_input["cwd"]
+    try:
+        if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
+                   for automation in triage_automations(orca, workspace)):
+            return None
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
+    try:
+        runs = hourly_runtime.scheduled_runs(orca, workspace)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        runs = []
+    questions = (hook_input.get("tool_input") or {}).get("questions") or []
+    texts = []
+    for question in questions:
+        texts.append(question.get("question", ""))
+        texts.extend(value for option in question.get("options") or []
+                     for value in (option.get("label", ""), option.get("description", "")))
+    reasons = []
+    if not any(unicodedata.name(char, "").startswith((
+            "HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
+            "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")) for value in texts for char in value):
+        reasons.append("問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
+    pane = os.environ.get("ORCA_PANE_KEY")
+    started = next((run.get("startedAt") for run in runs
+                    if pane and run.get("terminalPaneKey") == pane), None)
+    if not isinstance(started, (int, float)):
+        config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
+        session = read_json(config / "sessions" / f"{os.environ.get('CLAUDE_PID', '')}.json")
+        started = session.get("startedAt") if (isinstance(session, dict) and
+                  session.get("sessionId") == hook_input.get("session_id")) else None
+    try:
+        if not isinstance(started, (int, float)):
+            raise ValueError("この回の開始時刻を確認できません")
+        _, sent = handoff.SavedHandoff.newest((handoffs_dir or handoff.HANDOFFS).expanduser())
+        sent_at = datetime.fromisoformat(sent.sent_at.replace("Z", "+00:00"))
+        if sent_at < datetime.fromtimestamp(started / 1000, tz=timezone.utc):
+            reasons.append("最後の引き継ぎはこの回の開始前です。質問の前に handoff.py send で引き継ぎを送ってください。")
+    except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
+        reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
+    if not reasons:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": " ".join(reasons)}}
 
 
 def decide(hook_input, state_dir, orca="orca"):
@@ -203,12 +259,18 @@ def missing_inbox_watch(workspace, orca):
             "do not start another reader of ~/.cache/orca-briefs/offsets/close-done-triage.offset.")
 
 
-def main():
+def main(handoffs_dir: Path | None = None) -> int:
     try:
         hook_input = json.load(sys.stdin)
     except ValueError:
         return 0
-    decision = decide(hook_input, str(Path(STATE_DIR).expanduser()), os.environ.get("ORCA_CLI_COMMAND", "orca"))
+    orca = os.environ.get("ORCA_CLI_COMMAND", "orca")
+    if hook_input.get("hook_event_name") == "PreToolUse":
+        decision = question_decision(hook_input, orca, handoffs_dir)
+        if decision:
+            json.dump(decision, sys.stdout, ensure_ascii=False)
+        return 0
+    decision = decide(hook_input, str(Path(STATE_DIR).expanduser()), orca)
     if decision:
         json.dump(decision, sys.stdout)
     else:
