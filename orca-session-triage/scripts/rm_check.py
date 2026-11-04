@@ -471,7 +471,8 @@ def pipe_ends() -> dict[int, tuple[str | None, str | None]]:
                 if os.getpgid(int(proc.name)) != group:
                     continue
                 stdin, stdout = (str((proc / "fd" / fd).readlink()) for fd in ("0", "1"))
-                ends[int(proc.name)] = tuple(end if end.startswith("pipe:") else None for end in (stdin, stdout))
+                ends[int(proc.name)] = (stdin if stdin.startswith("pipe:") else None,
+                                        stdout if stdout.startswith("pipe:") else None)
             except (OSError, ValueError):
                 continue
         return ends
