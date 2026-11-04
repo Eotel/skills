@@ -21,14 +21,14 @@ and prints nothing. Read a long inbox this way rather than cutting the output,
 and read past entries by time or worktree with `inbox --since`. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
 `repo/worktree` (older entries without a repo use their worktree). A read with
-`--kind`, `--source`, or `--id` prints no `NEXT_OFFSET`, so an entry the filter
+`--kind`, `--source`, `--id`, or `--since` prints no `NEXT_OFFSET`, so an entry the filter
 hid is never acknowledged: acknowledge from an unfiltered read.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
-scheduled triage tab may read or acknowledge that cursor; a run Orca marked
+scheduled triage tab may acknowledge that cursor; a run Orca marked
 `dispatch_failed` on a restart still counts while its tab is connected. An older tab must
-leave new inbox entries for the current run; it can finish without handling
+leave new inbox entries unacknowledged for the current run; it can finish without handling
 them. The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local
 Mac) reads with
@@ -56,7 +56,7 @@ records the ask (or one of its questions) answered once the send lands (the
 id's first 8 or more characters will do, as for `read --id`);
 `scripts/inbox_read.py answered <id> --note <why>` records one answered another
 way (on another Mac, by the user in the lane, or no longer asked), and
-`open-asks` lists the rest, oldest first (`--json` for other tools; the board
+`open-asks` lists the rest apart from handoffs, oldest first (`--json` for other tools; the board
 reads it). Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
 It marks only the asks an answer after them proves answered: a lead decision

@@ -3674,6 +3674,70 @@ class InboxReadTests(unittest.TestCase):
                 self.assertEqual(output.getvalue(),
                                  "t5 ask host1 old\n旧形式\n\n")
 
+    def test_an_empty_filtered_read_names_matching_entries_before_the_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))
+            write_jsonl(inbox, [
+                {"id": "early", "ts": "2026-11-04T08:00:00+09:00", "kind": "ask", "repo": "r",
+                 "worktree": "a", "text": "古い質問"},
+                {"id": "latest", "ts": "2026-11-04T10:00:00+09:00", "kind": "ask", "repo": "r",
+                 "worktree": "a", "text": "最新の質問"},
+                {"id": "remote", "ts": "2026-11-04T09:00:00+09:00", "kind": "ask", "repo": "r",
+                 "worktree": "a", "text": "遅れて届いた質問"},
+                {"id": "other", "ts": "2026-11-04T11:00:00+09:00", "kind": "done", "repo": "r",
+                 "worktree": "b", "text": "別の送り元"},
+            ])
+            acknowledged = str(inbox.stat().st_size)
+            cursor.write_text(acknowledged)
+            with inbox.open("a") as stream:
+                stream.write(json.dumps({"id": "new", "kind": "info", "worktree": "c", "text": "経過"}) + "\n")
+
+            def run(*argv: str) -> tuple[int, str, str]:
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    code = inbox_read.main(["read", *argv])
+                return code, out.getvalue(), err.getvalue()
+
+            for filters in (("--kind", "ask"), ("--source", "r/a"), ("--kind", "ask", "--source", "r/a")):
+                with self.subTest(filters=filters):
+                    code, output, error = run(*filters)
+                    self.assertEqual((code, output), (0, ""))
+                    self.assertIn("before the cursor: 3", error)
+                    self.assertIn("id=latest", error)
+                    self.assertIn("2026-11-04T10:00:00+09:00", error)
+            self.assertIn("before the cursor: 0", run("--source", "missing")[2])
+            self.assertEqual(cursor.read_text(), acknowledged)
+
+    def test_since_reads_acknowledged_entries_by_time_without_an_offset_to_acknowledge(self) -> None:
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))
+            write_jsonl(inbox, [
+                {"id": "before", "ts": (midnight - timedelta(seconds=1)).isoformat(), "kind": "ask",
+                 "worktree": "a", "text": "昨日の質問"},
+                {"id": "since", "ts": midnight.isoformat(), "kind": "ask", "worktree": "a", "text": "今日の質問"},
+                {"id": "info", "ts": midnight.isoformat(), "kind": "info", "worktree": "a", "text": "経過"},
+                {"id": "bad-time", "ts": "unknown", "kind": "ask", "worktree": "a", "text": "時刻なし"},
+            ])
+            acknowledged = str(inbox.stat().st_size)
+            cursor.write_text(acknowledged)
+            for since in ("00:00", midnight.isoformat()):
+                with self.subTest(since=since), \
+                        patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    self.assertEqual(inbox_read.main(["read", "--since", since]), 0)
+                    self.assertIn("id=since", out.getvalue())
+                    self.assertIn("id=info", out.getvalue())
+                    for hidden in ("id=before", "id=bad-time", "NEXT_OFFSET"):
+                        self.assertNotIn(hidden, out.getvalue())
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    self.assertEqual(inbox_read.main([
+                        "read", "--since", since, "--kind", "ask", "--source", "a", "--summary"]), 0)
+                self.assertEqual(len(out.getvalue().splitlines()), 1)
+                self.assertIn("id=since", out.getvalue())
+            self.assertEqual(cursor.read_text(), acknowledged)
+
     def test_questions_come_four_at_a_time_ready_for_ask_user_question(self):
         def question(n, **extra):
             return {"question": f"Q{n} をどうしますか？", "header": f"判断{n}", "multiSelect": False,
@@ -3749,14 +3813,36 @@ class InboxReadTests(unittest.TestCase):
             recorded = [json.loads(line)["id"] for line in (Path(root) / "answers.jsonl").read_text().splitlines()]
 
             self.assertEqual([(ask["id"], ask["source"], ask["open_questions"]) for ask in listed],
-                             [("early", "r/b", [1, 2]), ("late", "a", []),
+                             [("early", "r/b", [{"number": n, **question} for n, question in enumerate(two, 1)]),
+                              ("late", "a", []),
                               ("c8f79c0f-1111-4222-8333-444455556666", "c", [])])
             self.assertEqual([(ask["id"], ask["open_questions"]) for ask in partly],
-                             [("early", [2]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
+                             [("early", [{"number": 2, **two[1]}]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
             self.assertEqual((by_prefix[0], recorded[-1]), (0, "c8f79c0f-1111-4222-8333-444455556666"))
             self.assertEqual(run("open-asks")[1], "")
             self.assertEqual(unknown[0], 1)
             self.assertIn("done1", unknown[2])
+
+    def test_open_asks_leaves_marked_handoffs_to_lead_decisions(self) -> None:
+        question = {"question": "続けますか？", "header": "継続", "recommended": "続ける",
+                    "options": [{"label": "続ける", "description": "作業を再開する"},
+                                {"label": "待つ", "description": "次の判断を待つ"}]}
+        with tempfile.TemporaryDirectory() as root:
+            inbox, answers = (Path(root) / name for name in ("inbox.jsonl", "answers.jsonl"))
+            write_jsonl(inbox, [
+                {"id": "handoff", "kind": "ask", "worktree": "triage", "questions": [question],
+                 "text": "判断をお願いします\n\n—— 送る直前に道具が足した事実 ——\n走査の開始後に届いた報告: 0 件（なし）"},
+                {"id": "normal", "kind": "ask", "worktree": "triage", "questions": [question],
+                 "text": "引き継ぎのない通常の質問"},
+            ])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers)}):
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["open-asks", "--json"]), 0)
+                self.assertEqual([ask["id"] for ask in json.loads(out.getvalue())], ["normal"])
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["questions"]), 0)
+                self.assertEqual([item["id"] for item in json.loads(out.getvalue())["items"]], ["normal:1"])
+            self.assertFalse(answers.exists())
 
     def test_answered_before_marks_only_asks_an_answer_proves_and_names_the_rest(self):
         # 2026-10-29: a bulk mark took an unanswered ask out of open-asks, and it waited 25 hours.
@@ -4055,9 +4141,16 @@ class InboxReadTests(unittest.TestCase):
                     patch.object(hourly_runtime, "scheduled_runs", return_value=[
                         {"status": "completed", "terminalPaneKey": "new-pane"},
                         {"status": "completed", "terminalPaneKey": "old-pane"}]):
+                for options in ([], ["--summary"], ["--kind", "ask"]):
+                    with self.subTest(options=options), redirect_stdout(io.StringIO()) as out, \
+                            redirect_stderr(io.StringIO()):
+                        self.assertEqual(inbox_read.main(["read", *options]), 0)
+                    self.assertIn("new question", out.getvalue())
+                    self.assertEqual(cursor.read_text(), "0")
                 with redirect_stderr(io.StringIO()) as error:
                     self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 1)
                 self.assertIn("latest scheduled", error.getvalue())
+                self.assertIn("inbox --since HH:MM --wt NAME", error.getvalue())
                 self.assertEqual(cursor.read_text(), "0")
                 os.environ["ORCA_PANE_KEY"] = "new-pane"
                 with redirect_stdout(io.StringIO()):
