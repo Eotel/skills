@@ -521,10 +521,13 @@ def cut_off(row):
 
     Claude Code does not resume such a turn, and a monitor it left running keeps
     Orca at working, so only the transcript shows the agent stopped mid-task.
+    A failure Codex's tab still shows can be an earlier turn's: it counts only
+    while no turn runs.
     """
     codex = row["codex"][-1] if row["codex"] else {}
     orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
-    return (row.get("codex_screen_error") or codex.get("api_error")
+    screen = row.get("codex_screen_error")
+    return ((screen if screen and not turn_runs(row) else None) or codex.get("api_error")
             or (row["claude"] or {}).get("api_error")
             or (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None))
 
@@ -2362,9 +2365,11 @@ WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切�
 
 
 def wake_line(row: dict, stop: StopReason) -> str:
-    """name | the stopped agent's tab | what it needs | the error."""
-    tab = next((t.get("handle") for t in row.get("terminals") or [] if t.get("handle")
-                and (stop["agent"] is None or t.get("agent") == stop["agent"])), None)
+    """name | the stopped agent's tab, or its candidates when several agent tabs could be it | what it needs |
+    the error."""
+    tabs = [t["handle"] for t in row.get("terminals") or [] if t.get("handle") and t.get("agent")
+            and (stop["agent"] is None or t["agent"] == stop["agent"])]
+    tab = tabs[0] if len(tabs) == 1 else f"不明（{', '.join(tabs)}）" if tabs else None
     action = (f"利用上限: {stop['resets'] or '戻る時刻は不明'} まで待つ" if stop["kind"] == "usage_limit"
               else WAKE_ACTIONS[stop["kind"]])
     error = " ".join(stop["error"].split())

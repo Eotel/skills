@@ -1068,11 +1068,17 @@ class ClassifyTests(unittest.TestCase):
         codex = {"/w/cut": [{"rollout": "r", "last_user": "finish", "last_role": "assistant",
                               "last_assistant": "Done.", "last_assistant_at": "2026-10-01T01:00:00Z",
                               "pending_requests": []}]}
-        row = self.inventory(
-            [worktree("/w/cut", "done", agent="codex", pr={"number": 1, "state": "merged"})],
-            [terminal("/w/cut", "codex", preview="Done.\n" + failure + "\n")], codex)[0]
+        rows = {r["path"]: r for r in self.inventory(
+            [worktree("/w/cut", "done", agent="codex", pr={"number": 1, "state": "merged"}),
+             worktree("/w/resumed", "working", agent="codex")],
+            [terminal("/w/cut", "codex", preview="Done.\n" + failure + "\n"),
+             terminal("/w/resumed", "codex", preview=failure + "\n› try again\n• Retrying the build.\n")],
+            {**codex, "/w/resumed": codex["/w/cut"]})}
+        row = rows["/w/cut"]
         self.assertEqual((row["class"], row["reasons"], row["closable"]),
                          ("stalled", ["turn ended with an API error: " + failure], []))
+        # The tab still shows the earlier turn's failure while a new turn runs.
+        self.assertEqual((rows["/w/resumed"]["class"], rows["/w/resumed"]["stop"]), ("working", None))
 
     def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self):
         # 2026-10-06 a lead ended its turn while workers ran; their reports sat unread for 20 hours.
@@ -1783,7 +1789,15 @@ class ScanCommandTests(unittest.TestCase):
             stopped("/w/app/limit", None, "term_l", "usage_limit", "wait", "You've hit your weekly limit",
                     "Nov 7 at 8pm (Asia/Tokyo)"),
             stopped("/w/app/dns", None, "term_d", "connection", "wake", "API Error: Can't reach the API server"),
-            stopped("/w/app/login", "mbp16", "term_g", "login", "human", "Login expired · Please run /login"),
+            # Orca's copy of another Mac's message names no agent: its tab is the agent's, never a shell's.
+            {**stopped("/w/app/login", "mbp16", "term_g", "login", "human", "Login expired · Please run /login"),
+             "terminals": [{"handle": "term_sh", "agent": None}, {"handle": "term_g", "agent": "claude"}],
+             "stop": {"kind": "login", "action": "human", "agent": None, "error": "Login expired · Please run /login",
+                      "resets": None}},
+            {**stopped("/w/app/two", "mbp16", "term_a", "connection", "wake", "API Error: Connection lost"),
+             "terminals": [{"handle": "term_a", "agent": "claude"}, {"handle": "term_b", "agent": "codex"}],
+             "stop": {"kind": "connection", "action": "wake", "agent": None, "error": "API Error: Connection lost",
+                      "resets": None}},
             {"path": "/w/app/done", "repo": "app", "environment": None, "class": "finished", "reasons": [],
              "comment": "", "claude": None, "codex": [], "terminals": []},
         ], ensure_ascii=False))
@@ -1794,7 +1808,8 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines(), [
             "limit | term_l | 利用上限: Nov 7 at 8pm (Asia/Tokyo) まで待つ | You've hit your weekly limit",
             "dns | term_d | 通信断: 起こす | API Error: Can't reach the API server",
-            "mbp16::login | term_g | ログイン切れ: 人が /login する | Login expired · Please run /login"])
+            "mbp16::login | term_g | ログイン切れ: 人が /login する | Login expired · Please run /login",
+            "mbp16::two | 不明（term_a, term_b） | 通信断: 起こす | API Error: Connection lost"])
 
     def test_summary_names_each_missing_hook_file_with_its_host(self):
         saved, _ = self.saved_scan()
