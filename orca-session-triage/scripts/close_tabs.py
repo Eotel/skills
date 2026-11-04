@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Close the tabs a saved scan listed, unless their worktree moved after the scan.
 
-usage: close_tabs.py --from SCAN_JSON HANDLE [HANDLE ...]
+usage: close_tabs.py --from SCAN_JSON [HANDLE ...] [--row NAME ...]
 
 Just before closing each tab it reads again what moves while a lane works: the
 newest entry of each of the worktree's Claude transcripts and of the Codex
@@ -179,9 +179,16 @@ def moved_after_scan(row: dict, host: TabHost, projects: Path, inbox: Path, call
     return sorted((activity for activity in seen if activity.at > started), key=lambda activity: activity.at)
 
 
+def row_handles(row: dict) -> list[str]:
+    """The handles the row lists for cleanup, once each; sleeping cards have no handle."""
+    return list(dict.fromkeys(handle for handle in [*(row.get("closable") or []), *(row.get("meaningful_tabs") or []),
+                                                    *(card.get("handle") for card in row.get("done_cards") or [])]
+                              if handle and not handle.startswith("(no handle)")))
+
+
 def row_of(rows: Sequence[dict], handle: str) -> dict | None:
-    return next((row for row in rows if any(tab.get("handle") == handle for tab in row.get("terminals") or [])),
-                None)
+    return next((row for row in rows if handle in row_handles(row)
+                 or any(tab.get("handle") == handle for tab in row.get("terminals") or [])), None)
 
 
 def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, inbox: Path,
@@ -208,7 +215,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--from", dest="from_file", required=True, metavar="SCAN_JSON",
                         help="the saved scan whose rows list these tabs")
-    parser.add_argument("handles", nargs="+", metavar="HANDLE")
+    parser.add_argument("handles", nargs="*", metavar="HANDLE")
+    parser.add_argument("--row", action="append", default=[], metavar="NAME",
+                        help="close this row's closable, meaningful_tabs, and done_cards handles; repeatable; "
+                             "NAME accepts the same repo/name, name, path, or identity as scan_sessions.py --row")
     parser.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                         help="Claude Code transcript root (default: %(default)s)")
     parser.add_argument("--inbox", type=Path,
@@ -216,7 +226,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
                         help="triage inbox (default: $TRIAGE_INBOX or %(default)s)")
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.handles and not args.row:
+        parser.error("pass HANDLE or --row NAME")
+    return args
 
 
 def main(argv: Sequence[str] | None = None, host: TabHost | None = None) -> int:
@@ -226,10 +239,18 @@ def main(argv: Sequence[str] | None = None, host: TabHost | None = None) -> int:
     except (OSError, ValueError) as error:
         print(f"--from: {error}", file=sys.stderr)
         return 2
+    try:
+        selected = [scan_sessions.select_row(rows, name) for name in args.row]
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    targets = [(row_of(rows, handle), handle) for handle in args.handles]
+    targets.extend((row, handle) for row in selected for handle in row_handles(row))
+    unique = {(row.get("environment") if row else None, handle): (row, handle) for row, handle in targets}
     host = host or OrcaTabs(args.orca)
     caller = Caller.from_environment()
-    results = [close_one(rows, handle, host, args.claude_projects.expanduser(), args.inbox.expanduser(), caller)
-               for handle in dict.fromkeys(args.handles)]
+    results = [close_one([row] if row else rows, handle, host, args.claude_projects.expanduser(),
+                         args.inbox.expanduser(), caller) for row, handle in unique.values()]
     print(*(line for _, line in results), sep="\n")
     return 0 if all(closed for closed, _ in results) else 1
 

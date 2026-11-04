@@ -52,13 +52,23 @@ board's done cards; close what the user approves.
   `hook_errors` (`host`, `path`, `tab`) and reasons, on any Mac. The screen
   keeps an old error until the tab runs again.
   `--summary` prints class counts, review rows, finished worktree/tab counts,
-  open PR cleanup rows, and each hook error with its host. `--rows` prints one line per row (name, the
+  open PR cleanup rows with each one's `rm_check.py` command, and each hook error with its host. `--rows` prints one line per row (name, the
   verdict's class over the scan's, GitHub repo and PR, tab count, newest final
-  message time, and its question, `waits_on`, `next_step`, or message start).
-  `--row NAME` prints one row as JSON with fixed keys: no null strings, the
-  newest final message of Claude, Codex, or Orca in `final`, and `github` as
-  owner/repo from origin for `gh -R`. `--from SCAN_JSON` reads a saved scan
-  instead of scanning again. Read rows through these rather than parsing the
+  message time, its question, `waits_on`, `next_step`, or message start,
+  `reasons`, `git.dirty`, and `git.unpushed`); `--class CLASS` keeps one class.
+  `--row NAME` prints one row as JSON with the fixed keys its `--help` lists: no null strings, the
+  newest final message of Claude, Codex, or Orca in `final`, `github` as
+  owner/repo from origin for `gh -R`, the agents' `transcripts`, and the PR's
+  completed independent review (`review`: head, verdict, path, and whether it
+  asks for changes on the current head) beside `merge_question`. NAME is
+  repo/name as `--summary` prints it, the name (a unique one on another Mac
+  needs no `ENVIRONMENT::`), the path, or the row identity; with no single
+  match it lists candidates on stderr and exits 1. `--from SCAN_JSON` reads a saved scan
+  instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
+  `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
+  meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
+  commands). `--only NAME` scans one worktree and queues it in `--review-out` even
+  when it would not need a careful read. Read rows through these rather than parsing the
   scan's JSON by hand. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
   reads each idle worktree's newest final message and returns `jev`: `asks`,
@@ -86,7 +96,8 @@ board's done cards; close what the user approves.
   characters), `closable` tab, and `meaningful_tabs` entry on its own line,
   led by the worktree's name: read cards through it. With
   `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
-  that closes them. Each row records the scan's start (`scanned_at`).
+  that closes them, and a finished or open PR cleanup row with its
+  `rm_check.py` command. Each row records the scan's start (`scanned_at`).
   The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
   repository's main checkout is a row (`main`) while it hosts an agent. A
@@ -119,7 +130,8 @@ board's done cards; close what the user approves.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted". `--confirm-gone` confirms a removal
   finished.
-- `scripts/close_tabs.py --from SCAN_JSON HANDLE ...`: closes tabs the saved
+- `scripts/close_tabs.py --from SCAN_JSON HANDLE ...` (or `--row NAME`, repeatable, for a
+  row's `closable`, `meaningful_tabs`, and done-card handles): closes tabs the saved
   scan listed, and keeps each one whose worktree's transcripts, triage inbox
   reports, or agent states in Orca, other than the calling session's own,
   changed after the scan started. Close tabs through it.
