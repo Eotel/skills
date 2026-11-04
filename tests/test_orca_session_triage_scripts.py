@@ -3472,6 +3472,22 @@ class LeadDecisionProposalTests(unittest.TestCase):
                           ("keep:/w/b", "2026-10-01T02:00:00Z", "2026-10-01T02:00:00Z", 1)])
         self.assertEqual(result["settled"], [])
 
+    def test_unanswered_settles_a_structured_ask_answered_question_by_question(self) -> None:
+        write_jsonl(self.inbox, [{"id": "ask2", "kind": "ask", "worktree": "lane", "ts": "2026-10-01T00:00:00Z",
+                                  "text": "two", "questions": [{"question": "A?"}, {"question": "B?"}]}])
+        write_jsonl(self.handed, [{"decision": "whole", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask2"},
+                                  {"decision": "one", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask3:1"}])
+        write_jsonl(self.answers, [{"id": "ask2:1", "at": "2026-10-01T02:00:00Z", "how": "reply", "note": "A"},
+                                   {"id": "ask2:2", "at": "2026-10-01T02:01:00Z", "how": "reply", "note": "B"},
+                                   {"id": "ask3", "at": "2026-10-01T02:02:00Z", "how": "reply", "note": "all"}])
+
+        code, shown = self.call("unanswered", "--handed-off-file", str(self.handed))
+
+        self.assertEqual(code, 0)
+        result = json.loads(shown)
+        self.assertEqual(result["unanswered"], [])
+        self.assertEqual([item["decision"] for item in result["settled"]], ["whole", "one"])
+
     def test_unanswered_settles_bound_asks_with_the_answer_record_and_reads_old_handoffs(self) -> None:
         write_jsonl(self.handed, [{"decision": "bound", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask1"},
                                   {"decision": "bound", "handed_off_at": "2026-10-01T02:00:00Z"},

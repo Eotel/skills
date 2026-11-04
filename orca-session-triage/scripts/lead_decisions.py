@@ -265,6 +265,17 @@ def ask_answers(path: Path) -> dict[str, dict]:
     return found
 
 
+def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
+    """The answer covering an ask as open-asks reads it: a record for `<id>` (for `<id>:<n>`, also one for the whole
+    ask), or one for every question of a structured ask."""
+    whole, _, number = ask_id.partition(":")
+    if found := answers.get(ask_id) or (answers.get(whole) if number else None):
+        return found
+    questions = inbox_read.questions_of(asks.get(ask_id) or {})
+    parts = [answers.get(f"{ask_id}:{index}") for index in range(1, len(questions) + 1)]
+    return {"id": ask_id, "answers": parts} if questions and all(parts) else None
+
+
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
                   decisions: list[str] | None = None) -> dict[str, list[dict]]:
@@ -273,13 +284,14 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     for item in handed:
         history.setdefault(item.decision, []).append(item)
     keys = list(dict.fromkeys(decisions)) if decisions else list(history)
+    asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
     settled = []
     last = {}
     for key in keys:
         item = history[key][-1] if key in history else None
         answer = (asdict(answered[key]) if key in answered else
-                  next((answers[ask] for entry in reversed(history.get(key, []))
-                        if (ask := entry.ask_id) and ask in answers), None))
+                  next((found for entry in reversed(history.get(key, []))
+                        if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
         if answer is not None:
             settled.append({"decision": key, "answer": answer})
         else:
