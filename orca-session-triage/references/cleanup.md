@@ -67,11 +67,14 @@ Run these per worktree, in order.
      those folders alone keep the worktree, it moves them to
      `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/` (listed in
      `archived`) and checks again; it moves nothing while anything else blocks
-     or needs review. Without the option nothing moves. Before that, the option
-     copies each file to review that the main checkout also ignores and does not
-     have yet (a new record under `.claude/reviews/`) to the same place in main,
-     confirmed with cmp (`copied_to_main`); `.env` files are not copied. With
-     `--detach-nested` as well, nested copies and these folders go together.
+     or needs review. Without the option nothing moves. Before that, when only
+     paths to review, those folders, and nested worktrees keep it, the option
+     copies each record under `.claude/reviews/` that the main checkout also
+     ignores and does not have yet to the same place in main, confirmed with cmp
+     (`copied_to_main`). Other ignored files, such as `.env` or
+     `.claude/settings.local.json`, are settings main would run with and stay
+     for review. With `--detach-nested` as well, nested copies and these
+     folders go together.
    - `regenerable` lists what a tool writes again from tracked files or
      installed packages with no one's input: untracked Python bytecode, and,
      among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
@@ -106,8 +109,8 @@ Run these per worktree, in order.
      saved scan when that scan lists the handle in `closable`, then run
      `rm_check.py` again. A
      process outside Orca tabs blocks with its PID; a `node` server or another
-     job is left running and reported. The check's own process group (the
-     command its output is piped into) is not listed.
+     job is left running and reported. The commands the check's output is
+     piped into are not listed.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
      (uncommitted changes, ignored paths to open, HEAD on no remote). A tracked

@@ -2070,7 +2070,7 @@ class RmCheckTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
              str(self.wt.resolve())],
-            stdout=subprocess.PIPE, text=True, start_new_session=True,
+            stdout=subprocess.PIPE, text=True,
         )
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
@@ -2092,7 +2092,7 @@ class RmCheckTests(unittest.TestCase):
     def test_process_running_from_worktree_blocks_without_path_in_command(self):
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)"],
-            cwd=self.wt, stdout=subprocess.PIPE, text=True, start_new_session=True,
+            cwd=self.wt, stdout=subprocess.PIPE, text=True,
         )
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
@@ -2342,21 +2342,34 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(Path(item["to"]).name for item in result["archived"]), moved)
 
     def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
-        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n.claude/reviews/\n")
+        self.ignore_review_records()
+        (self.wt / ".claude/settings.local.json").write_text('{"hooks": {}}\n')
+
+        code, result = self.run_main("--archive-scratch")
+
+        self.assertEqual((self.main / ".claude/reviews/new.md").read_text(), "the worktree's review\n")
+        self.assertEqual([Path(item["to"]).name for item in result["copied_to_main"]], ["new.md"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.main / ".claude/settings.local.json").exists())
+
+    def test_archive_scratch_copies_nothing_while_other_blockers_keep_the_worktree(self) -> None:
+        self.ignore_review_records()
+        (self.wt / "app.txt").write_text("unsaved work\n")
+
+        _, result = self.run_main("--archive-scratch")
+
+        self.assertEqual(result["copied_to_main"], [])
+        self.assertFalse((self.main / ".claude/reviews/new.md").exists())
+
+    def ignore_review_records(self) -> None:
+        """Main ignores .claude/ and keeps an older review; the worktree has a new one main lacks."""
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n.claude/\n")
         git(self.main, "commit", "-q", "-am", "ignore review records")
         git(self.wt, "merge", "-q", "--ff-only", "main")
         (self.main / ".claude/reviews").mkdir(parents=True)
         (self.main / ".claude/reviews/old.md").write_text("main's record\n")
         (self.wt / ".claude/reviews").mkdir(parents=True)
         (self.wt / ".claude/reviews/new.md").write_text("the worktree's review\n")
-        (self.wt / ".env").write_text("SECRET=1\n")
-
-        code, result = self.run_main("--archive-scratch")
-
-        self.assertEqual((self.main / ".claude/reviews/new.md").read_text(), "the worktree's review\n")
-        self.assertEqual([Path(item["to"]).name for item in result["copied_to_main"]], ["new.md"])
-        self.assertEqual((code, result["review"]), (1, [".env (not in main checkout)"]))
-        self.assertFalse((self.main / ".env").exists())
 
     def test_detach_nested_and_archive_scratch_clear_a_worktree_only_they_keep(self) -> None:
         copy = self.nested_catalog()
@@ -2991,14 +3004,14 @@ class RmCheckTests(unittest.TestCase):
 
     def test_stale_remote_refs_are_fetched_before_judging(self) -> None:
         bare = Path(self.tmp.name) / "remote.git"
-        git(Path(self.tmp.name), "init", "--bare", "-q", str(bare))
+        git(Path(self.tmp.name), "init", "--bare", "-q", "-b", "main", str(bare))
         git(self.main, "remote", "add", "origin", str(bare))
         git(self.main, "push", "-q", "origin", "main")
         git(self.main, "fetch", "-q", "origin")
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
         other = Path(self.tmp.name) / "other"
-        git(Path(self.tmp.name), "clone", "-q", "-b", "main", str(bare), str(other))
+        git(Path(self.tmp.name), "clone", "-q", str(bare), str(other))
         git(other, "fetch", "-q", str(self.wt), "feature")
         git(other, "merge", "-q", "--ff-only", "FETCH_HEAD")
         git(other, "push", "-q", "origin", "main")

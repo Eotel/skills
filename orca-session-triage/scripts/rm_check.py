@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -54,6 +55,9 @@ LOG_SUFFIX = ".log"
 NESTED_READY = "worktrees of other repositories remain inside: "
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
 SCRATCH_DIRS = (".yomiyasu", ".investigate")
+# Records --archive-scratch copies to main. Other ignored files, such as .claude/settings.local.json or .env,
+# are settings tools in main would run with, so they stay for review.
+RECORD_DIRS = (".claude/reviews/",)
 ARCHIVE_DIR = Path.home() / ".cache/orca-briefs/archive"
 # Closes a busy tab only while its worktree has not moved since the scan that listed it.
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
@@ -455,17 +459,59 @@ def runs_nothing(root, members, table):
                or any(wait in table[pid][1] for wait in SETUP_WAITS) for pid in members)
 
 
-def in_own_group(pid: int) -> bool:
-    """Whether `pid` shares this check's process group: the other end of a pipe it prints into."""
+def pipe_ends() -> dict[int, tuple[str | None, str | None]]:
+    """{pid: (stdin pipe, stdout pipe's other end)} for this check's process group, the pipes named
+    alike on both ends: /proc's pipe:[inode] on Linux, lsof's pipe addresses on macOS."""
+    group = os.getpgrp()
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        ends = {}
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if os.getpgid(int(proc.name)) != group:
+                    continue
+                ends[int(proc.name)] = (str((proc / "fd/0").readlink()), str((proc / "fd/1").readlink()))
+            except (OSError, ValueError):
+                continue
+        return ends
     try:
-        return os.getpgid(pid) == os.getpgrp()
+        output = subprocess.run(["lsof", "-n", "-P", "-a", "-g", str(group), "-d", "0,1", "-F", "pfdn"],
+                                capture_output=True, text=True).stdout
     except OSError:
-        return False
+        return {}
+    ends: dict[int, tuple[str | None, str | None]] = {}
+    pid = fd = None
+    for line in output.splitlines():
+        kind, value = line[:1], line[1:]
+        if kind == "p":
+            pid, fd = int(value), None
+            ends.setdefault(pid, (None, None))
+        elif kind == "f":
+            fd = value
+        elif pid is not None and fd == "0" and kind == "d":
+            ends[pid] = (value, ends[pid][1])
+        elif pid is not None and fd == "1" and kind == "n" and value.startswith("->"):
+            ends[pid] = (ends[pid][0], value[2:])
+    return ends
+
+
+def output_readers() -> set[int]:
+    """The commands this check's output is piped through (`rm_check.py | jq | ...`), each reading the one before."""
+    if not stat.S_ISFIFO(os.fstat(1).st_mode):
+        return set()
+    ends = pipe_ends()
+    readers: set[int] = set()
+    # A subshell and the command it runs both read the pipe they inherit.
+    pipes = {ends.get(os.getpid(), (None, None))[1]} - {None}
+    while pipes:
+        found = {pid for pid, (stdin, _) in ends.items() if stdin in pipes} - readers
+        readers |= found
+        pipes = {ends[pid][1] for pid in found} - {None}
+    return readers
 
 
 def processes_in(worktree):
     """Processes using the worktree in their command or current directory, excluding ancestors and
-    this check's process group.
+    the commands reading this check's output.
 
     Each names whether it runs in an Orca tab (`in_orca_tab`), that tab's handle when the
     system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`).
@@ -483,11 +529,12 @@ def processes_in(worktree):
     cwds = process_cwds(processes)
     if cwds is None:
         return None
+    readers = output_readers()
     found = []
     for pid, (_, command) in processes.items():
         cwd = cwds.get(pid)
         inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
-        if pid not in ancestors and (path.search(command) or inside) and not in_own_group(pid):
+        if pid not in ancestors and pid not in readers and (path.search(command) or inside):
             found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
@@ -803,22 +850,30 @@ def scratch_to_archive(worktree: Path, result: dict, *, besides_nested: bool = F
     return sorted(worktree / top for top in tops)
 
 
+def holds_only_records(result: dict) -> bool:
+    """Whether only paths to review, changes inside scratch directories, and nested worktrees ready to detach
+    keep the worktree, so copying its records to main is a step toward removing it."""
+    others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
+              and not blocker.startswith(NESTED_READY)]
+    return not others and all(Path(rel).parts[0] in SCRATCH_DIRS for rel in result["uncommitted"])
+
+
 def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str, str]]:
-    """Copy each file of a path to review that the main checkout also ignores and does not have yet (a new
-    review record under .claude/reviews/) to the same place in main, keeping the copy only when cmp finds it
-    identical; a later check then finds the path in main. Files main has, symlinks, the scratch directories
-    --archive-scratch moves, and .env files (main would run with the worktree's settings) stay for review."""
+    """Copy each record under RECORD_DIRS in a path to review that the main checkout also ignores and does
+    not have yet to the same place in main, keeping the copy only when cmp finds it identical; a later check
+    then finds the path in main. Files main has and symlinks stay for review."""
     copied = []
     for entry in review:
         rel = entry.rpartition(" (")[0]
         source = worktree / rel
-        if (Path(rel).parts[0] in SCRATCH_DIRS or Path(rel).name.startswith(".env")
+        if (not any(rel.startswith(top) or top.startswith(rel) for top in RECORD_DIRS)
                 or git(main, "check-ignore", "-q", "--", rel).returncode != 0):
             continue
         files = [source] if source.is_file() else [child for child in source.rglob("*") if child.is_file()]
         for file in sorted(files):
             target = main / file.relative_to(worktree)
-            if file.is_symlink() or target.exists() or target.is_symlink():
+            if (not file.relative_to(worktree).as_posix().startswith(RECORD_DIRS) or file.is_symlink()
+                    or target.exists() or target.is_symlink()):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file, target)
@@ -1032,7 +1087,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                       decided=tuple(decided), since=since)
     result = recheck()
     copied = []
-    if args.archive_scratch:
+    # Nothing is written to main while anything else keeps the worktree.
+    if args.archive_scratch and holds_only_records(result):
         copied = copy_to_main(Path(worktree), Path(main), result["review"])
         if copied:
             result = recheck()
