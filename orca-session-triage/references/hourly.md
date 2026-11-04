@@ -132,11 +132,19 @@ cleanup allowed before a user choice by the Boundary and `cleanup.md`. Write the
 questions and instructions for other lanes, including any cleanup done, in one
 file and send it with `python3 ~/.claude/skills/orca-session-triage/scripts/handoff.py
 send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
---decision KEY (once per question) --lead-worktree <the lead's worktree>`
+--decision KEY (once per question)`
 (`--kind info` with nothing to hand off but cleanup). At the moment it sends,
 it adds every inbox report that arrived after the scan began and the lead's
-latest message and unanswered questions read again from its transcript, so the
-handoff never rests on the scan's start. Do not sign the body: it ends the
+latest message, unanswered question count, and undelivered queued instructions
+with their enqueue times and elapsed minutes, read again from its transcript.
+`--decision-ask KEY=ID` binds a decision to its inbox ask (repeat per key).
+The lead defaults to the shared state's appointed worktree; `--lead-worktree`
+overrides it, and `--state-file` selects the shared state for both `send` and
+`lead-state`. `handoff.py lead-state` prints the lead's worktree, agent states
+and stop times, latest message, unanswered questions with choices and ask times,
+queued instructions, and tab screen tails as JSON; `--orca` selects its CLI.
+`--claude-projects` selects the transcript root for both commands.
+Do not sign the body: it ends the
 text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and
 the session's start time, and replaces a signature the body ends with. When it
 says on stderr that it sent without one, the handoff went unsigned. Ack the
@@ -165,11 +173,16 @@ handoff a stable key in the form `hourly_state.py asked --decision` uses, such
 as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 `--decision` key already has an answer and prints those answers, and records
 each key it sends. Before writing the handoff, run `lead_decisions.py
-unanswered` without arguments: it lists, as JSON, every key any earlier run
-handed off that still has no answer, with when it was last handed off. For a
+unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]}`.
+Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and
+`handoff_count`. Settled keys include the decision or bound ask's answer record;
+old handoffs without an ask binding still read. For a
 key naming PRs (`merge:owner/repo#136`, `merge:owner/repo#12+#14`,
 `spawn:owner/repo#6303::review-fix`) it adds each PR's `state`, `updatedAt`,
-and `updated_after_handoff`, read with one GitHub query per repository; a
+and `updated_after_handoff`, read with one GitHub query per repository, plus inbox
+reports naming the key, PR reference, or URL, split before and after the last
+handoff. `--asana-status OUT_JSON` adds each PR's current `asana` object from the
+run's saved status output; without it, no Asana values are attached. A
 repository gh cannot read leaves them null and is named on stderr. Carry each
 key still open into this handoff. When its PR changed since (merged, closed,
 or updated), check whether the question still stands: drop it, or ask under a
@@ -182,6 +195,11 @@ until the key has an answer, `asana99_status.py` marks that difference
 `lead_decisions.py show` gives the answers: follow each as
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
+`show --match WORD` (repeat per word) matches any word in the key or answer,
+ignoring case, and prints one line per answer. `--since-last-handoff` selects
+answers since the newest saved handoff; `--handoffs-dir` selects that directory.
+These views show newest answers first in JST and mark a `remove:` key 未実行
+while its path still exists.
 The lead records an answer with
 `lead_decisions.py record --decision KEY --answer-file FILE`, and several with
 `lead_decisions.py record-many --file FILE` (or on standard input), one JSON

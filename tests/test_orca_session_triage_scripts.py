@@ -47,6 +47,7 @@ cleanup_hourly = load_script("cleanup_hourly_tabs")
 hourly_runs = load_script("hourly_runs")
 inbox_alert = load_script("inbox_alert")
 close_tabs = importlib.import_module("close_tabs")
+handoff = importlib.import_module("handoff")
 
 
 def write_jsonl(path, rows):
@@ -205,6 +206,21 @@ class ClaudeTranscriptTests(unittest.TestCase):
 
     def test_returns_none_without_a_transcript(self):
         self.assertIsNone(scan.read_claude(self.projects, "/nowhere"))
+
+    def test_queued_input_replays_all_operations_and_reaches_the_scan_row(self) -> None:
+        stamp = "2026-10-01T01:00:00Z"
+        operations = [("dequeue", None), ("enqueue", "cleared"), ("popAll", None),
+                      ("enqueue", "delivered"), ("enqueue", "first"), ("enqueue", "removed"),
+                      ("dequeue", None), ("remove", "removed"), ("enqueue", "second")]
+        path = self.transcript([{"type": "queue-operation", "operation": operation,
+                                 "timestamp": stamp, **({"content": content} if content is not None else {})}
+                                for operation, content in operations])
+        now = scan.parse_time("2026-10-01T01:12:00Z")
+        expected = [{"text": value, "enqueued_at": stamp, "minutes": 12} for value in ("first", "second")]
+
+        self.assertEqual(scan.queued_input(path, now), expected)
+        rows = scan.build_inventory([worktree(self.worktree)], [], self.projects, {}, "要判断", now=now.timestamp())
+        self.assertEqual(rows[0]["queued_input"], expected)
 
 
 def codex_row(ts, kind, payload):
@@ -3388,6 +3404,229 @@ NOTHING_OWED = {"needs_owner": [], "closed_issues": []}
 def gh_issue(url, number, closing_prs=()):
     return {"number": number, "title": f"issue {number}", "url": url + str(number), "assignees": [],
             "closedByPullRequestsReferences": [{"number": pr} for pr in closing_prs]}
+
+
+class LeadDecisionProposalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.lead = handoff.lead_decisions
+        self.log = self.root / "decisions.jsonl"
+        self.handed = self.root / "handed.jsonl"
+        self.inbox = self.root / "inbox.jsonl"
+        self.answers = self.root / "answers.jsonl"
+        environment = patch.dict(os.environ, {"TRIAGE_INBOX": str(self.inbox),
+                                              "TRIAGE_ASK_ANSWERS": str(self.answers)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def call(self, *args: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = self.lead.main(["--decisions-file", str(self.log), *args])
+        return code, out.getvalue()
+
+    def test_show_match_searches_keys_and_answers_with_any_word_ignoring_case(self) -> None:
+        self.lead.append(self.log,
+                         self.lead.Decision("1", "merge:Acme/app#1", "Hold\nfor review", "2026-10-01T01:00:00Z"),
+                         self.lead.Decision("2", "remove:/w/a", "READY to remove", "2026-10-01T02:00:00Z"),
+                         self.lead.Decision("3", "keep:/w/b", "wait", "2026-10-01T03:00:00Z"))
+
+        code, shown = self.call("show", "--match", "ACME", "--match", "ready")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(shown.splitlines(), ["2026-10-01T11:00:00+09:00 remove:/w/a  READY to remove",
+                                              "2026-10-01T10:00:00+09:00 merge:Acme/app#1  Hold for review"])
+
+    def test_show_since_newest_handoff_sorts_in_jst_and_marks_existing_remove_paths(self) -> None:
+        kept = self.root / "kept"
+        kept.mkdir()
+        gone = self.root / "gone"
+        directory = self.root / "handoffs"
+        for stamp in ("2026-10-01T00:00:00+00:00", "2026-10-01T02:00:00+00:00"):
+            handoff.SavedHandoff("body", "info", [], stamp, 0).save(directory, datetime.fromisoformat(stamp))
+        self.lead.append(self.log,
+                         self.lead.Decision("1", f"remove:{kept}", "remove it", "2026-10-01T11:00:00+09:00"),
+                         self.lead.Decision("2", f"remove:mac::{gone}", "done", "2026-10-01T03:00:00Z"),
+                         self.lead.Decision("3", "old", "old answer", "2026-10-01T01:00:00Z"))
+
+        code, shown = self.call("show", "--since-last-handoff", "--handoffs-dir", str(directory))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(shown.splitlines(), [f"2026-10-01T12:00:00+09:00 remove:mac::{gone}  done",
+                                              f"2026-10-01T11:00:00+09:00 remove:{kept} 未実行  remove it"])
+
+    def test_unanswered_records_first_handoff_and_total_count_per_key(self) -> None:
+        write_jsonl(self.handed, [{"decision": key, "handed_off_at": stamp} for key, stamp in [
+            ("keep:/w/a", "2026-10-01T01:00:00Z"), ("keep:/w/b", "2026-10-01T02:00:00Z"),
+            ("keep:/w/a", "2026-10-01T03:00:00Z")]])
+
+        code, shown = self.call("unanswered", "--handed-off-file", str(self.handed))
+
+        self.assertEqual(code, 0)
+        result = json.loads(shown)
+        self.assertEqual([(item["decision"], item["first_handed_off_at"], item["handed_off_at"], item["handoff_count"])
+                          for item in result["unanswered"]],
+                         [("keep:/w/a", "2026-10-01T01:00:00Z", "2026-10-01T03:00:00Z", 2),
+                          ("keep:/w/b", "2026-10-01T02:00:00Z", "2026-10-01T02:00:00Z", 1)])
+        self.assertEqual(result["settled"], [])
+
+    def test_unanswered_settles_bound_asks_with_the_answer_record_and_reads_old_handoffs(self) -> None:
+        write_jsonl(self.handed, [{"decision": "bound", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask1"},
+                                  {"decision": "bound", "handed_off_at": "2026-10-01T02:00:00Z"},
+                                  {"decision": "old", "handed_off_at": "2026-10-01T01:00:00Z"},
+                                  {"decision": "direct", "handed_off_at": "2026-10-01T01:00:00Z"}])
+        answer = {"id": "ask1", "at": "2026-10-01T02:00:00Z", "how": "reply", "note": "go ahead"}
+        self.answers.write_text("not JSON\n" + json.dumps(answer))
+        decision = self.lead.Decision("d", "direct", "wait", "2026-10-01T02:00:00Z")
+        self.lead.append(self.log, decision)
+
+        code, shown = self.call("unanswered", "--handed-off-file", str(self.handed))
+
+        self.assertEqual(code, 0)
+        result = json.loads(shown)
+        self.assertEqual([item["decision"] for item in result["unanswered"]], ["old"])
+        self.assertEqual(result["settled"], [{"decision": "bound", "answer": answer},
+                                              {"decision": "direct", "answer": self.lead.asdict(decision)}])
+        code, selected = self.call("unanswered", "--handed-off-file", str(self.handed),
+                                   "--decision", "bound", "--decision", "new")
+        self.assertEqual(code, 0)
+        self.assertEqual([item["decision"] for item in json.loads(selected)["unanswered"]], ["new"])
+
+    def test_pr_keys_attach_named_reports_around_the_last_handoff_and_optional_asana(self) -> None:
+        key = "merge:acme/app#12+#14"
+        stamp = "2026-10-01T02:00:00Z"
+        write_jsonl(self.handed, [{"decision": key, "handed_off_at": "2026-10-01T00:00:00Z"},
+                                  {"decision": key, "handed_off_at": stamp}])
+        reports = [{"id": "key", "ts": "2026-10-01T01:00:00Z", "kind": "done", "worktree": "a", "text": key},
+                   {"id": "number", "ts": "2026-10-01T01:30:00Z", "kind": "info", "worktree": "b",
+                    "text": "Ready: acme/app#14 " + "x" * 200},
+                   {"id": "url", "ts": "2026-10-01T03:00:00Z", "kind": "info", "worktree": "c",
+                    "text": "https://github.com/acme/app/pull/12を確認"},
+                   {"id": "other", "ts": "2026-10-01T03:00:00Z", "text": "acme/app#120"}]
+        write_jsonl(self.inbox, reports)
+        status = self.root / "asana.json"
+        status.write_text(json.dumps([{"url": f"https://github.com/acme/app/pull/{number}",
+                                      "asana": {"completed": completed}} for number, completed in [(12, True), (14, False)]]))
+
+        def gh(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(args[:2], ["gh", "api"])
+            return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"repository": {
+                f"pr_{number}": {"state": "OPEN", "updatedAt": stamp} for number in (12, 14)}}}), "")
+
+        with patch("subprocess.run", side_effect=gh) as run:
+            code, shown = self.call("unanswered", "--handed-off-file", str(self.handed), "--asana-status", str(status))
+            _, without = self.call("unanswered", "--handed-off-file", str(self.handed))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_count, 2)
+        row = json.loads(shown)["unanswered"][0]
+        self.assertEqual(row["reports"], {"before": [{**reports[0]}, {**reports[1], "text": reports[1]["text"][:160]}],
+                                           "after": [reports[2]]})
+        self.assertEqual([pr["asana"] for pr in row["prs"]], [{"completed": True}, {"completed": False}])
+        self.assertTrue(all("asana" not in pr for pr in json.loads(without)["unanswered"][0]["prs"]))
+
+
+class HandoffProposalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / "projects"
+        self.inbox = self.root / "inbox.jsonl"
+        self.inbox.write_text("")
+        self.state = self.root / "hourly.json"
+        self.body = self.root / "body.txt"
+        self.body.write_text("handoff body")
+        self.handed = self.root / "handed.jsonl"
+        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        processes = patch.object(handoff.scan_sessions, "process_table", return_value={})
+        processes.start()
+        self.addCleanup(processes.stop)
+
+    def call(self, action: str, *args: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = handoff.main([action, "--state-file", str(self.state), "--claude-projects", str(self.projects), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def send(self, *args: str) -> tuple[int, str, str]:
+        return self.call("send", "--inbox", str(self.inbox), "--body-file", str(self.body), "--since", "0",
+                         "--decisions-file", str(self.root / "decisions.jsonl"), "--handed-off-file", str(self.handed),
+                         "--handoffs-dir", str(self.root / "handoffs"), "--notify", "fake-notify", *args)
+
+    def test_send_binds_an_ask_to_each_decision_log_entry(self) -> None:
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            code, _, err = self.send("--decision", "keep:/w/a", "--decision-ask", "keep:/w/a=ask1",
+                                     "--decision", "keep:/w/b")
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_args.args[0][:3], ["fake-notify", "--kind", "ask"])
+        self.assertEqual([(item.decision, item.ask_id) for item in handoff.lead_decisions.handed_off(self.handed)],
+                         [("keep:/w/a", "ask1"), ("keep:/w/b", None)])
+
+    def test_lead_state_reads_agents_questions_and_screen_from_the_appointed_worktree(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        question = {"questions": [{"question": "Merge?", "options": [{"label": "Yes"}, {"label": "Wait"}]}]}
+        write_jsonl(self.projects / "-w-lead" / "old.jsonl", [assistant(text("old"))])
+        write_jsonl(self.projects / "-w-lead" / "new.jsonl", [
+            user("go"), {**assistant(text("latest")), "timestamp": "2026-10-01T01:00:00Z"},
+            assistant({"type": "tool_use", "id": "answered", "name": "AskUserQuestion", "input": question}),
+            user([{"type": "tool_result", "tool_use_id": "answered", "content": "yes"}]),
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion", "input": question}),
+             "timestamp": "2026-10-01T02:00:00Z"},
+            {"type": "queue-operation", "operation": "enqueue", "content": "undelivered",
+             "timestamp": "2026-10-01T02:01:00Z"}])
+        os.utime(self.projects / "-w-lead" / "old.jsonl", (1, 1))
+        agent = done_agent("claude", "tab:leaf")
+        row = {**worktree("/w/lead"), "agents": [agent]}
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/other"), row]},
+                   ("terminal", "list"): {"terminals": [terminal("/w/other", "claude", "other"),
+                                                           terminal("/w/lead", "claude", "lead-tab")]},
+                   ("terminal", "read", "--terminal", "lead-tab", "--screen"):
+                       {"terminal": {"source": "screen", "tail": ["latest", "❯"]}}}
+
+        def orca(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(args[0], "fake-orca")
+            self.assertEqual(args[-1], "--json")
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))
+
+        with patch("subprocess.run", side_effect=orca) as run:
+            code, shown, err = self.call("lead-state", "--orca", "fake-orca")
+
+        self.assertEqual(code, 0, err)
+        result = json.loads(shown)
+        self.assertEqual(result["worktree"], "/w/lead")
+        self.assertEqual(result["agents"][0]["state"], "done")
+        self.assertEqual(result["agents"][0]["stopped_at"], scan.iso_time(agent["stateStartedAt"]))
+        self.assertEqual(result["final"], {"at": "2026-10-01T01:00:00Z", "text": "latest"})
+        self.assertEqual(result["pending_questions"], [{"id": "pending", "asked_at": "2026-10-01T02:00:00Z", **question}])
+        self.assertEqual(result["terminals"], [{"handle": "lead-tab", "screen_tail": ["latest", "❯"]}])
+        self.assertEqual([(item["text"], item["enqueued_at"]) for item in result["queued_input"]],
+                         [("undelivered", "2026-10-01T02:01:00Z")])
+        self.assertIsInstance(result["queued_input"][0]["minutes"], int)
+        self.assertEqual(run.call_count, 3)
+
+    def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        write_jsonl(self.projects / "-w-lead" / "s.jsonl", [
+            user("go"), assistant(text("last reply")),
+            {"type": "queue-operation", "operation": "enqueue", "content": "pending instruction",
+             "timestamp": "2026-10-01T01:00:00Z"}])
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            code, _, err = self.send()
+
+        self.assertEqual(code, 0, err)
+        body = run.call_args.args[0][-1]
+        self.assertIn("指揮の今（lead）", body)
+        self.assertIn("last reply", body)
+        self.assertIn("pending instruction", body)
+        self.assertRegex(body, r"2026-10-01T01:00:00Z、\d+ 分経過")
 
 
 class HourlyStateTests(unittest.TestCase):
