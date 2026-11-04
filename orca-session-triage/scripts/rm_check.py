@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 import filecmp
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import TypedDict
+from typing import NamedTuple, TypedDict
 from urllib.parse import urlsplit
 
 import lead_decisions
@@ -42,10 +43,15 @@ BYTECODE_SUFFIX = ".pyc"
 # writes a new one on the next install, so a removed checkout's identity binds nothing.
 # husky and vite-hooks write the scripts under their `_` directory on each install. GraphQL codegen
 # writes graphql/generated/; a generated/ elsewhere may hold hand-made output, so it goes to review.
+# taihei-cbm's tests write the uploaded data files under apps/api/media/files/datafile/storage/.
 REGENERABLE_PARTS = {"__generated__"}
 REGENERABLE_PART_PAIRS = {("graphql", "generated"), ("var", "test-storage")}
 REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/",
-                        ".husky/_/", ".vite-hooks/_/")
+                        ".husky/_/", ".vite-hooks/_/", "apps/api/media/files/datafile/storage/")
+# An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
+LOG_SUFFIX = ".log"
+# The blocker for nested worktrees --detach-nested can remove.
+NESTED_READY = "worktrees of other repositories remain inside: "
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
 SCRATCH_DIRS = (".yomiyasu", ".investigate")
 ARCHIVE_DIR = Path.home() / ".cache/orca-briefs/archive"
@@ -55,6 +61,9 @@ CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 ENV_LOCAL_KEY_SUFFIXES = ("_PORT", "_PORT_RANGE", "_BIND_IP")
 ENV_LOCAL_KEYS = {"COMPOSE_PROJECT_NAME"}
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Remote refs older than this are fetched again before the check judges merged work by them.
+FETCH_AFTER = timedelta(hours=1)
+FETCH_TIMEOUT = 60
 # `orca worktree rm` answers `removing: true` and finishes in the background within about a minute.
 GONE_WAIT_SECONDS = 60
 GONE_POLL_SECONDS = 2
@@ -77,6 +86,23 @@ def holds_only_bytecode(path: Path) -> bool:
         return path.is_file() and not path.is_symlink() and path.suffix == BYTECODE_SUFFIX
     files = [child for child in path.rglob("*") if child.is_symlink() or not child.is_dir()]
     return bool(files) and all(holds_only_bytecode(child) for child in files)
+
+
+def log_files(path: Path) -> list[Path] | None:
+    """The files of a directory whose files, in any subdirectory, are all *.log; None for anything else."""
+    if path.is_symlink() or not path.is_dir():
+        return None
+    files = [child for child in path.rglob("*") if child.is_symlink() or not child.is_dir()]
+    if not files or any(child.is_symlink() or child.suffix != LOG_SUFFIX for child in files):
+        return None
+    return files
+
+
+def log_note(rel: str, files: list[Path]) -> str:
+    stats = [child.stat() for child in files]
+    latest = datetime.fromtimestamp(max(stat.st_mtime for stat in stats), timezone.utc)
+    return "%s holds only logs: %d bytes, last written %s" % (
+        rel, sum(stat.st_size for stat in stats), latest.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
 def working_changes(worktree) -> tuple[list[str], list[str]]:
@@ -187,15 +213,23 @@ def nested_worktrees(source: Path) -> list[Path]:
     return sorted(child for child in source.iterdir() if (child / ".git").is_file())
 
 
-def ignored_paths(worktree: str | Path, main: str | Path) -> tuple[list[str], list[str], list[Path]]:
-    """(review, regenerable, nested): ignored paths that hold something and are neither caches nor
+class IgnoredPaths(NamedTuple):
+    review: list[str]
+    regenerable: list[str]
+    nested: list[Path]
+    # The size and last write of each directory of logs counted as regenerable.
+    logs: list[str]
+
+
+def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
+    """(review, regenerable, nested, logs): ignored paths that hold something and are neither caches nor
     copies of the main checkout, split into those to open and those a setup or test run writes again,
     and the worktrees of other repositories found at them (such as `local-deps/<repo>`).
 
     `--ignored=matching` names each path an ignore pattern matched, so a generated
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
-    review, regenerable, nested = [], [], []
+    review, regenerable, nested, logs = [], [], [], []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
     for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
@@ -211,6 +245,10 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> tuple[list[str], li
         if holds_only_regenerable(source, Path(worktree)):
             regenerable.append(rel)
             continue
+        if (files := log_files(source)) is not None:
+            regenerable.append(rel)
+            logs.append(log_note(rel, files))
+            continue
         where = "not in main checkout" if not copy.exists() else "differs from main checkout"
         if source.name == ".env" and source.is_file():
             keys = env_keys_beyond_example(source)
@@ -220,7 +258,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> tuple[list[str], li
             if keys:
                 where += "; values .env.example does not have: " + ", ".join(keys)
         review.append("%s (%s)" % (rel, where))
-    return review, regenerable, nested
+    return IgnoredPaths(review, regenerable, nested, logs)
 
 
 def on_remote(worktree: Path, head: str) -> bool:
@@ -248,7 +286,7 @@ def nested_check(copy: Path) -> dict:
     changes = [rel for rel in changes if rel not in regenerable]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
-    review, _, deeper = ignored_paths(copy, repository)
+    review, _, deeper, _ = ignored_paths(copy, repository)
     if review or deeper:
         blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
     head = git(copy, "rev-parse", "HEAD").stdout.strip()
@@ -417,8 +455,17 @@ def runs_nothing(root, members, table):
                or any(wait in table[pid][1] for wait in SETUP_WAITS) for pid in members)
 
 
+def in_own_group(pid: int) -> bool:
+    """Whether `pid` shares this check's process group: the other end of a pipe it prints into."""
+    try:
+        return os.getpgid(pid) == os.getpgrp()
+    except OSError:
+        return False
+
+
 def processes_in(worktree):
-    """Processes using the worktree in their command or current directory, excluding ancestors.
+    """Processes using the worktree in their command or current directory, excluding ancestors and
+    this check's process group.
 
     Each names whether it runs in an Orca tab (`in_orca_tab`), that tab's handle when the
     system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`).
@@ -440,7 +487,7 @@ def processes_in(worktree):
     for pid, (_, command) in processes.items():
         cwd = cwds.get(pid)
         inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
-        if pid not in ancestors and (path.search(command) or inside):
+        if pid not in ancestors and (path.search(command) or inside) and not in_own_group(pid):
             found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
@@ -456,11 +503,46 @@ def processes_in(worktree):
              "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None} for item in found]
 
 
+# Written again by an install or a test run; their churn says nothing about who uses the worktree.
+UNWATCHED_DIRS = {".git", "node_modules", ".venv"}
+
+
+def moved_since(worktree: Path, since: datetime) -> list[str]:
+    """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
+    after = since.timestamp()
+    moved = []
+    for top, dirs, files in os.walk(worktree):
+        dirs[:] = [name for name in dirs if name not in UNWATCHED_DIRS]
+        for name in files:
+            try:
+                if (Path(top) / name).lstat().st_mtime > after:
+                    moved.append(Path(top) / name)
+            except OSError:
+                continue
+    blockers = []
+    if moved:
+        latest = max(moved, key=lambda path: path.lstat().st_mtime)
+        blockers.append("走査（%s）の後に作業場のファイルが %d 個変わりました（最新 %s の %s）。別の担当が使っているかもしれません"
+                        % (since.isoformat(timespec="seconds"), len(moved),
+                           datetime.fromtimestamp(latest.lstat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                           latest.relative_to(worktree)))
+    # The reflog dates every move of HEAD (commit, checkout, reset); the commit date stands in without one.
+    moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
+    stamp = re.search(r"@\{(\d+)\}", moves)
+    moved_at = int(stamp.group(1)) if stamp else int(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
+    if moved_at > after:
+        blockers.append("走査（%s）の後に HEAD が動きました（%s）。別の担当が使っているかもしれません"
+                        % (since.isoformat(timespec="seconds"),
+                           datetime.fromtimestamp(moved_at, timezone.utc).isoformat(timespec="seconds")))
+    return blockers
+
+
 def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None,
-          *, decided: tuple[str, ...] = ()):
+          *, decided: tuple[str, ...] = (), since: datetime | None = None):
     """Return the removal verdict, including containers and processes using `worktree`.
 
     `decided` are blockers main found before the check: an Orca comment to keep it, an unanswered docker.
+    `since` is when the scan that listed the worktree ran: work after it means someone uses the worktree.
     """
     blockers = list(decided)
     if Path(worktree).resolve() == Path(main).resolve():
@@ -496,12 +578,12 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested = ignored_paths(worktree, main)
+    review, regenerable, nested, logs = ignored_paths(worktree, main)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
     if ready:
-        blockers.append("worktrees of other repositories remain inside: %s. Pass --detach-nested to remove them "
+        blockers.append(NESTED_READY + "%s. Pass --detach-nested to remove them "
                         "from their repositories first, so none is left as a prunable record" % ", ".join(ready))
     if held:
         blockers.append("worktrees of other repositories inside cannot be detached: " + ", ".join(held))
@@ -524,9 +606,11 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                             "rm_check をやり直してください: " + "; ".join(closes)
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
+    if since is not None:
+        blockers.extend(moved_since(Path(worktree), since))
     return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
             "regenerable": bytecode + regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
-            "containers": compose_in(worktree, compose_projects), "processes": processes or []}
+            "containers": compose_in(worktree, compose_projects), "processes": processes or [], "notes": logs}
 
 
 def main_checkout(worktree):
@@ -564,12 +648,16 @@ def remote_identity(url):
     return host.lower(), path.strip("/").removesuffix(".git")
 
 
-def stale_fetch_note(worktree: str | Path, base: str | None, pr_head: str | None, has_pr: bool) -> str | None:
-    """Warn when no worktree has fetched the base remote in the last day."""
-    ref = (base or "").removeprefix("refs/remotes/")
-    remote, separator, _ = ref.partition("/")
-    if not separator:
+def base_remote(worktree: str | Path, base: str | None) -> str | None:
+    """The remote a remote-tracking base belongs to, when the repository has that remote."""
+    remote, separator, _ = (base or "").removeprefix("refs/remotes/").partition("/")
+    if not separator or git(worktree, "remote", "get-url", remote).returncode != 0:
         return None
+    return remote
+
+
+def last_fetch(worktree: str | Path, remote: str) -> datetime | None:
+    """When any worktree of the repository last fetched `remote`, read from the FETCH_HEAD files; None if never."""
     url = git(worktree, "remote", "get-url", remote)
     common = git(worktree, "rev-parse", "--git-common-dir")
     if url.returncode != 0 or common.returncode != 0:
@@ -586,10 +674,35 @@ def stale_fetch_note(worktree: str | Path, base: str | None, pr_head: str | None
                     fetched_at.append(path.stat().st_mtime)
         except OSError:
             continue
-    if not fetched_at:
+    return datetime.fromtimestamp(max(fetched_at), timezone.utc) if fetched_at else None
+
+
+def fetch_when_stale(worktree: str | Path, base: str | None) -> str | None:
+    """Fetch the base's remote when no worktree fetched it within FETCH_AFTER; a note when that fetch fails."""
+    remote = base_remote(worktree, base)
+    if remote is None:
         return None
-    latest = datetime.fromtimestamp(max(fetched_at), timezone.utc)
-    if datetime.now(timezone.utc) - latest <= timedelta(days=1):
+    fetched = last_fetch(worktree, remote)
+    if fetched is not None and datetime.now(timezone.utc) - fetched <= FETCH_AFTER:
+        return None
+    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                   "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"}
+    try:
+        done = subprocess.run(["git", "-C", str(worktree), "fetch", "--quiet", remote], capture_output=True,
+                              text=True, timeout=FETCH_TIMEOUT, env=environment)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return "git fetch %s failed before the check: %s" % (remote, error)
+    if done.returncode != 0:
+        return "git fetch %s failed before the check (exit %d): %s" % (
+            remote, done.returncode, done.stderr.strip()[-300:])
+    return None
+
+
+def stale_fetch_note(worktree: str | Path, base: str | None, pr_head: str | None, has_pr: bool) -> str | None:
+    """Warn when no worktree has fetched the base remote in the last day."""
+    remote = base_remote(worktree, base)
+    latest = last_fetch(worktree, remote) if remote else None
+    if remote is None or latest is None or datetime.now(timezone.utc) - latest <= timedelta(days=1):
         return None
     when = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
     note = "%s の参照は %s の fetch のままです。" % (remote, when)
@@ -676,16 +789,44 @@ def merged_pr_at_head(worktree) -> tuple[dict | None, str | None]:
     return next((pr for pr in prs if pr.get("headRefOid") == head), None), None
 
 
-def scratch_to_archive(worktree: Path, result: dict) -> list[Path]:
+def scratch_to_archive(worktree: Path, result: dict, *, besides_nested: bool = False) -> list[Path]:
     """The scratch directories that alone keep the worktree: every blocker is an uncommitted change
-    inside one of them, and every path to review lies in one. Empty when anything else keeps it."""
+    inside one of them, and every path to review lies in one. Empty when anything else keeps it.
+    `besides_nested` also lets nested worktrees ready to detach stay, for --detach-nested to remove."""
     # A review entry is "<path> (<where>)", and <where> holds no " (".
     paths = [*result["uncommitted"], *(entry.rpartition(" (")[0] for entry in result["review"])]
     tops = {Path(rel).parts[0] for rel in paths}
-    others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)]
+    others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
+              and not (besides_nested and blocker.startswith(NESTED_READY))]
     if others or not tops or not tops <= set(SCRATCH_DIRS):
         return []
     return sorted(worktree / top for top in tops)
+
+
+def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str, str]]:
+    """Copy each file of a path to review that the main checkout also ignores and does not have yet (a new
+    review record under .claude/reviews/) to the same place in main, keeping the copy only when cmp finds it
+    identical; a later check then finds the path in main. Files main has, symlinks, the scratch directories
+    --archive-scratch moves, and .env files (main would run with the worktree's settings) stay for review."""
+    copied = []
+    for entry in review:
+        rel = entry.rpartition(" (")[0]
+        source = worktree / rel
+        if (Path(rel).parts[0] in SCRATCH_DIRS or Path(rel).name.startswith(".env")
+                or git(main, "check-ignore", "-q", "--", rel).returncode != 0):
+            continue
+        files = [source] if source.is_file() else [child for child in source.rglob("*") if child.is_file()]
+        for file in sorted(files):
+            target = main / file.relative_to(worktree)
+            if file.is_symlink() or target.exists() or target.is_symlink():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, target)
+            if filecmp.cmp(file, target, shallow=False):
+                copied.append({"from": str(file), "to": str(target)})
+            else:
+                target.unlink()
+    return copied
 
 
 def archive_target(archive: Path, worktree: Path, scratch: Path, day: str) -> Path:
@@ -753,7 +894,10 @@ def confirm_gone(worktree: Path, orca: str, wait: float) -> dict:
 
 def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNotes()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--worktree", required=True, help="worktree path to check")
+    parser.add_argument("path", nargs="?", metavar="PATH", help="worktree path to check, the same as --worktree")
+    parser.add_argument("pr_number", nargs="?", metavar="PR",
+                        help='PR number, the same as --pr; "-" for none, as rm-check-batch specs write it')
+    parser.add_argument("--worktree", help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
     parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD; without a PR, use the branch's upstream if only it holds HEAD)")
     parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit "
@@ -762,6 +906,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--pr-head", help="full SHA of a PR head confirmed MERGED on a host with gh; HEAD may be its ancestor")
     parser.add_argument("--head-ahead-of-pr", type=int, help="ahead_by from comparing <pr-head>...<HEAD> with gh; use when the PR head object is absent here")
     parser.add_argument("--fetch-failed", action="store_true", help="record that git fetch failed before this check; remote refs may be stale")
+    parser.add_argument("--since", type=datetime.fromisoformat, metavar="ISO",
+                        help="block when the worktree's files (outside %s) or HEAD moved after this time: someone "
+                             "else may be using it (default: the scanned_at of --from)" % ", ".join(sorted(UNWATCHED_DIRS)))
+    parser.add_argument("--from", dest="from_file", type=Path, metavar="SCAN_JSON",
+                        help="a saved scan_sessions.py JSON whose scanned_at is the default --since")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                         help="the lead's answers in an append-only JSONL log (default: %(default)s)")
@@ -770,9 +919,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "recompiled catalogs, nothing ignored to open, and HEAD on a remote, restore those "
                              "catalogs and remove the copies with git worktree remove --force, then check again")
     parser.add_argument("--archive-scratch", action="store_true",
-                        help="when %s alone keep the worktree (nothing else blocks or needs review), move them to "
+                        help="first copy each file to review that the main checkout also ignores and lacks (new "
+                             "records under .claude/reviews/) to the same place in main, confirmed with cmp; then "
+                             "when %s alone keep the worktree (nothing else blocks or needs review), move them to "
                              "<archive-dir>/<worktree>-<name>-<YYYYMMDD>/, then check again; off by default, so "
-                             "move them only where the lead's rules say to" % " and ".join(SCRATCH_DIRS))
+                             "move them only where the lead's rules say to. With --detach-nested, nested worktrees "
+                             "and these records together do not hold each other back" % " and ".join(SCRATCH_DIRS))
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
                         help="where --archive-scratch moves them (default: %(default)s)")
     parser.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
@@ -792,12 +944,36 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--pr-head must be a full commit SHA")
     if args.head_ahead_of_pr is not None and (not args.pr_head or args.head_ahead_of_pr < 0):
         parser.error("--head-ahead-of-pr needs --pr-head and a non-negative ahead_by")
+    if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
+        parser.error("PATH and --worktree name different worktrees")
+    if not (args.path or args.worktree):
+        parser.error("give the worktree as PATH or --worktree")
+    if args.pr_number not in (None, "-"):
+        if not args.pr_number.isdigit() or (args.pr and args.pr != int(args.pr_number)):
+            parser.error("PR must be a number or -, and agree with --pr")
+        args.pr = int(args.pr_number)
 
-    worktree = str(Path(args.worktree).resolve())
-    if git(worktree, "rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        json.dump({"worktree": worktree, "ok": False, "blockers": ["not a git worktree"]}, sys.stdout)
+    worktree = str(Path(args.worktree or args.path).resolve())
+    inside = git(worktree, "rev-parse", "--is-inside-work-tree")
+    gitdir = Path(worktree) / ".git"
+    if inside.stdout.strip() != "true" and gitdir.is_file() and Path(
+            gitdir.read_text(errors="replace").removeprefix("gitdir:").strip()).is_dir():
+        # A gitdir that is there answers on a second try once git's lock or index refresh has passed.
+        inside = git(worktree, "rev-parse", "--is-inside-work-tree")
+    if inside.stdout.strip() != "true":
+        json.dump({"worktree": worktree, "ok": False,
+                   "blockers": ["not a git worktree: git rev-parse exited %d: %s"
+                                % (inside.returncode, inside.stderr.strip() or "(no stderr)")]},
+                  sys.stdout, ensure_ascii=False)
         print()
         return 2
+    since = args.since
+    if since is None and args.from_file:
+        rows = json.loads(args.from_file.read_text(encoding="utf-8"))
+        scanned = [row["scanned_at"] for row in rows if row.get("scanned_at")]
+        since = datetime.fromisoformat(scanned[0]) if scanned else None
+    if since is not None and since.tzinfo is None:
+        since = since.astimezone()
     main = str(Path(args.main or main_checkout(worktree)).resolve())
     pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
     notes = []
@@ -819,6 +995,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                             % (comment, key))
         else:
             notes.append("Lead answered %s: %r" % (key, answer.answer))
+    fetch_note = fetch_when_stale(worktree, args.base or default_base(worktree))
+    if fetch_note:
+        notes.append(fetch_note)
     if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree)
                                                          or default_base(worktree)):
         pr, lookup_error = merged_pr_at_head(worktree)
@@ -849,20 +1028,29 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             notes.append("docker compose ls did not answer in %d seconds; the worktree defines no compose project"
                          % DOCKER_TIMEOUT)
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
-    result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr, decided=tuple(decided))
+    recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
+                      decided=tuple(decided), since=since)
+    result = recheck()
+    copied = []
+    if args.archive_scratch:
+        copied = copy_to_main(Path(worktree), Path(main), result["review"])
+        if copied:
+            result = recheck()
     if args.detach_nested:
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
+        # Records --archive-scratch moves next do not keep it.
         others = [blocker for blocker in result["blockers"]
                   if not blocker.startswith("worktrees of other repositories")]
-        removable = nested and not others and not result["review"] and not any(item["blockers"] for item in nested)
+        scratch_next = args.archive_scratch and bool(scratch_to_archive(Path(worktree), result, besides_nested=True))
+        removable = (nested and (scratch_next or (not others and not result["review"]))
+                     and not any(item["blockers"] for item in nested))
         detached = [item["path"] for item in nested if removable
                     and (not item["restore"]
                          or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
                     and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
         if detached:
-            result = check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                           decided=tuple(decided))
+            result = recheck()
         elif nested:
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
                          "paths to review, or a copy with blockers")
@@ -877,11 +1065,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             archived.append({"from": str(scratch), "to": str(target)})
         if archived:
             kept = {key: result[key] for key in ("detached",) if key in result}
-            result = {**check(worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                             decided=tuple(decided)), **kept}
+            result = {**recheck(), **kept}
         elif any((Path(worktree) / name).exists() for name in SCRATCH_DIRS):
             notes.append("--archive-scratch moved nothing: the worktree is kept for other blockers or paths to review")
         result["archived"] = archived
+        result["copied_to_main"] = copied
+    notes[:0] = result.pop("notes")
     elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
         if not args.pr_head:
