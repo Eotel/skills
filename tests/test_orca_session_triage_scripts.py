@@ -473,6 +473,27 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((report["claude"]["transcript"], report["class"]), (str(moved), "waiting"))
         self.assertEqual(shell["claude"]["final_text"], "Done.")
 
+    def test_a_session_in_a_checkout_nested_in_another_worktree_belongs_to_the_tab_that_started_it(self) -> None:
+        # 2026-11-04: Orca listed work-reports' main checkout, and the background Claude worked in a worktree under
+        # its .claude/worktrees, so the scan gave that session to the main checkout instead of montly-report.
+        root = Path(self.tmp.name)
+        main = root / "ghq/work-reports"
+        nested = main / ".claude/worktrees/readability"
+        nested.mkdir(parents=True)
+        (main / ".git").mkdir()
+        (nested / ".git").write_text("gitdir: ../../../.git/worktrees/readability\n")
+        sessions = root / "profile/sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "88175.json").write_text(json.dumps({"pid": 88175, "sessionId": "moved", "cwd": str(nested)}))
+        write_jsonl(scan.claude_project_dir(self.projects, str(nested)) / "moved.jsonl", [user("go")])
+        processes = {88175: (1114, "claude bg-spare"), 1114: (1, "claude")}
+
+        live = scan.running_claude_transcripts([str(main), "/w/report"], [sessions], self.projects, processes,
+                                               lambda pids: {1114: "/w/report", 1: "/"})
+
+        self.assertEqual({path: [p.name for p in found] for path, found in live.items()},
+                         {"/w/report": ["moved.jsonl"]})
+
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
         tree = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}

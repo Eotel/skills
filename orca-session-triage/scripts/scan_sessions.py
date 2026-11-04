@@ -222,8 +222,14 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
     where = {**cwds(sorted({member for chain in chains.values() for member in chain} - known.keys())), **known}
 
     def worktree_of(cwd: str) -> str | None:
-        return max((path for path in worktree_paths if cwd == path or cwd.startswith(path.rstrip("/") + "/")),
+        path = max((path for path in worktree_paths if cwd == path or cwd.startswith(path.rstrip("/") + "/")),
                    key=len, default=None)
+        # A checkout nested inside it, such as a worktree Claude made under .claude/worktrees, is not that worktree.
+        inside = Path(cwd)
+        if path and any((directory / ".git").exists()
+                        for directory in [inside, *inside.parents][:len(inside.parts) - len(Path(path).parts)]):
+            return None
+        return path
 
     found: dict[str, set[Path]] = {}
     for pid, (session_id, cwd, own_projects) in live.items():

@@ -48,7 +48,8 @@ board's done cards; close what the user approves.
   and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
   A local row also reads the transcript of each Claude session running under
   it (its `sessions/<pid>.json`, matched by the first of the process and its
-  ancestors whose cwd is inside the worktree), even after the session moved its
+  ancestors whose cwd is inside the worktree and not in a checkout nested in it,
+  such as a worktree under its `.claude/worktrees`), even after the session moved its
   cwd elsewhere; among those it takes the transcript with the newest entry.
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
