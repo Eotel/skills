@@ -163,7 +163,7 @@ def no_pending_questions(state_file, pane):
     questions = data["questions"]
     return isinstance(questions, dict) and all(
         isinstance(question, dict) and
-        (question.get("answer") is not None or
+        (question.get("answer") is not None or question.get("withdrawn_at") or
          question.get("owner_pane") not in (None, pane))
         for question in questions.values())
 

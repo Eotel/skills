@@ -2964,7 +2964,7 @@ def gh_issue(url, number, closing_prs=()):
 
 
 class HourlyStateTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -2973,6 +2973,21 @@ class HourlyStateTests(unittest.TestCase):
         hermetic = patch.object(hourly_state.scan_sessions, "VERDICTS_FILE", str(self.root / "no-verdicts.json"))
         hermetic.start()
         self.addCleanup(hermetic.stop)
+        # Other script tests load another copy of lead_decisions into sys.modules.
+        for module in dict.fromkeys((hourly_state.lead_decisions, hourly_state.answer_evidence.lead_decisions)):
+            for name, value in (("DEFAULT_LOG", self.root / "decisions.jsonl"),
+                                ("HANDED_OFF_LOG", self.root / "handed-off.jsonl")):
+                isolated = patch.object(module, name, value)
+                isolated.start()
+                self.addCleanup(isolated.stop)
+        environment = patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                              "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl"),
+                                              "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+                                              "ORCA_WORKTREE_ID": "repo::/w/triage",
+                                              "ORCA_WORKTREE_PATH": "/w/triage",
+                                              "ORCA_TERMINAL_HANDLE": "term_triage"})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def source(self, name, content):
         path = self.root / name
@@ -3051,6 +3066,140 @@ class HourlyStateTests(unittest.TestCase):
             _, asked = self.call("asked", "--row", "/w/a", "--decision", "merge:PR#10",
                                  "--final-message-file", message, "--question-file", question)
         self.assertEqual(asked["owner_pane"], "tab:leaf")
+
+    def test_get_and_conflicting_answer_show_the_recorded_answer_time_and_tab(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        question = self.source("question.txt", "Proceed?")
+        answer = self.source("answer.txt", "Yes.")
+        other = self.source("other.txt", "No.")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
+                             "--final-message-file", message, "--question-file", question)
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_answer"}):
+            _, recorded = self.call("answered", "--id", asked["id"], "--answer-file", answer,
+                                    "--answered-at", "2026-10-28T01:00:00Z")
+        self.assertEqual(self.call("get", "--id", asked["id"]), (0, recorded))
+        with redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()):
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "answered", "--id", asked["id"],
+                                                "--answer-file", other]), 1)
+        evidence = json.loads(err.getvalue().split("answer already recorded: ", 1)[1])
+        self.assertEqual(evidence, {"answer": "Yes.", "answered_at": "2026-10-28T01:00:00+00:00",
+                                    "answered_in": "term_answer"})
+        saved = json.loads(self.state.read_text())
+        del saved["questions"][asked["id"]]["answered_in"]
+        self.state.write_text(json.dumps(saved))
+        with redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()):
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "answered", "--id", asked["id"],
+                                                "--answer-file", other]), 1)
+        self.assertIsNone(json.loads(err.getvalue().split("answer already recorded: ", 1)[1])["answered_in"])
+
+    def test_answer_without_a_terminal_handle_records_its_worktree(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
+                             "--final-message-file", message, "--question-file", message)
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": ""}):
+            _, recorded = self.call("answered", "--id", asked["id"], "--answer-file", message)
+        self.assertEqual(recorded["answered_in"], "/w/triage")
+
+    def test_summary_of_pending_and_stale_asks_has_one_line_with_each_items_identity_and_age(self) -> None:
+        message = self.source("message.txt", "Choose a release\n" + "detail " * 50)
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "release",
+                             "--asked-at", "2026-10-28T01:00:00Z",
+                             "--final-message-file", message, "--question-file", message)
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "waiting", "repo": "app",
+                                         "claude": {"final_text": "Choose a release", "final_at": "2026-10-28T01:00:00Z"}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
+                                               "ts": "2026-10-28T01:00:00Z", "text": "Choose a release"}])
+        for argv, identity in ((["pending", "--summary"], f"id={asked['id']}"),
+                               (["stale-asks", "--from", str(scan_json), "--summary"], "ask=abcd1234-0000")):
+            with self.subTest(command=argv[0]), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hourly_state.main(["--state-file", str(self.state), *argv]), 0)
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertIn("lane | unanswered | since=2026-10-28T01:00:00", lines[0])
+                self.assertRegex(lines[0], r"age_minutes=\d+")
+                self.assertIn(identity, lines[0])
+                self.assertIn("Choose a release", lines[0])
+
+    def test_asked_skips_all_closed_references_in_the_rows_origin_and_pending_explains_closure(self) -> None:
+        lane = self.root / "lane"
+        subprocess.run(["git", "init", "-q", str(lane)], check=True)
+        subprocess.run(["git", "-C", str(lane), "remote", "add", "origin", "git@github.com:acme/app.git"], check=True)
+        question = self.source("question.txt", "Close #10 and #11?")
+        args = ("asked", "--row", str(lane), "--decision", "close",
+                "--final-message-file", question, "--question-file", question)
+        closed = {f"item_{number}": {"state": "CLOSED", "updatedAt": "2026-10-28T01:00:00Z"}
+                  for number in (10, 11)}
+        with patch.object(hourly_state.scan_sessions, "graphql_repository", return_value=closed) as read:
+            code, skipped = self.call(*args)
+        self.assertEqual(code, 0)
+        self.assertFalse(skipped["recorded"])
+        self.assertEqual(self.call("show")[1]["questions"], {})
+        self.assertEqual(read.call_args.args[0], "acme/app")
+        self.assertIn("issueOrPullRequest(number: 11)", read.call_args.args[1])
+        with patch.object(hourly_state.scan_sessions, "graphql_repository",
+                          return_value={**closed, "item_11": {"state": "OPEN"}}):
+            _, asked = self.call(*args)
+        with patch.object(hourly_state.scan_sessions, "graphql_repository", return_value=closed):
+            _, pending = self.call("pending")
+        self.assertEqual(pending["questions"], [])
+        self.assertEqual(pending["settled"][0]["id"], asked["id"])
+        self.assertEqual([item["number"] for item in pending["settled"][0]["evidence"]], [10, 11])
+        # The same path on another Mac may hold another repository: no evidence, so it is recorded.
+        with patch.object(hourly_state.scan_sessions, "graphql_repository", return_value=closed):
+            _, remote = self.call("asked", *args[1:2], f"mbp16::{lane}", *args[3:])
+        self.assertIsNone(remote["answer"])
+
+    def test_pending_settles_covers_only_after_every_keys_answer_is_later_than_the_question(self) -> None:
+        message = self.source("message.txt", "Choose both releases?")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "both",
+                             "--final-message-file", message, "--question-file", message,
+                             "--asked-at", "2026-10-28T01:00:00Z", "--covers", "first", "--covers", "second")
+        log = self.root / "decisions.jsonl"
+        records = [{"id": key, "decision": key, "answer": f"answer {key}", "decided_at": at}
+                   for key, at in (("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T01:00:00Z"))]
+        write_jsonl(log, records)
+        self.assertEqual(self.call("pending")[1]["questions"][0]["id"], asked["id"])
+        records.append({"id": "later", "decision": "second", "answer": "second settled",
+                        "decided_at": "2026-10-28T03:00:00Z"})
+        write_jsonl(log, records)
+        _, pending = self.call("pending")
+        self.assertEqual(pending["questions"], [])
+        self.assertEqual([(item["decision"], item["decided_at"]) for item in pending["settled"][0]["evidence"]],
+                         [("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T03:00:00Z")])
+        self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
+
+    def test_withdraw_keeps_a_reason_and_time_without_recording_a_user_answer(self) -> None:
+        message = self.source("message.txt", "Proceed?")
+        reason = self.source("reason.txt", "Superseded by the new request.")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
+                             "--final-message-file", message, "--question-file", message)
+        self.assertFalse(cleanup_hourly.no_pending_questions(self.state, asked["owner_pane"]))
+        _, withdrawn = self.call("withdraw", "--id", asked["id"], "--reason-file", reason)
+        self.assertIsNone(withdrawn["answer"])
+        self.assertTrue(cleanup_hourly.no_pending_questions(self.state, asked["owner_pane"]))
+        self.assertEqual(withdrawn["withdrawal_reason"], "Superseded by the new request.")
+        self.assertIsNotNone(scan.parse_time(withdrawn["withdrawn_at"]))
+        self.assertEqual(self.call("withdraw", "--id", asked["id"], "--reason-file", reason)[1], withdrawn)
+        pending = self.call("pending")[1]
+        self.assertEqual(pending["questions"], [])
+        self.assertEqual(pending["settled"][0]["state"], "withdrawn")
+
+    def test_pending_finds_an_unrecorded_answer_in_an_earlier_runs_transcript(self) -> None:
+        message = self.source("message.txt", "Which release?")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "release",
+                             "--final-message-file", message, "--question-file", message,
+                             "--asked-at", "2026-10-28T01:00:00Z")
+        transcript = self.root / "claude/projects/-w-triage/earlier-run.jsonl"
+        write_jsonl(transcript, [{**tool_result("answered", {"questions": [{"question": "Which release?"}],
+                                                            "answers": {"Which release?": "Release B"}}),
+                                 "timestamp": "2026-10-28T02:00:00Z"}])
+        _, pending = self.call("pending")
+        found = pending["questions"][0]
+        self.assertEqual(found["id"], asked["id"])
+        self.assertEqual(found["unrecorded_answers"][0]["at"], "2026-10-28T02:00:00+00:00")
+        self.assertIn("Release B", found["unrecorded_answers"][0]["text"])
+        self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
 
     def test_same_question_for_a_later_pr_is_a_new_decision(self):
         message = self.source("message.txt", "Ready to merge.\n")
@@ -3230,6 +3379,115 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([answer["source"] for answer in deeplink["candidates"]],
                          ["lead_decisions answer:orca-deeplink-pr::photos"])
         self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
+
+    def test_stale_asks_excludes_its_own_row_left_messages_and_handoffs_and_fills_questions(self) -> None:
+        message = self.source("message.txt", "Leave this message.")
+        self.call("leave", "--row", "/w/left", "--final-message-file", message)
+        self.call("leave", "--row", "/w/changed", "--final-message-file", message)
+        rows = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
+                 "claude": {"final_text": final, "final_at": "2026-10-28T01:00:00Z"}}
+                for name, final in (("triage", "Own question"), ("left", "Leave this message."),
+                                    ("changed", "A new question"), ("comment", ""), ("screen", ""))]
+        rows[3]["comment"] = "要判断: 公開は明日でよいですか？"
+        rows[4]["done_cards"] = [{"screen_tail": ["⏺ 画像を使いますか？", "✻ Worked for 1m", "❯"]}]
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps(rows))
+        body = "Earlier triage handoff\n—— 送る直前に道具が足した事実 ——\nNo new reports."
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "comment",
+                                               "ts": "2026-10-28T01:00:00Z", "text": body}])
+        _, stale = self.call("stale-asks", "--from", str(scan_json))
+        self.assertEqual([item["name"] for item in stale], ["changed", "comment", "screen"])
+        self.assertEqual(stale[1]["question"], "公開は明日でよいですか？")
+        self.assertEqual(stale[2]["question"], "画像を使いますか？")
+        self.assertTrue(all(item["state"] == "unasked" for item in stale))
+
+    def test_a_decision_naming_an_old_ask_does_not_answer_the_new_id_in_its_body(self) -> None:
+        rows = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
+                 "claude": {"final_text": "Waiting.", "final_at": "2026-10-28T01:00:00Z"}}
+                for name in ("old-lane", "new-lane")]
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps(rows))
+        write_jsonl(self.root / "inbox.jsonl", [
+            {"id": ask_id, "kind": "ask", "worktree": name, "text": "Proceed?", "ts": "2026-10-28T01:00:00Z"}
+            for name, ask_id in (("old-lane", "89d59136-1111"), ("new-lane", "abcd1234-2222"))])
+        write_jsonl(self.root / "decisions.jsonl", [{"id": "1", "decision": "ask-89d59136-superseded",
+                                                   "answer": "Continue with abcd1234-2222 instead.",
+                                                   "decided_at": "2026-10-28T02:00:00Z"}])
+        _, stale = self.call("stale-asks", "--from", str(scan_json))
+        by_name = {item["name"]: item for item in stale}
+        self.assertEqual(by_name["old-lane"]["state"], "stopped_after_answer")
+        self.assertEqual(by_name["new-lane"]["state"], "unanswered")
+        self.assertEqual(by_name["new-lane"]["candidates"], [])
+
+    def test_unanswered_handoff_key_keeps_a_marked_old_ask_even_on_a_finished_row(self) -> None:
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "finished", "repo": "app",
+                                         "claude": {"final_at": "2026-10-29T01:00:00Z", "final_text": "Finished."}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": ask_id, "kind": "ask", "worktree": "lane",
+                                               "text": "Earlier question", "ts": "2026-10-28T01:00:00Z"}
+                                              for ask_id in ("89d59136-1111", "abcd1234-2222")])
+        write_jsonl(self.root / "answers.jsonl", [{"id": ask_id, "ts": "2026-10-28T02:00:00Z"}
+                                                for ask_id in ("89d59136-1111", "abcd1234-2222")])
+        write_jsonl(self.root / "handed-off.jsonl", [{"decision": key, "handed_off_at": "2026-10-28T02:00:00Z"}
+                                                   for key in ("ask-89d59136", "ask-abcd1234")])
+        _, stale = self.call("stale-asks", "--from", str(scan_json))
+        self.assertEqual([item["ask"]["id"] for item in stale], ["89d59136-1111", "abcd1234-2222"])
+        self.assertEqual((stale[0]["row"], stale[0]["state"], stale[0]["ask"]["marked"]),
+                         ("/w/lane", "unanswered", True))
+        self.assertEqual(stale[0]["question"], "Earlier question")
+        self.assertEqual(stale[0]["decisions"], ["ask-89d59136"])
+
+    def test_blocked_on_miura_includes_current_pr_state_update_and_time_since_answer(self) -> None:
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "stalled", "repo": "app",
+                                         "git": {"github": "acme/app"}, "pr": {"number": 10, "state": "OPEN"},
+                                         "verdict": {"class": "blocked", "waits_on": "三浦さんの判断"},
+                                         "claude": {"final_text": "Waiting.", "final_at": "2026-10-28T01:00:00Z"}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
+                                               "text": "Deploy?", "ts": "2026-10-28T01:00:00Z"}])
+        write_jsonl(self.root / "decisions.jsonl", [{"id": "1", "decision": "ask-abcd1234", "answer": "Deploy.",
+                                                   "decided_at": "2026-10-28T02:00:00Z"}])
+        github = FakeGitHub({"acme/app": [pr_node(10, state="MERGED", updated_at="2026-10-28T03:00:00Z")]})
+        with patch.object(hourly_state.scan_sessions.subprocess, "run", side_effect=github):
+            _, stale = self.call("stale-asks", "--from", str(scan_json))
+        self.assertEqual(stale[0]["state"], "stopped_after_answer")
+        self.assertEqual(stale[0]["pr"], {"state": "MERGED", "updatedAt": "2026-10-28T03:00:00Z"})
+        self.assertEqual(stale[0]["answer_age_minutes"], stale[0]["age_minutes"])
+        self.assertEqual(len(github.graphql()), 1)
+        rows = json.loads(scan_json.read_text())
+        rows[0]["claude"]["final_at"] = "2026-10-28T03:00:00Z"
+        scan_json.write_text(json.dumps(rows))
+        with patch.object(hourly_state.scan_sessions.subprocess, "run", side_effect=github):
+            _, continued = self.call("stale-asks", "--from", str(scan_json))
+        self.assertEqual(continued[0]["state"], "unasked")
+        self.assertEqual(continued[0]["answer_age_minutes"], continued[0]["age_minutes"] + 60)
+
+    def test_appointed_lead_is_replaced_and_is_the_default_transcript_source_for_stale_asks(self) -> None:
+        lead = self.root.resolve() / "lead"
+        self.call("appoint-lead", "--worktree", str(self.root / "old"))
+        code, appointed = self.call("appoint-lead", "--worktree", str(lead / ".." / "lead"),
+                                    "--appointed-at", "2026-10-28T11:00:00+09:00")
+        self.assertEqual((code, appointed), (0, {"worktree": str(lead), "appointed_at": "2026-10-28T02:00:00+00:00"}))
+        self.assertEqual(hourly_state.appointed_lead(self.call("show")[1]), lead)
+        transcript = scan.claude_project_dir(self.root / "claude/projects", str(lead)) / "lead.jsonl"
+        write_jsonl(transcript, [
+            {**user("公開日は未定です"), "timestamp": "2026-10-28T00:00:00Z"},
+            {**user("公開日は明日にしましょう"), "timestamp": "2026-10-28T02:00:00Z"},
+            {**user("無関係の発言"), "timestamp": "2026-10-28T03:00:00Z"},
+            {**user("公開日についての内部通知"), "isMeta": True, "timestamp": "2026-10-28T04:00:00Z"},
+        ])
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "waiting", "repo": "app",
+                                         "claude": {"final_text": "公開日を決めますか？", "final_at": "2026-10-28T01:00:00Z"}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
+                                               "text": "公開日を決めますか？", "ts": "2026-10-28T01:00:00Z"}])
+        _, stale = self.call("stale-asks", "--from", str(scan_json))
+        self.assertEqual(stale[0]["state"], "unanswered")
+        self.assertEqual([item["text"] for item in stale[0]["candidates"]], ["公開日は明日にしましょう"])
+        _, explicit = self.call("stale-asks", "--from", str(scan_json), "--asked-in", str(lead))
+        self.assertEqual(explicit, stale)
+        _, elsewhere = self.call("stale-asks", "--from", str(scan_json), "--asked-in", str(self.root / "elsewhere"))
+        self.assertEqual(elsewhere[0]["candidates"], [])
 
     def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self):
         # The hourly run saves the scan before orca-row-classify reads its queue; that verdict lands in the store.
@@ -3558,6 +3816,37 @@ def tool_result(content, result):
 
 
 class HourlyRunsTests(unittest.TestCase):
+    def test_tail_and_questions_read_each_runs_last_utterance_and_match_results_by_tool_id(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            projects = home / ".claude/projects/-w-triage"
+            question = {"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_1",
+                        "input": {"questions": [{"question": "Which release?"}]}}
+            asked = {**assistant(text("Choose a release."), question), "timestamp": "2026-10-28T01:00:00Z"}
+            unrelated = tool_result("another tool finished", {})
+            unrelated["message"]["content"][0]["tool_use_id"] = "other_tool"
+            write_jsonl(projects / "waiting.jsonl", [asked, unrelated,
+                         {**user("Hold on."), "timestamp": "2026-10-28T01:01:00Z"}])
+            write_jsonl(projects / "answered.jsonl", [asked,
+                {**tool_result("answered", {"answers": {"Which release?": "Release B"}}),
+                 "timestamp": "2026-10-28T02:00:00Z"},
+                {**assistant(text("Release B is queued.")), "timestamp": "2026-10-28T02:01:00Z"}])
+            runs = [{"status": "completed", "usage": {"providerSessionId": name}, "workspaceId": "repo::/w/triage"}
+                    for name in ("waiting", "answered")]
+            with patch.object(hourly_runtime, "scheduled_runs", return_value=runs), \
+                    patch.object(Path, "home", return_value=home), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hourly_runs.main(["--workspace", "/w/triage", "--tail", "--questions", "--json"]), 0)
+            waiting, answered = json.loads(out.getvalue())
+        self.assertEqual((waiting["tail"]["role"], waiting["tail"]["text"]), ("user", "Hold on."))
+        self.assertTrue(waiting["ask_user_question_waiting"])
+        self.assertEqual(waiting["questions"][0]["asked_at"], "2026-10-28T01:00:00Z")
+        self.assertIsNone(waiting["questions"][0]["answered_at"])
+        self.assertEqual(answered["tail"]["text"], "Release B is queued.")
+        self.assertFalse(answered["ask_user_question_waiting"])
+        self.assertEqual((answered["questions"][0]["question"], answered["questions"][0]["answer"],
+                          answered["questions"][0]["answered_at"]),
+                         ("Which release?", "Release B", "2026-10-28T02:00:00Z"))
+
     def test_lists_each_scheduled_run_with_its_precheck_reason_and_transcript(self):
         with tempfile.TemporaryDirectory() as root:
             home = Path(root) / "Application Support" / "home"

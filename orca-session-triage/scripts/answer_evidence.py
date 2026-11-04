@@ -38,6 +38,9 @@ NAME_MIN = 4
 # `#1234` or `owner/repo#1234`; shorter numbers are too common to name a PR.
 PR_NUMBER = re.compile(r"(?<![#\d])#(\d{3,})(?!\d)")
 ID_PREFIX = 8
+ASK_KEY = re.compile(r"(?<![\w-])ask-([a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}|\w+)")
+# A word of a question a user's own message may repeat: two or more kanji, katakana, or letters and digits.
+QUESTION_WORD = re.compile(r"[一-龯々]{2,}|[ァ-ヺー]{2,}|[A-Za-z0-9_]{2,}")
 # rm_check.py asks the lead `remove:<path>` about a worktree's keep note: an answer about the worktree, not to its ask.
 NOT_ANSWERS = ("remove:",)
 
@@ -49,6 +52,23 @@ class Answer:
     text: str
     ask_id: str | None = None  # the `<id>` or `<id>:<n>` a delivered answer names exactly
     answered: tuple[str, ...] = ()  # the questions an AskUserQuestion answer answered, as it showed them
+    free_text: bool = False  # a user's ordinary message is a candidate, never proof
+
+
+def key_ask_id(key: str) -> str | None:
+    found = ASK_KEY.search(key)
+    return found.group(1) if found else None
+
+
+def names_ask_id(named: str, ask_id: str) -> bool:
+    return named == ask_id or len(named) >= ID_PREFIX and ask_id.startswith(named)
+
+
+def matches_ask(answer: Answer, ask_id: str, number: int | None = None) -> bool:
+    named = answer.ask_id or ""
+    if answer.source.startswith("lead_decisions "):
+        return names_ask_id(named, ask_id)
+    return named in (ask_id, f"{ask_id}:{number}")
 
 
 def questions_of(ask: dict) -> list[str]:
@@ -73,8 +93,10 @@ def names_id(text: str, ask_id: str) -> bool:
 def proves(answer: Answer, ask: dict, number: int | None, shared: frozenset[str]) -> bool:
     """Whether the answer names the ask (number None) or its structured question `number` exactly."""
     ask_id = str(ask.get("id") or "")
+    if answer.free_text:
+        return False
     if answer.ask_id is not None:
-        return answer.ask_id in (ask_id, f"{ask_id}:{number}")
+        return matches_ask(answer, ask_id, number)
     if number is None:
         return bool(ask_id) and names_id(answer.text, ask_id)
     question = questions_of(ask)[number - 1]
@@ -84,8 +106,15 @@ def proves(answer: Answer, ask: dict, number: int | None, shared: frozenset[str]
 
 
 def relates(answer: Answer, ask: dict) -> bool:
+    if (answer.source.startswith("lead_decisions ") and answer.ask_id is not None
+            and not matches_ask(answer, str(ask.get("id") or ""))):
+        return False
     worktree = str(ask.get("worktree") or "")
     numbers = dict.fromkeys(PR_NUMBER.findall(str(ask.get("text") or "")))
+    question = "\n".join(questions_of(ask)) or str(ask.get("text") or "")
+    words = QUESTION_WORD.findall(question)
+    if answer.free_text and any(word.casefold() in answer.text.casefold() for word in words):
+        return True
     return ((len(worktree) >= NAME_MIN
              and re.search(rf"(?<![\w-]){re.escape(worktree)}(?![\w-])", answer.text) is not None)
             or any(re.search(rf"(?<![#\d])#{number}(?!\d)", answer.text) for number in numbers))
@@ -119,7 +148,8 @@ def related_to(ask: dict, answers: Sequence[Answer]) -> list[Answer]:
 
 
 def decisions(log: Path) -> Iterator[Answer]:
-    yield from (Answer(at, f"lead_decisions {item.decision}", f"{item.decision}\n{item.answer}")
+    yield from (Answer(at, f"lead_decisions {item.decision}", f"{item.decision}\n{item.answer}",
+                      ask_id=key_ask_id(item.decision))
                 for item in lead_decisions.latest(lead_decisions.records(log)).values()
                 if not item.decision.startswith(NOT_ANSWERS)
                 if (at := scan_sessions.parse_time(item.decided_at)) is not None)
@@ -139,17 +169,20 @@ def delivered(log: Path) -> Iterator[Answer]:
 
 
 def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:
-    """Each AskUserQuestion the user answered: the questions it answered, and as its text the questions, choices,
-    answers, and notes, one per line (JSON would escape the quotes and line breaks a question holds)."""
+    """AskUserQuestion answers with their questions, choices and notes, and ordinary user messages as candidates.
+    Text stays one item per line: JSON would escape the quotes and line breaks a question holds."""
     for path in transcripts:
         with path.open("rb") as stream:
-            # The lead's transcript passes 150 MB; only an answered AskUserQuestion carries "answers".
-            for raw in (line for line in stream if b'"answers"' in line):
+            # Skip assistant/tool traffic in the lead's large transcript before decoding it.
+            for raw in (line for line in stream if b'"answers"' in line or b'"user"' in line):
                 try:
                     entry = json.loads(raw)
                 except ValueError:
                     continue
                 result = entry.get("toolUseResult") if isinstance(entry, dict) else None
+                if (isinstance(entry, dict) and not result and scan_sessions.is_real_user_message(entry)
+                        and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None):
+                    yield Answer(at, f"user {path.name}", scan_sessions.user_text(entry), free_text=True)
                 if not (isinstance(result, dict) and isinstance(result.get("answers"), dict)
                         and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None):
                     continue
@@ -173,7 +206,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                         help="the lead's recorded answers (default: %(default)s)")
     parser.add_argument("--asked-in", type=Path, action="append", default=[], metavar="WORKTREE",
-                        help="a worktree whose Claude transcripts hold AskUserQuestion answers, such as the lead's "
+                        help="a worktree whose Claude transcripts hold user answers, such as the lead's "
                              "or the triage workspace; repeat per worktree. The current directory is always read")
     parser.add_argument("--claude-projects", type=Path,
                         default=Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude") / "projects",
