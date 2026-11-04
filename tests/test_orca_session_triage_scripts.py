@@ -2106,6 +2106,28 @@ class RmCheckTests(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
+    def test_the_reader_of_its_output_does_not_block(self) -> None:
+        # rm_check.py | <reader in the worktree>: the reader shares the check's process group.
+        reader = f"{sys.executable} -c 'import sys; sys.stdout.write(sys.stdin.read())'"
+        command = (f"{sys.executable} {rmcheck.__file__} {self.wt} - --base main --no-docker "
+                   f"| (cd {self.wt} && {reader})")
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+
+        result = json.loads(completed.stdout)
+        self.assertEqual((result["ok"], result["processes"]), (True, []), completed.stderr)
+
+    def test_a_worker_beside_the_reader_of_its_output_still_blocks(self) -> None:
+        # The reader writes to /dev/null, which a worker in the same process group reads.
+        out = Path(self.tmp.name) / "out.json"
+        command = (f"(cd {self.wt} && exec sleep 30 < /dev/null) & sleep 1; "
+                   f"{sys.executable} {rmcheck.__file__} {self.wt} - --base main --no-docker "
+                   f"| tee {out} > /dev/null; kill $!")
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
+
+        result = json.loads(out.read_text())
+        self.assertFalse(result["ok"], completed.stderr)
+        self.assertEqual(len(result["processes"]), 1)
+
     def test_check_does_not_count_itself_or_its_shell(self):
         binary = Path(self.tmp.name) / "bin/orca"
         binary.parent.mkdir()
@@ -2330,6 +2352,97 @@ class RmCheckTests(unittest.TestCase):
         self.assertRegex(" ".join(moved), r"^wt-investigate-\d{8} wt-yomiyasu-\d{8}$")
         self.assertEqual((archive / moved[1] / "inputs" / "draft.md").read_text(), "原文\n")
         self.assertEqual(sorted(Path(item["to"]).name for item in result["archived"]), moved)
+
+    def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
+        self.ignore_review_records()
+        (self.wt / ".claude/settings.local.json").write_text('{"hooks": {}}\n')
+        (self.main / ".claude/reviews/topic").write_text("a file in main\n")
+        (self.wt / ".claude/reviews/topic").mkdir()
+        (self.wt / ".claude/reviews/topic/more.md").write_text("needs a directory main has as a file\n")
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (self.main / ".claude/reviews/linked").symlink_to(outside)
+        (self.wt / ".claude/reviews/linked").mkdir()
+        (self.wt / ".claude/reviews/linked/away.md").write_text("main links this directory elsewhere\n")
+
+        code, result = self.run_main("--archive-scratch")
+
+        self.assertEqual((self.main / ".claude/reviews/new.md").read_text(), "the worktree's review\n")
+        self.assertEqual([Path(item["to"]).name for item in result["copied_to_main"]], ["new.md"])
+        self.assertEqual(code, 1)
+        self.assertFalse((self.main / ".claude/settings.local.json").exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_archive_scratch_copies_nothing_while_other_blockers_keep_the_worktree(self) -> None:
+        self.ignore_review_records()
+        (self.wt / "app.txt").write_text("unsaved work\n")
+
+        _, result = self.run_main("--archive-scratch")
+
+        self.assertEqual(result["copied_to_main"], [])
+        self.assertFalse((self.main / ".claude/reviews/new.md").exists())
+
+    def ignore_review_records(self) -> None:
+        """Main ignores .claude/ and keeps an older review; the worktree has a new one main lacks."""
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n.claude/\n")
+        git(self.main, "commit", "-q", "-am", "ignore review records")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.main / ".claude/reviews").mkdir(parents=True)
+        (self.main / ".claude/reviews/old.md").write_text("main's record\n")
+        (self.wt / ".claude/reviews").mkdir(parents=True)
+        (self.wt / ".claude/reviews/new.md").write_text("the worktree's review\n")
+
+    def test_detach_nested_and_archive_scratch_clear_a_worktree_only_they_keep(self) -> None:
+        copy = self.nested_catalog()
+        (self.wt / ".investigate").mkdir()
+        (self.wt / ".investigate" / "notes.md").write_text("調べた記録\n")
+        archive = Path(self.tmp.name) / "archive"
+
+        _, alone = self.run_main("--detach-nested")
+        code, result = self.run_main("--detach-nested", "--archive-scratch", "--archive-dir", str(archive))
+
+        self.assertEqual(alone["detached"], [])
+        self.assertEqual((code, result["ok"], len(result["detached"]), len(result["archived"])), (0, True, 1, 1))
+        self.assertFalse(copy.exists() or (self.wt / ".investigate").exists())
+
+    def test_work_after_the_scan_blocks_removal(self) -> None:
+        scan_file = Path(self.tmp.name) / "scan.json"
+        scanned_at = datetime.now().astimezone().isoformat()
+        scan_file.write_text(json.dumps([{"path": str(self.wt), "scanned_at": scanned_at}]))
+        (self.wt / "node_modules").mkdir()
+        (self.wt / "node_modules" / "pkg.js").write_text("installed\n")
+
+        before_code, before = self.run_main("--from", str(scan_file))
+        time.sleep(1.1)  # the reflog dates a move of HEAD to the second
+        (self.wt / "draft.md").write_text("new notes\n")
+        git(self.wt, "add", "draft.md")
+        git(self.wt, "commit", "-q", "-m", "draft")
+        git(self.main, "merge", "-q", "feature")
+        code, result = self.run_main("--from", str(scan_file))
+        later_code, _ = self.run_main("--since", datetime.now().astimezone().isoformat())
+
+        self.assertEqual((before_code, before["blockers"]), (0, []))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(result["blockers"]), 2)
+        self.assertIn("draft.md", result["blockers"][0])
+        self.assertIn("HEAD", result["blockers"][1])
+        self.assertEqual(later_code, 0)
+
+    def test_an_ignored_directory_of_logs_or_cbm_test_storage_is_regenerable(self) -> None:
+        (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\nlogs/\napps/api/media/\n")
+        git(self.main, "commit", "-q", "-am", "ignore logs")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.wt / "logs").mkdir()
+        (self.wt / "logs" / "app.log").write_text("DEBUG ready\n")
+        storage = self.wt / "apps/api/media/files/datafile/storage/2026/11"
+        storage.mkdir(parents=True)
+        (storage / "upload.csv").write_text("a,b\n")
+
+        code, result = self.run_main()
+
+        self.assertEqual((code, result["review"]), (0, []))
+        self.assertEqual(sorted(result["regenerable"]), ["apps/api/media/", "logs/"])
+        self.assertRegex(" ".join(result["notes"]), r"logs/ holds only logs: 12 bytes, last written \d{4}-")
 
     def test_open_pr_at_clean_checkout_head_is_removable(self):
         (self.wt / "app.txt").write_text("pushed change\n")
@@ -2910,6 +3023,54 @@ class RmCheckTests(unittest.TestCase):
                          ["1 uncommitted changes",
                           "no base ref found (origin/HEAD, origin/main, origin/master); pass --base"])
 
+    def test_stale_remote_refs_are_fetched_before_judging(self) -> None:
+        bare = Path(self.tmp.name) / "remote.git"
+        git(Path(self.tmp.name), "init", "--bare", "-q", "-b", "main", str(bare))
+        git(self.main, "remote", "add", "origin", str(bare))
+        git(self.main, "push", "-q", "origin", "main")
+        git(self.main, "fetch", "-q", "origin")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        other = Path(self.tmp.name) / "other"
+        git(Path(self.tmp.name), "clone", "-q", str(bare), str(other))
+        git(other, "fetch", "-q", str(self.wt), "feature")
+        git(other, "merge", "-q", "--ff-only", "FETCH_HEAD")
+        git(other, "push", "-q", "origin", "main")
+        fetched = Path(git(self.wt, "rev-parse", "--git-common-dir")) / "FETCH_HEAD"
+        old = (datetime.now() - timedelta(hours=2)).timestamp()
+        os.utime(fetched, (old, old))
+
+        code, result = self.run_main_without_base()
+
+        self.assertEqual((code, result["blockers"]), (0, []))
+
+    def test_the_remote_the_branch_started_from_is_fetched_before_judging(self) -> None:
+        bare = Path(self.tmp.name) / "upstream.git"
+        git(Path(self.tmp.name), "init", "--bare", "-q", "-b", "main", str(bare))
+        git(self.main, "remote", "add", "upstream", str(bare))
+        git(self.main, "push", "-q", "upstream", "main")
+        git(self.main, "fetch", "-q", "upstream")
+        self.wt = Path(self.tmp.name) / "from-upstream"
+        git(self.main, "worktree", "add", "-q", "-b", "fork-work", str(self.wt), "upstream/main")
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        git(self.wt, "push", "-q", str(bare), "fork-work:main")
+        fetched = Path(git(self.wt, "rev-parse", "--git-common-dir")) / "FETCH_HEAD"
+        old = (datetime.now() - timedelta(hours=2)).timestamp()
+        os.utime(fetched, (old, old))
+
+        code, result = self.run_main_without_base()
+
+        self.assertEqual((code, result["blockers"]), (0, []))
+
+    def test_command_accepts_the_worktree_and_pr_as_positional_arguments(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = rmcheck.main([str(self.wt), "-", "--base", "main", "--no-docker"],
+                                worktree_notes=FakeWorktreeNotes())
+
+        self.assertEqual((code, json.loads(out.getvalue())["worktree"]), (0, str(self.wt.resolve())))
+
     def test_command_rejects_a_path_that_is_not_a_git_worktree(self):
         plain = Path(self.tmp.name) / "plain"
         plain.mkdir()
@@ -2918,7 +3079,8 @@ class RmCheckTests(unittest.TestCase):
             code = rmcheck.main(["--worktree", str(plain), "--no-docker"])
 
         self.assertEqual(code, 2)
-        self.assertEqual(json.loads(out.getvalue())["blockers"], ["not a git worktree"])
+        [blocker] = json.loads(out.getvalue())["blockers"]
+        self.assertRegex(blocker, r"^not a git worktree: git rev-parse exited 128: fatal: not a git repository")
 
 
 class RmCheckConfirmGoneTests(unittest.TestCase):

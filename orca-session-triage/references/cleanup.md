@@ -24,7 +24,12 @@ blocks its removal).
 
 Run these per worktree, in order.
 
-1. `scripts/rm_check.py --worktree <path> [--pr <n>]`. Pass `--pr` when the worktree
+1. `scripts/rm_check.py --worktree <path> [--pr <n>] --from SCAN_JSON` (or
+   `rm_check.py <path> <PR|->`). With `--from`, a file outside `.git`,
+   `node_modules`, and `.venv` or a move of HEAD after the scan's `scanned_at`
+   (or `--since`) blocks: another lane may be using the worktree. Remote refs
+   not fetched within the hour are fetched first; a failed fetch is in `notes`.
+   Pass `--pr` when the worktree
    has a PR: a MERGED PR whose head equals HEAD counts as merged (squash merges),
    an OPEN PR whose head equals HEAD clears the unmerged-commit check, and the
    PR's fetched base branch becomes the base. Without it the base is the
@@ -62,15 +67,25 @@ Run these per worktree, in order.
      those folders alone keep the worktree, it moves them to
      `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/` (listed in
      `archived`) and checks again; it moves nothing while anything else blocks
-     or needs review. Without the option nothing moves.
+     or needs review. Without the option nothing moves. Before that, when only
+     paths to review, those folders, and nested worktrees keep it, the option
+     copies each record under `.claude/reviews/` that the main checkout also
+     ignores and does not have yet to the same place in main, confirmed with cmp
+     (`copied_to_main`). Other ignored files, such as `.env` or
+     `.claude/settings.local.json`, are settings main would run with and stay
+     for review. With `--detach-nested` as well, nested copies and these
+     folders go together.
    - `regenerable` lists what a tool writes again from tracked files or
      installed packages with no one's input: untracked Python bytecode, and,
      among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
      `graphql/generated/`, `src/paraglide/`), e2e output (`e2e/screenshots/`, `e2e/.state/`,
      `e2e/.auth/`), and the hook scripts husky and vite-hooks write on install
      (`.husky/_/`, `.vite-hooks/_/`), MkDocs' `site/` beside `mkdocs.yml`,
-     Django's test databases (`test_*.sqlite3`) and `var/test-storage/`, and an
-     ignored directory holding only these and empty files (`web/var/`). They do
+     Django's test databases (`test_*.sqlite3`) and `var/test-storage/`,
+     taihei-cbm's test uploads (`apps/api/media/files/datafile/storage/`), an
+     ignored directory of only `*.log` files (its size and last write in
+     `notes`), and an ignored directory holding only these and empty files
+     (`web/var/`). They do
      not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
@@ -94,7 +109,8 @@ Run these per worktree, in order.
      saved scan when that scan lists the handle in `closable`, then run
      `rm_check.py` again. A
      process outside Orca tabs blocks with its PID; a `node` server or another
-     job is left running and reported.
+     job is left running and reported. The commands the check's output is
+     piped into are not listed.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
      (uncommitted changes, ignored paths to open, HEAD on no remote). A tracked
