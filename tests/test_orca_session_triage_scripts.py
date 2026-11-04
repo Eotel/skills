@@ -3145,6 +3145,10 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(pending["questions"], [])
         self.assertEqual(pending["settled"][0]["id"], asked["id"])
         self.assertEqual([item["number"] for item in pending["settled"][0]["evidence"]], [10, 11])
+        # The same path on another Mac may hold another repository: no evidence, so it is recorded.
+        with patch.object(hourly_state.scan_sessions, "graphql_repository", return_value=closed):
+            _, remote = self.call("asked", *args[1:2], f"mbp16::{lane}", *args[3:])
+        self.assertIsNone(remote["answer"])
 
     def test_pending_settles_covers_only_after_every_keys_answer_is_later_than_the_question(self) -> None:
         message = self.source("message.txt", "Choose both releases?")
@@ -3170,8 +3174,10 @@ class HourlyStateTests(unittest.TestCase):
         reason = self.source("reason.txt", "Superseded by the new request.")
         _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
                              "--final-message-file", message, "--question-file", message)
+        self.assertFalse(cleanup_hourly.no_pending_questions(self.state, asked["owner_pane"]))
         _, withdrawn = self.call("withdraw", "--id", asked["id"], "--reason-file", reason)
         self.assertIsNone(withdrawn["answer"])
+        self.assertTrue(cleanup_hourly.no_pending_questions(self.state, asked["owner_pane"]))
         self.assertEqual(withdrawn["withdrawal_reason"], "Superseded by the new request.")
         self.assertIsNotNone(scan.parse_time(withdrawn["withdrawn_at"]))
         self.assertEqual(self.call("withdraw", "--id", asked["id"], "--reason-file", reason)[1], withdrawn)

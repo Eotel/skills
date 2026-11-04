@@ -451,10 +451,10 @@ def owner_name(value):
 
 
 def closed_references(row: str, question: str) -> list[dict]:
-    """The question's #numbers in its checkout's origin, only when every reference is CLOSED."""
+    """The question's #numbers in its checkout's origin, only when every reference is CLOSED. A row on another
+    Mac (ENVIRONMENT::path) gives none: the same path here may hold another repository."""
     numbers = list(dict.fromkeys(int(number) for number in re.findall(r"#(\d+)\b", question)))
-    _, separator, path = row.partition("::")
-    repo = origin_slug(path if separator else row) if numbers else None
+    repo = origin_slug(row) if numbers and "::" not in row else None
     if not repo:
         return []
     owner, name = repo.split("/")
