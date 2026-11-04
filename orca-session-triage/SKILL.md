@@ -39,12 +39,17 @@ board's done cards; close what the user approves.
   (`✻ … for …`), or mode line (⏵⏵) names an agent the terminal list leaves
   out (it does on some reads), and the last ⏺ reply, or the indented lines
   above the turn-end line when the ⏺ scrolled off, is the row's
-  `orca_message` (`from: screen`).
+  `orca_message` (`from: screen`). Codex's reply bullet (•, not a command it
+  ran) or turn-end line (`Worked for … • HH:MM`) names Codex the same way; its
+  last reply, or the `↳ Recap:` under that turn's end when the reply scrolled
+  off, is the message.
   It also reads the tabs of worktrees with a done or waiting agent, the agent
   tabs of worktrees Orca keeps no agent for, and another Mac's shell tabs Orca
   lists without output: a permission selector or an AskUserQuestion selector
   (`Enter to select`) makes the row `waiting` with `prompt_waiting` (`tab`,
-  `question`, `choices`) whatever verdict was saved, and its question is the
+  `question`, `choices`, and for a permission prompt `target`: the tool and
+  its description, the command's first line, and a PreToolUse hook's reason)
+  whatever verdict was saved, and its question, followed by the target, is the
   row's `question`; a notice that a restart dropped background jobs adds a reason,
   and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
   A local row also reads the transcript of each Claude session running under

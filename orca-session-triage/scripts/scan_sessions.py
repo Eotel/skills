@@ -53,6 +53,7 @@ class PromptWaiting(TypedDict):
     tab: str
     question: str
     choices: list[str]
+    target: NotRequired[str]  # what a permission prompt asks about (prompt_target)
 
 
 class DoneCard(TypedDict):
@@ -613,11 +614,17 @@ STATE_REASONS = {
 }
 
 
+def prompt_question(prompt: dict) -> str:
+    """A prompt's question, followed by what a permission prompt asks about."""
+    question = prompt.get("question") or ""
+    return f"{question} — {prompt['target']}" if question and prompt.get("target") else question
+
+
 def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     reasons = []
     if prompt := row.get("prompt_waiting"):
         kind = "permission prompt" if prompt["question"].startswith(PERMISSION_QUESTION) else "question"
-        reasons.append(f"{kind} on screen: " + prompt["question"])
+        reasons.append(f"{kind} on screen: " + prompt_question(prompt))
     claude = row["claude"] or {}
     jev = row.get("jev") or {}
     asks = jev.get("asks")
@@ -740,6 +747,16 @@ CLAUDE_MODE_LINE = "⏵⏵ "
 TOOL_CALL = re.compile(r"⏺ (?:[A-Za-z][\w.:-]*\(|.*\(MCP\))")
 COLLAPSED_CALLS = "(ctrl+o to expand)"
 TOOL_RESULT = "⎿"
+# Codex's reply bullet ("• text", its continuation lines indented), the line a turn ends with ("Worked for 4m 28s •
+# 11:43"; "─ Worked for 1m 02s ───" in older builds), and the recap it can print under that line. A bullet followed
+# by a └ result or naming an action ("• Ran …", "• Hook failed", "• Edited …", "• Working (…)") is not a reply.
+CODEX_REPLY = "• "
+CODEX_TURN_END = re.compile(r"[─━ ]*Worked for \d[^•·─━]*(?:[•·] *\d{1,2}:\d{2})?[─━ ]*")
+CODEX_ACTION = re.compile(r"• (?:Ran|Running|Failed|Explored|Edited|Added|Deleted|Updated Plan|Waited|Waiting|Working|"
+                          r"Hook|Called|Searched)\b")
+CODEX_RESULT = "└"
+CODEX_RECAP = "↳ Recap:"
+CODEX_PROMPT = "› "
 
 
 def screen_lines(screen: dict) -> list[str]:
@@ -790,8 +807,44 @@ FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 LOST_WAITS = "background shell command tasks didn't finish before the previous session ended"
 
 
+# Above its question, Claude Code's permission frame names what it asks about: under a rule, the tool and the call's
+# description ("Bash command", "Post the approved comment"), then sections split by dashed rules, each line behind a
+# │ gutter: the command, and the reason a PreToolUse hook gave for asking, ending with where the hook is set.
+DASHED_RULE = re.compile(r"╌+")
+GUTTER = "│"
+HOOK_ASKS = "Hook PreToolUse"
+HOOK_SOURCE = re.compile(r"\s*\[\w+\]$")
+COMMAND_HEAD = 100
+
+
+def prompt_target(lines: list[str]) -> str:
+    """The tool and its description, the command's first line, and a PreToolUse hook's reason from the permission
+    frame in `lines` (stripped, above the question), joined with " / "; "" when the frame's top rule is not shown."""
+    top = max((index for index, line in enumerate(lines) if RULE.fullmatch(line)), default=None)
+    if top is None:
+        return ""
+    sections: list[list[str]] = [[]]
+    for line in lines[top + 1:]:
+        if DASHED_RULE.fullmatch(line):
+            sections.append([])
+        else:
+            sections[-1].append(line)
+    title, *about = sections[0] or [""]
+    parts = [f"{title}: {unwrapped(about)}" if about else title]
+    for section in sections[1:]:
+        shown = [line.removeprefix(GUTTER).strip() for line in section if line.startswith(GUTTER)]
+        if shown and shown[0].startswith(HOOK_ASKS):
+            # The hook's heading can wrap; its reason starts after the line ending with ":".
+            heading = next((index for index, line in enumerate(shown) if line.endswith(":")), 0)
+            parts.append("Hook: " + HOOK_SOURCE.sub("", unwrapped(shown[heading + 1:])))
+        elif shown and len(parts) == 1:
+            cut = len(shown) > 1 or len(shown[0]) > COMMAND_HEAD
+            parts.append(shown[0][:COMMAND_HEAD] + ("…" if cut else ""))
+    return " / ".join(part for part in parts if part)
+
+
 def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
-    """The permission question a rendered screen waits on, with its numbered choices."""
+    """The permission question a rendered screen waits on, with its numbered choices and what it asks about."""
     lines = [line.strip() for line in screen_lines(screen) if line.strip()]
     asked = [index for index, line in enumerate(lines) if line.startswith(PERMISSION_QUESTION)]
     after = lines[asked[-1] + 1:] if asked else []
@@ -799,7 +852,9 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     choices = list(takewhile(CHOICE.fullmatch, after[first:])) if first is not None else []
     if not any(line.startswith("❯") for line in choices):
         return None
-    return {"tab": tab, "question": lines[asked[-1]], "choices": [CHOICE.sub(r"\1", line) for line in choices]}
+    target = prompt_target(lines[:asked[-1]])
+    return {"tab": tab, "question": lines[asked[-1]], "choices": [CHOICE.sub(r"\1", line) for line in choices],
+            **({"target": target} if target else {})}
 
 
 def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screens,
@@ -854,17 +909,53 @@ def screen_tail(screen: dict) -> list[str]:
 
 
 def screen_agent(screen: dict) -> str | None:
-    """"claude" when the screen shows Claude Code: its reply bullet, its turn-end line, or its mode line."""
-    shows = any(CLAUDE_LINE_STARTS.match(line.strip()) or CLAUDE_MODE_LINE in line for line in screen_lines(screen))
-    return "claude" if shows else None
+    """"claude" when the screen shows Claude Code (its reply bullet, turn-end line, or mode line), "codex" when it
+    shows Codex (its turn-end line, or its › prompt beside a bullet: devenv prints "• Running …" in a shell too)."""
+    lines = screen_lines(screen)
+    if any(CLAUDE_LINE_STARTS.match(line.strip()) or CLAUDE_MODE_LINE in line for line in lines):
+        return "claude"
+    if any(CODEX_TURN_END.fullmatch(line.strip()) for line in lines) or (
+            any(line.startswith(CODEX_PROMPT) for line in lines) and any(line.startswith(CODEX_REPLY) for line in lines)):
+        return "codex"
+    return None
+
+
+def codex_screen_message(lines: list[str]) -> str:
+    """Codex's last reply: the last • block that is not an action, up to its turn-end line. When no reply of the last
+    ended turn is shown (its bullet scrolled off), the recap Codex printed under that turn's end line."""
+    def action(index: int) -> bool:
+        following = next((line.strip() for line in lines[index + 1:] if line.strip()), "")
+        return bool(CODEX_ACTION.match(lines[index])) or following.startswith(CODEX_RESULT)
+
+    reply = max((index for index, line in enumerate(lines) if line.startswith(CODEX_REPLY) and not action(index)),
+                default=None)
+    recap = max((index for index, line in enumerate(lines) if line.strip().startswith(CODEX_RECAP)), default=None)
+    if recap is not None:
+        ends = [index for index, line in enumerate(lines[:recap]) if CODEX_TURN_END.fullmatch(line.strip())]
+        if reply is None or reply < (ends[-2] if len(ends) > 1 else -1):
+            said = [lines[recap].strip().removeprefix(CODEX_RECAP),
+                    *takewhile(lambda line: line[:1].isspace() and line.strip(), lines[recap + 1:])]
+            return unwrapped([line.strip() for line in said])
+    if reply is None:
+        return ""
+    block = [lines[reply][2:]]
+    for line in lines[reply + 1:]:
+        if (line.strip() and not line[:1].isspace() or CODEX_TURN_END.fullmatch(line.strip())
+                or line.strip().startswith(CODEX_RECAP)):
+            break
+        block.append(line)
+    return "\n".join(line[2:] if line.startswith("  ") else line.strip() for line in block).strip()
 
 
 def screen_message(screen: dict) -> str:
-    """Claude's last reply on the screen: the last ⏺ block, its indented continuation lines unindented.
+    """The agent's last reply on the screen: Claude's last ⏺ block, its indented continuation lines unindented, or
+    Codex's (codex_screen_message).
 
     A reply whose ⏺ line scrolled off the top is read from the indented lines above the last turn-end line.
     """
     lines = screen_lines(screen)
+    if screen_agent(screen) == "codex":
+        return codex_screen_message(lines)
     def tool_call(index):
         following = lines[index + 1].strip() if index + 1 < len(lines) else ""
         return (TOOL_CALL.match(lines[index]) or lines[index].rstrip().endswith(COLLAPSED_CALLS)
@@ -957,7 +1048,7 @@ def orca_said(worktree):
 
 def with_screen_agents(terms, screens, environment):
     """(terms, message): the tabs, each without an agent given the one its screen shows, and the last
-    Claude reply read on them. Another Mac's terminal list names a tab's agent on some reads only."""
+    Claude or Codex reply read on them. Another Mac's terminal list names a tab's agent on some reads only."""
     found, message = [], ""
     for term in terms:
         screen = rendered(screens.get((environment, term.get("handle"))))
@@ -2222,7 +2313,7 @@ def row_view(row: dict) -> dict:
     asked = {"claude": (row.get("claude") or {}).get("last_user"),
              "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     github = github_of(row)
-    question = (row.get("prompt_waiting") or {}).get("question") or verdict.get("question") or ""
+    question = prompt_question(row.get("prompt_waiting") or {}) or verdict.get("question") or ""
     merge_question = asks_merge(question, row.get("comment") or "")
     transcripts: Transcripts = {
         "claude": [path] if (path := (row.get("claude") or {}).get("transcript")) else [],

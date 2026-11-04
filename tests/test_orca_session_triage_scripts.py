@@ -439,6 +439,27 @@ class ClassifyTests(unittest.TestCase):
         moved = {"source": "screen", "tail": [question, "  1. Yes", "❯ 2. No"]}
         self.assertEqual(scan.permission_prompt(moved, "term_prompt")["choices"], ["1. Yes", "2. No"])
 
+    def test_a_permission_prompt_names_the_command_and_the_hooks_reason_it_asks_about(self) -> None:
+        # 2026-10-28: svm-320-321-reply waited on this frame; the scan showed only "Do you want to proceed?".
+        screen = {"source": "screen", "tail": [
+            "─" * 80, " Bash command", " Post approved SVM-320 comment with notifications", "╌" * 80,
+            " │ bee issue comment SVM-320 --notify 2305985 --notify 221939 --yes <",
+            " │ $SP/svm320-reply.md 2>&1 | tail -5", "╌" * 80,
+            " │ Hook PreToolUse:Bash requires confirmation for", " │ this command:",
+            " │ Backlog に書き込むコマンドです。外部の人が読む文は、三浦さんが下書きを見てか", " │ ら投稿します。 [settings]",
+            " settings.json to update hooks", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "",
+            " Esc to cancel · Tab to amend"]}
+
+        prompt = scan.permission_prompt(screen, "term_svm")
+
+        self.assertEqual(prompt["target"], " / ".join([
+            "Bash command: Post approved SVM-320 comment with notifications",
+            "bee issue comment SVM-320 --notify 2305985 --notify 221939 --yes <…",
+            "Hook: Backlog に書き込むコマンドです。外部の人が読む文は、三浦さんが下書きを見てから投稿します。"]))
+        self.assertEqual(scan.waiting_reasons({"prompt_waiting": prompt, "claude": None, "codex": [], "agents": [],
+                                               "comment": ""}, "要判断"),
+                         ["permission prompt on screen: Do you want to proceed? — " + prompt["target"]])
+
     def test_a_question_selector_on_screen_waits_whatever_verdict_was_saved(self) -> None:
         # A Claude Orca keeps no agent of (hooks of a background session do not reach it) shows AskUserQuestion.
         tree = worktree("/w/report")
@@ -741,6 +762,43 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(rows[0]["terminals"][0]["agent"], "claude")
         self.assertEqual((rows[0]["class"], rows[0]["reasons"]), ("stalled", ["final message says done (Jev 0.90)"]))
         self.assertEqual(rows[2]["class"], "working")
+
+    def test_a_remote_codex_tab_is_read_from_its_reply_bullet_or_the_recap_under_its_turn_end(self):
+        # 2026-11-04: MBP16's and the Mac mini's Codex tabs came back with an empty final message and question.
+        def remote(name: str, handle: str) -> tuple[dict, dict]:
+            return ({**worktree("/remote/" + name, agent="codex"), "_environment": "macbook-pro-16"},
+                    {**terminal("/remote/" + name, None, handle, title=None), "_environment": "macbook-pro-16"})
+        sentinel, sentinel_term = remote("sentinel", "term_m")
+        textarea, textarea_term = remote("textarea", "term_t")
+        # masters-741's setup shell: devenv's own bullets are no agent.
+        setup, setup_term = remote("setup", "term_s")
+        devenv = {"source": "screen", "tail": [
+            "• Running devenv:enterShell", "✓ Running devenv:enterShell in 24.4ms", "• Running devenv:enterTest",
+            "✓ Running devenv:enterTest in 458ns (no command)", "[bootstrap-worktree] done", "➜"]}
+        replied = {"source": "screen", "tail": [
+            "• Ran ps -axo pid,ppid,etime,args | rg 'find /Users/shiftone/ghq'",
+            "  └ 44926 44924       01:23 /usr/bin/find /Users/shiftone/ghq -maxdepth 5 -iname *plinth*",
+            "• Orca CLI本体で試しましたが、実画面取得は2回とも permission_denied でした。結果が食い違っていま",
+            "  す。", "  次に必要なのは、get-app-state が成功する操作経路です。待機します。",
+            "  Worked for 4m 28s • 11:43", "› Ask Codex to do anything", "  ? for shortcuts"]}
+        recapped = {"source": "screen", "tail": [
+            "  main の取り込み内容は未コミットで保持しました。", "• Hook failed", "  └ hook timed out after 10s",
+            "  Worked for 22m 5s • 14:43", "  ↳ Recap: Textarea の全幅化は実装・push 済みで、PR #239 を作成し",
+            "           ました。PR は未 merge のままです。", "› Ask Codex to do anything"]}
+        said = []
+
+        rows = scan.build_inventory([sentinel, textarea, setup], [sentinel_term, textarea_term, setup_term],
+                                    self.projects, {}, "要判断", now=NOW,
+                                    judge=lambda message: said.append(message) or verdict(),
+                                    screens={("macbook-pro-16", "term_m"): replied,
+                                             ("macbook-pro-16", "term_t"): recapped,
+                                             ("macbook-pro-16", "term_s"): devenv})
+
+        self.assertEqual(said, ["Orca CLI本体で試しましたが、実画面取得は2回とも permission_denied でした。結果が食い違っていま\n"
+                                "す。\n次に必要なのは、get-app-state が成功する操作経路です。待機します。",
+                                "Textarea の全幅化は実装・push 済みで、PR #239 を作成しました。PR は未 merge のままです。"])
+        self.assertEqual([row["terminals"][0]["agent"] for row in rows], ["codex", "codex", None])
+        self.assertNotIn("orca_message", rows[2])
 
     def test_a_tab_orca_detached_but_still_runs_is_read(self):
         detached = {**terminal("/w/u", "claude", "term_detached"), "orphaned": True, "connected": True,
