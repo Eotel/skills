@@ -1833,6 +1833,7 @@ class ScanCommandTests(unittest.TestCase):
                     expected = ["python3", str(SCRIPTS / "rm_check.py"), "--worktree", row["path"]]
                     if number := (row.get("pr") or row.get("linked_pr") or {}).get("number"):
                         expected += ["--pr", str(number)]
+                    expected += ["--from", str(saved.absolute())]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):

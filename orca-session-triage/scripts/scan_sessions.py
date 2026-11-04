@@ -1769,7 +1769,8 @@ def write_review_queue(path: str, rows: list[dict], verdicts: dict | None = None
     write_json_atomically(target, payload)
 
 
-def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = False) -> None:
+def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = False,
+                  scan_file: Path | None = None) -> None:
     counts = {}
     for row in rows:
         counts[row["class"]] = counts.get(row["class"], 0) + 1
@@ -1782,12 +1783,12 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        print("    " + rm_check_command(row))
+        print("    " + rm_check_command(row, scan_file))
     open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
-        print("    " + rm_check_command(row))
+        print("    " + rm_check_command(row, scan_file))
     hooks = [(row, error) for row in rows for error in row.get("hook_errors") or []]
     print(f"hook errors: {len(hooks)}")
     for row, error in hooks:
@@ -1956,9 +1957,11 @@ def pr_number(row: dict) -> int | None:
     return (row.get("pr") or {}).get("number") or (row.get("linked_pr") or {}).get("number")
 
 
-def rm_check_command(row: dict) -> str:
+def rm_check_command(row: dict, scan_file: Path | None = None) -> str:
+    """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it."""
     pr = pr_number(row)
-    return shlex.join(["python3", str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else [])])
+    return shlex.join(["python3", str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
+                       *(["--from", str(scan_file)] if scan_file else [])])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
@@ -1986,7 +1989,7 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
         lines.append(f"{lead} | close: " + shlex.join(["python3", str(CLOSE_TABS), "--from", str(scan_file),
                                                       *row["closable"]]))
     if row.get("open_pr_cleanup") or ((row.get("verdict") or {}).get("class") or row["class"]) == "finished":
-        lines.append(f"{lead} | rm-check: " + rm_check_command(row))
+        lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
     return lines
 
 
@@ -2080,7 +2083,8 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
             for line in card_lines(row, scan_file):
                 print(line)
     elif args.summary:
-        print_summary(rows, verdicts, force_review=bool(args.only))
+        print_summary(rows, verdicts, force_review=bool(args.only),
+                      scan_file=Path(args.from_file).expanduser().absolute() if args.from_file else None)
     else:
         json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
         print()
