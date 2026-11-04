@@ -406,6 +406,73 @@ class ClassifyTests(unittest.TestCase):
         moved = {"source": "screen", "tail": [question, "  1. Yes", "❯ 2. No"]}
         self.assertEqual(scan.permission_prompt(moved, "term_prompt")["choices"], ["1. Yes", "2. No"])
 
+    def test_a_question_selector_on_screen_waits_whatever_verdict_was_saved(self) -> None:
+        # A Claude Orca keeps no agent of (hooks of a background session do not reach it) shows AskUserQuestion.
+        tree = worktree("/w/report")
+        footer = "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+        term = terminal(tree["path"], "claude", "term_ask", preview="report on main")
+        screen = {"source": "screen", "tail": [
+            "⏺ 11月の表を作りました。", "─" * 40, "←  ☐ 不具合  ☐ Asana  ✔ Submit  →", "",
+            "報告書の第2節の注記と第3節の11月の予定が矛盾します。どちらの決まりに", "しますか？", "",
+            "❯ 1. 注記に合わせる (Recommended)", "     不具合の修正は工数に入れない", "  2. 予定に合わせる",
+            "     緊急対応は工数に入れる", "  3. Type something.", "─" * 40, "  4. Chat about this", "", footer]}
+
+        self.assertEqual(scan.screen_targets([tree], [term]), [term])
+        rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, judge=judging({}),
+                                    screens={(None, "term_ask"): screen})
+        question = "報告書の第2節の注記と第3節の11月の予定が矛盾します。どちらの決まりにしますか？"
+        self.assertEqual(rows[0]["prompt_waiting"], {
+            "tab": "term_ask", "question": question,
+            "choices": ["1. 注記に合わせる (Recommended)", "2. 予定に合わせる", "3. Type something.",
+                        "4. Chat about this"]})
+        saved = {"class": "blocked", "question": "空気環境測定の 24 万円を請求しますか？",
+                 "read": scan.read_key(rows[0])}
+        [shown] = scan.with_verdicts(rows, {scan.row_identity(rows[0]): saved})
+        view = scan.row_view(shown)
+        self.assertEqual((view["class"], view["question"]), ("waiting", question))
+
+    def test_a_running_claude_transcript_outside_the_worktree_is_read(self) -> None:
+        sessions = Path(self.tmp.name) / "profile/sessions"
+        sessions.mkdir(parents=True)
+        def session(pid: int, session_id: str, cwd: str) -> None:
+            (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "cwd": cwd}))
+        # The tab's Claude (cwd: the worktree) started a background Claude through its daemon, which moved away.
+        session(1114, "tab", "/w/report")
+        session(88175, "moved", "/ghq/work-reports/.claude/worktrees/readability")
+        # Another tab's Claude moved its own cwd; only its shell is still in the worktree.
+        session(70, "wandered", "/ghq/other")
+        session(99, "gone", "/w/report")
+        processes = {88175: (88141, "claude bg-spare"), 88141: (88093, "claude bg-pty-host"),
+                     88093: (1114, "/opt/homebrew/bin/claude"), 1114: (990, "claude"), 990: (1, "-zsh"),
+                     70: (60, "claude"), 60: (1, "-zsh"), 99: (1, "vim")}
+        cwds = {88141: "/private/tmp/cc-daemon", 88093: "/Users/x", 990: "/w/report", 60: "/w/shell", 1: "/"}
+        for cwd, session_id, said, at in (
+                ("/ghq/work-reports/.claude/worktrees/readability", "moved", "どちらにしますか？", "2026-11-04T03:02:00Z"),
+                ("/ghq/other", "wandered", "Done.", "2026-11-04T03:00:00Z"),
+                ("/w/report", "tab", "Started.", "2026-11-02T01:46:39Z")):
+            write_jsonl(scan.claude_project_dir(self.projects, cwd) / f"{session_id}.jsonl",
+                        [user("go"), {**assistant(text(said)), "timestamp": at}])
+        asked = assistant({"type": "tool_use", "id": "ask1", "name": "AskUserQuestion",
+                           "input": {"questions": [{"question": "どちらにしますか？"}]}})
+        moved = scan.claude_project_dir(self.projects, "/ghq/work-reports/.claude/worktrees/readability") / "moved.jsonl"
+        with moved.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(asked) + "\n")
+        # Claude Code keeps rewriting the metadata of the transcript the tab's session continued from.
+        yesterday = time.time() - 86400
+        os.utime(moved, (yesterday, yesterday))
+
+        live = scan.running_claude_transcripts(["/w/report", "/w/shell"], [sessions], self.projects, processes,
+                                               lambda pids: {pid: cwds[pid] for pid in pids if pid in cwds})
+        rows = scan.build_inventory([worktree("/w/report"), worktree("/w/shell")],
+                                    [terminal("/w/report", "claude"), terminal("/w/shell", "claude", "term_2")],
+                                    self.projects, {}, "要判断", now=NOW, judge=judging({}), live_transcripts=live)
+
+        self.assertEqual({path: [p.name for p in found] for path, found in live.items()},
+                         {"/w/report": ["moved.jsonl", "tab.jsonl"], "/w/shell": ["wandered.jsonl"]})
+        report, shell = rows
+        self.assertEqual((report["claude"]["transcript"], report["class"]), (str(moved), "waiting"))
+        self.assertEqual(shell["claude"]["final_text"], "Done.")
+
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
         tree = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
