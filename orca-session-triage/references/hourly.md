@@ -79,6 +79,12 @@ After these checks permit the turn to end, the same hook queues this hourly
 session's transcript. The external retrospective service skips a session the
 run's own forked retrospective already recorded and reviews one it did not.
 See `references/retro.md` for both and for reviewing their proposals.
+Before AskUserQuestion in the hourly workspace, a PreToolUse hook in the same
+script refuses the call when any question's text, options and descriptions hold
+no kana or kanji. While another tab is appointed lead (`hourly_state.py
+appoint-lead`), it also refuses a question asked before this run sent its
+handoff (`handoff.py last` older than the run's start): a question stops the
+turn, so send the handoff first. With no lead, the run asks the user itself.
 
 ## In the run
 
@@ -90,8 +96,11 @@ question from that tab (or one without a recorded owner) is unanswered, its
 latest conversation may still ask the user, its transcript is missing or active
 within five minutes, or its rendered screen shows a draft or a nonempty input
 field. When Orca has no provider session ID, the script requires one transcript
-whose scheduled prompt matches the run's start time. Inspect
-`keep:` output and retry on a later hourly run; leave the workspace open.
+whose scheduled prompt matches the run's start time. A tab Orca detached from
+the window (`orphaned`) whose run recorded no pane is matched by the provider
+session Orca's agent hooks saved for its recorded pane. Each tab gets one
+`closed:` or `keep:` line with the reason. Inspect `keep:` output and retry on
+a later hourly run; leave the workspace open.
 
 In every hourly run, run the Asana 99 sweep as `asana-pr-review` describes and
 read its `asana99_status.py` 「次の一手」,

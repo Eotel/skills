@@ -6,6 +6,8 @@ Requires Orca run, terminal, agent, question, transcript, and rendered-screen ev
 
 import argparse
 from collections import deque
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -13,6 +15,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from typing import Any
 
 import hourly_runtime
 import scan_sessions
@@ -26,39 +29,90 @@ QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回�
                       r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)
 
 
-def prior_tabs(runs, terminals, agents, workspace, current_pane):
-    """Only completed scheduled runs with an idle, owned terminal can be closed."""
-    terms = {hourly_runtime.pane_key(term): term for term in terminals
-             if hourly_runtime.workspace_path(term.get("worktreeId")) == os.path.realpath(workspace)}
-    for run in runs:
-        pane = run.get("terminalPaneKey")
-        if run.get("status") != "completed" or not pane or pane == current_pane:
+@dataclass(frozen=True)
+class PaneSession:
+    session_id: str
+    transcript: Path | None
+    agent: dict[str, Any]
+
+
+def saved_sessions(path: Path, workspace: str) -> dict[str, PaneSession]:
+    """The provider conversation each pane last reported through Orca's agent hooks."""
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    sessions = {}
+    for pane, entry in (data.get("entries") or {}).items():
+        if hourly_runtime.workspace_path(entry.get("worktreeId")) != os.path.realpath(workspace):
             continue
-        term = terms.get(pane)
+        provider = entry.get("providerSession") or {}
+        sessions[pane] = PaneSession(provider.get("id") or "",
+                                     Path(provider["transcriptPath"]) if provider.get("transcriptPath") else None,
+                                     entry.get("payload") or {})
+    return sessions
+
+
+def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agents: list[dict[str, Any]],
+               workspace: str, current_pane: str | None,
+               sessions: dict[str, PaneSession] | None = None) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Only completed scheduled runs with an idle, owned terminal can be closed."""
+    sessions = sessions or {}
+    recorded = [session.transcript for session in sessions.values() if session.transcript]
+    transcripts = [(run, transcript_for(run, Path.home(), recorded)) for run in runs
+                   if run.get("status") == "completed" and not run.get("terminalPaneKey")]
+    for term in terminals:
+        if hourly_runtime.workspace_path(term.get("worktreeId")) != os.path.realpath(workspace):
+            continue
+        pane = hourly_runtime.pane_key(term)
+        if pane in (current_pane, os.environ.get("ORCA_PANE_KEY")):
+            continue
+        matches = [run for run in runs if run.get("terminalPaneKey") == pane]
+        saved = sessions.get(pane)
+        if not matches and term.get("orphaned") and term.get("connected"):
+            matches = [run for run, transcript in transcripts
+                       if saved and transcript and transcript.stem == saved.session_id]
+        if not matches and not term.get("orphaned"):
+            continue
+        if len(matches) != 1:
+            print(f"keep: {term.get('handle') or pane}: no unique scheduled run and transcript")
+            continue
+        run = matches[0]
         owned_agents = [agent for agent in agents
                         if agent.get("paneKey") == pane or agent.get("parentPaneKey") == pane]
-        if (not term or not term.get("handle") or not term.get("connected") or
-                term.get("orphaned") or not owned_agents or
-                any(agent.get("state") != "done" or
-                    (agent.get("mainAgent") or {}).get("state") != "done"
-                    for agent in owned_agents)):
+        if not owned_agents and term.get("orphaned") and saved and saved.agent:
+            owned_agents = [saved.agent]
+        problems = []
+        if run.get("status") != "completed":
+            problems.append("scheduled run is not completed")
+        if not term.get("handle") or not term.get("connected"):
+            problems.append("terminal is not connected or has no handle")
+        if not owned_agents or any(agent.get("state") != "done" or
+                                   (agent.get("mainAgent") or {}).get("state") != "done"
+                                   for agent in owned_agents):
+            problems.append("agent or background work is active or unknown")
+        if problems:
+            print(f"keep: {term.get('handle') or pane}: " + "; ".join(problems))
             continue
-        yield run, term
+        yield {**run, "terminalPaneKey": pane}, term
 
 
-def transcript_for(run, home):
+def transcript_for(run: dict[str, Any], home: Path, recorded: Iterable[Path] = ()) -> Path | None:
+    recorded = [path for path in recorded if path.is_file()]
     session_id = (run.get("usage") or {}).get("providerSessionId")
     if session_id and "/" not in session_id:
-        found = list((home / ".claude/projects").glob(f"*/{session_id}.jsonl"))
+        found = {path.resolve(): path for path in recorded if path.stem == session_id}
+        found.update((path.resolve(), path) for path in (home / ".claude/projects").glob(f"*/{session_id}.jsonl"))
         if len(found) == 1:
-            return found[0]
+            return next(iter(found.values()))
     started = run.get("startedAt")
     workspace = hourly_runtime.workspace_path(run.get("workspaceId"))
     if not isinstance(started, (int, float)) or not workspace:
         return None
     directory = scan_sessions.find_claude_dir(home / ".claude/projects", workspace)
     matches = []
-    for path in directory.glob("*.jsonl"):
+    paths = {path.resolve(): path for path in recorded}
+    paths.update((path.resolve(), path) for path in directory.glob("*.jsonl"))
+    for path in paths.values():
         with path.open(encoding="utf-8", errors="replace") as stream:
             for raw in stream:
                 try:
@@ -168,7 +222,7 @@ def no_pending_questions(state_file, pane):
         for question in questions.values())
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", default=hourly_runtime.workspace_path(
         os.environ.get("ORCA_WORKTREE_ID") or os.environ.get("ORCA_WORKTREE_PATH")))
@@ -176,6 +230,9 @@ def main(argv=None):
     parser.add_argument("--state-file", type=Path, default=Path.home() /
                         ".cache/orca-session-triage/hourly-state.json")
     parser.add_argument("--min-idle-minutes", type=int, default=5)
+    parser.add_argument("--agent-status-file", type=Path, default=Path.home() /
+                        "Library/Application Support/orca/agent-hooks/last-status.json",
+                        help="Orca's saved pane and provider-session records (default: %(default)s)")
     args = parser.parse_args(argv)
     if not args.workspace:
         parser.error("--workspace or ORCA_WORKTREE_ID is required")
@@ -189,11 +246,14 @@ def main(argv=None):
             print("keep: workspace is missing")
             return 0
         current = hourly_runtime.latest_pane(runs, hourly_runtime.live_panes(terminals))
-        for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current):
+        sessions = saved_sessions(args.agent_status_file, args.workspace)
+        recorded = [session.transcript for session in sessions.values() if session.transcript]
+        for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current,
+                                    sessions):
             if not no_pending_questions(args.state_file, run["terminalPaneKey"]):
                 print(f"keep: {term['handle']} may have an unanswered question")
                 continue
-            transcript = transcript_for(run, Path.home())
+            transcript = transcript_for(run, Path.home(), recorded)
             if transcript is None:
                 print(f"keep: {term['handle']} has no unique transcript")
                 continue
@@ -206,7 +266,7 @@ def main(argv=None):
                 print(f"keep: {term['handle']}: " + "; ".join(problems))
                 continue
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
-            print(f"closed: {term['handle']}")
+            print(f"closed: {term['handle']}: completed scheduled run, idle transcript and empty composer")
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f"keep: could not verify previous tabs: {error}")
         return 1
