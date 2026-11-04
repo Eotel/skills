@@ -882,8 +882,11 @@ def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str
             if (not file.relative_to(worktree).as_posix().startswith(RECORD_DIRS) or file.is_symlink()
                     or target.exists() or target.is_symlink()):
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file, target)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, target)
+            except OSError:  # a file in main where the record needs a directory: it stays for review
+                continue
             if filecmp.cmp(file, target, shallow=False):
                 copied.append({"from": str(file), "to": str(target)})
             else:

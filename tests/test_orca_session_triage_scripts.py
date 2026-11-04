@@ -2356,6 +2356,9 @@ class RmCheckTests(unittest.TestCase):
     def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
         self.ignore_review_records()
         (self.wt / ".claude/settings.local.json").write_text('{"hooks": {}}\n')
+        (self.main / ".claude/reviews/topic").write_text("a file in main\n")
+        (self.wt / ".claude/reviews/topic").mkdir()
+        (self.wt / ".claude/reviews/topic/more.md").write_text("needs a directory main has as a file\n")
 
         code, result = self.run_main("--archive-scratch")
 
