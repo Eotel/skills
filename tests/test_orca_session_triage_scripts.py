@@ -2998,7 +2998,7 @@ class RmCheckTests(unittest.TestCase):
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
         other = Path(self.tmp.name) / "other"
-        git(Path(self.tmp.name), "clone", "-q", str(bare), str(other))
+        git(Path(self.tmp.name), "clone", "-q", "-b", "main", str(bare), str(other))
         git(other, "fetch", "-q", str(self.wt), "feature")
         git(other, "merge", "-q", "--ff-only", "FETCH_HEAD")
         git(other, "push", "-q", "origin", "main")
