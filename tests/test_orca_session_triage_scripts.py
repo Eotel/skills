@@ -973,9 +973,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("working", ["a background job runs after the agent's turn"], [])])
 
-    def processes(self, table, now, clocks, tcp="", path="/w/p"):
-        """worktree_processes of `path` over a process table whose processes all sit in /w/p; `clocks` maps a pid
-        to ps's elapsed and CPU columns, and `tcp` is lsof's output, or the error it fails with."""
+    def processes(self, table, now, clocks, tcp="", path="/w/p", elsewhere=()):
+        """worktree_processes of `path` over a process table whose processes sit in /w/p, or /tmp for `elsewhere`;
+        `clocks` maps a pid to ps's elapsed and CPU columns, and `tcp` is lsof's output, or the error it fails
+        with."""
         ps = "".join(f"{pid} {elapsed} {cpu}\n" for pid, (elapsed, cpu) in clocks.items())
 
         def run(args, **kwargs):
@@ -984,7 +985,8 @@ class ClassifyTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, ps if args[0] == "ps" else tcp, "")
 
         with patch.object(scan.rm_check, "process_table", return_value=table), \
-                patch.object(scan.rm_check, "process_cwds", return_value=dict.fromkeys(table, "/w/p")), \
+                patch.object(scan.rm_check, "process_cwds",
+                             return_value={pid: "/tmp" if pid in elsewhere else "/w/p" for pid in table}), \
                 patch.object(scan.rm_check, "output_readers", return_value=set()), \
                 patch.object(scan.subprocess, "run", side_effect=run):
             return scan.worktree_processes([path], Path(self.tmp.name) / "cpu.json", now)
@@ -1020,20 +1022,31 @@ class ClassifyTests(unittest.TestCase):
                                    processes=found, now=now)
             return row["class"], row["reasons"]
 
-        self.assertEqual(classify(self.processes(table, NOW, clocks)), ("working", [
+        # The scan's clock and ps's elapsed time put one start on either side of a minute.
+        self.assertEqual(classify(self.processes(table, NOW + 29.6, clocks), NOW + 29.6), ("working", [
             "a background job runs after the agent's turn: PID 9204 /bin/zsh -c source snapshot.sh && eval 'gh run "
             "watch 7' (running 2h00m, CPU 0.01s); PID 9205 gh run watch 7 (running 2h00m, CPU 0.4s)"]))
         # A scan of another worktree keeps the history, and a socket read that times out keeps the CPU times.
         self.processes(table, NOW + 1800, {}, path="/w/q")
-        an_hour_later = self.processes(table, NOW + 3600, {pid: ("03:00:00", cpu) for pid, (_, cpu) in clocks.items()},
+        an_hour_later = self.processes(table, NOW + 3630.1,
+                                       {pid: ("03:00:00", cpu) for pid, (_, cpu) in clocks.items()},
                                        tcp=subprocess.TimeoutExpired("lsof", 30))
-        self.assertEqual(classify(an_hour_later, NOW + 3600)[0], "stalled")
-        self.assertTrue(classify(an_hour_later, NOW + 3600)[1][0].startswith("裏の作業が止まっている: PID 9204"))
+        self.assertEqual(classify(an_hour_later, NOW + 3630.1)[0], "stalled")
+        self.assertTrue(classify(an_hour_later, NOW + 3630.1)[1][0].startswith("裏の作業が止まっている: PID 9204"))
 
         (Path(self.tmp.name) / "cpu.json").unlink()
         closed = self.processes(table, NOW, clocks, tcp="p9205\nf5\nn10.0.0.2:52000->140.82.112.6:443\nTST=CLOSE_WAIT\n")
         self.assertEqual(classify(closed)[0], "stalled")
         self.assertIn("TCP closed: 10.0.0.2:52000->140.82.112.6:443", classify(closed)[1][0])
+
+        # A script waiting on a sleep it started in another directory still waits.
+        (Path(self.tmp.name) / "cpu.json").unlink()
+        script = {9201: (1, "-zsh"), 9202: (9201, "claude"), 9206: (9202, "bash wait.sh"),
+                  9207: (9206, "sleep 7200")}
+        for now, elapsed in ((NOW, "01:00:00"), (NOW + 3600, "02:00:00")):
+            found = self.processes(script, now, {9206: (elapsed, "0:00.01"), 9207: ("00:30:00", "0:00.00")},
+                                   elsewhere=(9207,))
+        self.assertEqual(classify(found, NOW + 3600)[0], "working")
 
     def test_an_unsure_question_behind_a_background_job_is_read(self):
         maybe = "PR は出しました。表記をどちらにそろえるかは別に決める必要があります。"

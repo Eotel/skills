@@ -1077,6 +1077,7 @@ STOPPED_AFTER = 3600  # seconds background work runs with its CPU time still bef
 # CPU seconds such work may add in that time: under one tick of ps's 0.01 seconds. A poller that runs gh every
 # five minutes adds ticks every hour; ps on macOS does not count a process's exited children.
 CPU_STILL = 0.005
+START_SLACK = 120  # seconds two reads of one process's start time may differ: ps's elapsed time and the scan's clock
 CLOSED_TCP = ("CLOSED", "CLOSE_WAIT")
 SHELLS = ("zsh", "bash", "sh", "fish")
 AGENT_CLIS = ("claude", "codex", "codex.js")
@@ -1127,7 +1128,7 @@ def clock_seconds(value: str) -> float | None:
 def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str, list[WorktreeProcess]]:
     """The processes of wait loops, timed waits, and agents' background jobs in each local worktree: by
     rm_check.py's rule (current directory or command inside it), those whose job a `sleep` or a shell running a
-    command line or script started (see waits and job_root).
+    command line or script started (see waits and job_root), and the children they started anywhere.
 
     One process table and directory inventory serves every worktree. `still_since` comes from `cpu_file`, which
     keeps each process's CPU time and when it last moved; an entry is dropped once its process is gone.
@@ -1143,6 +1144,19 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
         found[path] = [item for item in rm_check.processes_using(path, table, cwds, readers)
                        if not any(wait in item["command"] for wait in rm_check.SETUP_WAITS)
                        and waits(job_root(item["pid"], table))]
+    children: dict[int, list[int]] = {}
+    for pid, (parent, _) in table.items():
+        children.setdefault(parent, []).append(pid)
+    for items in found.values():
+        # A job's children belong to it wherever they run (`(cd /tmp && sleep 600)`).
+        listed = {item["pid"] for item in items}
+        stack = list(listed)
+        while stack:
+            for child in children.get(stack.pop(), []):
+                if child not in listed:
+                    listed.add(child)
+                    stack.append(child)
+                    items.append({"pid": child, "command": table[child][1][:160]})
     pids = sorted({item["pid"] for items in found.values() for item in items})
     clocks: dict[int, tuple[float | None, float | None]] = {}
     closed: dict[int, list[str]] = {}
@@ -1176,23 +1190,25 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
     kept = kept if isinstance(kept, dict) else {}
     # A process of a worktree this scan left out (--only) keeps its history while it lives.
     seen: dict[str, dict] = {key: value for key, value in kept.items()
-                             if (pid := key.partition(":")[0]).isdigit() and int(pid) in table
-                             and int(pid) not in pids}
+                             if key.isdigit() and int(key) in table and int(key) not in pids}
     still: dict[int, float | None] = {}
     for pid in pids:
         elapsed, cpu = clocks.get(pid, (None, None))
         if elapsed is None or cpu is None:
             still[pid] = None
             continue
-        # A pid the system reused starts at another minute.
-        key = f"{pid}:{round((now - elapsed) / 60)}"
-        before = kept.get(key)
-        if isinstance(before, dict) and isinstance(before.get("cpu"), (int, float)) and cpu - before["cpu"] <= CPU_STILL:
-            seen[key] = before
+        start, before = now - elapsed, kept.get(str(pid))
+        # A pid the system reused started at another time.
+        if not (isinstance(before, dict) and isinstance(before.get("start"), (int, float))
+                and isinstance(before.get("cpu"), (int, float)) and abs(before["start"] - start) <= START_SLACK):
+            before = None
+        if before is not None and cpu - before["cpu"] <= CPU_STILL:
+            seen[str(pid)] = before
         else:
             # Seen first, a process that has added no CPU time since it started has been still all along.
-            seen[key] = {"cpu": cpu, "since": now - elapsed if before is None and cpu <= CPU_STILL else now}
-        still[pid] = seen[key].get("since")
+            seen[str(pid)] = {"start": start, "cpu": cpu,
+                              "since": start if before is None and cpu <= CPU_STILL else now}
+        still[pid] = seen[str(pid)].get("since")
     try:
         write_json_atomically(cpu_file, seen)
     except OSError:
