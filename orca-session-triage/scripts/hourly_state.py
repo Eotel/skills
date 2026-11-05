@@ -273,6 +273,9 @@ def appointed_lead(state: dict) -> Path | None:
 
 
 def row_question(row: dict, final: dict) -> str:
+    # The question --row shows, then what a scan saved before marker_question existed leaves.
+    if question := scan_sessions.row_question(row).strip():
+        return question
     question = str((row.get("verdict") or {}).get("question") or "").strip()
     if question:
         return str(question)

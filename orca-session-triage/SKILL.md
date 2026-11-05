@@ -109,7 +109,12 @@ board's done cards; close what the user approves.
   that reason, and never finishes while the job runs. A decision marker
   outlives its answer, so a `waiting` row's question is checked against its
   latest message before you ask it; when that message settled it, rewrite the
-  comment without the marker so other tabs stop listing it. Each row lists its
+  comment without the marker so other tabs stop listing it. The marker alone
+  leaves a row whose agent is in its turn `working` (reason 「old decision marker
+  in comment」). A `waiting` row's `question`, in `--row`, `--rows`, and
+  stale-asks alike, is a prompt on its screen, else the comment's text after the
+  marker, the Codex reply read on another Mac's screen, the verdict's question,
+  or the final message. Each row lists its
   `done_cards`, one per agent Orca shows
   as done: the `handle` that closes its tab (null while the tab sleeps or
   no live tab can be assigned to it uniquely),
@@ -149,9 +154,13 @@ board's done cards; close what the user approves.
   `finished` goes to `cleanup.md`. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
   `verdict` until its final message, PR, latest review or comment from a person other than
-  the PR author, tree, permission prompt, or newest `done` or `ask` in the
+  the PR author, tree, permission prompt, Orca comment, or newest `done` or `ask` in the
   triage inbox or that ask's answer changes (a reply read from another Mac's
-  screen has no time, so its text stands for it);
+  screen has no time, so its text stands for it), or until every issue and PR
+  its `waits_on` names closed (reason 「everything the saved verdict waits on
+  closed: …」; read in the same GraphQL query: `repo#N` is the repository of the
+  row's organization named so or the only known one ending in `-repo`, and a
+  bare `#N` the one named before it or the row's own);
   act on it the same way in every run. Each queued row carries those inbox
   reports and which report came last, since the Orca comment has no time; an
   answered ask carries `answered` (`at`, `note`) from `ask-answers.jsonl`. A Stop
