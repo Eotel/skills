@@ -973,19 +973,21 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("working", ["a background job runs after the agent's turn"], [])])
 
-    def processes(self, table, now, clocks, tcp=""):
-        """worktree_processes over a process table whose processes all sit in /w/p; `clocks` maps a pid to
-        ps's elapsed and CPU columns, and `tcp` is lsof's output."""
+    def processes(self, table, now, clocks, tcp="", path="/w/p"):
+        """worktree_processes of `path` over a process table whose processes all sit in /w/p; `clocks` maps a pid
+        to ps's elapsed and CPU columns, and `tcp` is lsof's output, or the error it fails with."""
         ps = "".join(f"{pid} {elapsed} {cpu}\n" for pid, (elapsed, cpu) in clocks.items())
 
         def run(args, **kwargs):
+            if args[0] == "lsof" and isinstance(tcp, Exception):
+                raise tcp
             return subprocess.CompletedProcess(args, 0, ps if args[0] == "ps" else tcp, "")
 
         with patch.object(scan.rm_check, "process_table", return_value=table), \
                 patch.object(scan.rm_check, "process_cwds", return_value=dict.fromkeys(table, "/w/p")), \
                 patch.object(scan.rm_check, "output_readers", return_value=set()), \
                 patch.object(scan.subprocess, "run", side_effect=run):
-            return {"/w/p": scan.worktree_processes(["/w/p"], Path(self.tmp.name) / "cpu.json", now)["/w/p"]}
+            return scan.worktree_processes([path], Path(self.tmp.name) / "cpu.json", now)
 
     def test_a_wait_loop_left_running_keeps_a_worktree_without_an_agent_working(self):
         table = {9101: (1, "bash /tmp/wait-merge.sh"), 9102: (9101, "sleep 60"),
@@ -1021,7 +1023,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(classify(self.processes(table, NOW, clocks)), ("working", [
             "a background job runs after the agent's turn: PID 9204 /bin/zsh -c source snapshot.sh && eval 'gh run "
             "watch 7' (running 2h00m, CPU 0.01s); PID 9205 gh run watch 7 (running 2h00m, CPU 0.4s)"]))
-        an_hour_later = self.processes(table, NOW + 3600, {pid: ("03:00:00", cpu) for pid, (_, cpu) in clocks.items()})
+        # A scan of another worktree keeps the history, and a socket read that times out keeps the CPU times.
+        self.processes(table, NOW + 1800, {}, path="/w/q")
+        an_hour_later = self.processes(table, NOW + 3600, {pid: ("03:00:00", cpu) for pid, (_, cpu) in clocks.items()},
+                                       tcp=subprocess.TimeoutExpired("lsof", 30))
         self.assertEqual(classify(an_hour_later, NOW + 3600)[0], "stalled")
         self.assertTrue(classify(an_hour_later, NOW + 3600)[1][0].startswith("裏の作業が止まっている: PID 9204"))
 

@@ -1130,7 +1130,7 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
     command line or script started (see waits and job_root).
 
     One process table and directory inventory serves every worktree. `still_since` comes from `cpu_file`, which
-    keeps each process's CPU time and when it last moved; a process not seen again is dropped from it.
+    keeps each process's CPU time and when it last moved; an entry is dropped once its process is gone.
     """
     table = rm_check.process_table()
     cwds = rm_check.process_cwds(table) if table else None
@@ -1148,13 +1148,15 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
     closed: dict[int, list[str]] = {}
     if pids:
         listed = ",".join(map(str, pids))
-        try:
-            ps = subprocess.run(["ps", "-o", "pid=,etime=,time=", "-p", listed], capture_output=True, text=True,
-                                timeout=ORCA_TIMEOUT).stdout
-            tcp = subprocess.run(["lsof", "-n", "-P", "-a", "-p", listed, "-iTCP", "-FpnT"], capture_output=True,
-                                 text=True, timeout=ORCA_TIMEOUT).stdout
-        except (OSError, subprocess.SubprocessError):
-            ps = tcp = ""
+
+        def output(command: list[str]) -> str:
+            # A failed socket read must not take the CPU times with it.
+            try:
+                return subprocess.run(command, capture_output=True, text=True, timeout=ORCA_TIMEOUT).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        ps = output(["ps", "-o", "pid=,etime=,time=", "-p", listed])
+        tcp = output(["lsof", "-n", "-P", "-a", "-p", listed, "-iTCP", "-FpnT"])
         for line in ps.splitlines():
             fields = line.split()
             if len(fields) == 3 and fields[0].isdigit():
@@ -1171,7 +1173,11 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
         kept = json.loads(cpu_file.read_text())
     except (OSError, ValueError):
         kept = {}
-    seen: dict[str, dict] = {}
+    kept = kept if isinstance(kept, dict) else {}
+    # A process of a worktree this scan left out (--only) keeps its history while it lives.
+    seen: dict[str, dict] = {key: value for key, value in kept.items()
+                             if (pid := key.partition(":")[0]).isdigit() and int(pid) in table
+                             and int(pid) not in pids}
     still: dict[int, float | None] = {}
     for pid in pids:
         elapsed, cpu = clocks.get(pid, (None, None))
@@ -1180,7 +1186,7 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
             continue
         # A pid the system reused starts at another minute.
         key = f"{pid}:{round((now - elapsed) / 60)}"
-        before = kept.get(key) if isinstance(kept, dict) else None
+        before = kept.get(key)
         if isinstance(before, dict) and isinstance(before.get("cpu"), (int, float)) and cpu - before["cpu"] <= CPU_STILL:
             seen[key] = before
         else:
@@ -1188,8 +1194,7 @@ def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str
             seen[key] = {"cpu": cpu, "since": now - elapsed if before is None and cpu <= CPU_STILL else now}
         still[pid] = seen[key].get("since")
     try:
-        cpu_file.parent.mkdir(parents=True, exist_ok=True)
-        cpu_file.write_text(json.dumps(seen))
+        write_json_atomically(cpu_file, seen)
     except OSError:
         pass
     return {path: [{"pid": item["pid"], "parent": table[item["pid"]][0], "command": item["command"],
