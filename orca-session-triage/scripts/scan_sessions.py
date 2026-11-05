@@ -564,6 +564,10 @@ def stop_reason(row: dict) -> StopReason | None:
     tag = claude.get("api_error_kind") if error == claude.get("api_error") else None
     agent = "claude" if error == claude.get("api_error") else "codex" if row.get("codex") or row.get(
         "codex_screen_error") else None
+    # Another agent Orca shows in its own turn took the worktree over: the failure is history.
+    running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
+    if agent and running and agent not in running:
+        return None
     if tag == "rate_limit" or USAGE_LIMIT.search(error):
         resets = RESETS.search(error)
         return {"kind": "usage_limit", "action": "wait", "agent": agent, "error": error,

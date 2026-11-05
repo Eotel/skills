@@ -1050,6 +1050,14 @@ class ClassifyTests(unittest.TestCase):
             "/w/flagged": ("stalled", "other", "human", None)})
         self.assertEqual(rows["/w/limit"]["reasons"], ["usage limit; resets Nov 7 at 8pm (Asia/Tokyo)"])
 
+        # The lane went on in Codex after Claude's limit: Claude's failure no longer stops it.
+        ended("/w/handed", "You've hit your weekly limit · resets Nov 7 at 8pm (Asia/Tokyo)", "rate_limit")
+        codex = {"/w/handed": [{"rollout": "r", "last_user": "continue", "last_role": "user", "last_assistant": None,
+                                "last_assistant_at": None, "pending_requests": []}]}
+        [handed] = self.inventory([worktree("/w/handed", "working", agent="codex")],
+                                  [terminal("/w/handed", "codex", "term_x")], codex)
+        self.assertEqual((handed["class"], handed["stop"]), ("working", None))
+
     def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self):
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.
         def stop(line):
