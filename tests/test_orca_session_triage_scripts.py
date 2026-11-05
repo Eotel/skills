@@ -1000,6 +1000,13 @@ class ClassifyTests(unittest.TestCase):
             "a background job runs in the worktree: PID 9101 bash /tmp/wait-merge.sh (running 1h00m, CPU 0.02s)",
             "a background job runs in the worktree: PID 9102 sleep 60 (running 0h00m, CPU 0.0s)"])
 
+        # A loop whose check hung for an hour no longer waits.
+        hung = {9101: (1, "bash /tmp/wait-merge.sh"), 9106: (9101, "gh pr checks 5 --watch")}
+        self.processes(hung, NOW - 3600, {9101: ("01:00:00", "0:00.02"), 9106: ("00:50:00", "0:00.30")})
+        found = self.processes(hung, NOW, {9101: ("02:00:00", "0:00.02"), 9106: ("01:50:00", "0:00.30")})
+        [row] = self.inventory([worktree("/w/p")], [], processes=found)
+        self.assertEqual((row["class"], row["reasons"]), ("stalled", [scan.NO_SESSION_REASON]))
+
     def test_background_work_whose_cpu_time_stays_still_for_an_hour_or_whose_connection_closed_is_stalled(self):
         self.claude_says("/w/p", user("go"), assistant(text("Watching the run.")))
         table = {9201: (1, "-zsh"), 9202: (9201, "claude"), 9203: (9202, "node mcp-server.js"),
@@ -1229,8 +1236,10 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/lead", "done"), worktree("/w/asks", "done")],
             [terminal("/w/lead", "claude", "term_lead"), terminal("/w/asks", "claude", "term_asks")],
             self.projects, {}, "要判断", now=NOW, judge=judging({asks: verdict(0.9, "blocked_on_others")}),
-            mail=mail)
+            mail=mail, processes={"/w/lead": [{"pid": 9301, "parent": 1, "command": "sleep 60", "elapsed": 5.0,
+                                               "cpu": 0.0, "still_since": None, "closed": []}]})
 
+        # A wait still running in the lead's worktree does not hide its unread reports.
         self.assertEqual({r["path"]: (r["class"], r["reasons"], r["closable"]) for r in result}, {
             "/w/lead": ("stalled", [f"2 orchestration messages unread since its last turn began (oldest {at(50)})"],
                         []),

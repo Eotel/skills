@@ -1219,18 +1219,19 @@ def process_line(process: WorktreeProcess) -> str:
 def with_processes(row: dict, now: float) -> tuple[str, list[str]]:
     """The class and reasons once the worktree's processes are read: a wait still running keeps a stalled or
     finished row working, and background work whose processes at the ends all stopped makes its working row
-    stalled. A turn an API failure ended stays stalled: its agent does not come back for the wait."""
+    stalled. A turn an API failure ended and a lead's unread worker reports stay stalled: the agent does not
+    come back for the wait, and the lead is woken for its mail."""
     processes = row.get("processes") or []
-    if not processes or row.get("stop"):
+    if not processes or row.get("stop") or row.get("unread_mail"):
         return row["class"], row["reasons"]
     lines = [process_line(process) for process in processes[:3]]
-    if row["class"] in ("stalled", "finished"):
-        mail = [mail_reason(row["unread_mail"])] if row.get("unread_mail") else []
-        return "working", ["a background job runs in the worktree: " + line for line in lines] + mail
+    # A shell running a job only waits for its children: the processes at the ends do the work.
+    parents = {process["parent"] for process in processes}
+    halted = all(stopped(process, now) for process in processes if process["pid"] not in parents)
+    if row["class"] in ("stalled", "finished") and not halted:
+        return "working", ["a background job runs in the worktree: " + line for line in lines]
     if row["class"] == "working" and row["reasons"] == [BACKGROUND_REASON]:
-        # A shell running a job only waits for its children: the processes at the ends do the work.
-        parents = {process["parent"] for process in processes}
-        if all(stopped(process, now) for process in processes if process["pid"] not in parents):
+        if halted:
             return "stalled", ["裏の作業が止まっている: " + "; ".join(lines)]
         return "working", [BACKGROUND_REASON + ": " + "; ".join(lines)]
     return row["class"], row["reasons"]

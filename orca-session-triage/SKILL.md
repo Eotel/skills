@@ -60,13 +60,15 @@ board's done cards; close what the user approves.
   It also reads the worktree's processes by `rm_check.py`'s rule whose job a
   `sleep` or a shell running a command line or script started (a wait loop, a
   timed wait, an agent's background job; not an MCP server, or a dev server or
-  plugin left behind). One keeps a `stalled` or `finished` row `working` (reason
-  「a background job runs in the worktree: PID …」), unless an API error ended the
-  turn. A row working for a background job lists each one's running time, CPU
-  time, and TCP peers whose connection closed in `processes` and its reason;
-  when every one lost its connection or added no CPU time for an hour (CPU times
-  kept in `~/.cache/orca-session-triage/process-cpu.json`; a `sleep` never
-  counts), the row is `stalled` (reason 「裏の作業が止まっている: …」).
+  plugin left behind). Each lists its running time, CPU time, and TCP peers
+  whose connection closed in `processes`. A job stopped once every process at
+  its ends lost its connection or added no CPU time for an hour (CPU times kept
+  in `~/.cache/orca-session-triage/process-cpu.json`; a `sleep` never stops).
+  One not stopped keeps a `stalled` or `finished` row `working` (reason 「a
+  background job runs in the worktree: PID …」), unless an API error ended the
+  turn or the lead has unread worker reports. A row working for a background
+  job gives its processes in its reason, and is `stalled` once they stopped
+  (reason 「裏の作業が止まっている: …」).
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
