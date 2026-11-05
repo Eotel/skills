@@ -5163,7 +5163,8 @@ class InboxReadTests(unittest.TestCase):
             write_jsonl(inbox, [
                 {"id": "r1", "ts": "t1", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
                  "handle": "term_a", "text": "判断 4 件", "questions": [
-                     question(1, issue="spin-dd/taihei-report#239"), question(2), question(3), question(4)]},
+                     question(1, issue="spin-dd/taihei-report#239", context="移した帳票を出す作業です。"),
+                     question(2), question(3), question(4)]},
                 {"id": "r2", "ts": "t2", "kind": "ask", "host": "h", "worktree": "plain", "text": "文章だけの質問"},
                 {"id": "r3", "ts": "t3", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
                  "text": "判断 2 件", "questions": [question(5), question(6)]},
@@ -5185,7 +5186,8 @@ class InboxReadTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in first["items"]], ["r1:1", "r1:3", "r1:4", "r3:1"])
         self.assertEqual(first["questions"][0], {
-            "question": "Q1 をどうしますか？（spin-dd/taihei-report#239）", "header": "判断1", "multiSelect": False,
+            "question": "移した帳票を出す作業です。 Q1 をどうしますか？（spin-dd/taihei-report#239）", "header": "判断1",
+            "multiSelect": False,
             "options": [{"label": "直す（推奨）", "description": "移した帳票に合わせる"},
                         {"label": "残す", "description": "今の帳票のまま"}]})
         self.assertEqual((first["items"][0]["source"], first["items"][0]["handle"]), ("report/decisions", "term_a"))
@@ -5462,8 +5464,8 @@ class InboxReadTests(unittest.TestCase):
 
     def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self):
         # 2026-10-28: read --id of epm-11432-review-fix's ask d57cdf88 showed only its one-line text.
-        asked = [{"question": "どちらで直しますか？", "header": "方針", "multiSelect": False, "recommended": "A",
-                  "issue": "spin-dd/taihei-epm-server#11432",
+        asked = [{"context": "二重送信を止める直しです。", "question": "どちらで直しますか？", "header": "方針",
+                  "multiSelect": False, "recommended": "A", "issue": "spin-dd/taihei-epm-server#11432",
                   "options": [{"label": "A", "description": "画面で止める"}, {"label": "B", "description": "API で止める"}]},
                  {"question": "いつ出しますか？", "header": "時期", "multiSelect": False, "recommended": "今日",
                   "options": [{"label": "今日", "description": "devel へ"}, {"label": "明日", "description": "本番と同時"}]}]
@@ -5481,7 +5483,8 @@ class InboxReadTests(unittest.TestCase):
 
             full, summary = run("--id", "d57cdf88"), run("--summary")
 
-        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] どちらで直しますか？（推奨: A）\n"
+        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] 二重送信を止める直しです。\n"
+                      "  どちらで直しますか？（推奨: A）\n"
                       "  - A: 画面で止める\n  - B: API で止める\n  関わる issue: spin-dd/taihei-epm-server#11432\n"
                       "Q2 id=d57cdf88-1111-4222-8333-444455556666:2 [時期]", full)
         self.assertIn("伺い直します  [質問 2 件: 方針・時期]", summary.splitlines()[0])
