@@ -884,6 +884,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
                                        if not key.startswith(f"{proposal_id}:")}
             continue
+        if status == "adopted" and (item.get("retires") or item.get("confirms")) and not item.get("merges"):
+            # Adopting a retirement or a confirmation closes or settles other proposals; no note or lane is left.
+            continue
         action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
         if category in SEPARATE_WORK:
             # A lane makes the tool fix or the upstream report; the board or the deciding person tells the lead.
@@ -948,8 +951,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                                "actor": "triage-retro", "result": f"appended to {path}{rewrite}",
                                "undo": json.dumps(expected, ensure_ascii=False)})
             else:
+                # A confirmation's applied receipt carries no undo token: the worker wrote nothing for it.
                 applied = next((e for e in reversed(item.get("executions", []))
-                                if e.get("outcome") == "applied"), None)
+                                if e.get("outcome") == "applied" and e.get("undo")), None)
                 token = (json.loads(applied["undo"]) if applied else
                          data["applied_actions"].get(proposal_id))
                 if token is None and contents.count(line) == 1:

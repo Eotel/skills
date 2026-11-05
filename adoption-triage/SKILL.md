@@ -9,4 +9,4 @@ Read [references/policy.md](references/policy.md) when a retrospective or review
 
 Read [references/ledger.md](references/ledger.md) when writing, collecting, or reading decisions. Use the script for all ledger writes. Human decisions belong in the adoption triage page; repository merge and Mac deployment follow each repository's rules.
 
-Read [references/consolidation.md](references/consolidation.md) when a session is started to consolidate the ledger, such as from the adoption page's 整理 button. It reviews every candidate and proposes merges and retirements with evidence; decisions stay on the adoption page.
+Read [references/consolidation.md](references/consolidation.md) when a session is started to consolidate the ledger, such as from the adoption page's 整理 button. It reviews every candidate and proposes merges, confirmations of work already in place, and retirements with evidence; decisions stay on the adoption page.

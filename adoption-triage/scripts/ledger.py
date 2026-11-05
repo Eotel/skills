@@ -24,7 +24,8 @@ DECISIONS = {"adopt", "reject", "hold", "revoke"}
 # handed_off: the worker left an adopted change to a lane, which records applied when it ships.
 OUTCOMES = {"applied", "reverted", "failed", "handed_off"}
 # merges: this proposal combines the listed ones; retires: it withdraws the listed stale ones.
-RELATIONS = {"merges": "merged_into", "retires": "retired_by"}
+# merges and retires close their targets when adopted; confirms records its adopted targets as applied.
+RELATIONS = {"merges": "merged_into", "retires": "retired_by", "confirms": "confirmed_by"}
 
 
 def required_text(value, name, limit=4000):
@@ -151,7 +152,8 @@ def project(rows):
             if item["status"] == "adopted" and decision in {"reject", "hold"}:
                 raise ValueError(f"revoke adoption before {decision}: {proposal_id}")
             if decision == "adopt":
-                item["implemented_at"] = None
+                # A proposal that only retires or confirms others has done its work in the adoption's own write.
+                item["implemented_at"] = row["ts"] if nothing_to_apply(item) else None
                 item["reverted_at"] = None
                 item["revoked_at"] = None
             item["status"] = {"adopt": "adopted", "reject": "rejected", "hold": "held",
@@ -192,9 +194,14 @@ def project(rows):
         -timestamp(item["ts"]).timestamp()))
 
 
+def nothing_to_apply(item: dict) -> bool:
+    """Whether adopting the proposal is its whole work: it retires or confirms others and merges none."""
+    return bool(item["retires"] or item["confirms"]) and not item["merges"]
+
+
 def active_owner(item: dict, known: dict[str, dict], besides: str | None = None) -> str | None:
-    """The undecided or adopted proposal, other than `besides`, that already merges or retires the item."""
-    return next((owner for owner in (*item["merged_into"], *item["retired_by"])
+    """The undecided or adopted proposal, other than `besides`, that already merges, retires, or confirms the item."""
+    return next((owner for owner in (*item["merged_into"], *item["retired_by"], *item["confirmed_by"])
                  if owner != besides and known[owner]["status"] in {"pending", "held", "adopted"}), None)
 
 
@@ -207,28 +214,40 @@ def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
 
 
 def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
-    """Decisions that close the open targets of an adopted consolidation; re-adopting a target reopens it."""
+    """Decisions that close the open targets of an adopted consolidation; re-adopting a target reopens it.
+
+    A direct target adopted and not yet applied is revoked. The targets a closed consolidation hands on
+    are closed only while undecided: one already adopted stays adopted for its lane to finish."""
     rows, seen = [], {owner["proposal_id"]}
     for relation, label in (("merges", "統合先"), ("retires", "取り下げの提案")):
-        queue = list(owner[relation])
+        queue = [(target_id, True) for target_id in owner[relation]]
         while queue:
-            target_id = queue.pop(0)
+            target_id, direct = queue.pop(0)
             if target_id in seen:
                 continue
             seen.add(target_id)
             target = known[target_id]
             if target["status"] in {"pending", "held"}:
                 decision = "reject"
-            elif target["status"] == "adopted" and not target["implemented_at"]:
+            elif direct and target["status"] == "adopted" and not target["implemented_at"]:
                 decision = "revoke"
             else:
                 continue
             # A consolidation closed here hands its own targets on, or they would return as candidates.
-            queue.extend((*target["merges"], *target["retires"]))
+            queue.extend((handed, False) for handed in (*target["merges"], *target["retires"]))
             rows.append({**envelope("decision", target_id), "decision": decision, "actor": actor,
                          "reason": f"{label}「{owner['proposal']}」を採用",
                          "after_id": target["latest_event_id"]})
     return rows
+
+
+def confirming_executions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
+    """Applied records, under each target's adoption, for the adopted and unapplied proposals the owner confirms."""
+    return [{**envelope("execution", target["proposal_id"]), "decision_id": target["decisions"][-1]["id"],
+             "outcome": "applied", "actor": actor, "result": f"実施の確認「{owner['proposal']}」を採用",
+             "after_id": target["latest_event_id"]}
+            for target in (known[target_id] for target_id in owner["confirms"])
+            if target["status"] == "adopted" and not target["implemented_at"]]
 
 
 def envelope(kind, proposal_id):
@@ -274,8 +293,9 @@ def validate_proposal(body):
             if not isinstance(value, str) or value == proposal_id:
                 raise ValueError(f"{relation} must list other proposals")
             uuid.UUID(value)
-    if set(body.get("merges", [])) & set(body.get("retires", [])):
-        raise ValueError("a proposal cannot both merge and retire the same proposal")
+    named = [value for relation in RELATIONS for value in body.get(relation, [])]
+    if len(set(named)) != len(named):
+        raise ValueError("a proposal names each other proposal in one relation only")
     return row
 
 
@@ -349,6 +369,12 @@ def append(events, imports, row):
                     blocker = consolidation_blocker(known[target_id], known)
                     if blocker:
                         raise ValueError(f"{relation} target {blocker}: {target_id}")
+                    adopted = known[target_id]["status"] == "adopted"
+                    if relation == "merges" and adopted:
+                        raise ValueError(f"merges target is adopted: {target_id}; close it with retires, "
+                                         "or record its work as done with confirms")
+                    if relation == "confirms" and not adopted:
+                        raise ValueError(f"confirms target is not adopted: {target_id}")
         elif row["type"] == "decision":
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
@@ -384,15 +410,16 @@ def append(events, imports, row):
             row["after_id"] = known[proposal_id]["latest_event_id"]
         adopted = row["type"] == "decision" and row["decision"] == "adopt"
         closed = closing_decisions(known[proposal_id], known, row["actor"]) if adopted else []
-        # One write keeps the adoption and the targets it closes together.
+        confirmed = confirming_executions(known[proposal_id], known, row["actor"]) if adopted else []
+        # One write keeps the adoption and the targets it closes or confirms together.
         data = b"".join((json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-                        for event in (row, *closed))
+                        for event in (row, *closed, *confirmed))
         if os.write(fd, data) != len(data):
             raise OSError("partial event write")
         os.fsync(fd)
     finally:
         os.close(fd)
-    return {**row, "closed": closed} if adopted else row
+    return {**row, "closed": closed, "confirmed": confirmed} if adopted else row
 
 
 def replace_import(imports, name, temporary_path, allow_reorder=False):
