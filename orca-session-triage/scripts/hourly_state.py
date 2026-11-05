@@ -563,9 +563,14 @@ def change(data, args):
         if question.get("withdrawn_at"):
             raise ValueError(f"question was withdrawn at {question['withdrawn_at']}: {question['withdrawal_reason']}")
         answer = file_text(args.answer_file)
+        earlier = {key: question.get(key) for key in ("answer", "answered_at", "answered_in")}
+        if args.replace_reason_file and question["answer"] is not None and question["answer"] != answer:
+            # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
+            question.setdefault("replaced", []).append(
+                {**earlier, "reason": file_text(args.replace_reason_file), "replaced_at": stamp()})
+            question["answer"] = None
         if question["answer"] is not None and question["answer"] != answer:
-            raise ValueError("answer already recorded: " + json.dumps(
-                {key: question.get(key) for key in ("answer", "answered_at", "answered_in")}, ensure_ascii=False))
+            raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
         if question["answer"] is None:
             question.update(answer=answer, answered_at=recorded_at(args.answered_at),
                             answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
@@ -713,6 +718,9 @@ def main(argv: list[str] | None = None) -> int:
     answered.add_argument("--id", required=True)
     answered.add_argument("--answer-file", required=True)
     answered.add_argument("--answered-at", help="original ISO 8601 time when importing an answer")
+    answered.add_argument("--replace-reason-file",
+                          help="replace a different recorded answer with this checked one, keeping the earlier "
+                               "answer, its time and tab under `replaced` with this file's reason")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
