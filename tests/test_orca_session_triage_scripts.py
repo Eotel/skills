@@ -5465,6 +5465,31 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual([line.split("  ")[0] for line in watched],
                          [f"伺い中 triage-hourly: {old} ask h x id=a1", f"unanswered 30 min: {old} ask h y id=a2"])
 
+    def test_taking_over_an_ask_takes_the_questions_claimed_one_by_one(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            two = [{"question": f"Q{n}？", "header": f"Q{n}", "recommended": "A", "multiSelect": False,
+                    "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]}
+                   for n in (1, 2)]
+            write_jsonl(inbox, [{"id": "a1", "ts": "2026-11-05T10:00:00+09:00", "kind": "ask", "host": "h",
+                                 "worktree": "x", "text": "2 問", "questions": two}])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl"),
+                           "TRIAGE_ASK_CLAIMS": str(Path(root) / "claims.jsonl")}
+
+            def run(*argv: str) -> int:
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                        redirect_stderr(io.StringIO()):
+                    return inbox_read.main(list(argv))
+
+            codes = [run("claim", "a1:1", "--by", "triage-hourly"), run("claim", "a1", "--by", "triage", "--take-over"),
+                     run("claim", "a1", "--by", "triage")]
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
+                inbox_read.main(["questions"])
+
+        self.assertEqual(codes, [0, 0, 0])
+        self.assertEqual([(item["id"], item["by"]) for item in json.loads(out.getvalue())["claimed"]],
+                         [("a1:1", "triage"), ("a1:2", "triage")])
+
     def test_summary_prints_one_short_line_per_entry(self):
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"

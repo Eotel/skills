@@ -444,13 +444,15 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
         fcntl.flock(stream, fcntl.LOCK_EX)
         stream.seek(0)
         held = parsed_claims(stream.read())
-        taken = [] if take_over else list({claim.id: claim for claimed in ids
-                                           for claim in overlapping_claims(held, claimed, open_keys)
-                                           if claim.by != by}.values())
-        if taken:
+        taken = list({claim.id: claim for claimed in ids for claim in overlapping_claims(held, claimed, open_keys)
+                      if claim.by != by}.values())
+        if taken and not take_over:
             return taken
+        # Taking over an ask also takes its questions another worktree claimed one by one.
+        written = dict.fromkeys([*ids, *(claim.id for claim in taken
+                                         if any(claim.id.startswith(f"{claimed}:") for claimed in ids))])
         stream.write("".join(json.dumps({"id": claimed, "by": by, "ts": stamp}, ensure_ascii=False) + "\n"
-                             for claimed in ids))
+                             for claimed in written))
         stream.flush()
         os.fsync(stream.fileno())
     return []
