@@ -92,6 +92,12 @@ no kana or kanji. While another tab is appointed lead (`hourly_state.py
 appoint-lead`), it also refuses a question asked before this run sent its
 handoff (`handoff.py last` older than the run's start): a question stops the
 turn, so send the handoff first. With no lead, the run asks the user itself.
+After AskUserQuestion, a PostToolUse hook in the same script names each answer
+whose chosen option sends something out (a post, merge, send, push, or
+production change) while the same question carries a note. Check how to read
+the choice and the note with the user in one question before handing it to a
+lane as permission; the hook does not judge whether they disagree. Record the
+checked answer with `hourly_state.py answered --replace-reason-file`.
 
 ## In the run
 

@@ -234,8 +234,11 @@ def full_text(item: dict) -> str:
     for number, question in enumerate(questions_of(item), 1):
         if not isinstance(question, dict):
             continue
-        lines.append(f"Q{number} id={item.get('id')}:{number} [{question.get('header')}] {question.get('question')}"
-                     f"（推奨: {question.get('recommended')}）")
+        label = f"Q{number} id={item.get('id')}:{number} [{question.get('header')}]"
+        asked = f"{question.get('question')}（推奨: {question.get('recommended')}）"
+        # The context (what the work is and what choosing does) comes before the question it explains.
+        lines.extend((f"{label} {question['context']}", f"  {asked}") if question.get("context")
+                     else (f"{label} {asked}",))
         lines.extend(f"  - {option.get('label')}: {option.get('description')}"
                      for option in question.get("options") or [] if isinstance(option, dict))
         if question.get("issue"):
@@ -469,11 +472,11 @@ def pending_questions(asks: list[OpenAsk]) -> list[PendingQuestion]:
 
 
 def ask_user_question(question: dict) -> dict:
-    """AskUserQuestion's question: the recommended option first and marked, the issue named after the question."""
+    """AskUserQuestion's question: its context before it, the issue named after it, and the recommended option
+    first and marked."""
     recommended = question.get("recommended")
     options = sorted(question["options"], key=lambda option: option["label"] != recommended)
-    issue = question.get("issue")
-    return {"question": question["question"] + (f"（{issue}）" if issue else ""), "header": question["header"],
+    return {"question": answer_evidence.shown_question(question), "header": question["header"],
             "multiSelect": bool(question.get("multiSelect")),
             "options": [{"label": option["label"] + (RECOMMENDED_MARK if option["label"] == recommended else ""),
                          "description": option["description"]} for option in options]}

@@ -4122,6 +4122,27 @@ class HourlyStateTests(unittest.TestCase):
                                                 "--answer-file", other]), 1)
         self.assertIsNone(json.loads(err.getvalue().split("answer already recorded: ", 1)[1])["answered_in"])
 
+    def test_checked_answer_replaces_the_recorded_one_and_keeps_it_with_the_reason(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        question = self.source("question.txt", "下書きのとおり投稿しますか？")
+        noted = self.source("noted.txt", "「下書きのとおり投稿」。メモ「不要.」")
+        checked = self.source("checked.txt", "返事の投稿は不要")
+        reason = self.source("reason.txt", "メモの読みを 1 問で確かめた")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "post:TOUGOU_KAIKEI-799",
+                             "--final-message-file", message, "--question-file", question)
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_hourly"}):
+            _, first = self.call("answered", "--id", asked["id"], "--answer-file", noted,
+                                 "--answered-at", "2026-11-04T07:14:00Z")
+            _, replaced = self.call("answered", "--id", asked["id"], "--answer-file", checked,
+                                    "--replace-reason-file", reason)
+        self.assertEqual(replaced["answer"], "返事の投稿は不要")
+        self.assertEqual([{key: earlier[key] for key in ("answer", "answered_at", "answered_in", "reason")}
+                          for earlier in replaced["replaced"]],
+                         [{"answer": first["answer"], "answered_at": first["answered_at"],
+                           "answered_in": "term_hourly", "reason": "メモの読みを 1 問で確かめた"}])
+        self.assertIn("replaced_at", replaced["replaced"][0])
+        self.assertEqual(self.call("get", "--id", asked["id"]), (0, replaced))
+
     def test_answer_without_a_terminal_handle_records_its_worktree(self) -> None:
         message = self.source("message.txt", "Ready.")
         _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
@@ -5182,7 +5203,8 @@ class InboxReadTests(unittest.TestCase):
             write_jsonl(inbox, [
                 {"id": "r1", "ts": "t1", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
                  "handle": "term_a", "text": "判断 4 件", "questions": [
-                     question(1, issue="spin-dd/taihei-report#239"), question(2), question(3), question(4)]},
+                     question(1, issue="spin-dd/taihei-report#239", context="移した帳票を出す作業です。"),
+                     question(2), question(3), question(4)]},
                 {"id": "r2", "ts": "t2", "kind": "ask", "host": "h", "worktree": "plain", "text": "文章だけの質問"},
                 {"id": "r3", "ts": "t3", "kind": "ask", "host": "h", "repo": "report", "worktree": "decisions",
                  "text": "判断 2 件", "questions": [question(5), question(6)]},
@@ -5204,7 +5226,8 @@ class InboxReadTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in first["items"]], ["r1:1", "r1:3", "r1:4", "r3:1"])
         self.assertEqual(first["questions"][0], {
-            "question": "Q1 をどうしますか？（spin-dd/taihei-report#239）", "header": "判断1", "multiSelect": False,
+            "question": "移した帳票を出す作業です。 Q1 をどうしますか？（spin-dd/taihei-report#239）", "header": "判断1",
+            "multiSelect": False,
             "options": [{"label": "直す（推奨）", "description": "移した帳票に合わせる"},
                         {"label": "残す", "description": "今の帳票のまま"}]})
         self.assertEqual((first["items"][0]["source"], first["items"][0]["handle"]), ("report/decisions", "term_a"))
@@ -5524,8 +5547,8 @@ class InboxReadTests(unittest.TestCase):
 
     def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self):
         # 2026-10-28: read --id of epm-11432-review-fix's ask d57cdf88 showed only its one-line text.
-        asked = [{"question": "どちらで直しますか？", "header": "方針", "multiSelect": False, "recommended": "A",
-                  "issue": "spin-dd/taihei-epm-server#11432",
+        asked = [{"context": "二重送信を止める直しです。", "question": "どちらで直しますか？", "header": "方針",
+                  "multiSelect": False, "recommended": "A", "issue": "spin-dd/taihei-epm-server#11432",
                   "options": [{"label": "A", "description": "画面で止める"}, {"label": "B", "description": "API で止める"}]},
                  {"question": "いつ出しますか？", "header": "時期", "multiSelect": False, "recommended": "今日",
                   "options": [{"label": "今日", "description": "devel へ"}, {"label": "明日", "description": "本番と同時"}]}]
@@ -5543,7 +5566,8 @@ class InboxReadTests(unittest.TestCase):
 
             full, summary = run("--id", "d57cdf88"), run("--summary")
 
-        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] どちらで直しますか？（推奨: A）\n"
+        self.assertIn("伺い直します\nQ1 id=d57cdf88-1111-4222-8333-444455556666:1 [方針] 二重送信を止める直しです。\n"
+                      "  どちらで直しますか？（推奨: A）\n"
                       "  - A: 画面で止める\n  - B: API で止める\n  関わる issue: spin-dd/taihei-epm-server#11432\n"
                       "Q2 id=d57cdf88-1111-4222-8333-444455556666:2 [時期]", full)
         self.assertIn("伺い直します  [質問 2 件: 方針・時期]", summary.splitlines()[0])
@@ -5882,6 +5906,35 @@ class StopCheckTests(unittest.TestCase):
                     self.assertIn("日本語", decision["permissionDecisionReason"])
                 else:
                     self.assertEqual(out.getvalue(), "")
+
+    def test_answer_hook_asks_to_check_a_note_on_an_outward_choice(self) -> None:
+        post = {"question": "TOUGOU_KAIKEI-799 の返事を投稿しますか？", "header": "799 投稿", "multiSelect": False,
+                "options": [{"label": "下書きのとおり投稿 (Recommended)", "description": "吉岡さんに返事を出します"},
+                            {"label": "直してから", "description": "下書きを直させます"}]}
+        record = {"question": "記録だけにしますか？", "header": "記録", "multiSelect": False,
+                  "options": [{"label": "書かずに記録", "description": "台帳に残すだけ"},
+                              {"label": "書く", "description": "skill に書きます"}]}
+
+        def answer(answers: dict[str, str], notes: dict[str, str]) -> str:
+            hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
+                    "cwd": "/w/triage", "tool_input": {"questions": [post, record]},
+                    "tool_response": {"questions": [post, record], "answers": answers,
+                                      "annotations": {question: {"notes": note} for question, note in notes.items()}}}
+            with patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(stopcheck.main(self.root), 0)
+            return out.getvalue()
+
+        chosen = {post["question"]: "下書きのとおり投稿 (Recommended)", record["question"]: "書かずに記録"}
+        decision = json.loads(answer(chosen, {post["question"]: "不要."}))
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("799 投稿", decision["reason"])
+        self.assertIn("不要.", decision["reason"])
+        self.assertIn("1 問で確かめ", decision["reason"])
+        for answers, notes in ((chosen, {}), (chosen, {record["question"]: "あとで見る"}),
+                               ({post["question"]: "(notes only)"}, {post["question"]: "不要."})):
+            with self.subTest(notes=notes, answers=answers):
+                self.assertEqual(answer(answers, notes), "")
 
     def test_hourly_question_hook_requires_a_handoff_from_this_run(self) -> None:
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [

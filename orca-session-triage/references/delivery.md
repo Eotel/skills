@@ -8,8 +8,10 @@
   before listing it. Put a recommended option first.
 - An inbox `ask` sent with `triage-notify --questions` carries its questions in
   AskUserQuestion's shape. `scripts/inbox_read.py questions` prints the next
-  four as AskUserQuestion input (`questions`: the recommended option first and
-  marked, the issue named after the question) with each one's `id`, `source`,
+  four as AskUserQuestion input (`questions`: the question's `context`, one
+  sentence on what the work is and what choosing does, before it, the issue
+  named after it, and the recommended option first and marked; `read --id` also
+  shows the context before the question) with each one's `id`, `source`,
   and `handle` in `items` for relaying the answer. Relay each answer with
   `send --decision <answer> --ask <id>`: the question drops out of the next
   batch once the send lands. `--after <next_after>` pages on without recording
