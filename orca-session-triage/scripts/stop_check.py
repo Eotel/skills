@@ -17,6 +17,9 @@ After the checks pass, an hourly transcript path is queued for the external
 retrospective worker.
 Before AskUserQuestion in the hourly workspace, the PreToolUse hook checks for
 kana or kanji in the questions, options and descriptions, and a handoff sent during this run.
+After AskUserQuestion, the PostToolUse hook tells Claude to check, in one question, how to read
+each answer whose chosen option sends something out (a post, merge, send, push, or production
+change) while the same question carries a note. It does not judge whether they disagree.
 """
 
 from datetime import datetime, timezone
@@ -107,6 +110,45 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
         reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
     return deny(reasons)
+
+
+# An option that sends something out of this session: a post, merge, send, push, or production change.
+OUTWARD = re.compile(r"投稿|merge|マージ|送(?:る|り|っ|信)|push|本番", re.IGNORECASE)
+
+
+def noted_outward_answers(hook_input: dict[str, Any]) -> list[str]:
+    """Each answered question, as `header: chosen labels (メモ: notes)`, whose chosen option sends
+    something out while the same question carries a note."""
+    if hook_input.get("tool_name") != "AskUserQuestion":
+        return []
+    response = hook_input.get("tool_response")
+    if not isinstance(response, dict):
+        return []
+    answers, annotations = response.get("answers") or {}, response.get("annotations") or {}
+    found = []
+    for question in response.get("questions") or (hook_input.get("tool_input") or {}).get("questions") or []:
+        text = question.get("question", "")
+        note = (annotations.get(text) or {}).get("notes") if isinstance(annotations.get(text), dict) else None
+        answer = answers.get(text)
+        if not (isinstance(note, str) and note.strip() and isinstance(answer, str)):
+            continue
+        picked = set(answer.split(", ")) | {answer}
+        chosen = [option for option in question.get("options") or [] if option.get("label") in picked]
+        if any(OUTWARD.search(f"{option.get('label', '')} {option.get('description', '')}") for option in chosen):
+            labels = "・".join(option["label"] for option in chosen)
+            found.append(f"{question.get('header') or text}: 「{labels}」（メモ: {note.strip()}）")
+    return found
+
+
+def answer_decision(hook_input: dict[str, Any]) -> dict[str, Any] | None:
+    """A PostToolUse decision that puts the check in front of Claude, or None."""
+    noted = noted_outward_answers(hook_input)
+    if not noted:
+        return None
+    return {"decision": "block", "reason": (
+        "外へ出す操作の選択肢に、メモが付いた答えがあります。" + " / ".join(noted) +
+        "。担当へ許可として渡す前に、選択肢とメモの読みを 1 問で確かめてください。"
+        "確かめた答えは hourly_state.py answered --replace-reason-file で記録を置き換えます。")}
 
 
 def deny(reasons: list[str]) -> dict[str, Any] | None:
@@ -277,6 +319,11 @@ def main(handoffs_dir: Path | None = None) -> int:
     except ValueError:
         return 0
     orca = os.environ.get("ORCA_CLI_COMMAND", "orca")
+    if hook_input.get("hook_event_name") == "PostToolUse":
+        decision = answer_decision(hook_input)
+        if decision:
+            json.dump(decision, sys.stdout, ensure_ascii=False)
+        return 0
     if hook_input.get("hook_event_name") == "PreToolUse":
         decision = question_decision(hook_input, orca, Path(STATE_DIR).expanduser(), handoffs_dir)
         if decision:

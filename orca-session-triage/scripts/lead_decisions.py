@@ -208,7 +208,7 @@ def github_pr_states(repo: str, numbers: list[int]) -> Mapping[int, PrState] | N
         return None
     found = {int(ref): PrState(node.get("state"), node.get("updatedAt"))
              for repository, aliases in read for alias, ref in aliases.items()
-             if isinstance(node := (repository or {}).get(alias), dict)}
+             if isinstance(ref, int) and isinstance(node := (repository or {}).get(alias), dict)}
     missing = [f"#{number}" for number in numbers if number not in found]
     if missing:
         print(f"GitHub has no PR {' '.join(missing)} in {repo}, so its fields are null", file=sys.stderr)
