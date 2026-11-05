@@ -5471,8 +5471,8 @@ class InboxReadTests(unittest.TestCase):
             two = [{"question": f"Q{n}？", "header": f"Q{n}", "recommended": "A", "multiSelect": False,
                     "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]}
                    for n in (1, 2)]
-            write_jsonl(inbox, [{"id": "a1", "ts": "2026-11-05T10:00:00+09:00", "kind": "ask", "host": "h",
-                                 "worktree": "x", "text": "2 問", "questions": two}])
+            write_jsonl(inbox, [{"id": ask_id, "ts": "2026-11-05T10:00:00+09:00", "kind": "ask", "host": "h",
+                                 "worktree": "x", "text": "2 問", "questions": two} for ask_id in ("a1", "a2")])
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl"),
                            "TRIAGE_ASK_CLAIMS": str(Path(root) / "claims.jsonl")}
 
@@ -5482,13 +5482,19 @@ class InboxReadTests(unittest.TestCase):
                     return inbox_read.main(list(argv))
 
             codes = [run("claim", "a1:1", "--by", "triage-hourly"), run("claim", "a1", "--by", "triage", "--take-over"),
-                     run("claim", "a1", "--by", "triage")]
+                     run("claim", "a1", "--by", "triage"),
+                     # The other way: the questions of an ask another tab claimed whole.
+                     run("claim", "a2", "--by", "triage-hourly"),
+                     run("claim", "a2:1,a2:2", "--by", "triage", "--take-over"), run("claim", "a2:1", "--by", "triage")]
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
                 inbox_read.main(["questions"])
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as listed:
+                inbox_read.main(["open-asks", "--json"])
 
-        self.assertEqual(codes, [0, 0, 0])
+        self.assertEqual(codes, [0, 0, 0, 0, 0, 0])
         self.assertEqual([(item["id"], item["by"]) for item in json.loads(out.getvalue())["claimed"]],
-                         [("a1:1", "triage"), ("a1:2", "triage")])
+                         [("a1:1", "triage"), ("a1:2", "triage"), ("a2:1", "triage"), ("a2:2", "triage")])
+        self.assertEqual([ask["claimed"]["by"] for ask in json.loads(listed.getvalue())], ["triage", "triage"])
 
     def test_summary_prints_one_short_line_per_entry(self):
         with tempfile.TemporaryDirectory() as root:

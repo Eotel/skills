@@ -179,9 +179,10 @@ def question_claim(claims: dict[str, Claim], ask_id: str, number: int) -> Claim 
 
 
 def ask_claim(ask: OpenAsk, claims: dict[str, Claim]) -> Claim | None:
-    """The claim on the ask itself, or on every one of its open questions."""
+    """The claim on every one of the ask's open questions (a question's own claim before the ask's), or on the
+    ask itself when none is open."""
     ask_id = ask.report["id"]
-    if ask_id in claims or not ask.open_questions:
+    if not ask.open_questions:
         return claims.get(ask_id)
     found = [question_claim(claims, ask_id, number) for number in ask.open_questions]
     return found[0] if all(found) else None
@@ -428,10 +429,12 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None
 
 
 def overlapping_claims(claims: dict[str, Claim], claimed: str, open_keys: frozenset[str]) -> list[Claim]:
-    """The claims on the open ask or questions that `claimed` (`<id>` or `<id>:<n>`) also covers."""
+    """The claims on the open ask or questions that `claimed` (`<id>` or `<id>:<n>`) also covers; a question's
+    own claim stands before the ask's, as question_claim reads them."""
     ask_id = claimed.split(":", 1)[0]
-    return [claim for key, claim in claims.items() if key in open_keys
-            and (key == claimed or key == ask_id or claimed == ask_id and key.startswith(f"{ask_id}:"))]
+    keys = ([ask_id, *(key for key in claims if key.startswith(f"{ask_id}:"))] if claimed == ask_id
+            else [claimed if claimed in claims else ask_id])
+    return [claims[key] for key in keys if key in claims and key in open_keys]
 
 
 def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str],
