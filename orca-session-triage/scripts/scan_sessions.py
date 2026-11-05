@@ -1890,8 +1890,9 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             row = {**row, "waits_on": "self",
                    "reasons": [*(reasons if isinstance(reasons, list) else []),
                                "human PR response after the latest commit"]}
+        # Read before the inbox reports join the row, the verdict's freshness is not known here.
         if waits and all(slug and (prs.get((slug, Item(number))) or {}).get("state") in ("CLOSED", "MERGED")
-                         for slug, number in waits) and current_verdict(row, verdicts or {}):
+                         for slug, number in waits):
             closed = [f"{slug}#{number}" for slug, number in waits]
             row = {**row, "waits_closed": closed,
                    "reasons": [*row.get("reasons", []), "everything the saved verdict waits on closed: "

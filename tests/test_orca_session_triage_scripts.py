@@ -1359,13 +1359,15 @@ class NextStepFactTests(unittest.TestCase):
                 return scan.add_next_step_facts(rows, git_lookup=gits.get, verdicts=verdicts,
                                                 pr_lookup=partial(scan.gh_prs, cache_dir=Path(cache)))[0]
 
-        verdicts = {"/w/sp": {"read": scan.read_key(scan_with("OPEN", {})), "class": "blocked",
+        # The scan joins the inbox reports, which the verdict's read includes, after these facts.
+        inbox = {"done": {"at": "2026-10-28T01:00:00Z", "host": "mbp", "text": "done"}}
+        verdicts = {"/w/sp": {"read": scan.read_key({**scan_with("OPEN", {}), "inbox": inbox}), "class": "blocked",
                               "waits_on": "hdknr（masters#731→#732 のレビュー）、三浦さん（masters-ui#125→#126 の merge）"}}
-        waiting = scan_with("OPEN", verdicts)
+        waiting = {**scan_with("OPEN", verdicts), "inbox": inbox}
         self.assertEqual((scan.review_queue([waiting], verdicts), scan.with_verdicts([waiting], verdicts)[0]["verdict"]["class"]),
                          ([], "blocked"))
 
-        closed = scan_with("MERGED", verdicts)
+        closed = {**scan_with("MERGED", verdicts), "inbox": inbox}
         self.assertEqual([entry["path"] for entry in scan.review_queue([closed], verdicts)], ["/w/sp"])
         self.assertNotIn("verdict", scan.with_verdicts([closed], verdicts)[0])
         self.assertEqual(closed["reasons"], ["everything the saved verdict waits on closed: "
