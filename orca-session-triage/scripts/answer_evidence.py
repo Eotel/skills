@@ -71,10 +71,17 @@ def matches_ask(answer: Answer, ask_id: str, number: int | None = None) -> bool:
     return named in (ask_id, f"{ask_id}:{number}")
 
 
+def shown_question(question: dict) -> str:
+    """A structured question as inbox_read.ask_user_question shows it to the user: its context (what the work
+    is and what choosing does) first, then the question, then the issue."""
+    context = f"{question['context']} " if question.get("context") else ""
+    issue = f"（{question['issue']}）" if question.get("issue") else ""
+    return context + str(question.get("question") or "") + issue
+
+
 def questions_of(ask: dict) -> list[str]:
     """Each structured question as inbox_read.ask_user_question shows it to the user."""
-    return [str(question.get("question") or "") + (f"（{question['issue']}）" if question.get("issue") else "")
-            if isinstance(question, dict) else "" for question in ask.get("questions") or []]
+    return [shown_question(question) if isinstance(question, dict) else "" for question in ask.get("questions") or []]
 
 
 def shared_questions(entries: Iterable[dict]) -> frozenset[str]:
