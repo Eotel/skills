@@ -465,6 +465,20 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(retro.facts_path(self.target).exists())
         self.assertFalse((self.home / "notify.log").exists())
 
+    def test_adopted_retirement_is_neither_written_nor_handed_off(self) -> None:
+        ledger = FakeLedger()
+        for category in ("fact", "script"):
+            proposal_id = str(uuid.uuid4())
+            ledger.propose({"proposal_id": proposal_id, "proposal": "古い手順の案（6c704a29）を取り下げる",
+                            "retires": [str(uuid.uuid4())], "evidence": [],
+                            "target": f"triage-retro:skill:orca-session-triage:{category}"})
+            ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        data = retro.load(self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 0)
+        self.assertEqual([item["executions"] for item in ledger.list()], [[], []])
+        self.assertFalse(retro.facts_path(self.target).exists())
+
     def published_remote(self) -> tuple[Path, list[dict[str, int]], Any]:
         """A bare origin for the skill checkout, a list of open PRs, and a run() that fakes gh over it."""
         remote = self.home / "remote.git"

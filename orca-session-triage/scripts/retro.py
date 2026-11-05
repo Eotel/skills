@@ -884,6 +884,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
                                        if not key.startswith(f"{proposal_id}:")}
             continue
+        if status == "adopted" and (item.get("retires") or (item.get("confirms") and not item.get("merges"))):
+            # Adopting a retirement or a confirmation closes or settles other proposals; no note or lane is left.
+            continue
         action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
         if category in SEPARATE_WORK:
             # A lane makes the tool fix or the upstream report; the board or the deciding person tells the lead.
