@@ -16,7 +16,9 @@
   `send --decision <answer> --ask <id>`: the question drops out of the next
   batch once the send lands. `--after <next_after>` pages on without recording
   anything. The questions come from the asks not answered yet (`open-asks`),
-  wherever the inbox cursor stands.
+  wherever the inbox cursor stands. A question another tab claimed with
+  `inbox_read.py claim` (it is asking the user now) is left out and listed
+  under `claimed`; claim the ones you ask before asking them.
 - Before asking a decision that a verdict or final message leaves open, search
   that lane's user messages and, in an hourly run, the shared questions and
   answers in `hourly-state.md`. A final

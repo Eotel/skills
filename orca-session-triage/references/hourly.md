@@ -59,7 +59,17 @@ id's first 8 or more characters will do, as for `read --id`);
 `scripts/inbox_read.py answered <id> --note <why>` records one answered another
 way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest apart from handoffs, oldest first (`--json` for other tools; the board
-reads it). Asks from before the record began stay open until the lead marks
+reads it).
+Before either tab asks the user an inbox ask itself, it records that with
+`scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
+`~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another
+worktree already claims one of them, `claim` names that claim, writes nothing,
+and exits 1: do not ask it (`--take-over` only once that tab is known not to be
+asking). `open-asks`
+then marks the ask 伺い中 with who and since when, the lead's `watch` prints the
+claim once and stops reminding of it, `questions` leaves the claimed questions
+out of its batch (listing them under `claimed`), and `stale-asks` names the
+claim on the ask, so the other tab does not ask it again. Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
 It marks only the asks an answer after them proves answered: a lead decision
 or an AskUserQuestion answer (in the transcripts of the current directory's
