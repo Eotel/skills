@@ -4177,19 +4177,25 @@ class HourlyStateTests(unittest.TestCase):
         scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "waiting", "repo": "app",
                                          "claude": {"final_text": "Choose a release", "final_at": "2026-10-28T01:00:00Z"}}]))
         write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
-                                               "ts": "2026-10-28T01:00:00Z", "text": "Choose a release"}])
+                                               "ts": "2026-10-28T01:00:00Z", "text": "Choose a release",
+                                               "questions": [{"question": "Which?"}, {"question": "When?"}]}])
         claims = self.root / "claims.jsonl"
-        write_jsonl(claims, [{"id": "abcd1234-0000", "by": "triage-lead", "ts": "2026-10-28T10:05:00+09:00"}])
-        with patch.dict(os.environ, {"TRIAGE_ASK_CLAIMS": str(claims)}):
-            outputs = []
-            for summary in ([], ["--summary"]):
-                with redirect_stdout(io.StringIO()) as out:
-                    self.assertEqual(hourly_state.main(["--state-file", str(self.state), "stale-asks",
-                                                        "--from", str(scan_json), *summary]), 0)
-                outputs.append(out.getvalue())
-        self.assertEqual(json.loads(outputs[0])[0]["ask"]["claimed"],
+        outputs = []
+        # One question claimed leaves the other to ask; both claimed, the ask is being asked.
+        for claimed in ("abcd1234-0000:1", "abcd1234-0000:2"):
+            with claims.open("a") as stream:
+                stream.write(json.dumps({"id": claimed, "by": "triage-lead", "ts": "2026-10-28T10:05:00+09:00"}) + "\n")
+            with patch.dict(os.environ, {"TRIAGE_ASK_CLAIMS": str(claims)}):
+                for summary in ([], ["--summary"]):
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(hourly_state.main(["--state-file", str(self.state), "stale-asks",
+                                                            "--from", str(scan_json), *summary]), 0)
+                    outputs.append(out.getvalue())
+        self.assertIsNone(json.loads(outputs[0])[0]["ask"]["claimed"])
+        self.assertNotIn("伺い中", outputs[1])
+        self.assertEqual(json.loads(outputs[2])[0]["ask"]["claimed"],
                          {"by": "triage-lead", "at": "2026-10-28T10:05:00+09:00"})
-        self.assertIn("伺い中 triage-lead", outputs[1])
+        self.assertIn("伺い中 triage-lead", outputs[3])
 
     def test_asked_skips_all_closed_references_in_the_rows_origin_and_pending_explains_closure(self) -> None:
         lane = self.root / "lane"
@@ -5438,12 +5444,16 @@ class InboxReadTests(unittest.TestCase):
                 return code, out.getvalue(), err.getvalue()
 
             self.assertEqual(run("claim", "a1", "--by", "triage-hourly")[0], 0)
+            # Both tabs read the batch before either claimed it: the second claim is refused.
+            refused = run("claim", "a1:2", "--by", "triage")
             self.assertEqual(run("claim", "a2:1", "--by", "triage-hourly")[0], 1)
             listed = run("open-asks")[1].splitlines()
             viewed = {ask["id"]: ask for ask in json.loads(run("open-asks", "--json")[1])}
             batch = json.loads(run("questions")[1])
             watched = run("watch", "--once")[1].splitlines()
 
+        self.assertEqual(refused[0], 1)
+        self.assertIn("a1 は 伺い中 triage-hourly", refused[2])
         self.assertIn("伺い中 triage-hourly", listed[0])
         self.assertIn("id=a1", listed[0])
         self.assertNotIn("伺い中", listed[1])

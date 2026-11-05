@@ -62,7 +62,10 @@ way (on another Mac, by the user in the lane, or no longer asked), and
 reads it).
 Before either tab asks the user an inbox ask itself, it records that with
 `scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
-`~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). `open-asks`
+`~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another
+worktree already claims one of them, `claim` names that claim, writes nothing,
+and exits 1: do not ask it (`--take-over` only once that tab is known not to be
+asking). `open-asks`
 then marks the ask 伺い中 with who and since when, the lead's `watch` prints the
 claim once and stops reminding of it, `questions` leaves the claimed questions
 out of its batch (listing them under `claimed`), and `stale-asks` names the

@@ -159,10 +159,12 @@ def claims_path() -> Path:
 
 def read_claims(path: Path) -> dict[str, Claim]:
     """The latest claim on each ask or question id."""
-    if not path.exists():
-        return {}
+    return parsed_claims(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def parsed_claims(text: str) -> dict[str, Claim]:
     found: dict[str, Claim] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         try:
             record = json.loads(line)
         except ValueError:
@@ -174,13 +176,6 @@ def read_claims(path: Path) -> dict[str, Claim]:
 
 def question_claim(claims: dict[str, Claim], ask_id: str, number: int) -> Claim | None:
     return claims.get(f"{ask_id}:{number}") or claims.get(ask_id)
-
-
-def report_claim(report: dict, claims: dict[str, Claim]) -> Claim | None:
-    """The claim on the ask or on any one of its questions: someone is asking it now."""
-    ask_id = str(report.get("id") or "")
-    return claims.get(ask_id) or next((claims[key] for number in range(1, len(questions_of(report)) + 1)
-                                       if (key := f"{ask_id}:{number}") in claims), None)
 
 
 def ask_claim(ask: OpenAsk, claims: dict[str, Claim]) -> Claim | None:
@@ -432,16 +427,33 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None
         os.fsync(stream.fileno())
 
 
-def record_claims(path: Path, ids: list[str], by: str) -> None:
-    """Append one claim line per id, under the same lock the answer writers use."""
+def overlapping_claims(claims: dict[str, Claim], claimed: str, open_keys: frozenset[str]) -> list[Claim]:
+    """The claims on the open ask or questions that `claimed` (`<id>` or `<id>:<n>`) also covers."""
+    ask_id = claimed.split(":", 1)[0]
+    return [claim for key, claim in claims.items() if key in open_keys
+            and (key == claimed or key == ask_id or claimed == ask_id and key.startswith(f"{ask_id}:"))]
+
+
+def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str],
+                  take_over: bool = False) -> list[Claim]:
+    """Append one claim line per id under a lock, unless another worktree already claims an open ask or
+    question they cover: then return those claims and write nothing, so two tabs never both go on to ask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    with path.open("a", encoding="utf-8") as stream:
+    with path.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        held = parsed_claims(stream.read())
+        taken = [] if take_over else list({claim.id: claim for claimed in ids
+                                           for claim in overlapping_claims(held, claimed, open_keys)
+                                           if claim.by != by}.values())
+        if taken:
+            return taken
         stream.write("".join(json.dumps({"id": claimed, "by": by, "ts": stamp}, ensure_ascii=False) + "\n"
                              for claimed in ids))
         stream.flush()
         os.fsync(stream.fileno())
+    return []
 
 
 def claim_label(claim: Claim) -> str:
@@ -623,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
                                              "them, and questions leaves them out")
     claim.add_argument("ids", help="comma-separated ask ids, or <ask id>:<question number>")
     claim.add_argument("--by", required=True, help="the worktree asking them")
+    claim.add_argument("--take-over", action="store_true",
+                       help="claim them even though another worktree claims one; only when it is not asking")
     questions = actions.add_parser(
         "questions", help="print, as JSON, the next 4 unanswered structured questions: `questions` to pass to "
                           "AskUserQuestion, `items` naming each one's id and source, `remaining`, and "
@@ -661,7 +675,14 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.by.strip():
                     raise ValueError("--by names the worktree asking")
                 ids = checked_answer_ids(args.ids, entries)
-                record_claims(claims_path(), ids, args.by.strip())
+                open_keys = frozenset(key for ask in asks for key in (
+                    ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+                taken = record_claims(claims_path(), ids, args.by.strip(), open_keys, args.take_over)
+                for claim in taken:
+                    print(f"inbox-read: {claim.id} は {claim_label(claim)}。重ねて伺わない"
+                          "（伺っていないと分かったときだけ --take-over）", file=sys.stderr)
+                if taken:
+                    return 1
                 print(f"claimed: {len(ids)} by {args.by.strip()}")
             elif args.action == "answered":
                 if args.ids is not None:

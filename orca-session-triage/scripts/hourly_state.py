@@ -307,7 +307,7 @@ def blocked_prs(rows: list[dict]) -> dict[str, dict]:
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
                handed: list[lead_decisions.HandOff], prs: dict[str, dict],
-               claims: dict[str, inbox_read.Claim] | None = None) -> list[dict]:
+               claimed: dict[str, inbox_read.Claim] | None = None) -> list[dict]:
     """Waiting rows, rows blocked on the user, and rows an unanswered handoff key names, longest waiting first.
     The lane's asks that count are
     those still open and those it sent in its last turn:
@@ -319,7 +319,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
       its question; `choices_in_info` lists choices it sent as info since its last turn began.
     `candidates` holds the newest answers that name only the lane or its PR numbers, for the lead to check: the
     lead may ask the user a waiting row's question itself. An unanswered item's `ask.claimed` names the tab that
-    claimed it with `inbox_read.py claim` and is asking the user now.
+    claimed it with `inbox_read.py claim` and is asking the user now: `claimed` holds, by ask id, the claim on each
+    open ask itself or on every one of its open questions (inbox_read.ask_claim).
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
@@ -373,8 +374,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     "merge_question": scan_sessions.asks_merge(asked or question, comment),
                     "decisions": keys.get(ask["id"], []),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids,
-                            "claimed": (claim.view() if (claim := inbox_read.report_claim(ask, claims or {}))
-                                        else None)},
+                            "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
             continue
         later = [(answer, item) for _, item, proof in counted for answer in proof
@@ -752,14 +752,16 @@ def main(argv: list[str] | None = None) -> int:
                                                scan_sessions.absorb_verdicts(args.verdicts, write=False))
             entries = inbox_read.inbox_entries(inbox_read.paths()[0])
             answers_log = inbox_read.answers_path()
-            open_ids = frozenset(ask.report["id"] for ask in
-                                 inbox_read.open_asks(entries, inbox_read.answered_ids(answers_log)))
+            asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers_log))
+            open_ids = frozenset(ask.report["id"] for ask in asks)
+            claims = inbox_read.read_claims(inbox_read.claims_path())
             decided = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
             handed = list({item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
                            if item.decision not in decided}.values())
             result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
                                 datetime.now(timezone.utc), state=data, handed=handed, prs=blocked_prs(rows),
-                                claims=inbox_read.read_claims(inbox_read.claims_path()))
+                                claimed={ask.report["id"]: claim for ask in asks
+                                         if (claim := inbox_read.ask_claim(ask, claims))})
         except READ_ERRORS as error:
             print(f"hourly state: {error}", file=sys.stderr)
             return 1
