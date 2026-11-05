@@ -380,9 +380,9 @@ class ClassifyTests(unittest.TestCase):
     def claude_says(self, path, *rows):
         write_jsonl(scan.claude_project_dir(self.projects, path) / "s.jsonl", list(rows))
 
-    def inventory(self, worktrees, terminals, codex=None, judge=None):
-        return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=NOW,
-                                    judge=judge or judging({}))
+    def inventory(self, worktrees, terminals, codex=None, judge=None, processes=None, now=NOW):
+        return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=now,
+                                    judge=judge or judging({}), processes=processes)
 
     def classes(self, worktrees, terminals, codex=None, judge=None):
         rows = self.inventory(worktrees, terminals, codex, judge)
@@ -973,6 +973,81 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("working", ["a background job runs after the agent's turn"], [])])
 
+    def processes(self, table, now, clocks, tcp="", path="/w/p", elsewhere=()):
+        """worktree_processes of `path` over a process table whose processes sit in /w/p, or /tmp for `elsewhere`;
+        `clocks` maps a pid to ps's elapsed and CPU columns, and `tcp` is lsof's output, or the error it fails
+        with."""
+        ps = "".join(f"{pid} {elapsed} {cpu}\n" for pid, (elapsed, cpu) in clocks.items())
+
+        def run(args, **kwargs):
+            if args[0] == "lsof" and isinstance(tcp, Exception):
+                raise tcp
+            return subprocess.CompletedProcess(args, 0, ps if args[0] == "ps" else tcp, "")
+
+        with patch.object(scan.rm_check, "process_table", return_value=table), \
+                patch.object(scan.rm_check, "process_cwds",
+                             return_value={pid: "/tmp" if pid in elsewhere else "/w/p" for pid in table}), \
+                patch.object(scan.rm_check, "output_readers", return_value=set()), \
+                patch.object(scan.subprocess, "run", side_effect=run):
+            return scan.worktree_processes([path], Path(self.tmp.name) / "cpu.json", now)
+
+    def test_a_wait_loop_left_running_keeps_a_worktree_without_an_agent_working(self):
+        table = {9101: (1, "bash /tmp/wait-merge.sh"), 9102: (9101, "sleep 60"),
+                 9103: (1, "node /Users/me/.claude/plugins/cache/codex/scripts/broker.mjs serve"),
+                 9104: (1, "pnpm dev"), 9105: (9104, "sh -c while read -r line; do echo \"$line\"; done")}
+        found = self.processes(table, NOW, {9101: ("01:00:00", "0:00.02"), 9102: ("00:20", "0:00.00")})
+
+        [row] = self.inventory([worktree("/w/p")], [], processes=found)
+
+        self.assertEqual((row["class"], [process["pid"] for process in row["processes"]]), ("working", [9101, 9102]))
+        self.assertEqual(row["reasons"], [
+            "a background job runs in the worktree: PID 9101 bash /tmp/wait-merge.sh (running 1h00m, CPU 0.02s)",
+            "a background job runs in the worktree: PID 9102 sleep 60 (running 0h00m, CPU 0.0s)"])
+
+        # A loop whose check hung for an hour no longer waits.
+        hung = {9101: (1, "bash /tmp/wait-merge.sh"), 9106: (9101, "gh pr checks 5 --watch")}
+        self.processes(hung, NOW - 3600, {9101: ("01:00:00", "0:00.02"), 9106: ("00:50:00", "0:00.30")})
+        found = self.processes(hung, NOW, {9101: ("02:00:00", "0:00.02"), 9106: ("01:50:00", "0:00.30")})
+        [row] = self.inventory([worktree("/w/p")], [], processes=found)
+        self.assertEqual((row["class"], row["reasons"]), ("stalled", [scan.NO_SESSION_REASON]))
+
+    def test_background_work_whose_cpu_time_stays_still_for_an_hour_or_whose_connection_closed_is_stalled(self):
+        self.claude_says("/w/p", user("go"), assistant(text("Watching the run.")))
+        table = {9201: (1, "-zsh"), 9202: (9201, "claude"), 9203: (9202, "node mcp-server.js"),
+                 9204: (9202, "/bin/zsh -c source snapshot.sh && eval 'gh run watch 7'"), 9205: (9204, "gh run watch 7")}
+        clocks = {9204: ("02:00:00", "0:00.01"), 9205: ("02:00:00", "0:00.40")}
+
+        def classify(found, now=NOW):
+            [row] = self.inventory([worktree("/w/p", "working", turn="done")], [terminal("/w/p", "claude")],
+                                   processes=found, now=now)
+            return row["class"], row["reasons"]
+
+        # The scan's clock and ps's elapsed time put one start on either side of a minute.
+        self.assertEqual(classify(self.processes(table, NOW + 29.6, clocks), NOW + 29.6), ("working", [
+            "a background job runs after the agent's turn: PID 9204 /bin/zsh -c source snapshot.sh && eval 'gh run "
+            "watch 7' (running 2h00m, CPU 0.01s); PID 9205 gh run watch 7 (running 2h00m, CPU 0.4s)"]))
+        # A scan of another worktree keeps the history, and a socket read that times out keeps the CPU times.
+        self.processes(table, NOW + 1800, {}, path="/w/q")
+        an_hour_later = self.processes(table, NOW + 3630.1,
+                                       {pid: ("03:00:00", cpu) for pid, (_, cpu) in clocks.items()},
+                                       tcp=subprocess.TimeoutExpired("lsof", 30))
+        self.assertEqual(classify(an_hour_later, NOW + 3630.1)[0], "stalled")
+        self.assertTrue(classify(an_hour_later, NOW + 3630.1)[1][0].startswith("裏の作業が止まっている: PID 9204"))
+
+        (Path(self.tmp.name) / "cpu.json").unlink()
+        closed = self.processes(table, NOW, clocks, tcp="p9205\nf5\nn10.0.0.2:52000->140.82.112.6:443\nTST=CLOSE_WAIT\n")
+        self.assertEqual(classify(closed)[0], "stalled")
+        self.assertIn("TCP closed: 10.0.0.2:52000->140.82.112.6:443", classify(closed)[1][0])
+
+        # A script waiting on a sleep it started in another directory still waits.
+        (Path(self.tmp.name) / "cpu.json").unlink()
+        script = {9201: (1, "-zsh"), 9202: (9201, "claude"), 9206: (9202, "bash wait.sh"),
+                  9207: (9206, "sleep 7200")}
+        for now, elapsed in ((NOW, "01:00:00"), (NOW + 3600, "02:00:00")):
+            found = self.processes(script, now, {9206: (elapsed, "0:00.01"), 9207: ("00:30:00", "0:00.00")},
+                                   elsewhere=(9207,))
+        self.assertEqual(classify(found, NOW + 3600)[0], "working")
+
     def test_an_unsure_question_behind_a_background_job_is_read(self):
         maybe = "PR は出しました。表記をどちらにそろえるかは別に決める必要があります。"
         self.claude_says("/w/m", user("go"), assistant(text(maybe)))
@@ -1179,8 +1254,10 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/lead", "done"), worktree("/w/asks", "done")],
             [terminal("/w/lead", "claude", "term_lead"), terminal("/w/asks", "claude", "term_asks")],
             self.projects, {}, "要判断", now=NOW, judge=judging({asks: verdict(0.9, "blocked_on_others")}),
-            mail=mail)
+            mail=mail, processes={"/w/lead": [{"pid": 9301, "parent": 1, "command": "sleep 60", "elapsed": 5.0,
+                                               "cpu": 0.0, "still_since": None, "closed": []}]})
 
+        # A wait still running in the lead's worktree does not hide its unread reports.
         self.assertEqual({r["path"]: (r["class"], r["reasons"], r["closable"]) for r in result}, {
             "/w/lead": ("stalled", [f"2 orchestration messages unread since its last turn began (oldest {at(50)})"],
                         []),

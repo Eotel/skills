@@ -516,6 +516,25 @@ def output_readers() -> set[int]:
     return readers
 
 
+def processes_using(worktree: str, processes: dict[int, tuple[int, str]], cwds: dict[int, str],
+                    readers: set[int]) -> list[dict]:
+    """The processes of one table whose command names the worktree or whose current directory is inside it,
+    without this process's ancestors and `readers`; several worktrees can share the table and directories."""
+    path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
+    ancestors = set()
+    pid = os.getpid()
+    while pid in processes and pid not in ancestors:
+        ancestors.add(pid)
+        pid = processes[pid][0]
+    found = []
+    for pid, (_, command) in processes.items():
+        cwd = cwds.get(pid)
+        inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
+        if pid not in ancestors and pid not in readers and (path.search(command) or inside):
+            found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
+    return found
+
+
 def processes_in(worktree):
     """Processes using the worktree in their command or current directory, excluding ancestors and
     the commands reading this check's output.
@@ -524,25 +543,13 @@ def processes_in(worktree):
     system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`).
     A process of the tab running this check counts as outside a tab: it must not close itself.
     """
-    path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
     processes = process_table()
     if processes is None:
         return None
-    ancestors = set()
-    pid = os.getpid()
-    while pid in processes and pid not in ancestors:
-        ancestors.add(pid)
-        pid = processes[pid][0]
     cwds = process_cwds(processes)
     if cwds is None:
         return None
-    readers = output_readers()
-    found = []
-    for pid, (_, command) in processes.items():
-        cwd = cwds.get(pid)
-        inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
-        if pid not in ancestors and pid not in readers and (path.search(command) or inside):
-            found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
+    found = processes_using(worktree, processes, cwds, output_readers())
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
              if (root := tab_root(item["pid"], processes)) is not None and root != own_tab}

@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 
 import hourly_runtime
 import inbox_read
+import rm_check
 from worktree_notes import keep_note
 
 DEFAULT_CODEX_SESSIONS = [
@@ -1061,11 +1062,208 @@ def with_screen_agents(terms, screens, environment):
     return found, message
 
 
+class WorktreeProcess(TypedDict):
+    pid: int
+    parent: int
+    command: str
+    elapsed: float | None  # seconds it has run
+    cpu: float | None  # its CPU seconds
+    still_since: float | None  # epoch since which its CPU time has not moved, from earlier scans
+    closed: list[str]  # TCP peers whose side of a connection closed
+
+
+PROCESS_CPU = "~/.cache/orca-session-triage/process-cpu.json"
+STOPPED_AFTER = 3600  # seconds background work runs with its CPU time still before it counts as stopped
+# CPU seconds such work may add in that time: under one tick of ps's 0.01 seconds. A poller that runs gh every
+# five minutes adds ticks every hour; ps on macOS does not count a process's exited children.
+CPU_STILL = 0.005
+START_SLACK = 120  # seconds two reads of one process's start time may differ: ps's elapsed time and the scan's clock
+CLOSED_TCP = ("CLOSED", "CLOSE_WAIT")
+SHELLS = ("zsh", "bash", "sh", "fish")
+AGENT_CLIS = ("claude", "codex", "codex.js")
+
+
+def agent_cli(command: str) -> bool:
+    return any(Path(token).name in AGENT_CLIS for token in command.split()[:2])
+
+
+def waits(command: str) -> bool:
+    """A timed wait (`sleep`), or a shell running a command line or script (`zsh -c …`, `bash -lc …`,
+    `bash wait.sh`): how agents run their background jobs and how wait loops are written."""
+    tokens = command.split()
+    if not tokens:
+        return False
+    if Path(tokens[0]).name == "sleep":
+        return True
+    return Path(tokens[0]).name in SHELLS and len(tokens) > 1 and (not tokens[1].startswith("-") or any(
+        token.startswith("-") and not token.startswith("--") and "c" in token for token in tokens[1:3]))
+
+
+def job_root(pid: int, table: dict[int, tuple[int, str]]) -> str:
+    """The command that started the process's job: its ancestor just below launchd, an agent CLI, or a tab's
+    own shell. An MCP server's job is itself, and a leftover dev server's or plugin's is not a shell."""
+    seen = set()
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        parent = table[pid][0]
+        above = table[parent][1] if parent in table else ""
+        if parent <= 1 or not above or agent_cli(above) or rm_check.LOGIN_SHELL.fullmatch(above.strip()):
+            break
+        pid = parent
+    return table[pid][1] if pid in table else ""
+
+
+def clock_seconds(value: str) -> float | None:
+    """Seconds from ps's [[days-]hours:]minutes:seconds."""
+    days, _, clock = value.rpartition("-")
+    try:
+        seconds = 0.0
+        for part in clock.split(":"):
+            seconds = seconds * 60 + float(part)
+        return seconds + int(days or 0) * 86400
+    except ValueError:
+        return None
+
+
+def worktree_processes(paths: list[str], cpu_file: Path, now: float) -> dict[str, list[WorktreeProcess]]:
+    """The processes of wait loops, timed waits, and agents' background jobs in each local worktree: by
+    rm_check.py's rule (current directory or command inside it), those whose job a `sleep` or a shell running a
+    command line or script started (see waits and job_root), and the children they started anywhere.
+
+    One process table and directory inventory serves every worktree. `still_since` comes from `cpu_file`, which
+    keeps each process's CPU time and when it last moved; an entry is dropped once its process is gone.
+    """
+    table = rm_check.process_table()
+    cwds = rm_check.process_cwds(table) if table else None
+    if not paths or not table or cwds is None:
+        return {}
+    readers = rm_check.output_readers()
+    found = {}
+    for path in paths:
+        # The shell still running a tab's setup is no work.
+        found[path] = [item for item in rm_check.processes_using(path, table, cwds, readers)
+                       if not any(wait in item["command"] for wait in rm_check.SETUP_WAITS)
+                       and waits(job_root(item["pid"], table))]
+    children: dict[int, list[int]] = {}
+    for pid, (parent, _) in table.items():
+        children.setdefault(parent, []).append(pid)
+    for items in found.values():
+        # A job's children belong to it wherever they run (`(cd /tmp && sleep 600)`).
+        listed = {item["pid"] for item in items}
+        stack = list(listed)
+        while stack:
+            for child in children.get(stack.pop(), []):
+                if child not in listed:
+                    listed.add(child)
+                    stack.append(child)
+                    items.append({"pid": child, "command": table[child][1][:160]})
+    pids = sorted({item["pid"] for items in found.values() for item in items})
+    clocks: dict[int, tuple[float | None, float | None]] = {}
+    closed: dict[int, list[str]] = {}
+    if pids:
+        listed = ",".join(map(str, pids))
+
+        def output(command: list[str]) -> str:
+            # A failed socket read must not take the CPU times with it.
+            try:
+                return subprocess.run(command, capture_output=True, text=True, timeout=ORCA_TIMEOUT).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        ps = output(["ps", "-o", "pid=,etime=,time=", "-p", listed])
+        tcp = output(["lsof", "-n", "-P", "-a", "-p", listed, "-iTCP", "-FpnT"])
+        for line in ps.splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[0].isdigit():
+                clocks[int(fields[0])] = (clock_seconds(fields[1]), clock_seconds(fields[2]))
+        pid, peer = None, ""
+        for line in tcp.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:]) if line[1:].isdigit() else None
+            elif line.startswith("n"):
+                peer = line[1:]
+            elif pid is not None and line.removeprefix("TST=") in CLOSED_TCP:
+                closed.setdefault(pid, []).append(peer)
+    try:
+        kept = json.loads(cpu_file.read_text())
+    except (OSError, ValueError):
+        kept = {}
+    kept = kept if isinstance(kept, dict) else {}
+    # A process of a worktree this scan left out (--only) keeps its history while it lives.
+    seen: dict[str, dict] = {key: value for key, value in kept.items()
+                             if key.isdigit() and int(key) in table and int(key) not in pids}
+    still: dict[int, float | None] = {}
+    for pid in pids:
+        elapsed, cpu = clocks.get(pid, (None, None))
+        if elapsed is None or cpu is None:
+            still[pid] = None
+            continue
+        start, before = now - elapsed, kept.get(str(pid))
+        # A pid the system reused started at another time.
+        if not (isinstance(before, dict) and isinstance(before.get("start"), (int, float))
+                and isinstance(before.get("cpu"), (int, float)) and abs(before["start"] - start) <= START_SLACK):
+            before = None
+        if before is not None and cpu - before["cpu"] <= CPU_STILL:
+            seen[str(pid)] = before
+        else:
+            # Seen first, a process that has added no CPU time since it started has been still all along.
+            seen[str(pid)] = {"start": start, "cpu": cpu,
+                              "since": start if before is None and cpu <= CPU_STILL else now}
+        still[pid] = seen[str(pid)].get("since")
+    try:
+        write_json_atomically(cpu_file, seen)
+    except OSError:
+        pass
+    return {path: [{"pid": item["pid"], "parent": table[item["pid"]][0], "command": item["command"],
+                    "elapsed": clocks.get(item["pid"], (None,))[0],
+                    "cpu": clocks.get(item["pid"], (None, None))[1], "still_since": still.get(item["pid"]),
+                    "closed": closed.get(item["pid"], [])} for item in items]
+            for path, items in found.items()}
+
+
+def stopped(process: WorktreeProcess, now: float) -> bool:
+    """Background work that stopped: its connection closed, or its CPU time has not moved for an hour. A `sleep`
+    is a timed wait and never counts."""
+    if Path(process["command"].split()[0]).name == "sleep":
+        return False
+    since = process["still_since"]
+    return bool(process["closed"]) or (since is not None and now - since >= STOPPED_AFTER)
+
+
+def process_line(process: WorktreeProcess) -> str:
+    def span(seconds: float | None) -> str:
+        return "?" if seconds is None else f"{int(seconds // 3600)}h{int(seconds % 3600 // 60):02d}m"
+    closed = f", TCP closed: {', '.join(process['closed'])}" if process["closed"] else ""
+    return (f"PID {process['pid']} {process['command'][:80]} (running {span(process['elapsed'])}, "
+            f"CPU {process['cpu'] if process['cpu'] is not None else '?'}s{closed})")
+
+
+def with_processes(row: dict, now: float) -> tuple[str, list[str]]:
+    """The class and reasons once the worktree's processes are read: a wait still running keeps a stalled or
+    finished row working, and background work whose processes at the ends all stopped makes its working row
+    stalled. A turn an API failure ended and a lead's unread worker reports stay stalled: the agent does not
+    come back for the wait, and the lead is woken for its mail."""
+    processes = row.get("processes") or []
+    if not processes or row.get("stop") or row.get("unread_mail"):
+        return row["class"], row["reasons"]
+    lines = [process_line(process) for process in processes[:3]]
+    # A shell running a job only waits for its children: the processes at the ends do the work.
+    parents = {process["parent"] for process in processes}
+    halted = all(stopped(process, now) for process in processes if process["pid"] not in parents)
+    if row["class"] in ("stalled", "finished") and not halted:
+        return "working", ["a background job runs in the worktree: " + line for line in lines]
+    if row["class"] == "working" and row["reasons"] == [BACKGROUND_REASON]:
+        if halted:
+            return "stalled", ["裏の作業が止まっている: " + "; ".join(lines)]
+        return "working", [BACKGROUND_REASON + ": " + "; ".join(lines)]
+    return row["class"], row["reasons"]
+
+
 def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: str | Path,
                     codex_by_cwd: dict[str, list[dict]], decision_marker: str, now: float | None = None,
                     shell_idle_minutes: float = 30, judge: Callable[[str], dict | None] = lambda message: None,
                     mail: dict | None = None, screens: Screens | None = None,
-                    live_transcripts: dict[str, list[Path]] | None = None) -> list[dict]:
+                    live_transcripts: dict[str, list[Path]] | None = None,
+                    processes: dict[str, list[WorktreeProcess]] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1077,7 +1275,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     without output metadata use their last line, and another
     Mac's worktree whose agents Orca keeps no message of takes the agent and
     last reply its tabs show. `live_transcripts` maps a local worktree to the transcripts of Claude sessions
-    running under it elsewhere (see running_claude_transcripts).
+    running under it elsewhere (see running_claude_transcripts). `processes` maps a local worktree to the
+    processes working in it (see worktree_processes and with_processes).
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     screens = screens or {}
@@ -1142,6 +1341,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["stop"] = stop_reason(row)
         row["class"], row["reasons"] = classify(row, decision_marker)
+        row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
+        row["class"], row["reasons"] = with_processes(row, now)
         row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
         row["reasons"] = [*row["reasons"], *dict.fromkeys(
@@ -2258,8 +2459,8 @@ REVIEW_DIR = "~/.cache/orca-briefs/review/out"
 MERGE = re.compile(r"(?<![A-Za-z])merge(?![A-Za-z])|マージ", re.IGNORECASE)
 ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class", "scan_class", "reasons",
             "question", "merge_question", "review", "stop", "waits_on", "next_step", "verdict", "final",
-            "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "tabs",
-            "closable", "meaningful_tabs", "open_pr_cleanup")
+            "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "processes",
+            "tabs", "closable", "meaningful_tabs", "open_pr_cleanup")
 
 
 class ReviewResult(TypedDict):
@@ -2331,6 +2532,7 @@ def row_view(row: dict) -> dict:
         "final": final, "last_user": asked or "", "transcripts": transcripts,
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
         "prompt_waiting": row.get("prompt_waiting"), "queued_input": row.get("queued_input") or [],
+        "processes": row.get("processes") or [],
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
         "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
@@ -2466,13 +2668,16 @@ def main(argv: list[str] | None = None) -> int:
     # Orca state read from files has no live tabs to read.
     screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals))
     claude_root = str(Path(args.claude_projects).expanduser())
+    processes = {} if args.ps_json else worktree_processes(
+        [w["path"] for w in worktrees if not w.get("_environment")], Path(PROCESS_CPU).expanduser(), time.time())
     live = {} if args.ps_json else running_claude_transcripts(
         [w["path"] for w in worktrees if not w.get("_environment")], claude_session_dirs(), claude_root,
         process_table(), process_cwds)
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
-                                               mail=read_mail(args), screens=screens, live_transcripts=live),
+                                               mail=read_mail(args), screens=screens, live_transcripts=live,
+                                               processes=processes),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
