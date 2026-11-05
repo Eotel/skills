@@ -1057,6 +1057,11 @@ class ClassifyTests(unittest.TestCase):
         [handed] = self.inventory([worktree("/w/handed", "working", agent="codex")],
                                   [terminal("/w/handed", "codex", "term_x")], codex)
         self.assertEqual((handed["class"], handed["stop"]), ("working", None))
+        # And back: Codex failed earlier, then Claude, running in its place, failed too.
+        ended("/w/back", "API Error: Can't reach the API server (ENOTFOUND)", "server_error")
+        failed = {"/w/back": [{**codex["/w/handed"][0], "api_error": "■ Selected model is at capacity"}]}
+        [back] = self.inventory([worktree("/w/back", "working")], [terminal("/w/back", "claude", "term_b")], failed)
+        self.assertEqual((back["class"], back["stop"]["agent"], back["stop"]["kind"]), ("stalled", "claude", "connection"))
 
     def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self):
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.

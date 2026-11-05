@@ -516,20 +516,29 @@ def latest_message(row):
     return "claude", claude["final_text"]
 
 
-def cut_off(row):
-    """The API error that ended the last Claude or Codex turn, or None.
+def failure(row: dict) -> tuple[str, str | None] | None:
+    """(error, agent) of the API failure that ended the last Claude or Codex turn, or None.
 
     Claude Code does not resume such a turn, and a monitor it left running keeps
     Orca at working, so only the transcript shows the agent stopped mid-task.
     A failure Codex's tab still shows can be an earlier turn's: it counts only
-    while no turn runs.
+    while no turn runs. A failure of an agent another one Orca shows in its own
+    turn took the worktree over from is history. Orca's copy of another Mac's
+    message names no agent.
     """
+    running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
     codex = row["codex"][-1] if row["codex"] else {}
     orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
-    screen = row.get("codex_screen_error")
-    return ((screen if screen and not turn_runs(row) else None) or codex.get("api_error")
-            or (row["claude"] or {}).get("api_error")
-            or (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None))
+    found = [(None if running else row.get("codex_screen_error"), "codex"), (codex.get("api_error"), "codex"),
+             ((row["claude"] or {}).get("api_error"), "claude"),
+             (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None, None)]
+    return next(((error, agent) for error, agent in found
+                 if error and not (agent and running and agent not in running)), None)
+
+
+def cut_off(row: dict) -> str | None:
+    """The API error that ended the last Claude or Codex turn (failure), or None."""
+    return (failure(row) or (None, None))[0]
 
 
 # The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
@@ -557,17 +566,10 @@ def stop_reason(row: dict) -> StopReason | None:
     expired login a person has to renew, or another error a person reads (a safeguard flag, an invalid request),
     which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
-    error = cut_off(row)
-    if not error:
+    if not (found := failure(row)):
         return None
-    claude = row.get("claude") or {}
-    tag = claude.get("api_error_kind") if error == claude.get("api_error") else None
-    agent = "claude" if error == claude.get("api_error") else "codex" if row.get("codex") or row.get(
-        "codex_screen_error") else None
-    # Another agent Orca shows in its own turn took the worktree over: the failure is history.
-    running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
-    if agent and running and agent not in running:
-        return None
+    error, agent = found
+    tag = (row.get("claude") or {}).get("api_error_kind") if agent == "claude" else None
     if tag == "rate_limit" or USAGE_LIMIT.search(error):
         resets = RESETS.search(error)
         return {"kind": "usage_limit", "action": "wait", "agent": agent, "error": error,
