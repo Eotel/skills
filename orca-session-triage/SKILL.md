@@ -111,7 +111,7 @@ board's done cards; close what the user approves.
   latest message before you ask it; when that message settled it, rewrite the
   comment without the marker so other tabs stop listing it. The marker alone
   leaves a row whose agent is in its turn `working` (reason 「old decision marker
-  in comment」), and a row it makes `waiting` asks the comment's text as its
+  in comment」), and a row it alone makes `waiting` asks the comment's text as its
   `question`. Each row lists its
   `done_cards`, one per agent Orca shows
   as done: the `handle` that closes its tab (null while the tab sleeps or

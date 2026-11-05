@@ -1350,8 +1350,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
         row["class"], row["reasons"] = with_processes(row, now)
-        if MARKER_REASON in row["reasons"]:
-            # The marked comment asks the question: the final message may be about something else.
+        if waiting_reasons(row, decision_marker) == [MARKER_REASON]:
+            # The marked comment alone asks the question: the final message may be about something else.
             row["marker_question"] = (row["comment"] or "").removeprefix(decision_marker).lstrip(":： \n")
         row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
@@ -1779,7 +1779,7 @@ def checkout_in_use(git: dict, pr: dict) -> str | None:
 
 WAITED_ITEM = re.compile(r"github\.com/(?P<url>[\w.-]+/[\w.-]+)/(?:pull|issues)/(?P<url_number>\d+)"
                          r"|(?<![\w.-])(?:(?P<repo>[A-Za-z0-9][\w.-]*(?:/[\w.-]+)?)(?: PR)? ?)?#(?P<number>\d+)")
-NOT_REPOS = ("pr", "prs", "issue")
+NOT_REPOS = ("pr", "prs", "issue", "and", "or", "then", "review")  # words before `#N` that name no repository
 
 
 def waited_items(waits_on: str, slug: str, names: set[str]) -> list[tuple[str | None, int]]:

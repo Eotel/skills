@@ -845,8 +845,11 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/a"], ("waiting", ["AskUserQuestion pending"]))
         self.assertEqual(result["/w/b"], ("waiting", ["final message asks (Jev 0.90)"]))
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
-        # The marked comment asks, not the final message.
+        # The marked comment asks, not the final message; a final message that asks keeps its own question.
         self.assertEqual(scan.row_view(next(r for r in rows if r["path"] == "/w/c"))["question"], "which base?")
+        self.assertNotIn("marker_question", scan.build_inventory(
+            [worktree("/w/b", "done", comment="要判断: which base?")], [terminal("/w/b", "claude")], self.projects,
+            {}, "要判断", now=NOW, judge=judging({"PR is up.\nShall I merge it?": verdict(0.9)}))[0])
         # An agent in its turn works past the decision it marked.
         self.assertEqual(result["/w/old"], ("working", ["old decision marker in comment: an agent is in its turn"]))
         self.assertNotIn("/w/main", result)
@@ -1363,6 +1366,8 @@ class NextStepFactTests(unittest.TestCase):
         inbox = {"done": {"at": "2026-10-28T01:00:00Z", "host": "mbp", "text": "done"}}
         verdicts = {"/w/sp": {"read": scan.read_key({**scan_with("OPEN", {}), "inbox": inbox}), "class": "blocked",
                               "waits_on": "hdknr（masters#731→#732 のレビュー）、三浦さん（masters-ui#125→#126 の merge）"}}
+        self.assertEqual(scan.waited_items("masters#731 and #732", "spin-dd/x", {"taihei-coresys-masters"}),
+                         [("spin-dd/taihei-coresys-masters", 731), ("spin-dd/taihei-coresys-masters", 732)])
         waiting = {**scan_with("OPEN", verdicts), "inbox": inbox}
         self.assertEqual((scan.review_queue([waiting], verdicts), scan.with_verdicts([waiting], verdicts)[0]["verdict"]["class"]),
                          ([], "blocked"))
