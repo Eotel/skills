@@ -88,7 +88,8 @@ class FakeGitHub:
 
     `gh api graphql` answers each alias from the repository's PR nodes, newest first; a
     missing PR is a null alias with a NOT_FOUND error, and gh then exits 1 while the
-    other aliases keep their data. A REST read answers from `activity` by endpoint.
+    other aliases keep their data. An issue or PR read for its state answers from the
+    PR nodes. A REST read answers from `activity` by endpoint.
     """
 
     def __init__(self, repos, activity=None):
@@ -99,6 +100,8 @@ class FakeGitHub:
         if argv[:3] != ["gh", "api", "graphql"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps([self.activity.get(argv[-1], [])]), "")
         query = next(arg for arg in argv if arg.startswith("query=")).removeprefix("query=")
+        if "fragment PrFacts" in query and "...PrFacts" not in query:
+            return subprocess.CompletedProcess(argv, 1, "", "gh: Fragment PrFacts was defined, but not used")
         owner, name = re.search(r'repository\(owner: ("[^"]*"), name: ("[^"]*")\)', query).groups()
         nodes = sorted(self.repos.get(json.loads(owner) + "/" + json.loads(name), []), key=lambda n: -n["number"])
         repository, errors = {"defaultBranchRef": {"name": "main"}}, []
@@ -108,6 +111,8 @@ class FakeGitHub:
                 errors.append({"type": "NOT_FOUND", "path": ["repository", alias]})
         for alias, branch in re.findall(r'(\w+): pullRequests\(headRefName: ("(?:[^"\\]|\\.)*")', query):
             repository[alias] = {"nodes": [n for n in nodes if n["headRefName"] == json.loads(branch)][:5]}
+        for alias, number in re.findall(r"(\w+): issueOrPullRequest\(number: (\d+)\)", query):
+            repository[alias] = next(({"state": n["state"]} for n in nodes if n["number"] == int(number)), None)
         body = {"data": {"repository": repository}, **({"errors": errors} if errors else {})}
         return subprocess.CompletedProcess(argv, 1 if errors else 0, json.dumps(body), "")
 
@@ -826,16 +831,24 @@ class ClassifyTests(unittest.TestCase):
         self.claude_says("/w/a", user("go"), assistant(
             {"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}))
         self.claude_says("/w/b", user("go"), assistant(text("PR is up.\nShall I merge it?")))
-        result = self.classes(
+        self.claude_says("/w/c", user("go"), assistant(text("Rebased on main and pushed.")))
+        rows = self.inventory(
             [worktree("/w/a", "working"), worktree("/w/b", "done"),
-             worktree("/w/c", "working", comment="要判断: which base?"),
+             worktree("/w/c", "done", comment="要判断: which base?"),
+             worktree("/w/old", "working", comment="要判断: which base?"),
              worktree("/w/main", main=True)],
-            [terminal("/w/a", "claude"), terminal("/w/b", "claude"), terminal("/w/c", "claude")],
+            [terminal("/w/a", "claude"), terminal("/w/b", "claude"), terminal("/w/c", "claude"),
+             terminal("/w/old", "claude")],
             judge=judging({"PR is up.\nShall I merge it?": verdict(0.9)}))
+        result = {r["path"]: (r["class"], r["reasons"]) for r in rows}
 
         self.assertEqual(result["/w/a"], ("waiting", ["AskUserQuestion pending"]))
         self.assertEqual(result["/w/b"], ("waiting", ["final message asks (Jev 0.90)"]))
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
+        # The marked comment asks, not the final message.
+        self.assertEqual(scan.row_view(next(r for r in rows if r["path"] == "/w/c"))["question"], "which base?")
+        # An agent in its turn works past the decision it marked.
+        self.assertEqual(result["/w/old"], ("working", ["old decision marker in comment: an agent is in its turn"]))
         self.assertNotIn("/w/main", result)
 
     def test_a_final_message_jev_judges_as_waiting_on_the_user_is_waiting(self):
@@ -1328,6 +1341,37 @@ class JevTests(unittest.TestCase):
 
 
 class NextStepFactTests(unittest.TestCase):
+    def test_a_saved_verdict_is_read_again_once_everything_it_waits_on_closed(self):
+        # servicean-87 stayed blocked on masters#731→#732 and masters-ui#125→#126 after all four merged.
+        rows = [{"path": "/w/sp", "repo": "taihei-service-project", "class": "stalled", "linked_pr": None,
+                 "jev": {"asks": 0.1}, "claude": {"final_at": "t1"}, "codex": [], "reasons": []},
+                {"path": "/w/m", "repo": "taihei-coresys-masters", "class": "working", "linked_pr": None},
+                {"path": "/w/ui", "repo": "taihei-masters-ui", "class": "working", "linked_pr": None}]
+        gits = {"/w/sp": {"branch": "sp-87", "head": "aaa", "dirty": 0, "unpushed": 0,
+                          "github": "spin-dd/taihei-service-project"}}
+
+        def scan_with(masters_732: str, verdicts: dict) -> dict:
+            github = FakeGitHub({"spin-dd/taihei-coresys-masters": [pr_node(731, state="MERGED"),
+                                                                     pr_node(732, state=masters_732)],
+                                 "spin-dd/taihei-masters-ui": [pr_node(125, state="MERGED"),
+                                                                pr_node(126, state="MERGED")]})
+            with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
+                return scan.add_next_step_facts(rows, git_lookup=gits.get, verdicts=verdicts,
+                                                pr_lookup=partial(scan.gh_prs, cache_dir=Path(cache)))[0]
+
+        verdicts = {"/w/sp": {"read": scan.read_key(scan_with("OPEN", {})), "class": "blocked",
+                              "waits_on": "hdknr（masters#731→#732 のレビュー）、三浦さん（masters-ui#125→#126 の merge）"}}
+        waiting = scan_with("OPEN", verdicts)
+        self.assertEqual((scan.review_queue([waiting], verdicts), scan.with_verdicts([waiting], verdicts)[0]["verdict"]["class"]),
+                         ([], "blocked"))
+
+        closed = scan_with("MERGED", verdicts)
+        self.assertEqual([entry["path"] for entry in scan.review_queue([closed], verdicts)], ["/w/sp"])
+        self.assertNotIn("verdict", scan.with_verdicts([closed], verdicts)[0])
+        self.assertEqual(closed["reasons"], ["everything the saved verdict waits on closed: "
+                                             "spin-dd/taihei-coresys-masters#731, spin-dd/taihei-coresys-masters#732, "
+                                             "spin-dd/taihei-masters-ui#125, spin-dd/taihei-masters-ui#126"])
+
     def test_summarizes_review_merge_and_check_state_of_a_pr(self):
         data = {"number": 11263, "state": "OPEN", "reviewDecision": "APPROVED",
                 "reviewRequests": [{"login": "k-mizokami"}, {"name": "backend"}],
@@ -5973,7 +6017,8 @@ class VerdictStoreTests(unittest.TestCase):
         for changed in (self.row("/w/a", pr={**open_pr, "state": "MERGED"}),
                         self.row("/w/a", pr={**open_pr, "head_oid": "b"}),
                         self.row("/w/a", pr=open_pr, dirty=2),
-                        self.row("/w/a", pr=open_pr, final_at="t2")):
+                        self.row("/w/a", pr=open_pr, final_at="t2"),
+                        {**self.row("/w/a", pr=open_pr), "comment": "解消しました"}):
             self.assertEqual([e["path"] for e in scan.review_queue([changed], verdicts)], ["/w/a"])
         self.assertEqual([e["path"] for e in scan.review_queue([self.row("/w/none", final_at=None)], verdicts)],
                          ["/w/none"])

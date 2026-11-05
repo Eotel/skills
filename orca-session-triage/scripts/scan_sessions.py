@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NamedTuple, NotRequired, TypedDict
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -642,8 +642,12 @@ def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     if any(a["state"] == "waiting" for a in row["agents"]):
         reasons.append("Orca agent waiting")
     if decision_marker and (row["comment"] or "").startswith(decision_marker):
-        reasons.append("decision marker in comment")
+        reasons.append(MARKER_REASON)
     return reasons
+
+
+MARKER_REASON = "decision marker in comment"
+OLD_MARKER_REASON = "old decision marker in comment: an agent is in its turn"
 
 
 NO_SESSION_REASON = "no agent session in this worktree"
@@ -668,6 +672,9 @@ def classify(row, decision_marker):
         return "stalled", [stop_line(stop)]
     reasons = waiting_reasons(row, decision_marker)
     mail = [mail_reason(row["unread_mail"])] if row.get("unread_mail") else []
+    # An agent works past a decision it marked: the marker alone no longer waits on anyone.
+    if reasons == [MARKER_REASON] and turn_runs(row):
+        return "working", [OLD_MARKER_REASON]
     if reasons:
         return "waiting", reasons + mail
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
@@ -1343,6 +1350,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
         row["class"], row["reasons"] = with_processes(row, now)
+        if MARKER_REASON in row["reasons"]:
+            # The marked comment asks the question: the final message may be about something else.
+            row["marker_question"] = (row["comment"] or "").removeprefix(decision_marker).lstrip(":： \n")
         row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
         row["reasons"] = [*row["reasons"], *dict.fromkeys(
@@ -1457,7 +1467,12 @@ def summarize_pr(data, reviews=(), comments=(), line_comments=()):
     }
 
 
-PrRef = int | str  # a PR number, or the head branch to find the PR by
+class Item(NamedTuple):
+    """An issue or PR a saved verdict waits on, read only for its state."""
+    number: int
+
+
+PrRef = int | str | Item  # a PR number, the head branch to find the PR by, or an issue or PR to read the state of
 PrLookup = Callable[[str, list[PrRef]], dict[PrRef, dict | None]]
 
 GH_TIMEOUT = 15
@@ -1489,6 +1504,8 @@ def is_pr_ref(ref: object) -> bool:
     """A positive PR number, or a name git accepts for a branch (quoted with json.dumps in the query)."""
     if isinstance(ref, bool):
         return False
+    if isinstance(ref, Item):
+        return ref.number > 0
     if isinstance(ref, int):
         return ref > 0
     return isinstance(ref, str) and bool(ref) and not NOT_IN_BRANCH.search(ref)
@@ -1499,7 +1516,11 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
     aliases: dict[str, PrRef] = {}
     fields = ["defaultBranchRef { name }"]
     for index, ref in enumerate(refs):
-        if isinstance(ref, int):
+        if isinstance(ref, Item):
+            alias = f"item_{ref.number}"
+            fields.append(f"{alias}: issueOrPullRequest(number: {ref.number}) "
+                          "{ ... on Issue { state } ... on PullRequest { state } }")
+        elif isinstance(ref, int):
             alias = f"pr_{ref}"
             fields.append(f"{alias}: pullRequest(number: {ref}) {{ ...PrFacts }}")
         else:
@@ -1508,8 +1529,10 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
                           f"first: {BRANCH_CANDIDATES}, orderBy: {{field: CREATED_AT, direction: DESC}}) "
                           "{ nodes { ...PrFacts } }")
         aliases[alias] = ref
+    # GitHub refuses a fragment the query does not use: a query of states alone leaves it out.
+    facts = PR_FACTS if any(not isinstance(ref, Item) for ref in refs) else ""
     return (f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ "
-            + " ".join(fields) + " } }" + PR_FACTS), aliases
+            + " ".join(fields) + " } }" + facts), aliases
 
 
 def graphql_repository(slug: str, query: str) -> dict | None:
@@ -1624,14 +1647,17 @@ def gh_prs(slug: str, refs: list[PrRef],
         default_branch = (repository.get("defaultBranchRef") or {}).get("name")
         for alias, ref in aliases.items():
             answer = repository.get(alias) or {}
+            if isinstance(ref, Item):
+                found[ref] = {"state": answer["state"]} if isinstance(answer.get("state"), str) else None
+                continue
             node = (pr_for_branch(answer.get("nodes") or [], ref, default_branch)
                     if isinstance(ref, str) else answer)
             found[ref] = node if isinstance(node, dict) and isinstance(node.get("number"), int) else None
-    nodes = {node["number"]: node for node in found.values() if node}
+    nodes = {node["number"]: node for ref, node in found.items() if node and not isinstance(ref, Item)}
     with ThreadPoolExecutor(max_workers=max(1, min(4, len(nodes)))) as pool:
         activity = dict(zip(nodes, pool.map(lambda node: pr_activity(slug, node, cache_dir), nodes.values())))
-    return {ref: summarize_pr(view_fields(node), *activity[node["number"]]) if node else None
-            for ref, node in found.items()}
+    return {ref: (node if isinstance(ref, Item) else summarize_pr(view_fields(node), *activity[node["number"]]))
+            if node else None for ref, node in found.items()}
 
 
 def parse_time(value):
@@ -1751,12 +1777,39 @@ def checkout_in_use(git: dict, pr: dict) -> str | None:
     return datetime.fromtimestamp(latest).astimezone().strftime("%m/%d %H:%M")
 
 
+WAITED_ITEM = re.compile(r"github\.com/(?P<url>[\w.-]+/[\w.-]+)/(?:pull|issues)/(?P<url_number>\d+)"
+                         r"|(?<![\w.-])(?:(?P<repo>[A-Za-z0-9][\w.-]*(?:/[\w.-]+)?)(?: PR)? ?)?#(?P<number>\d+)")
+NOT_REPOS = ("pr", "prs", "issue")
+
+
+def waited_items(waits_on: str, slug: str, names: set[str]) -> list[tuple[str | None, int]]:
+    """The issues and PRs a verdict's waits_on names. `repo#N` is a repository of the row's organization:
+    among `names`, the repositories known there, the one named so or the only one whose name ends in `-repo`
+    (masters → taihei-coresys-masters), else None. A bare `#N` (or `PR #N`) belongs to the repository named
+    before it, else the row's own."""
+    org = slug.partition("/")[0]
+    items: list[tuple[str | None, int]] = []
+    last: str | None = slug
+    for found in WAITED_ITEM.finditer(waits_on):
+        repo = found["url"] or found["repo"]
+        if repo and "/" in repo:
+            last = repo
+        elif repo and repo.lower() not in NOT_REPOS:
+            ends = [name for name in names if name.lower().endswith("-" + repo.lower())]
+            last = (f"{org}/{repo}" if repo in names else f"{org}/{ends[0]}" if len(ends) == 1 else None)
+        items.append((last, int(found["url_number"] or found["number"] or 0)))
+    return list(dict.fromkeys(items))
+
+
 def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | None] = git_state,
-                        pr_lookup: PrLookup = gh_prs) -> list[dict]:
+                        pr_lookup: PrLookup = gh_prs, verdicts: dict | None = None) -> list[dict]:
     """Add git and PR facts to rows needing review or completed rows with no current agent.
 
     `pr_lookup(slug, refs)` reads every PR one repository's rows need at once
     and returns a summary or None per ref; repositories are read in parallel.
+    The issues and PRs each row's saved verdict waits on (`verdicts`) are read in the
+    same queries; once every one is closed, the row's `waits_closed` names them and
+    the verdict no longer holds (current_verdict), so the row is read again.
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
@@ -1767,6 +1820,16 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
     fact_row_ids = {id(row) for row in fact_rows}
     git_by_row = {id(row): (remote_git_hint(row) if row.get("environment") else git_lookup(row["path"]))
                    for row in fact_rows}
+    # Orca names a repository as GitHub does; the checkouts read here say which organization holds it.
+    known = {git["github"] for git in git_by_row.values() if git and git.get("github")}
+    repo_names = {row["repo"] for row in rows if row.get("repo")}
+    waits_by_row: dict[int, list[tuple[str | None, int]]] = {}
+    for row in fact_rows:
+        git, verdict = git_by_row[id(row)], (verdicts or {}).get(row_identity(row))
+        if git and git.get("github") and isinstance(verdict, dict) and isinstance(verdict.get("waits_on"), str):
+            org = git["github"].partition("/")[0]
+            names = repo_names | {slug.partition("/")[2] for slug in known if slug.partition("/")[0] == org}
+            waits_by_row[id(row)] = waited_items(verdict["waits_on"], git["github"], names)
     refs_by_repo: dict[str, list[PrRef]] = {}
     for row in rows:
         if id(row) not in fact_row_ids:
@@ -1777,6 +1840,12 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             refs = refs_by_repo.setdefault(git["github"], [])
             if ref not in refs:
                 refs.append(ref)
+        for slug, number in waits_by_row.get(id(row), []):
+            if slug is None:
+                continue
+            refs = refs_by_repo.setdefault(slug, [])
+            if Item(number) not in refs:
+                refs.append(Item(number))
 
     def lookup(slug: str) -> dict[PrRef, dict | None]:
         try:
@@ -1795,7 +1864,7 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
         if id(row) not in fact_row_ids:
             result.append(row)
             continue
-        git = git_by_row[id(row)]
+        git, waits = git_by_row[id(row)], waits_by_row.get(id(row), [])
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
         if pr is not None and git is not None:
@@ -1821,6 +1890,12 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             row = {**row, "waits_on": "self",
                    "reasons": [*(reasons if isinstance(reasons, list) else []),
                                "human PR response after the latest commit"]}
+        if waits and all(slug and (prs.get((slug, Item(number))) or {}).get("state") in ("CLOSED", "MERGED")
+                         for slug, number in waits) and current_verdict(row, verdicts or {}):
+            closed = [f"{slug}#{number}" for slug, number in waits]
+            row = {**row, "waits_closed": closed,
+                   "reasons": [*row.get("reasons", []), "everything the saved verdict waits on closed: "
+                               + ", ".join(closed)]}
         result.append(row)
     return result
 
@@ -1934,8 +2009,8 @@ def newest_report(row: dict) -> dict | None:
 
 
 def read_key(row: dict) -> str | None:
-    """What a careful read saw: final message, PR, human activity, tree, inbox reports, and permission prompt.
-    None without a message.
+    """What a careful read saw: final message, PR, human activity, tree, inbox reports, permission prompt, and
+    Orca comment. None without a message.
 
     A timeless message uses a text digest. An inbox answer changes the key,
     and a verdict holds only while the key is unchanged.
@@ -1951,7 +2026,8 @@ def read_key(row: dict) -> str | None:
              for _, report in sorted((row.get("inbox") or {}).items())]
     return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
                        pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty"),
-                       *([inbox] if inbox else []), *([row["prompt_waiting"]] if row.get("prompt_waiting") else [])])
+                       *([inbox] if inbox else []), *([row["prompt_waiting"]] if row.get("prompt_waiting") else []),
+                       *([{"comment": row["comment"]}] if row.get("comment") else [])])
 
 
 def row_identity(row):
@@ -1960,7 +2036,9 @@ def row_identity(row):
 
 
 def current_verdict(row, verdicts):
-    """The stored verdict for what the row shows now, or None."""
+    """The stored verdict for what the row shows now, or None once everything it waits on closed."""
+    if row.get("waits_closed"):
+        return None
     key = read_key(row)
     verdict = verdicts.get(row_identity(row)) if key is not None else None
     return verdict if isinstance(verdict, dict) and verdict.get("read") == key else None
@@ -2514,7 +2592,8 @@ def row_view(row: dict) -> dict:
     asked = {"claude": (row.get("claude") or {}).get("last_user"),
              "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     github = github_of(row)
-    question = prompt_question(row.get("prompt_waiting") or {}) or verdict.get("question") or ""
+    question = (prompt_question(row.get("prompt_waiting") or {}) or row.get("marker_question")
+                or verdict.get("question") or "")
     merge_question = asks_merge(question, row.get("comment") or "")
     transcripts: Transcripts = {
         "claude": [path] if (path := (row.get("claude") or {}).get("transcript")) else [],
@@ -2673,15 +2752,16 @@ def main(argv: list[str] | None = None) -> int:
     live = {} if args.ps_json else running_claude_transcripts(
         [w["path"] for w in worktrees if not w.get("_environment")], claude_session_dirs(), claude_root,
         process_table(), process_cwds)
+    verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
                                                processes=processes),
-                               pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()))
+                               pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()),
+                               verdicts=verdicts)
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
-    verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = with_verdicts(rows, verdicts)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
