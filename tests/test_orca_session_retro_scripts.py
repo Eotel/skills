@@ -479,6 +479,34 @@ class RetroTests(unittest.TestCase):
         self.assertEqual([item["executions"] for item in ledger.list()], [[], []])
         self.assertFalse(retro.facts_path(self.target).exists())
 
+    def test_adopted_consolidation_that_also_retires_is_still_handed_off(self) -> None:
+        # The merged proposal's work is still to do, so the ledger leaves it unimplemented.
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "2 つの案をまとめ、古い案を取り下げる",
+                        "merges": [str(uuid.uuid4())], "retires": [str(uuid.uuid4())], "evidence": [],
+                        "target": "triage-retro:skill:orca-session-triage:script"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        data = retro.load(self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        self.assertEqual([row["outcome"] for row in ledger.list()[0]["executions"]], ["handed_off"])
+
+    def test_revoking_a_note_confirmed_as_done_records_the_reversal(self) -> None:
+        # A confirmation records applied with no worker undo token; nothing was written to take back.
+        ledger = FakeLedger()
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "proposal": "伺う前に ask の id を知らせる", "evidence": [],
+                        "target": "triage-retro:skill:orca-session-triage:fact"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "Eotel"})
+        ledger.record({"proposal_id": proposal_id, "decision_id": ledger.list()[0]["decisions"][-1]["id"],
+                       "outcome": "applied", "actor": "Eotel", "result": "実施の確認「…」を採用"})
+        ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "Eotel"})
+        data = retro.load(self.state)
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        self.assertEqual(ledger.list()[0]["executions"][-1]["outcome"], "reverted")
+
     def published_remote(self) -> tuple[Path, list[dict[str, int]], Any]:
         """A bare origin for the skill checkout, a list of open PRs, and a run() that fakes gh over it."""
         remote = self.home / "remote.git"
