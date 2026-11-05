@@ -5485,13 +5485,14 @@ class InboxReadTests(unittest.TestCase):
                      run("claim", "a1", "--by", "triage"),
                      # The other way: the questions of an ask another tab claimed whole.
                      run("claim", "a2", "--by", "triage-hourly"),
-                     run("claim", "a2:1,a2:2", "--by", "triage", "--take-over"), run("claim", "a2:1", "--by", "triage")]
+                     run("claim", "a2:1,a2:2", "--by", "triage", "--take-over"), run("claim", "a2:1", "--by", "triage"),
+                     run("claim", "a2", "--by", "triage")]
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
                 inbox_read.main(["questions"])
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as listed:
                 inbox_read.main(["open-asks", "--json"])
 
-        self.assertEqual(codes, [0, 0, 0, 0, 0, 0])
+        self.assertEqual(codes, [0, 0, 0, 0, 0, 0, 0])
         self.assertEqual([(item["id"], item["by"]) for item in json.loads(out.getvalue())["claimed"]],
                          [("a1:1", "triage"), ("a1:2", "triage"), ("a2:1", "triage"), ("a2:2", "triage")])
         self.assertEqual([ask["claimed"]["by"] for ask in json.loads(listed.getvalue())], ["triage", "triage"])

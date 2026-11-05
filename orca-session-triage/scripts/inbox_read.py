@@ -432,8 +432,9 @@ def overlapping_claims(claims: dict[str, Claim], claimed: str, open_keys: frozen
     """The claims on the open ask or questions that `claimed` (`<id>` or `<id>:<n>`) also covers; a question's
     own claim stands before the ask's, as question_claim reads them."""
     ask_id = claimed.split(":", 1)[0]
-    keys = ([ask_id, *(key for key in claims if key.startswith(f"{ask_id}:"))] if claimed == ask_id
-            else [claimed if claimed in claims else ask_id])
+    covered = ([key for key in open_keys if key.startswith(f"{ask_id}:")] or [ask_id]) if claimed == ask_id \
+        else [claimed]
+    keys = dict.fromkeys(key if key in claims else ask_id for key in covered)
     return [claims[key] for key in keys if key in claims and key in open_keys]
 
 
