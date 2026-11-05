@@ -16,6 +16,13 @@ not answered yet, oldest first, and `questions` prints their structured question
 `answered --before` marks only the asks an answer proves answered, every open question
 of them (answer_evidence.py: the lead's decisions, AskUserQuestion answers, delivered
 answers), and names the rest with the related answers to check, without marking them.
+
+Being asked is a third state. `claim <id>[:<n>] --by <worktree>` records, before the
+worktree asks the user, that it is asking those asks (or questions) now, in
+~/.cache/orca-briefs/ask-claims.jsonl ($TRIAGE_ASK_CLAIMS), apart from the answers. `open-asks`
+marks a claimed ask 伺い中 with who and since when, `watch` prints each claim once and
+leaves its ask out of the reminders, and `questions` leaves claimed questions out of
+the batch and lists them under `claimed`, so another tab does not ask them again.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ ReportKind = Literal["ask", "done", "info"]
 REPORT_KINDS: frozenset[str] = frozenset(("ask", "done", "info"))
 WATCHED_KINDS = frozenset(("ask", "done"))
 ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
+CLAIMS = Path.home() / ".cache/orca-briefs/ask-claims.jsonl"
 REMIND_AFTER_MINUTES = 15
 ID_PREFIX_MIN = 8
 # AskUserQuestion takes one to four questions per call.
@@ -56,6 +64,17 @@ class OpenAsk:
     # Numbers of the questions still unanswered; empty for an ask without structured questions.
     open_questions: tuple[int, ...]
     at: datetime | None
+
+
+@dataclass(frozen=True)
+class Claim:
+    """A worktree asking the user an ask (`<id>`) or one of its questions (`<id>:<n>`) now."""
+    id: str
+    by: str
+    at: str
+
+    def view(self) -> dict:
+        return {"by": self.by, "at": self.at}
 
 
 @dataclass(frozen=True)
@@ -132,6 +151,45 @@ def paths() -> tuple[Path, Path]:
 
 def answers_path() -> Path:
     return Path(os.environ.get("TRIAGE_ASK_ANSWERS") or ANSWERS)
+
+
+def claims_path() -> Path:
+    return Path(os.environ.get("TRIAGE_ASK_CLAIMS") or CLAIMS)
+
+
+def read_claims(path: Path) -> dict[str, Claim]:
+    """The latest claim on each ask or question id."""
+    if not path.exists():
+        return {}
+    found: dict[str, Claim] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and all(isinstance(record.get(key), str) for key in ("id", "by", "ts")):
+            found[record["id"]] = Claim(record["id"], record["by"], record["ts"])
+    return found
+
+
+def question_claim(claims: dict[str, Claim], ask_id: str, number: int) -> Claim | None:
+    return claims.get(f"{ask_id}:{number}") or claims.get(ask_id)
+
+
+def report_claim(report: dict, claims: dict[str, Claim]) -> Claim | None:
+    """The claim on the ask or on any one of its questions: someone is asking it now."""
+    ask_id = str(report.get("id") or "")
+    return claims.get(ask_id) or next((claims[key] for number in range(1, len(questions_of(report)) + 1)
+                                       if (key := f"{ask_id}:{number}") in claims), None)
+
+
+def ask_claim(ask: OpenAsk, claims: dict[str, Claim]) -> Claim | None:
+    """The claim on the ask itself, or on every one of its open questions."""
+    ask_id = ask.report["id"]
+    if ask_id in claims or not ask.open_questions:
+        return claims.get(ask_id)
+    found = [question_claim(claims, ask_id, number) for number in ask.open_questions]
+    return found[0] if all(found) else None
 
 
 def complete_end(data: bytes) -> int:
@@ -371,11 +429,36 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None
         os.fsync(stream.fileno())
 
 
-def open_ask_view(ask: OpenAsk, now: datetime) -> dict:
-    report = ask.report
+def record_claims(path: Path, ids: list[str], by: str) -> None:
+    """Append one claim line per id, under the same lock the answer writers use."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.write("".join(json.dumps({"id": claimed, "by": by, "ts": stamp}, ensure_ascii=False) + "\n"
+                             for claimed in ids))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def claim_label(claim: Claim) -> str:
+    """`伺い中 <worktree> <HH:MM>〜`, as open-asks prefixes a claimed ask."""
+    try:
+        since = f" {datetime.fromisoformat(claim.at):%H:%M}〜"
+    except ValueError:
+        since = ""
+    return f"伺い中 {claim.by}{since}"
+
+
+def open_ask_view(ask: OpenAsk, now: datetime, claims: dict[str, Claim] | None = None) -> dict:
+    report, claims = ask.report, claims or {}
+    claimed = ask_claim(ask, claims)
     return {"id": report["id"], "ts": report.get("ts") or "", "host": report.get("host") or "",
             "source": source_of(report), "handle": report.get("handle") or "", "text": report.get("text") or "",
-            "open_questions": [{**questions_of(report)[number - 1], "number": number} for number in ask.open_questions],
+            "open_questions": [{**questions_of(report)[number - 1], "number": number,
+                                "claimed": (found.view() if (found := question_claim(claims, report["id"], number))
+                                            else None)} for number in ask.open_questions],
+            "claimed": claimed.view() if claimed else None,
             "age_minutes": minutes_since(ask.at, now)}
 
 
@@ -397,9 +480,15 @@ def ask_user_question(question: dict) -> dict:
 
 
 def question_batch(questions: list[PendingQuestion], after: str | None = None,
-                   order: list[str] | None = None) -> dict:
+                   order: list[str] | None = None, claims: dict[str, Claim] | None = None) -> dict:
     """The next questions after the id `after` in `order` (every structured question, answered or not, so
-    a batch answered since it was printed still pages on), with where each came from and what is left."""
+    a batch answered since it was printed still pages on), with where each came from and what is left.
+    A question another worktree claimed is left out and listed under `claimed`."""
+    claims = claims or {}
+    taken = {question.id: claim for question in questions
+             if (claim := question_claim(claims, question.report["id"], int(question.id.rsplit(":", 1)[1])))}
+    claimed = [{"id": question_id, **claim.view()} for question_id, claim in taken.items()]
+    questions = [question for question in questions if question.id not in taken]
     if after is not None:
         order = order if order is not None else [question.id for question in questions]
         if after not in order:
@@ -413,7 +502,7 @@ def question_batch(questions: list[PendingQuestion], after: str | None = None,
         "items": [{"id": question.id, "source": source_of(question.report), "host": question.report.get("host") or "",
                    "handle": question.report.get("handle") or "", "ts": question.report.get("ts") or "",
                    "issue": question.question.get("issue") or ""} for question in batch],
-        "remaining": left, "next_after": batch[-1].id if left else None,
+        "remaining": left, "next_after": batch[-1].id if left else None, "claimed": claimed,
     }
 
 
@@ -460,6 +549,7 @@ def watch(inbox: Path, cursor: Path, answers: Path, once: bool, interval: float,
         raise ValueError(f"watch reads only after an initialized cursor: run initialize with "
                          f"TRIAGE_READ_OFFSET={cursor} first")
     reminded: set[str] = set()
+    announced: set[tuple[str, str, str]] = set()
     while True:
         start, data, complete = pending_bytes(inbox, cursor)
         for raw in data[:complete].splitlines():
@@ -472,7 +562,14 @@ def watch(inbox: Path, cursor: Path, answers: Path, once: bool, interval: float,
         if complete:
             save(cursor, start + complete)
         now = datetime.now().astimezone()
+        claims = read_claims(claims_path())
         for ask in open_asks(inbox_entries(inbox), answered_ids(answers)):
+            claim = ask_claim(ask, claims)
+            if claim:
+                if (key := (ask.report["id"], claim.by, claim.at)) not in announced:
+                    announced.add(key)
+                    print(f"伺い中 {claim.by}: {summary_line(ask.report)}", flush=True)
+                continue
             age = minutes_since(ask.at, now)
             if age is not None and age >= remind_after and ask.report["id"] not in reminded:
                 reminded.add(ask.report["id"])
@@ -518,6 +615,11 @@ def main(argv: list[str] | None = None) -> int:
     answered.add_argument("--before", help="instead, every open ask asked before this ISO time")
     answered.add_argument("--note", default="", help="why, kept with the record")
     answer_evidence.add_arguments(answered)
+    claim = actions.add_parser("claim", help="record that a worktree is asking the user these asks now, before "
+                                             "it asks: open-asks marks them 伺い中, watch stops reminding of "
+                                             "them, and questions leaves them out")
+    claim.add_argument("ids", help="comma-separated ask ids, or <ask id>:<question number>")
+    claim.add_argument("--by", required=True, help="the worktree asking them")
     questions = actions.add_parser(
         "questions", help="print, as JSON, the next 4 unanswered structured questions: `questions` to pass to "
                           "AskUserQuestion, `items` naming each one's id and source, `remaining`, and "
@@ -547,11 +649,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "watch":
             watch(inbox, cursor, answers_path(), args.once, args.interval, args.remind_after)
             return 0
-        if args.action in ("open-asks", "questions", "answered"):
+        if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)
             asks = open_asks(entries, answered_ids(answers_path()))
+            claims = read_claims(claims_path())
             now = datetime.now().astimezone()
-            if args.action == "answered":
+            if args.action == "claim":
+                if not args.by.strip():
+                    raise ValueError("--by names the worktree asking")
+                ids = checked_answer_ids(args.ids, entries)
+                record_claims(claims_path(), ids, args.by.strip())
+                print(f"claimed: {len(ids)} by {args.by.strip()}")
+            elif args.action == "answered":
                 if args.ids is not None:
                     ids = checked_answer_ids(args.ids, entries)
                     refused = []
@@ -578,14 +687,16 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             elif args.action == "questions":
                 order = [question.id for question in pending_questions(open_asks(entries, frozenset()))]
-                print(json.dumps(question_batch(pending_questions(asks), args.after, order),
+                print(json.dumps(question_batch(pending_questions(asks), args.after, order, claims),
                                  ensure_ascii=False, indent=2))
             elif args.json:
-                print(json.dumps([open_ask_view(ask, now) for ask in asks], ensure_ascii=False, indent=2))
+                print(json.dumps([open_ask_view(ask, now, claims) for ask in asks], ensure_ascii=False, indent=2))
             else:
                 for ask in asks:
                     age = minutes_since(ask.at, now)
-                    print(f"unanswered {'?' if age is None else age} min: {summary_line(ask.report)}")
+                    claim = ask_claim(ask, claims)
+                    print(f"{claim_label(claim) + ' ' if claim else ''}"
+                          f"unanswered {'?' if age is None else age} min: {summary_line(ask.report)}")
             return 0
         data = inbox.read_bytes()
         end = complete_end(data)

@@ -4151,6 +4151,25 @@ class HourlyStateTests(unittest.TestCase):
                 self.assertIn(identity, lines[0])
                 self.assertIn("Choose a release", lines[0])
 
+    def test_stale_asks_name_an_ask_another_tab_is_asking(self) -> None:
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "waiting", "repo": "app",
+                                         "claude": {"final_text": "Choose a release", "final_at": "2026-10-28T01:00:00Z"}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
+                                               "ts": "2026-10-28T01:00:00Z", "text": "Choose a release"}])
+        claims = self.root / "claims.jsonl"
+        write_jsonl(claims, [{"id": "abcd1234-0000", "by": "triage-lead", "ts": "2026-10-28T10:05:00+09:00"}])
+        with patch.dict(os.environ, {"TRIAGE_ASK_CLAIMS": str(claims)}):
+            outputs = []
+            for summary in ([], ["--summary"]):
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(hourly_state.main(["--state-file", str(self.state), "stale-asks",
+                                                        "--from", str(scan_json), *summary]), 0)
+                outputs.append(out.getvalue())
+        self.assertEqual(json.loads(outputs[0])[0]["ask"]["claimed"],
+                         {"by": "triage-lead", "at": "2026-10-28T10:05:00+09:00"})
+        self.assertIn("伺い中 triage-lead", outputs[1])
+
     def test_asked_skips_all_closed_references_in_the_rows_origin_and_pending_explains_closure(self) -> None:
         lane = self.root / "lane"
         subprocess.run(["git", "init", "-q", str(lane)], check=True)
@@ -5226,11 +5245,11 @@ class InboxReadTests(unittest.TestCase):
             recorded = [json.loads(line)["id"] for line in (Path(root) / "answers.jsonl").read_text().splitlines()]
 
             self.assertEqual([(ask["id"], ask["source"], ask["open_questions"]) for ask in listed],
-                             [("early", "r/b", [{"number": n, **question} for n, question in enumerate(two, 1)]),
+                             [("early", "r/b", [{"number": n, "claimed": None, **question} for n, question in enumerate(two, 1)]),
                               ("late", "a", []),
                               ("c8f79c0f-1111-4222-8333-444455556666", "c", [])])
             self.assertEqual([(ask["id"], ask["open_questions"]) for ask in partly],
-                             [("early", [{"number": 2, **two[1]}]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
+                             [("early", [{"number": 2, "claimed": None, **two[1]}]), ("c8f79c0f-1111-4222-8333-444455556666", [])])
             self.assertEqual((by_prefix[0], recorded[-1]), (0, "c8f79c0f-1111-4222-8333-444455556666"))
             self.assertEqual(run("open-asks")[1], "")
             self.assertEqual(unknown[0], 1)
@@ -5369,6 +5388,49 @@ class InboxReadTests(unittest.TestCase):
             f"{old} ask h epm/x id=a1", f"{now} ask h cvm/y id=a2", f"{now} done h cvm/y id=d1",
             f"unanswered 30 min: {old} ask h epm/x id=a1"])
         self.assertEqual([line.split("  ")[0] for line in second], [f"{now} done h z id=d2"])
+
+    def test_a_claimed_ask_shows_as_being_asked_without_a_reminder_or_a_second_asking(self) -> None:
+        # 11/04 16:00: the hourly tab and the lead both asked TOUGOU_KAIKEI-799 and #172.
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            cursor = Path(root) / "watch.offset"
+            old = (datetime.now().astimezone() - timedelta(minutes=30)).isoformat(timespec="seconds")
+            two = [{"question": f"Q{n}？", "header": f"Q{n}", "recommended": "A", "multiSelect": False,
+                    "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]}
+                   for n in (1, 2)]
+            write_jsonl(inbox, [
+                {"id": "a1", "ts": old, "kind": "ask", "host": "h", "worktree": "x", "text": "投稿の 2 問",
+                 "questions": two},
+                {"id": "a2", "ts": old, "kind": "ask", "host": "h", "worktree": "y", "text": "merge してよいか"},
+            ])
+            cursor.write_text(str(inbox.stat().st_size))
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl"),
+                           "TRIAGE_ASK_CLAIMS": str(Path(root) / "claims.jsonl")}
+
+            def run(*argv: str) -> tuple[int, str, str]:
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
+                        redirect_stderr(io.StringIO()) as err:
+                    code = inbox_read.main(list(argv))
+                return code, out.getvalue(), err.getvalue()
+
+            self.assertEqual(run("claim", "a1", "--by", "triage-hourly")[0], 0)
+            self.assertEqual(run("claim", "a2:1", "--by", "triage-hourly")[0], 1)
+            listed = run("open-asks")[1].splitlines()
+            viewed = {ask["id"]: ask for ask in json.loads(run("open-asks", "--json")[1])}
+            batch = json.loads(run("questions")[1])
+            watched = run("watch", "--once")[1].splitlines()
+
+        self.assertIn("伺い中 triage-hourly", listed[0])
+        self.assertIn("id=a1", listed[0])
+        self.assertNotIn("伺い中", listed[1])
+        self.assertEqual(viewed["a1"]["claimed"]["by"], "triage-hourly")
+        self.assertIsNone(viewed["a2"]["claimed"])
+        self.assertEqual(batch["questions"], [])
+        self.assertEqual([(item["id"], item["by"]) for item in batch["claimed"]],
+                         [("a1:1", "triage-hourly"), ("a1:2", "triage-hourly")])
+        self.assertEqual([line.split("  ")[0] for line in watched],
+                         [f"伺い中 triage-hourly: {old} ask h x id=a1", f"unanswered 30 min: {old} ask h y id=a2"])
 
     def test_summary_prints_one_short_line_per_entry(self):
         with tempfile.TemporaryDirectory() as root:

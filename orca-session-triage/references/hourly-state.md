@@ -107,6 +107,8 @@ both on the item's line.
   has no proof, or its handed-off key is still unanswered. `ask.marked: true`
   means it was marked answered anyway and
   left `open-asks`: check `candidates`, then ask it again or record the answer.
+  `ask.claimed` (`by`, `at`) means another tab claimed it and is asking the
+  user now (`inbox_read.py claim`); `--summary` adds 伺い中. Do not ask it again.
 - `stopped_after_answer`: an answer came after the lane's last message and the
   lane has not spoken since. Relay `answer` (the newest) to the lane.
 - `unasked`: those asks were answered before the lane's last message, or it
