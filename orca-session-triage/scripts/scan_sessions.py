@@ -1350,9 +1350,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["class"], row["reasons"] = classify(row, decision_marker)
         row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
         row["class"], row["reasons"] = with_processes(row, now)
-        if waiting_reasons(row, decision_marker) == [MARKER_REASON]:
-            # The marked comment alone asks the question: the final message may be about something else.
-            row["marker_question"] = (row["comment"] or "").removeprefix(decision_marker).lstrip(":： \n")
+        if decision_marker and (marked := re.search(re.escape(decision_marker) + r"[:：]?\s*(.+)",
+                                                     row["comment"] or "", re.DOTALL)):
+            row["marker_question"] = marked.group(1).strip()
         row["hook_errors"] = hook_errors(terms, screens, w.get("_environment"))
         # Quoted as the screen shows it: a tab that has not run since keeps an old error on its screen.
         row["reasons"] = [*row["reasons"], *dict.fromkeys(
@@ -2586,6 +2586,20 @@ def review_result(row: dict, github: str) -> ReviewResult | None:
             "head_matches": current, "changes_requested": current is True and "直してから" in verdict}
 
 
+def row_question(row: dict) -> str:
+    """What a row asks the user. A waiting row asks a prompt on its screen, else the text after the decision marker
+    in its Orca comment, the Codex reply read on its screen, its verdict's question, or its final message, in that
+    order; another row asks only a prompt or its verdict's question."""
+    verdict = row.get("verdict") or {}
+    prompt = prompt_question(row.get("prompt_waiting") or {})
+    if (verdict.get("class") or row.get("class")) != "waiting":
+        return prompt or str(verdict.get("question") or "")
+    screen = row.get("orca_message") or {}
+    return next((str(text) for text in (prompt, row.get("marker_question"),
+                                        screen.get("text") if screen.get("from") == "screen" else "",
+                                        verdict.get("question"), final_message(row)["text"]) if text), "")
+
+
 def row_view(row: dict) -> dict:
     """One row with fixed keys and no null strings, so a reader never has to know the scan's raw shapes."""
     verdict = row.get("verdict") or {}
@@ -2593,8 +2607,7 @@ def row_view(row: dict) -> dict:
     asked = {"claude": (row.get("claude") or {}).get("last_user"),
              "codex": ((row.get("codex") or [{}])[-1]).get("last_user")}.get(final["source"])
     github = github_of(row)
-    question = (prompt_question(row.get("prompt_waiting") or {}) or row.get("marker_question")
-                or verdict.get("question") or "")
+    question = row_question(row)
     merge_question = asks_merge(question, row.get("comment") or "")
     transcripts: Transcripts = {
         "claude": [path] if (path := (row.get("claude") or {}).get("transcript")) else [],

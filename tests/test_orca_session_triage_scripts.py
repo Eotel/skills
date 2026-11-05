@@ -845,11 +845,12 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/a"], ("waiting", ["AskUserQuestion pending"]))
         self.assertEqual(result["/w/b"], ("waiting", ["final message asks (Jev 0.90)"]))
         self.assertEqual(result["/w/c"], ("waiting", ["decision marker in comment"]))
-        # The marked comment asks, not the final message; a final message that asks keeps its own question.
+        # A waiting row asks its marked comment before its final message, even one that asks too.
         self.assertEqual(scan.row_view(next(r for r in rows if r["path"] == "/w/c"))["question"], "which base?")
-        self.assertNotIn("marker_question", scan.build_inventory(
-            [worktree("/w/b", "done", comment="要判断: which base?")], [terminal("/w/b", "claude")], self.projects,
-            {}, "要判断", now=NOW, judge=judging({"PR is up.\nShall I merge it?": verdict(0.9)}))[0])
+        marked = scan.build_inventory(
+            [worktree("/w/b", "done", comment="PR #3 is up. 要判断: which base?")], [terminal("/w/b", "claude")],
+            self.projects, {}, "要判断", now=NOW, judge=judging({"PR is up.\nShall I merge it?": verdict(0.9)}))[0]
+        self.assertEqual(scan.row_view(marked)["question"], "which base?")
         # An agent in its turn works past the decision it marked.
         self.assertEqual(result["/w/old"], ("working", ["old decision marker in comment: an agent is in its turn"]))
         self.assertNotIn("/w/main", result)
@@ -4449,6 +4450,8 @@ class HourlyStateTests(unittest.TestCase):
                 for name, final in (("triage", "Own question"), ("left", "Leave this message."),
                                     ("changed", "A new question"), ("comment", ""), ("screen", ""))]
         rows[3]["comment"] = "要判断: 公開は明日でよいですか？"
+        # A verdict's question comes after the marked comment, as --row shows it.
+        rows[3].update(verdict={"class": "waiting", "question": "古い問い"}, marker_question="公開は明日でよいですか？")
         rows[4]["done_cards"] = [{"screen_tail": ["⏺ 画像を使いますか？", "✻ Worked for 1m", "❯"]}]
         scan_json = self.root / "scan.json"
         scan_json.write_text(json.dumps(rows))
