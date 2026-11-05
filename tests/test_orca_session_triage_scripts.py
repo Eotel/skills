@@ -798,6 +798,10 @@ class ClassifyTests(unittest.TestCase):
                                 "す。\n次に必要なのは、get-app-state が成功する操作経路です。待機します。",
                                 "Textarea の全幅化は実装・push 済みで、PR #239 を作成しました。PR は未 merge のままです。"])
         self.assertEqual([row["terminals"][0]["agent"] for row in rows], ["codex", "codex", None])
+        # A reply is told from a command by its └ result or its line counts, not by its first word.
+        self.assertEqual(scan.screen_message({"tail": [
+            "• Added regression tests and pushed the fix. Shall I merge?", "• Edited app.py (+12 -3)", "    12 +import json",
+            "  Worked for 1m 2s • 10:00"]}), "Added regression tests and pushed the fix. Shall I merge?")
         self.assertNotIn("orca_message", rows[2])
 
     def test_a_tab_orca_detached_but_still_runs_is_read(self):

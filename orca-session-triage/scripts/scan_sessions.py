@@ -749,11 +749,11 @@ COLLAPSED_CALLS = "(ctrl+o to expand)"
 TOOL_RESULT = "⎿"
 # Codex's reply bullet ("• text", its continuation lines indented), the line a turn ends with ("Worked for 4m 28s •
 # 11:43"; "─ Worked for 1m 02s ───" in older builds), and the recap it can print under that line. A bullet followed
-# by a └ result or naming an action ("• Ran …", "• Hook failed", "• Edited …", "• Working (…)") is not a reply.
+# by a └ result ("• Ran …", "• Hook failed"), a file change with its line counts ("• Edited app.py (+3 -1)"), or the
+# status line ("• Working (12s • esc to interrupt)") is not a reply.
 CODEX_REPLY = "• "
 CODEX_TURN_END = re.compile(r"[─━ ]*Worked for \d[^•·─━]*(?:[•·] *\d{1,2}:\d{2})?[─━ ]*")
-CODEX_ACTION = re.compile(r"• (?:Ran|Running|Failed|Explored|Edited|Added|Deleted|Updated Plan|Waited|Waiting|Working|"
-                          r"Hook|Called|Searched)\b")
+CODEX_ACTION = re.compile(r"• (?:(?:Edited|Added|Deleted) .+\(\+\d+ -\d+\)|Working \(.+\))\s*")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
@@ -925,7 +925,7 @@ def codex_screen_message(lines: list[str]) -> str:
     ended turn is shown (its bullet scrolled off), the recap Codex printed under that turn's end line."""
     def action(index: int) -> bool:
         following = next((line.strip() for line in lines[index + 1:] if line.strip()), "")
-        return bool(CODEX_ACTION.match(lines[index])) or following.startswith(CODEX_RESULT)
+        return bool(CODEX_ACTION.fullmatch(lines[index])) or following.startswith(CODEX_RESULT)
 
     reply = max((index for index, line in enumerate(lines) if line.startswith(CODEX_REPLY) and not action(index)),
                 default=None)
