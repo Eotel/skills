@@ -4122,6 +4122,27 @@ class HourlyStateTests(unittest.TestCase):
                                                 "--answer-file", other]), 1)
         self.assertIsNone(json.loads(err.getvalue().split("answer already recorded: ", 1)[1])["answered_in"])
 
+    def test_checked_answer_replaces_the_recorded_one_and_keeps_it_with_the_reason(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        question = self.source("question.txt", "下書きのとおり投稿しますか？")
+        noted = self.source("noted.txt", "「下書きのとおり投稿」。メモ「不要.」")
+        checked = self.source("checked.txt", "返事の投稿は不要")
+        reason = self.source("reason.txt", "メモの読みを 1 問で確かめた")
+        _, asked = self.call("asked", "--row", "/w/lane", "--decision", "post:TOUGOU_KAIKEI-799",
+                             "--final-message-file", message, "--question-file", question)
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_hourly"}):
+            _, first = self.call("answered", "--id", asked["id"], "--answer-file", noted,
+                                 "--answered-at", "2026-11-04T07:14:00Z")
+            _, replaced = self.call("answered", "--id", asked["id"], "--answer-file", checked,
+                                    "--replace-reason-file", reason)
+        self.assertEqual(replaced["answer"], "返事の投稿は不要")
+        self.assertEqual([{key: earlier[key] for key in ("answer", "answered_at", "answered_in", "reason")}
+                          for earlier in replaced["replaced"]],
+                         [{"answer": first["answer"], "answered_at": first["answered_at"],
+                           "answered_in": "term_hourly", "reason": "メモの読みを 1 問で確かめた"}])
+        self.assertIn("replaced_at", replaced["replaced"][0])
+        self.assertEqual(self.call("get", "--id", asked["id"]), (0, replaced))
+
     def test_answer_without_a_terminal_handle_records_its_worktree(self) -> None:
         message = self.source("message.txt", "Ready.")
         _, asked = self.call("asked", "--row", "/w/lane", "--decision", "proceed",
@@ -5820,6 +5841,35 @@ class StopCheckTests(unittest.TestCase):
                     self.assertIn("日本語", decision["permissionDecisionReason"])
                 else:
                     self.assertEqual(out.getvalue(), "")
+
+    def test_answer_hook_asks_to_check_a_note_on_an_outward_choice(self) -> None:
+        post = {"question": "TOUGOU_KAIKEI-799 の返事を投稿しますか？", "header": "799 投稿", "multiSelect": False,
+                "options": [{"label": "下書きのとおり投稿 (Recommended)", "description": "吉岡さんに返事を出します"},
+                            {"label": "直してから", "description": "下書きを直させます"}]}
+        record = {"question": "記録だけにしますか？", "header": "記録", "multiSelect": False,
+                  "options": [{"label": "書かずに記録", "description": "台帳に残すだけ"},
+                              {"label": "書く", "description": "skill に書きます"}]}
+
+        def answer(answers: dict[str, str], notes: dict[str, str]) -> str:
+            hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
+                    "cwd": "/w/triage", "tool_input": {"questions": [post, record]},
+                    "tool_response": {"questions": [post, record], "answers": answers,
+                                      "annotations": {question: {"notes": note} for question, note in notes.items()}}}
+            with patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(stopcheck.main(self.root), 0)
+            return out.getvalue()
+
+        chosen = {post["question"]: "下書きのとおり投稿 (Recommended)", record["question"]: "書かずに記録"}
+        decision = json.loads(answer(chosen, {post["question"]: "不要."}))
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("799 投稿", decision["reason"])
+        self.assertIn("不要.", decision["reason"])
+        self.assertIn("1 問で確かめ", decision["reason"])
+        for answers, notes in ((chosen, {}), (chosen, {record["question"]: "あとで見る"}),
+                               ({post["question"]: "(notes only)"}, {post["question"]: "不要."})):
+            with self.subTest(notes=notes, answers=answers):
+                self.assertEqual(answer(answers, notes), "")
 
     def test_hourly_question_hook_requires_a_handoff_from_this_run(self) -> None:
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
