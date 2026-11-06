@@ -342,6 +342,8 @@ def nested_check(copy: Path) -> dict:
     review, deeper = ignored.review, ignored.nested
     if review or deeper:
         blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
+    if ignored.lock_holders:
+        blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
     head = git(copy, "rev-parse", "HEAD").stdout.strip()
     if not head or not on_remote(copy, head):
         blockers.append("HEAD %s is on no remote branch" % head[:8])
@@ -944,7 +946,9 @@ def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
         if not found:
             return []
         movers |= found
-    return sorted(worktree / named for named in movers)
+    # A path inside another that moves goes with it.
+    return sorted(worktree / named for named in movers
+                  if not any(other != named and within(named, other) for other in movers))
 
 
 def holds_only_records(result: dict, movable: tuple[str, ...]) -> bool:

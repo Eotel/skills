@@ -2850,9 +2850,7 @@ class RmCheckTests(unittest.TestCase):
         stale = self.check()
         holder = subprocess.Popen(["sleep", "30"])
         try:
-            started = subprocess.run(["ps", "-o", "lstart=", "-p", str(holder.pid)], capture_output=True, text=True,
-                                     env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout.strip()
-            lock.write_text(json.dumps({"sessionId": "s", "pid": holder.pid, "procStart": started}))
+            lock.write_text(json.dumps({"sessionId": "s", "pid": holder.pid, "procStart": self.started_at(holder.pid)}))
             held = self.check()
         finally:
             holder.kill()
@@ -3060,6 +3058,17 @@ class RmCheckTests(unittest.TestCase):
         self.assertRegex(Path(moved["to"]).name, r"^wt-pr-descriptions-\d{8}$")
         self.assertEqual((Path(moved["to"]) / "917.md").read_text(), "PR 本文の写し\n")
         self.assertFalse(named.exists())
+
+    def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
+        (self.main / ".git/info/exclude").write_text("notes/child/\n")
+        (self.wt / "notes/child").mkdir(parents=True)
+        (self.wt / "notes/other.md").write_text("untracked\n")
+        (self.wt / "notes/child/draft.md").write_text("ignored\n")
+
+        code, result = self.run_main("--archive-path", "notes", "--archive-path", "notes/child",
+                                     "--archive-dir", str(Path(self.tmp.name) / "archive"))
+
+        self.assertEqual((code, [Path(item["from"]).name for item in result["archived"]]), (0, ["notes"]))
 
     def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
         self.ignore_review_records()
@@ -3470,6 +3479,28 @@ class RmCheckTests(unittest.TestCase):
         git(deps, "worktree", "add", "-q", "--detach", str(copy), "main")
         (copy / "locale/de/LC_MESSAGES/django.mo").write_bytes(b"recompiled catalog")
         return copy
+
+    def test_a_live_lock_in_a_nested_worktree_keeps_it_attached(self) -> None:
+        copy = self.nested_catalog()
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("**/.claude/scheduled_tasks.lock\n")
+        (copy / ".claude").mkdir()
+        holder = subprocess.Popen(["sleep", "30"])
+        try:
+            (copy / ".claude/scheduled_tasks.lock").write_text(
+                json.dumps({"pid": holder.pid, "procStart": self.started_at(holder.pid)}))
+            code, result = self.run_main("--detach-nested")
+        finally:
+            holder.kill()
+            holder.wait()
+
+        self.assertEqual((code, result["detached"]), (1, []))
+        self.assertTrue(copy.exists())
+        self.assertIn("PID %d" % holder.pid, " ".join(result["blockers"]))
+
+    def started_at(self, pid: int) -> str:
+        """ps's lstart in UTC, as a scheduled tasks lock records its holder's start."""
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                              env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout.strip()
 
     def test_nested_recompiled_catalog_is_restored_and_detached(self) -> None:
         copy = self.nested_catalog()
