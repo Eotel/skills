@@ -935,14 +935,16 @@ def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
               and not (besides_nested and blocker.startswith(NESTED_READY))]
     if others or not paths:
         return []
+    # Only what is on disk moves: a deleted tracked file named here keeps the worktree as a change.
+    present = [named for named in movable if (worktree / named).exists() or (worktree / named).is_symlink()]
     movers: set[str] = set()
     for rel in paths:
-        found = {named for named in movable if within(rel, named)}
+        found = {named for named in present if within(rel, named)}
         holder = worktree / rel
         if not found and holder.is_dir() and not holder.is_symlink() and all(
-                any(within(str(child.relative_to(worktree)), named) for named in movable)
+                any(within(str(child.relative_to(worktree)), named) for named in present)
                 for child in holder.rglob("*") if child.is_symlink() or not child.is_dir()):
-            found = {named for named in movable if within(named, rel) and (worktree / named).exists()}
+            found = {named for named in present if within(named, rel)}
         if not found:
             return []
         movers |= found

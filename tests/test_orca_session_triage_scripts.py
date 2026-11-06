@@ -3070,6 +3070,17 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, [Path(item["from"]).name for item in result["archived"]]), (0, ["notes"]))
 
+    def test_a_named_deletion_moves_nothing_and_keeps_the_worktree(self) -> None:
+        (self.wt / "notes").mkdir()
+        (self.wt / "notes/draft.md").write_text("untracked\n")
+        (self.wt / "app.txt").unlink()
+
+        code, result = self.run_main("--archive-path", "notes", "--archive-path", "app.txt",
+                                     "--archive-dir", str(Path(self.tmp.name) / "archive"))
+
+        self.assertEqual((code, result["archived"]), (1, []))
+        self.assertTrue((self.wt / "notes/draft.md").exists())
+
     def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
         self.ignore_review_records()
         (self.wt / ".claude/settings.local.json").write_text('{"hooks": {}}\n')
