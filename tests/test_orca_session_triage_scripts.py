@@ -3916,6 +3916,9 @@ class HandoffProposalTests(unittest.TestCase):
         processes = patch.object(handoff.scan_sessions, "process_table", return_value={})
         processes.start()
         self.addCleanup(processes.stop)
+        handoffs = patch.object(handoff, "HANDOFFS", self.root / "handoffs")
+        handoffs.start()
+        self.addCleanup(handoffs.stop)
 
     def call(self, action: str, *args: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -4011,6 +4014,9 @@ class HourlyStateTests(unittest.TestCase):
         hermetic = patch.object(hourly_state.scan_sessions, "VERDICTS_FILE", str(self.root / "no-verdicts.json"))
         hermetic.start()
         self.addCleanup(hermetic.stop)
+        handoffs = patch.object(handoff, "HANDOFFS", self.root / "handoffs")
+        handoffs.start()
+        self.addCleanup(handoffs.stop)
         # Other script tests load another copy of lead_decisions into sys.modules.
         for module in dict.fromkeys((hourly_state.lead_decisions, hourly_state.answer_evidence.lead_decisions)):
             for name, value in (("DEFAULT_LOG", self.root / "decisions.jsonl"),
@@ -4463,6 +4469,88 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([answer["source"] for answer in deeplink["candidates"]],
                          ["lead_decisions answer:orca-deeplink-pr::photos"])
         self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
+
+    def test_stale_asks_settles_a_row_its_key_answered_after_its_last_message_past_a_delivery_note(self):
+        # 2026-11-06: montly-report was unasked although ask:montly-report::spare-24man held the answer under 「中継済み」.
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([
+            {"path": f"/w/{name}", "repo": "app", "class": "waiting",
+             "claude": {"final_at": "2026-11-02T01:46:39Z", "final_text": "総額は 1,000 万円か 976 万円か"},
+             # A question on its screen or pending in its transcript came after the answer, though its
+             # transcript's last message did not.
+             **({"prompt_waiting": {"tab": "t", "question": "10月の報告書をどう送りますか？", "choices": ["1. 任せる"]}}
+                if name == "asking-on-screen" else {})}
+            for name in ("montly-report", "earlier-answer", "asking-on-screen")]
+            + [{"path": "/w/asking-in-transcript", "repo": "app", "class": "waiting",
+                "claude": {"final_at": None, "pending_questions": [{"question": "10月の報告書をどう送りますか？"}]}}]))
+        write_jsonl(self.root / "inbox.jsonl", [])
+        write_jsonl(self.root / "decisions.jsonl", [
+            {"id": "1", "decision": "ask:montly-report::spare-24man", "answer": "1,000 万円のまま",
+             "decided_at": "2026-11-05T12:21:00+09:00"},
+            {"id": "2", "decision": "ask:montly-report::spare-24man", "answer": "中継済み（12:2x send montly-report）",
+             "decided_at": "2026-11-05T04:16:40+00:00"},
+            {"id": "3", "decision": "ask:earlier-answer::total", "answer": "976 万円",
+             "decided_at": "2026-11-01T09:00:00+09:00"},
+            {"id": "4", "decision": "ask:asking-on-screen::total", "answer": "976 万円",
+             "decided_at": "2026-11-05T12:21:00+09:00"},
+            {"id": "5", "decision": "ask:asking-in-transcript::total", "answer": "976 万円",
+             "decided_at": "2026-11-05T12:21:00+09:00"}])
+
+        code, stale = self.call("stale-asks", "--from", str(scan_json))
+
+        self.assertEqual(code, 0)
+        self.assertEqual({item["name"]: item["state"] for item in stale},
+                         {"montly-report": "settled", "earlier-answer": "unasked", "asking-on-screen": "unasked",
+                          "asking-in-transcript": "unasked"})
+        settled = next(item for item in stale if item["state"] == "settled")
+        self.assertEqual(settled["evidence"], [{"decision": "ask:montly-report::spare-24man",
+                                                "decided_at": "2026-11-05T12:21:00+09:00", "answer": "1,000 万円のまま"}])
+
+    def test_stale_asks_and_lead_state_name_questions_closed_unanswered_since_the_last_handoff(self):
+        # 2026-11-06: the lead's two questions closed unanswered while lead-state showed no pending question.
+        question = {"questions": [{"question": "ECR の tag を付けますか？", "options": [{"label": "付ける"}]}]}
+
+        def asked(tool_id, at):
+            return {**assistant({"type": "tool_use", "id": tool_id, "name": "AskUserQuestion", "input": question}),
+                    "timestamp": at}
+
+        def rejected(tool_id, at):
+            return {"type": "user", "timestamp": at, "toolUseResult": "User rejected tool use", "message": {
+                "role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": True,
+                                             "content": "The user doesn't want to proceed with this tool use."}]}}
+
+        lead = self.root.resolve() / "lead"
+        lead_dir = scan.claude_project_dir(self.root / "claude/projects", str(lead))
+        # The lead closed the question, then started the session whose transcript is now the newest.
+        write_jsonl(lead_dir / "closed.jsonl", [
+            asked("before", "2026-11-05T09:00:00Z"), rejected("before", "2026-11-05T09:10:00Z"),
+            asked("after", "2026-11-05T10:39:58Z"), user("別の話"), rejected("after", "2026-11-06T00:04:38Z")])
+        os.utime(lead_dir / "closed.jsonl", (1, 1))
+        write_jsonl(lead_dir / "lead.jsonl", [
+            asked("answered", "2026-11-06T00:18:21Z"),
+            user([{"type": "tool_result", "tool_use_id": "answered", "content": "答えた"}])])
+        handoff.SavedHandoff(text="前回", kind="info", decisions=[], sent_at="2026-11-05T10:00:00+00:00",
+                             next_offset=0).save(self.root / "handoffs", datetime(2026, 11, 5, 10, tzinfo=timezone.utc))
+        self.call("appoint-lead", "--worktree", str(lead))
+        scan_json = self.root / "scan.json"
+        scan_json.write_text("[]")
+        write_jsonl(self.root / "inbox.jsonl", [])
+        replies = {("worktree", "ps"): {"worktrees": [{**worktree(str(lead)), "agents": []}]},
+                   ("terminal", "list"): {"terminals": []}}
+
+        _, stale = self.call("stale-asks", "--from", str(scan_json))
+        with patch.object(handoff.scan_sessions, "process_table", return_value={}), \
+                patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))), redirect_stdout(io.StringIO()) as out:
+            code = handoff.main(["lead-state", "--state-file", str(self.state), "--orca", "fake-orca",
+                                 "--claude-projects", str(self.root / "claude/projects")])
+
+        self.assertEqual([(item["state"], item["name"], item["since"], item["closed_at"], item["questions"])
+                          for item in stale],
+                         [("rejected", "lead", "2026-11-05T10:39:58Z", "2026-11-06T00:04:38Z", question["questions"])])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["rejected"], [
+            {"id": "after", "asked_at": "2026-11-05T10:39:58Z", "closed_at": "2026-11-06T00:04:38Z", **question}])
 
     def test_stale_asks_shows_the_pr_review_beside_its_merge_question(self) -> None:
         review_dir = self.root / "review"

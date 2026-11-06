@@ -14,7 +14,8 @@ Each sent handoff is kept in --handoffs-dir, one file per send named by its UTC 
 the exact text, kind, keys, time, and NEXT_OFFSET; `last` prints the newest.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
-latest message, unanswered questions and ask times, and undelivered queued input. Both commands
+latest message, unanswered questions and ask times, the questions closed unanswered (`rejected`, with
+ask and close times) since the newest kept handoff, and undelivered queued input. Both commands
 default to the lead appointed in the shared hourly state when --lead-worktree is omitted.
 `send` ends the text with the run's signature, <session name>（HH:MM の定時）: the name ListAgents
 prints first and the local time the session started, from $CLAUDE_CONFIG_DIR/sessions/$CLAUDE_PID.json
@@ -35,6 +36,7 @@ import subprocess
 import sys
 from typing import Protocol
 
+import answer_evidence
 import inbox_read
 import hourly_state
 import lead_decisions
@@ -82,6 +84,18 @@ class SavedHandoff:
         keys = "".join(f"\n  {key}" for key in self.decisions) or " (none)"
         return (f"sent_at: {self.sent_at}\nkind: {self.kind}\nnext_offset: {self.next_offset}\nfile: {path}\n"
                 f"decisions:{keys}\n\n{self.text}")
+
+
+def last_sent_at(directory: Path) -> datetime | None:
+    """When the newest kept handoff was sent; None before the first."""
+    try:
+        _, saved = SavedHandoff.newest(directory)
+    except LookupError:
+        return None
+    sent = scan_sessions.parse_time(saved.sent_at)
+    if sent is None:
+        raise ValueError(f"invalid handoff sent_at: {saved.sent_at}")
+    return sent
 
 
 def triage_notify(executable: Path) -> Deliver:
@@ -140,8 +154,9 @@ def lead_state(projects: Path, worktree: str) -> str:
                       for item in queued))
 
 
-def lead_details(projects: Path, worktree: str, orca: str) -> dict[str, object]:
-    """The lead's Orca state, newest transcript, unanswered questions, and rendered tab tails."""
+def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> dict[str, object]:
+    """The lead's Orca state, newest transcript, unanswered questions, questions closed unanswered since the
+    newest handoff kept in `handoffs`, and rendered tab tails."""
     page = scan_sessions.orca_payload(orca, ["worktree", "ps"])
     row = next((row for row in page["worktrees"] if Path(row["path"]) == Path(worktree)), None)
     if row is None:
@@ -176,13 +191,18 @@ def lead_details(projects: Path, worktree: str, orca: str) -> dict[str, object]:
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
         queued = scan_sessions.queued_input(transcript)
+    # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
+    rejected = answer_evidence.rejected_questions(
+        dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
+                       *([Path(claude["transcript"])] if claude else [])]), last_sent_at(handoffs))
     agents = [{"type": agent.get("agentType"), "state": agent.get("state"),
                "state_started_at": scan_sessions.iso_time(agent.get("stateStartedAt")),
                "stopped_at": scan_sessions.iso_time(agent.get("stateStartedAt"))
                if agent.get("state") in ("done", "waiting") else None,
                "main_agent": agent.get("mainAgent")} for agent in row.get("agents") or []]
     return {"worktree": worktree, "agents": agents, "final": final,
-            "pending_questions": list(questions.values()), "terminals": tabs, "queued_input": queued}
+            "pending_questions": list(questions.values()), "rejected": rejected, "terminals": tabs,
+            "queued_input": queued}
 
 
 def decision_asks(values: list[str], keys: list[str]) -> dict[str, str]:
@@ -268,7 +288,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="shared hourly state JSON (default: %(default)s)")
     lead.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                       help="Claude Code transcript root (default: %(default)s)")
-    state_command = commands.add_parser("lead-state", parents=[lead], help="print the appointed lead's current state as JSON")
+    state_command = commands.add_parser(
+        "lead-state", parents=[kept, lead],
+        help="print the appointed lead's current state as JSON, with the questions closed unanswered (rejected) "
+             "since the newest kept handoff")
     state_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                                help="Orca CLI executable (default: %(default)s)")
     send_command = commands.add_parser("send", parents=[kept, lead],
@@ -304,8 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "lead-state":
             if not args.lead_worktree:
                 raise ValueError("--lead-worktree or an appointed lead in --state-file is required")
-            print(json.dumps(lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca),
-                             ensure_ascii=False, indent=2))
+            print(json.dumps(lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca,
+                                          args.handoffs_dir.expanduser()), ensure_ascii=False, indent=2))
             return 0
         return send(args, triage_notify(Path(args.notify).expanduser()), inbox_read.Sender.of(workspace()))
     except subprocess.CalledProcessError as error:

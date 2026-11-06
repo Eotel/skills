@@ -24,7 +24,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import json
-from operator import attrgetter
+from operator import attrgetter, itemgetter
 import os
 from pathlib import Path
 import re
@@ -43,6 +43,8 @@ ASK_KEY = re.compile(r"(?<![\w-])ask-([a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA
 QUESTION_WORD = re.compile(r"[一-龯々]{2,}|[ァ-ヺー]{2,}|[A-Za-z0-9_]{2,}")
 # rm_check.py asks the lead `remove:<path>` about a worktree's keep note: an answer about the worktree, not to its ask.
 NOT_ANSWERS = ("remove:",)
+# The toolUseResult Claude Code writes when the user closes a tool's prompt, an AskUserQuestion's included.
+REJECTED = "User rejected tool use"
 
 
 @dataclass(frozen=True)
@@ -204,6 +206,36 @@ def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:
                              answered=tuple(str(question) for question in result["answers"]))
 
 
+def rejected_questions(transcripts: Iterable[Path], since: datetime | None) -> list[dict]:
+    """AskUserQuestion calls closed without an answer (Claude Code records the tool use rejected) at or after
+    `since`, closed earliest first, each with its id, questions, and asked and closed times. Its tool_result
+    takes a question out of the pending ones as an answer does."""
+    closed = []
+    for path in transcripts:
+        asked: dict[object, dict] = {}
+        with path.open("rb") as stream:
+            for raw in (line for line in stream if b"AskUserQuestion" in line or REJECTED.encode() in line):
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                content = scan_sessions.message_of(entry).get("content") if isinstance(entry, dict) else None
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                            and block.get("name") == "AskUserQuestion"):
+                        asked[block.get("id")] = {"id": block.get("id"), "asked_at": entry.get("timestamp"),
+                                                  "questions": (block.get("input") or {}).get("questions", [])}
+                    elif (entry.get("type") == "user" and entry.get("toolUseResult") == REJECTED
+                          and block.get("type") == "tool_result"
+                          and (question := asked.pop(block.get("tool_use_id"), None)) is not None
+                          and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None
+                          and (since is None or at >= since)):
+                        closed.append((at, {**question, "closed_at": entry.get("timestamp")}))
+    return [item for _, item in sorted(closed, key=itemgetter(0))]
+
+
 def transcripts_of(projects: Path, worktrees: Iterable[Path]) -> Iterator[Path]:
     for worktree in dict.fromkeys(worktrees):
         yield from sorted(scan_sessions.find_claude_dir(projects, str(worktree)).glob("*.jsonl"))
@@ -220,7 +252,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="Claude Code transcript root (default: $CLAUDE_CONFIG_DIR/projects, else %(default)s)")
 
 
+def asking_worktrees(args: argparse.Namespace) -> list[Path]:
+    """The worktrees whose transcripts hold the user's answers: the current directory and each --asked-in."""
+    return list(dict.fromkeys([Path.cwd(), *(path.expanduser().absolute() for path in args.asked_in)]))
+
+
 def from_arguments(args: argparse.Namespace, answers_log: Path) -> list[Answer]:
-    worktrees = [Path.cwd(), *(path.expanduser().absolute() for path in args.asked_in)]
     return [*decisions(args.decisions_file.expanduser()), *delivered(answers_log),
-            *asked_user(transcripts_of(args.claude_projects.expanduser(), worktrees))]
+            *asked_user(transcripts_of(args.claude_projects.expanduser(), asking_worktrees(args)))]

@@ -5,7 +5,10 @@ The lead never types into a scheduled triage tab, so it appends each answer here
 or several at once with `record-many` (JSON Lines of {"decision", "answer", "decided_at"?}: every
 line is checked first, and nothing is written while one is wrong).
 Every hourly run reads the log, drops answered questions from its handoff, and follows the answers.
-Records are only appended; a later record for the same decision replaces the earlier answer.
+Records are only appended; a later record for the same decision replaces the earlier answer, and
+`show --history` also prints the answers it replaced, with their times. `record` and `record-many`
+warn on stderr, and still record, when a text that only says the answer was passed on
+(「中継済み（…）」) replaces an answer.
 handoff.py appends each key it hands off to a second log; `handed_off` reads it, so a tool that
 writes what a question decides (asana_pr.py) can hold the write while the key has no answer.
 `unanswered` prints open keys and settled keys with their answer records. Open keys carry their
@@ -39,6 +42,9 @@ PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at"))
 JST = timezone(timedelta(hours=9))
 EXCERPT = 160
+# A record that only says an answer was passed on decides nothing: on 2026-11-06 「中継済み（12:2x send
+# montly-report）」 hid 「1,000 万円のまま」, recorded under the same key the hour before.
+DELIVERY_ONLY = re.compile(r"(?:(?:中継|送達|送信|転送)済み|中継した|送った|伝えた)(?:[（(][^）)]*[）)])?[。.]?")
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,36 @@ def handed_off(log: Path) -> Iterator[HandOff]:
 
 def latest(decisions: Iterable[Decision]) -> dict[str, Decision]:
     return {item.decision: item for item in decisions}
+
+
+def history(decisions: Iterable[Decision]) -> dict[str, list[Decision]]:
+    """Every record of each key in log order: the last is its answer, the earlier ones the answers it replaced."""
+    found: dict[str, list[Decision]] = {}
+    for item in decisions:
+        found.setdefault(item.decision, []).append(item)
+    return found
+
+
+def delivery_only(answer: str) -> bool:
+    return DELIVERY_ONLY.fullmatch(" ".join(answer.split())) is not None
+
+
+def substance(items: list[Decision]) -> Decision:
+    """A key's newest record that decides something, past later ones that only say it was passed on."""
+    return next((item for item in reversed(items) if not delivery_only(item.answer)), items[-1])
+
+
+def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]) -> list[str]:
+    """A warning for each entry that only says an answer was passed on, replacing that answer of its key."""
+    warnings = []
+    for entry in entries:
+        earlier = known.setdefault(entry.decision, [])
+        if delivery_only(entry.answer) and earlier and not delivery_only((answer := substance(earlier)).answer):
+            warnings.append(f"lead decisions: warning: {entry.decision}: {entry.answer!r} only says the answer was "
+                            f"passed on, and replaces the answer of {answer.decided_at}: "
+                            f"{' '.join(answer.answer.split())[:EXCERPT]} (`show --history` still prints it)")
+        earlier.append(entry)
+    return warnings
 
 
 def append(log: Path, *entries: Decision | HandOff) -> None:
@@ -317,8 +353,9 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     return {"unanswered": unanswered, "settled": settled}
 
 
-def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None) -> list[str]:
-    """One line per matching answer, newest first, with times in JST."""
+def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None,
+                 replaced: frozenset[str] = frozenset()) -> list[str]:
+    """One line per matching answer, newest first, with times in JST, marking the records `replaced` names."""
     selected = []
     for item in items:
         when = moment(item.decided_at)
@@ -333,6 +370,7 @@ def show_answers(items: Iterable[Decision], words: list[str], since: datetime | 
         stamp = when.astimezone(JST).isoformat(timespec="seconds") if when else item.decided_at
         path = item.decision.removeprefix("remove:").split("::", 1)[-1]
         pending = " 未実行" if item.decision.startswith("remove:") and Path(path).expanduser().exists() else ""
+        pending += " 置き換え済み" if item.id in replaced else ""
         shown.append(f"{stamp} {item.decision}{pending}  {' '.join(item.answer.split())[:EXCERPT]}")
     return shown
 
@@ -354,6 +392,9 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
     show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
     show.add_argument("--since-last-handoff", action="store_true",
                       help="answers since the newest saved handoff, newest first in JST")
+    show.add_argument("--history", action="store_true",
+                      help="also print the answers a later record of the same key replaced, with their times: "
+                           "under `replaced` in the JSON, marked 置き換え済み in the lines")
     # Imported here so log readers need not load the handoff or scan modules.
     import handoff
     show.add_argument("--handoffs-dir", type=Path, default=handoff.HANDOFFS,
@@ -367,6 +408,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
     unanswered.add_argument("--asana-status", type=Path, help="OUT_JSON already written by asana99_status.py")
     args = parser.parse_args(argv)
     log = args.decisions_file.expanduser()
+    warnings: list[str] = []
     try:
         if args.action == "record":
             decision = args.decision.strip()
@@ -374,6 +416,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
                 raise ValueError("--decision is empty")
             entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=non_empty(args.answer_file),
                              decided_at=decided_at(args.decided_at))
+            warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)
             result: object = asdict(entry)
         elif args.action == "record-many":
@@ -381,10 +424,12 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
             if bad or not given:
                 raise ValueError("nothing was recorded" + ("".join(f"\nline {item.number}: {item.reason}"
                                                                    for item in bad) or ": no answers were given"))
+            warnings = hidden_answers(history(records(log)), given)
             append(log, *given)
             result = [asdict(entry) for entry in given]
         elif args.action == "show":
-            items = latest(records(log)).values()
+            keys = history(records(log))
+            items = [item for found in keys.values() for item in (found if args.history else found[-1:])]
             if args.match or args.since_last_handoff:
                 since = None
                 if args.since_last_handoff:
@@ -392,9 +437,11 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
                     since = moment(saved.sent_at)
                     if since is None:
                         raise ValueError(f"invalid handoff sent_at: {saved.sent_at}")
-                print("\n".join(show_answers(items, args.match, since)))
+                replaced = frozenset(item.id for found in keys.values() for item in found[:-1])
+                print("\n".join(show_answers(items, args.match, since, replaced)))
                 return 0
-            result = [asdict(item) for item in items]
+            result = [{**asdict(found[-1]), "replaced": [asdict(item) for item in found[:-1]]} if args.history
+                      else asdict(found[-1]) for found in keys.values()]
         else:
             inbox = inbox_read.paths()[0].expanduser()
             entries = inbox_read.inbox_entries(inbox) if inbox.exists() else []
@@ -405,6 +452,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
     except (OSError, ValueError, LookupError) as error:
         print(f"lead decisions: {error}", file=sys.stderr)
         return 1
+    if warnings:
+        print(*warnings, sep="\n", file=sys.stderr)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
