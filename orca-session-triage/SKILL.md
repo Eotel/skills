@@ -7,6 +7,10 @@ hooks:
       hooks:
         - type: command
           command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -f "$f" ] && python3 "$f" || true'
+    - matcher: Bash
+      hooks:
+        - type: command
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/bash_timeout.py"; [ -f "$f" ] && python3 "$f" || true'
   PostToolUse:
     - matcher: AskUserQuestion
       hooks:
