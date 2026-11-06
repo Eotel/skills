@@ -41,6 +41,7 @@ precheck = load_script("precheck")
 hourly_runtime = sys.modules["hourly_runtime"]
 hourly_state = load_script("hourly_state")
 stopcheck = load_script("stop_check")
+bash_timeout = load_script("bash_timeout")
 inbox_service = load_script("inbox_watch_service")
 inbox_read = load_script("inbox_read")
 cleanup_hourly = load_script("cleanup_hourly_tabs")
@@ -6232,6 +6233,35 @@ class StopCheckTests(unittest.TestCase):
         (self.dir / "review-queue.json").write_text("[]")
         self.assertIsNone(self.check())
 
+
+class BashTimeoutHookTests(unittest.TestCase):
+    """On a heavily loaded Mac, a Bash call runs with the longest timeout instead of moving to the background."""
+
+    def hook_output(self, load: float, tool_input: dict) -> str:
+        hook = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": "s1",
+                "cwd": "/w/triage", "tool_input": tool_input}
+        with patch.object(bash_timeout.os, "getloadavg", return_value=(load, 1.0, 1.0)), \
+                patch.object(bash_timeout.sys, "stdin", io.StringIO(json.dumps(hook))), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(bash_timeout.main(), 0)
+        return out.getvalue()
+
+    def test_a_heavy_load_returns_the_call_with_only_its_timeout_raised(self) -> None:
+        call = {"command": "python3 handoff.py last", "description": "Read the last handoff"}
+        for given in ({}, {"timeout": 120000}):
+            with self.subTest(given=given):
+                self.assertEqual(json.loads(self.hook_output(390.0, {**call, **given})),
+                                 {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                         "updatedInput": {**call, "timeout": 600000}}})
+
+    def test_a_light_load_or_the_longest_timeout_leaves_the_call_alone(self) -> None:
+        call = {"command": "ls", "description": "List files"}
+        self.assertEqual(self.hook_output(100.0, call), "")
+        self.assertEqual(self.hook_output(390.0, {**call, "timeout": 600000}), "")
+
+    def test_a_call_started_in_the_background_keeps_its_input(self) -> None:
+        # Its timeout would set how long it may run in the background, not keep it in the foreground.
+        self.assertEqual(self.hook_output(390.0, {"command": "ls", "run_in_background": True}), "")
 
 
 class VerdictStoreTests(unittest.TestCase):

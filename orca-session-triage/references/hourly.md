@@ -105,6 +105,11 @@ production change) while the same question carries a note. Check how to read
 the choice and the note with the user in one question before handing it to a
 lane as permission; the hook does not judge whether they disagree. Record the
 checked answer with `hourly_state.py answered --replace-reason-file`.
+While the Mac's 1-minute load is above 300, a PreToolUse hook
+(`scripts/bash_timeout.py`) raises each Bash call's timeout to 600000 when it
+has none or a shorter one, so a tool that runs past the default 120 seconds
+stays in the foreground and its output is read in place. Do not add the timeout
+by hand.
 
 ## In the run
 
