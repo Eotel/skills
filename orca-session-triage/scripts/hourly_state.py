@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Keep decisions shared by successive hourly triage sessions in one JSON file.
 
 Use --state-file for an isolated copy. Mutations lock beside the file and replace

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Manage the macOS user services that watch the triage inbox outside Orca tabs.
 
 Use `render` to review its launchd plist, `status` to check the live watcher,

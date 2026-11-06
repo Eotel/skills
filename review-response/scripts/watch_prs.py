@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Poll a re-read list of owner/repo#N PRs and persist event history as JSON.
 
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,

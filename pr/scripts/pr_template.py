@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Pick the PR body template for a checkout, and check a body against its headings.
 
 pick: the repository's own pull request template wins. Otherwise the repository a PR goes to

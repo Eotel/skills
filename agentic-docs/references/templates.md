@@ -7,8 +7,8 @@ Use this reference when creating a new docs scaffold from the bundled templates.
 Prefer the script:
 
 ```bash
-python scripts/bootstrap_docs.py --target /path/to/repo --dry-run
-python scripts/bootstrap_docs.py --target /path/to/repo
+scripts/bootstrap_docs.py --target /path/to/repo --dry-run
+scripts/bootstrap_docs.py --target /path/to/repo
 ```
 
 The script copies `assets/templates/` into the target repository and replaces

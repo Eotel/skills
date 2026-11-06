@@ -15,7 +15,7 @@ editing the PR.
 
 ## Pick the template
 
-Run `python3 scripts/pr_template.py pick --repo-dir <checkout>` (path relative to this skill).
+Run `scripts/pr_template.py pick --repo-dir <checkout>` (path relative to this skill).
 It prints the kind, the template file, and its headings:
 
 - `repo`: the repository's own `pull_request_template.md`. Use its headings in order; it
@@ -39,7 +39,7 @@ the images to the repository.
 
 ## Check
 
-Run `python3 scripts/pr_template.py check <body-file> --repo-dir <checkout>` (`-` reads stdin).
+Run `scripts/pr_template.py check <body-file> --repo-dir <checkout>` (`-` reads stdin).
 It fails on a missing, misordered, or empty heading at the template's top heading level. It checks shape only: whether the first
 section says what happened to users or data is still the writer's job. A repository's own CI
 check on PR bodies, where one exists, has the final say.

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Emit DONE owner/repo@sha ok|FAILED [...] once per commit; exit when all finish."""
 
 import argparse

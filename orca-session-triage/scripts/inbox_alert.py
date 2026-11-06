@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Show a macOS notification for each new ask in the triage inbox.
 
 Pressing the notification brings the sender's agent tab forward when

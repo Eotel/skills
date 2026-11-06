@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Queue hourly triage transcripts and turn verified lessons into reversible skill notes.
 
 A live hourly tab reviews itself through a forked Agent and records the result with ``submit``.
@@ -1358,7 +1358,7 @@ def live_prompt(session_id: str, root: Path = SOURCE, rejected: str = "") -> str
     return (fork_prompt(session_transcript(session_id), root, rejected)
             + "\n\n答えは次の JSON Schema に合う JSON にし、道具はこの記録のコマンドだけに使う。"
             "標準入力に渡して実行し、出力を一行で報告する:\n"
-            f"python3 {script} submit --session-id {session_id} <<'JSON'\n...\nJSON\n\n"
+            f"{script} submit --session-id {session_id} <<'JSON'\n...\nJSON\n\n"
             "SCHEMA\n" + json.dumps(SCHEMA, ensure_ascii=False))
 
 

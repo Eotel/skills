@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Inventory legacy exec plans and remove completed plans once unreferenced."""
 
 from __future__ import annotations

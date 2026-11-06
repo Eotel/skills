@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Send an hourly run's handoff to the appointed lead with what changed after the scan.
 
 `send` appends, at the moment it sends, every inbox report that arrived after the

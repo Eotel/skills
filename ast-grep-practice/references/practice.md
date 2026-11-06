@@ -662,7 +662,7 @@ When maintaining the bundled presets, run
 [scripts/check_snapshots.py](../scripts/check_snapshots.py) from the skill root:
 
 ```bash
-python3 scripts/check_snapshots.py assets/node-import assets/examples
+scripts/check_snapshots.py assets/node-import assets/examples
 ```
 
 It generates snapshots in isolation and compares them with the committed files,

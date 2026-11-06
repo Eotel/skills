@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Allow a fresh hourly triage session unless an earlier turn is still working.
 
 Exit 0 to run, 1 when a turn is working, or 2 when Orca cannot tell. A turn

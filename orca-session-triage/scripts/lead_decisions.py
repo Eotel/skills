@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Record the lead's answers to questions an hourly triage run handed off, and list the open ones.
 
 The lead never types into a scheduled triage tab, so it appends each answer here with `record`,

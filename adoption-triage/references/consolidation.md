@@ -4,7 +4,7 @@
 
 ## 候補
 
-`python3 ~/.agents/skills/adoption-triage/scripts/ledger.py list --json --candidates` が返す案を全部見る。確認待ち・保留と、採用済みで未実施の案のうち、前の整理でまとめた案・取り下げの案にまだ含まれていないものが返る。
+`~/.agents/skills/adoption-triage/scripts/ledger.py list --json --candidates` が返す案を全部見る。確認待ち・保留と、採用済みで未実施の案のうち、前の整理でまとめた案・取り下げの案にまだ含まれていないものが返る。
 
 ## 1 件ずつ確かめること
 

@@ -6,20 +6,20 @@ hooks:
     - matcher: AskUserQuestion
       hooks:
         - type: command
-          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -f "$f" ] && python3 "$f" || true'
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -x "$f" ] && "$f" || true'
     - matcher: Bash
       hooks:
         - type: command
-          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/bash_timeout.py"; [ -f "$f" ] && python3 "$f" || true'
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/bash_timeout.py"; [ -x "$f" ] && "$f" || true'
   PostToolUse:
     - matcher: AskUserQuestion
       hooks:
         - type: command
-          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -f "$f" ] && python3 "$f" || true'
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -x "$f" ] && "$f" || true'
   Stop:
     - hooks:
         - type: command
-          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -f "$f" ] && python3 "$f" || true'
+          command: 'f="$HOME/.claude/skills/orca-session-triage/scripts/stop_check.py"; [ -x "$f" ] && "$f" || true'
 ---
 
 # Orca Session Triage

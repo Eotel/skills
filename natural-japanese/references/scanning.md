@@ -10,10 +10,10 @@
 パスを指定する。ファイルは変更されない。
 
 ```bash
-python3 scripts/check_japanese.py draft.md
-python3 scripts/check_japanese.py draft.md reply.md --format json
-python3 scripts/check_japanese.py < draft.md
-python3 scripts/check_japanese.py --input-format text < message.txt
+scripts/check_japanese.py draft.md
+scripts/check_japanese.py draft.md reply.md --format json
+scripts/check_japanese.py < draft.md
+scripts/check_japanese.py --input-format text < message.txt
 ```
 
 入力を省略するか `-` を指定すると標準入力を読む。ディレクトリの一括探索は

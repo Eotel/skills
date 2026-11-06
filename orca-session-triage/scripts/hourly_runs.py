@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """List a triage workspace's scheduled hourly runs, newest first, one line each.
 
 Each line gives when the run was scheduled and started (local time), Orca's status,

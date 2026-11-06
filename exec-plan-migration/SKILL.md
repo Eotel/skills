@@ -16,7 +16,7 @@ use the legacy shape have migrated.
 Work in a dedicated worktree from the default branch. Run:
 
 ```bash
-python <skill>/scripts/migrate_plans.py --root . --base origin/<default-branch>
+<skill>/scripts/migrate_plans.py --root . --base origin/<default-branch>
 ```
 
 The report lists the completed plans, every tracked line that references them
