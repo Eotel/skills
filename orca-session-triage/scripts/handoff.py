@@ -172,7 +172,6 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
     final: dict[str, str | None] = {"at": None, "text": None}
     questions = {}
     queued = []
-    rejected: list[dict] = []
     if claude:
         transcript = Path(claude["transcript"])
         entries = scan_sessions.load_jsonl(transcript)
@@ -192,7 +191,10 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
         queued = scan_sessions.queued_input(transcript)
-        rejected = answer_evidence.rejected_questions([transcript], last_sent_at(handoffs))
+    # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
+    rejected = answer_evidence.rejected_questions(
+        dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
+                       *([Path(claude["transcript"])] if claude else [])]), last_sent_at(handoffs))
     agents = [{"type": agent.get("agentType"), "state": agent.get("state"),
                "state_started_at": scan_sessions.iso_time(agent.get("stateStartedAt")),
                "stopped_at": scan_sessions.iso_time(agent.get("stateStartedAt"))

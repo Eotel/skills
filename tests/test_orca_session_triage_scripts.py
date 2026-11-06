@@ -4476,10 +4476,13 @@ class HourlyStateTests(unittest.TestCase):
         scan_json.write_text(json.dumps([
             {"path": f"/w/{name}", "repo": "app", "class": "waiting",
              "claude": {"final_at": "2026-11-02T01:46:39Z", "final_text": "総額は 1,000 万円か 976 万円か"},
-             # A question on its screen came after the answer, though its transcript's last message did not.
+             # A question on its screen or pending in its transcript came after the answer, though its
+             # transcript's last message did not.
              **({"prompt_waiting": {"tab": "t", "question": "10月の報告書をどう送りますか？", "choices": ["1. 任せる"]}}
                 if name == "asking-on-screen" else {})}
-            for name in ("montly-report", "earlier-answer", "asking-on-screen")]))
+            for name in ("montly-report", "earlier-answer", "asking-on-screen")]
+            + [{"path": "/w/asking-in-transcript", "repo": "app", "class": "waiting",
+                "claude": {"final_at": None, "pending_questions": [{"question": "10月の報告書をどう送りますか？"}]}}]))
         write_jsonl(self.root / "inbox.jsonl", [])
         write_jsonl(self.root / "decisions.jsonl", [
             {"id": "1", "decision": "ask:montly-report::spare-24man", "answer": "1,000 万円のまま",
@@ -4489,13 +4492,16 @@ class HourlyStateTests(unittest.TestCase):
             {"id": "3", "decision": "ask:earlier-answer::total", "answer": "976 万円",
              "decided_at": "2026-11-01T09:00:00+09:00"},
             {"id": "4", "decision": "ask:asking-on-screen::total", "answer": "976 万円",
+             "decided_at": "2026-11-05T12:21:00+09:00"},
+            {"id": "5", "decision": "ask:asking-in-transcript::total", "answer": "976 万円",
              "decided_at": "2026-11-05T12:21:00+09:00"}])
 
         code, stale = self.call("stale-asks", "--from", str(scan_json))
 
         self.assertEqual(code, 0)
         self.assertEqual({item["name"]: item["state"] for item in stale},
-                         {"montly-report": "settled", "earlier-answer": "unasked", "asking-on-screen": "unasked"})
+                         {"montly-report": "settled", "earlier-answer": "unasked", "asking-on-screen": "unasked",
+                          "asking-in-transcript": "unasked"})
         settled = next(item for item in stale if item["state"] == "settled")
         self.assertEqual(settled["evidence"], [{"decision": "ask:montly-report::spare-24man",
                                                 "decided_at": "2026-11-05T12:21:00+09:00", "answer": "1,000 万円のまま"}])
@@ -4514,9 +4520,13 @@ class HourlyStateTests(unittest.TestCase):
                                              "content": "The user doesn't want to proceed with this tool use."}]}}
 
         lead = self.root.resolve() / "lead"
-        write_jsonl(scan.claude_project_dir(self.root / "claude/projects", str(lead)) / "lead.jsonl", [
+        lead_dir = scan.claude_project_dir(self.root / "claude/projects", str(lead))
+        # The lead closed the question, then started the session whose transcript is now the newest.
+        write_jsonl(lead_dir / "closed.jsonl", [
             asked("before", "2026-11-05T09:00:00Z"), rejected("before", "2026-11-05T09:10:00Z"),
-            asked("after", "2026-11-05T10:39:58Z"), user("別の話"), rejected("after", "2026-11-06T00:04:38Z"),
+            asked("after", "2026-11-05T10:39:58Z"), user("別の話"), rejected("after", "2026-11-06T00:04:38Z")])
+        os.utime(lead_dir / "closed.jsonl", (1, 1))
+        write_jsonl(lead_dir / "lead.jsonl", [
             asked("answered", "2026-11-06T00:18:21Z"),
             user([{"type": "tool_result", "tool_use_id": "answered", "content": "答えた"}])])
         handoff.SavedHandoff(text="前回", kind="info", decisions=[], sent_at="2026-11-05T10:00:00+00:00",

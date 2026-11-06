@@ -396,9 +396,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                                   "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                                   "answer": answer_view(answer)}))
             continue
-        # A prompt on the lane's screen asks now, after every record: montly-report asked a new one on 2026-11-06.
+        # A question on the lane's screen or pending in its transcript asks now, after every record: montly-report
+        # asked a new one on 2026-11-06.
         keyed = [lead_decisions.substance(items) for key, items in (decided or {}).items()
                  if not scan_sessions.prompt_question(row.get("prompt_waiting") or {})
+                 and not (row.get("claude") or {}).get("pending_questions")
                  and key.startswith(f"ask:{view['name']}::") and any(
                      said_at is None or (at := scan_sessions.parse_time(item.decided_at)) is not None and at > said_at
                      for item in items)]
