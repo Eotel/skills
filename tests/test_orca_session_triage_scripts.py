@@ -2192,6 +2192,13 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
         self.assertEqual(json.loads(out.getvalue())["transcripts"],
                          {"claude": [str(claude)], "codex": [str(path) for path in rollouts]})
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login", "--transcripts"]), 0)
+        self.assertEqual(out.getvalue().splitlines(),
+                         [f"claude {claude}"] + [f"codex {path}" for path in rollouts])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+            scan.parse_args(["--from", str(saved), "--transcripts"])
+        self.assertEqual(stopped.exception.code, 2)
 
     def test_row_shows_the_completed_pr_review_beside_the_merge_question(self) -> None:
         saved, _ = self.saved_scan()

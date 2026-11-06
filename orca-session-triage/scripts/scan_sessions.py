@@ -2409,7 +2409,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     views.add_argument("--row", metavar="NAME",
                        help="print one row as JSON with fixed keys: " + ", ".join(ROW_KEYS) + ". "
                             "Strings are never null, `final` is the newest "
-                            "final message of Claude, Codex, or Orca, and `github` is owner/repo from origin; "
+                            "final message of Claude, Codex, or Orca, `transcripts` is "
+                            '{"claude": [path…], "codex": [path…]}, and `github` is owner/repo from origin; '
                             "NAME is repo/name, the last path segment (with optional ENVIRONMENT:: on another "
                             "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
                             "or " + REVIEW_DIR)
@@ -2421,6 +2422,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
                             "logs in, その他: a person reads it) | the error's first 200 characters")
+    parser.add_argument("--transcripts", action="store_true",
+                        help="with --row, print the row's transcript paths instead of JSON, one per line as "
+                             "`claude <path>` or `codex <path>`")
     parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                         help="read the rows a previous scan printed as JSON instead of scanning again")
     parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
@@ -2442,6 +2446,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--wake needs --from")
     if args.classes and not args.rows:
         parser.error("--class needs --rows")
+    if args.transcripts and not args.row:
+        parser.error("--transcripts needs --row")
     return args
 
 
@@ -2709,13 +2715,19 @@ def saved_rows(path: str) -> list[dict]:
     return rows
 
 
-def print_row(rows: list[dict], key: str) -> int:
+def print_row(rows: list[dict], key: str, transcripts: bool = False) -> int:
     try:
         row = select_row(rows, key)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
-    json.dump(row_view(row), sys.stdout, ensure_ascii=False, indent=2)
+    view = row_view(row)
+    if transcripts:
+        for agent, paths in view["transcripts"].items():
+            for path in paths:
+                print(f"{agent} {path}")
+        return 0
+    json.dump(view, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
 
@@ -2799,7 +2811,7 @@ def wake_line(row: dict, stop: StopReason) -> str:
 
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
     if args.row:
-        return print_row(rows, args.row)
+        return print_row(rows, args.row, args.transcripts)
     if args.rows:
         for row in rows:
             if not args.classes or ((row.get("verdict") or {}).get("class") or row["class"]) in args.classes:
