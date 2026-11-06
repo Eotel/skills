@@ -20,7 +20,9 @@ marked 既読). An id may be its first 8 or more characters, as handoffs and
 and prints nothing. Read a long inbox this way rather than cutting the output,
 and read past entries by time or worktree with `inbox --since`. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
-`repo/worktree` (older entries without a repo use their worktree). A read with
+`repo/worktree` (older entries without a repo use their worktree). A worktree
+name alone, as backlog-watch prints it, also reads its `repo/worktree` when one
+repo has it; a source no entry has names the near ones on stderr. A read with
 `--kind`, `--source`, `--id`, or `--since` prints no `NEXT_OFFSET`, so an entry the filter
 hid is never acknowledged: acknowledge from an unfiltered read.
 After handling the entries, pass `NEXT_OFFSET` to
@@ -59,7 +61,9 @@ id's first 8 or more characters will do, as for `read --id`);
 `scripts/inbox_read.py answered <id> --note <why>` records one answered another
 way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest apart from handoffs, oldest first (`--json` for other tools; the board
-reads it).
+reads it). It first records answered each board adoption notice whose proposals
+already have a lane in the ledger, naming the lane on stderr; `ledger.py owner
+<proposal id>` shows a proposal's lane, brief, and whether it is done.
 Before either tab asks the user an inbox ask itself, it records that with
 `scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
 `~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another

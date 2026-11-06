@@ -5167,6 +5167,35 @@ class InboxReadTests(unittest.TestCase):
             self.assertIn("before the cursor: 0", run("--source", "missing")[2])
             self.assertEqual(cursor.read_text(), acknowledged)
 
+    def test_source_takes_a_worktree_name_alone_and_names_near_sources_when_none_has_it(self) -> None:
+        # 2026-11-06: backlog-watch's worktree names passed to --source read 0 entries.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))
+            write_jsonl(inbox, [
+                {"ts": "t1", "kind": "done", "host": "h", "repo": "construction-materials",
+                 "worktree": "general-205-close-check", "text": "投稿した"},
+                {"ts": "t2", "kind": "info", "host": "h", "worktree": "general-205-close-check", "text": "旧形式"},
+                {"ts": "t3", "kind": "ask", "host": "h", "repo": "repo-a", "worktree": "same", "text": "a"},
+                {"ts": "t4", "kind": "ask", "host": "h", "repo": "repo-b", "worktree": "same", "text": "b"},
+            ])
+
+            def run(source: str) -> tuple[str, str]:
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(inbox_read.main(["read", "--source", source]), 0)
+                return out.getvalue(), err.getvalue()
+
+            self.assertEqual(run("general-205-close-check")[0],
+                             "t1 done h construction-materials/general-205-close-check\n投稿した\n\n"
+                             "t2 info h general-205-close-check\n旧形式\n\n")
+            output, error = run("general-205-close")
+            self.assertEqual(output, "")
+            self.assertIn("construction-materials/general-205-close-check", error)
+            # A worktree name two repos have names neither; both are near.
+            output, error = run("same")
+            self.assertEqual(output, "")
+            self.assertIn("repo-a/same, repo-b/same", error)
+
     def test_since_reads_acknowledged_entries_by_time_without_an_offset_to_acknowledge(self) -> None:
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         with tempfile.TemporaryDirectory() as root:
@@ -5283,6 +5312,54 @@ class InboxReadTests(unittest.TestCase):
             self.assertEqual(run("open-asks")[1], "")
             self.assertEqual(unknown[0], 1)
             self.assertIn("done1", unknown[2])
+
+    def test_open_asks_closes_an_adoption_notice_once_a_lane_holds_its_proposal(self) -> None:
+        # 2026-11-05: finding the lane of 14 adoption asks took a grep -r cut off at 120 seconds.
+        ledger_script = ROOT / "adoption-triage/scripts/ledger.py"
+        with tempfile.TemporaryDirectory() as root:
+            inbox, answers, events, imports, writer = (
+                Path(root) / name for name in ("inbox.jsonl", "answers.jsonl", "events.jsonl", "imports", "writer.json"))
+            writer.write_text('{"decision_writer": true, "name": "board"}')
+
+            def ledger(command: str, body: dict) -> dict:
+                result = subprocess.run([sys.executable, str(ledger_script), "--events", str(events), "--imports",
+                                         str(imports), "--decision-config", str(writer), command],
+                                        input=json.dumps(body, ensure_ascii=False), text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+
+            held, waiting = (ledger("propose", {
+                "source": {"session": "triage", "worktree": "triage"}, "fact": "事実", "proposal": "案",
+                "reason": "理由", "recommendation": "adopt", "priority": "normal"})["proposal_id"] for _ in range(2))
+            for proposal_id in (held, waiting):
+                adoption = ledger("decide", {"proposal_id": proposal_id, "decision": "adopt", "actor": "board"})["id"]
+                ledger("record", {"proposal_id": proposal_id, "decision_id": adoption, "outcome": "handed_off",
+                                  "actor": "triage-retro", "result": "担当へ渡した"})
+                if proposal_id == held:
+                    ledger("record", {"proposal_id": proposal_id, "decision_id": adoption, "outcome": "handed_off",
+                                      "actor": "adopt-lane", "result": "担当の handle term_1・指示書 /briefs/b.md"})
+            write_jsonl(inbox, [
+                {"id": f"{name}-ask", "ts": f"2026-11-06T15:1{n}:00+0900", "kind": "ask", "repo": "skills",
+                 "worktree": "adopt-triage-inbox",
+                 "text": f"採用 triage の採用に担当を立ててください。\n案の ID: {proposal_id}\n案: 案\n決定: 採用"}
+                for n, (name, proposal_id) in enumerate((("held", held), ("waiting", waiting)))])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers),
+                           "ADOPTION_TRIAGE_SCRIPT": str(ledger_script), "ADOPTION_TRIAGE_EVENTS": str(events),
+                           "ADOPTION_TRIAGE_IMPORTS": str(imports)}
+
+            def run(*argv: str) -> tuple[int, str, str]:
+                with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
+                        redirect_stderr(io.StringIO()) as err:
+                    code = inbox_read.main(list(argv))
+                return code, out.getvalue(), err.getvalue()
+
+            code, output, error = run("open-asks", "--json")
+            self.assertEqual((code, [ask["id"] for ask in json.loads(output)]), (0, ["waiting-ask"]))
+            self.assertIn("held-ask", error)
+            self.assertIn("adopt-lane", error)
+            code, output, error = run("open-asks")
+            self.assertEqual((code, output.count("\n"), error), (0, 1, ""))
+            self.assertIn("id=waiting-ask", output)
 
     def test_open_asks_leaves_marked_handoffs_to_lead_decisions(self) -> None:
         question = {"question": "続けますか？", "header": "継続", "recommended": "続ける",
