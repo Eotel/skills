@@ -118,10 +118,14 @@ At the start, run
 This checks Orca's run, terminal and agent records before closing previous
 scheduled tabs. It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
-latest conversation may still ask the user, its transcript is missing or active
-within five minutes, or its rendered screen shows a draft or a nonempty input
-field. When Orca has no provider session ID, the script requires one transcript
-whose scheduled prompt matches the run's start time. A tab Orca detached from
+latest conversation has an unanswered AskUserQuestion or no final message, its
+transcript is missing or active within five minutes, or its rendered screen
+shows a draft or a nonempty input field. Before closing a tab, it prints each
+line of its final message that asks the user something as
+`carry: HANDLE: LINE`; add each to this run's list of what awaits the user
+(the handoff, when another tab leads). When Orca has no provider session ID,
+the script requires one transcript whose scheduled prompt matches the run's
+start time. A tab Orca detached from
 the window (`orphaned`) whose run recorded no pane is matched by the provider
 session Orca's agent hooks saved for its recorded pane. Each tab gets one
 `closed:` or `keep:` line with the reason. Inspect `keep:` output and retry on

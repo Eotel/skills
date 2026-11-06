@@ -153,8 +153,8 @@ def newest_activity(transcript):
     return newest
 
 
-def unanswered_conversation(transcript):
-    """Keep a tab if its latest exchange may still need the user."""
+def latest_exchange(transcript: Path) -> tuple[str | None, bool]:
+    """The latest exchange's final text, and whether an AskUserQuestion in it still has no answer."""
     final_text = None
     pending_tools = set()
     with transcript.open(encoding="utf-8", errors="replace") as stream:
@@ -182,7 +182,12 @@ def unanswered_conversation(transcript):
                         pending_tools.add(block.get("id"))
                 elif block.get("type") == "tool_result":
                     pending_tools.discard(block.get("tool_use_id"))
-    return bool(pending_tools) or not final_text or bool(QUESTION.search(final_text))
+    return final_text, bool(pending_tools)
+
+
+def requests(text: str) -> list[str]:
+    """Lines of a final message that ask the user something, for the current run to carry over."""
+    return [line.strip() for line in text.splitlines() if QUESTION.search(line)]
 
 
 def close_blockers(term, transcript, screen, min_idle_minutes, now):
@@ -190,7 +195,8 @@ def close_blockers(term, transcript, screen, min_idle_minutes, now):
     newest = newest_activity(transcript)
     if newest is None or (now - newest).total_seconds() < min_idle_minutes * 60:
         problems.append("recent or unknown transcript activity")
-    if unanswered_conversation(transcript):
+    final_text, asking = latest_exchange(transcript)
+    if asking or not final_text:
         problems.append("unanswered conversation question")
     if (term.get("title") or "")[:1] in SPINNERS:
         problems.append("title is spinning")
@@ -265,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
             if problems:
                 print(f"keep: {term['handle']}: " + "; ".join(problems))
                 continue
+            final_text, _ = latest_exchange(transcript)
+            for line in requests(final_text or ""):
+                print(f"carry: {term['handle']}: {line}")
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
             print(f"closed: {term['handle']}: completed scheduled run, idle transcript and empty composer")
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:

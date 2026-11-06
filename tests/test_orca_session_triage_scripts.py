@@ -2193,6 +2193,13 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login"]), 0)
         self.assertEqual(json.loads(out.getvalue())["transcripts"],
                          {"claude": [str(claude)], "codex": [str(path) for path in rollouts]})
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "/w/app/fix-login", "--transcripts"]), 0)
+        self.assertEqual(out.getvalue().splitlines(),
+                         [f"claude {claude}"] + [f"codex {path}" for path in rollouts])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+            scan.parse_args(["--from", str(saved), "--transcripts"])
+        self.assertEqual(stopped.exception.code, 2)
 
     def test_row_shows_the_completed_pr_review_beside_the_merge_question(self) -> None:
         saved, _ = self.saved_scan()
@@ -4877,13 +4884,14 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     self.assertEqual(code, 0)
                     closed = [call.args[0] for call in calls.call_args_list if call.args[0][1:3] ==
                               ["terminal", "close"]]
-                    self.assertEqual(closed, [] if "？" in final else [
+                    self.assertEqual(closed, [
                         ["test-orca", "terminal", "close", "--terminal", "old-handle", "--json"]])
                     lines = out.getvalue().splitlines()
-                    self.assertEqual(len(lines), 2)
-                    self.assertIn("other-handle: no unique scheduled run and transcript", lines[1])
-                    self.assertIn("keep: old-handle: unanswered conversation question" if "？" in final else
-                                  "closed: old-handle: completed scheduled run", lines[0])
+                    carried = ["carry: old-handle: どちらの案にしますか？"] if "？" in final else []
+                    self.assertEqual(lines[:len(carried)], carried)
+                    self.assertIn("closed: old-handle: completed scheduled run", lines[len(carried)])
+                    self.assertIn("other-handle: no unique scheduled run and transcript", lines[-1])
+                    self.assertEqual(len(lines), len(carried) + 2)
 
     def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self):
         with tempfile.TemporaryDirectory() as root:
@@ -4960,6 +4968,12 @@ class HourlyTabCleanupTests(unittest.TestCase):
                 stream.write(json.dumps({"type": "assistant", "message": {"content": [
                     {"type": "text", "text": "どちらの案にしますか。\n判断に必要な背景は前段の説明です。"}]},
                     "timestamp": "2026-10-26T08:02:00Z"}) + "\n")
+            self.assertEqual(cleanup_hourly.close_blockers(
+                term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now), [])
+            with transcript.open("a") as stream:
+                stream.write(json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "AskUserQuestion", "input": {}}]},
+                    "timestamp": "2026-10-26T08:02:30Z"}) + "\n")
             self.assertIn("unanswered conversation question", cleanup_hourly.close_blockers(
                 term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now))
             with transcript.open("a") as stream:
