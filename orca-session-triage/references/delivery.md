@@ -73,6 +73,18 @@
   comes from: search its fixed text in the candidate repositories and read the
   other triage tabs' latest output. If the source is still unclear, ask the user
   which system it is.
+- When a meeting or a review gives feedback on a case's work, write its
+  feedback record first, in `~/.cache/orca-briefs/<case>/`: the transcript as
+  said, links to the pages or PRs made from it, and the fixes as `- [F1] …`
+  lines (form: `~/.cache/orca-briefs/bin/feedback_record.py --help`). A
+  scratchpad is deleted with its session. When the case has an implementation
+  lane, hand the record over in the same pass: `send <worktree> --feedback
+  <record>` to a running lane, `spawn-lane … --feedback <record>` to a new one.
+  The lane's `triage-notify --kind done` is then refused until it answers every
+  item. On 2026-11-05 a lead put a meeting's feedback on a page, kept the
+  transcript in a scratchpad, and sent nothing; the lane did not change, and
+  another session read the meeting again and proposed a layout the page had
+  already ruled out.
 - Before writing a brief or an AGENTS.md for a lane, read `codex-prompting`,
   `agentic-docs`, and `writing-for-agents`; before running several lanes in one
   repository, read `worker-contract`.
