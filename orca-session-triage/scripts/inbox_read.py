@@ -11,7 +11,9 @@ cursor, and names each ask left unanswered for 15 minutes.
 Being read and being answered differ. `answered` records an ask (or one of its
 questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
 ($TRIAGE_ASK_ANSWERS), as `send --decision --ask` does; `open-asks` lists the asks
-not answered yet, oldest first, and `questions` prints their structured questions
+not answered yet, oldest first, after recording answered each board adoption notice
+(「採用 triage の採用に担当を立ててください。」) whose proposals adoption-triage's ledger
+already has a lane for, and `questions` prints their structured questions
 (`triage-notify --kind ask --questions`) four at a time as AskUserQuestion input.
 `answered --before` marks only the asks an answer proves answered, every open question
 of them (answer_evidence.py: the lead's decisions, AskUserQuestion answers, delivered
@@ -31,11 +33,13 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 import fcntl
 from itertools import takewhile
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -56,6 +60,13 @@ ID_PREFIX_MIN = 8
 # AskUserQuestion takes one to four questions per call.
 QUESTIONS_PER_BATCH = 4
 RECOMMENDED_MARK = "（推奨）"
+# A source no entry has names at most this many near ones, alike at least this much (difflib's ratio).
+NEAR_SOURCES = 5
+NEAR_LIKENESS = 0.6
+# orca-board's adoption notice: its first line, and each proposal it asks a lane for.
+NOTICE = "採用 triage の採用に担当を立ててください。"
+NOTICE_ID = re.compile(r"^案の ID: ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.MULTILINE)
+LEDGER = "~/.agents/skills/adoption-triage/scripts/ledger.py"
 
 
 @dataclass(frozen=True)
@@ -101,10 +112,23 @@ class Sender:
 
 
 @dataclass(frozen=True)
+class SourceFilter:
+    """`read --source`: the value given, and the sources it names."""
+    given: str
+    names: frozenset[str]
+
+    @classmethod
+    def of(cls, given: str, entries: list[dict]) -> SourceFilter:
+        """A worktree name alone (as backlog-watch prints it) also names its repo/worktree when one repo has it."""
+        repos = {source_of(item) for item in entries if item.get("repo") and item.get("worktree") == given}
+        return cls(given, frozenset((given, *repos)) if len(repos) == 1 else frozenset((given,)))
+
+
+@dataclass(frozen=True)
 class ReadOptions:
     brief: bool = False
     kinds: frozenset[ReportKind] | None = None
-    source: str | None = None
+    source: SourceFilter | None = None
     summary: bool = False
     ids: frozenset[str] | None = None
     since: datetime | None = None
@@ -247,9 +271,18 @@ def entry_header(item: dict) -> str:
     return f"{label} {source_of(item)}" + (f" id={item['id']}" if item.get("id") else "")
 
 
+def near_sources(entries: list[dict], wanted: str) -> list[str]:
+    """The inbox's sources most like `wanted` by repo/worktree or by worktree alone, those holding it first."""
+    worktrees = {source_of(item): str(item.get("worktree") or "") for item in entries}
+    likeness = {source: max(SequenceMatcher(None, wanted, name).ratio() for name in (source, worktree))
+                for source, worktree in worktrees.items()}
+    near = [source for source, alike in likeness.items() if wanted in source or alike >= NEAR_LIKENESS]
+    return sorted(near, key=lambda source: (wanted not in source, -likeness[source], source))[:NEAR_SOURCES]
+
+
 def shown_by_filters(item: dict, options: ReadOptions) -> bool:
     return ((options.kinds is None or item.get("kind") in options.kinds)
-            and (options.source is None or source_of(item) == options.source)
+            and (options.source is None or source_of(item) in options.source.names)
             and (options.since is None or (when := asked_at(item)) is not None and when >= options.since))
 
 
@@ -287,6 +320,10 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
                      default={})
         print(f"inbox-read: no matching entries after the cursor; before the cursor: {len(earlier)} matching entries; "
               f"latest id={latest.get('id') or '-'} ts={latest.get('ts') or '-'}", file=sys.stderr)
+        entries = inbox_entries(inbox) if options.source is not None else []
+        if options.source is not None and not any(source_of(item) in options.source.names for item in entries):
+            print(f"inbox-read: no entry has source {options.source.given}; near sources: "
+                  f"{', '.join(near_sources(entries, options.source.given)) or 'none'}", file=sys.stderr)
     if options.filtered:
         print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, --id, or --since "
               "to acknowledge", file=sys.stderr)
@@ -393,6 +430,41 @@ def open_asks(entries: list[dict], answered: frozenset[str]) -> list[OpenAsk]:
             found.append(OpenAsk(item, left, asked_at(item)))
     # Python's sort is stable: asks without a readable time keep their append order, after the rest.
     return sorted(found, key=lambda ask: (ask.at is None, ask.at or datetime.min.replace(tzinfo=timezone.utc)))
+
+
+def ledger_owners(proposal_ids: list[str]) -> dict[str, str]:
+    """The lane holding each proposal that has one, by adoption-triage's `ledger.py owner`; ADOPTION_TRIAGE_SCRIPT,
+    ADOPTION_TRIAGE_EVENTS, and ADOPTION_TRIAGE_IMPORTS select another ledger, as adoption_handoff.py does."""
+    script = Path(os.environ.get("ADOPTION_TRIAGE_SCRIPT") or LEDGER).expanduser()
+    paths = [part for key, flag in (("ADOPTION_TRIAGE_EVENTS", "--events"), ("ADOPTION_TRIAGE_IMPORTS", "--imports"))
+             if os.environ.get(key) for part in (flag, os.environ[key])]
+    result = subprocess.run([sys.executable, str(script), *paths, "owner", "--json", *proposal_ids],
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout).strip()[:300])
+    return {view["proposal_id"]: view["owner"] for view in json.loads(result.stdout)["items"] if view["owner"]}
+
+
+def close_held_notices(asks: list[OpenAsk], answers: Path) -> list[OpenAsk]:
+    """Record answered each adoption notice whose proposals all have a lane in the ledger, naming the lanes;
+    return the asks left open."""
+    named = {ask.report["id"]: NOTICE_ID.findall(text) for ask in asks
+             if (text := str(ask.report.get("text") or "")).startswith(NOTICE)}
+    if not any(named.values()):
+        return asks
+    try:
+        owners = ledger_owners(sorted({proposal for proposals in named.values() for proposal in proposals}))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f"inbox-read: 台帳から担当を引けず、採用の通知を閉じなかった: {exc}", file=sys.stderr)
+        return asks
+    closed = set()
+    for ask_id, proposals in named.items():
+        if proposals and all(proposal in owners for proposal in proposals):
+            note = "・".join(f"案 {proposal[:8]} の担当 {owners[proposal]}" for proposal in proposals)
+            record_answers(answers, [ask_id], "inbox_read.py open-asks", note)
+            print(f"inbox-read: 採用の通知 {ask_id} を閉じた（{note}）", file=sys.stderr)
+            closed.add(ask_id)
+    return [ask for ask in asks if ask.report["id"] not in closed]
 
 
 def minutes_since(when: datetime | None, now: datetime) -> int | None:
@@ -607,7 +679,9 @@ def main(argv: list[str] | None = None) -> int:
                                                    "NEXT_OFFSET only without --kind, --source, --id, and --since")
     read_command.add_argument("--brief", action="store_true", help="show only the first 160 characters of info")
     read_command.add_argument("--kind", type=report_kinds, help="filter by comma-separated ask,done,info")
-    read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries)")
+    read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries); a "
+                                               "worktree name alone also reads its repo/worktree when one repo has "
+                                               "it, and a source no entry has names the near ones on stderr")
     read_command.add_argument("--since", type=since_time, metavar="HH:MM|ISO",
                               help="read entries at or after this time, including acknowledged ones; "
                                    "HH:MM means its most recent local occurrence; prints no NEXT_OFFSET")
@@ -625,7 +699,9 @@ def main(argv: list[str] | None = None) -> int:
                                help="minutes before an unanswered ask is named (default: %(default)s)")
     watch_command.add_argument("--once", action="store_true", help="read once and exit")
     open_command = actions.add_parser("open-asks", help="list asks not answered yet, oldest first, one summary "
-                                                        "line each after `unanswered <n> min:`")
+                                                        "line each after `unanswered <n> min:`; first record "
+                                                        "answered each adoption notice whose proposals have a lane "
+                                                        "in the ledger (`ledger.py owner`), naming the lane on stderr")
     open_command.add_argument("--json", action="store_true",
                               help="print a JSON list of {id, ts, host, source, handle, text, open_questions, "
                                    "age_minutes} instead; open_questions holds each unanswered question's "
@@ -665,7 +741,8 @@ def main(argv: list[str] | None = None) -> int:
                              "it: ~/.cache/orca-briefs/bin/inbox --since HH:MM --wt NAME (HH:MM: when this run "
                              "began; NAME: the worktree whose reports to read), or read --since HH:MM")
         if args.action == "read":
-            options = ReadOptions(brief=args.brief, kinds=args.kind, source=args.source, summary=args.summary,
+            source = SourceFilter.of(args.source, inbox_entries(inbox)) if args.source is not None else None
+            options = ReadOptions(brief=args.brief, kinds=args.kind, source=source, summary=args.summary,
                                   ids=args.ids, since=args.since)
             (read_ids if args.ids else read)(inbox, cursor, options)
             return 0
@@ -720,9 +797,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(question_batch(pending_questions(asks), args.after, order, claims),
                                  ensure_ascii=False, indent=2))
             elif args.json:
+                asks = close_held_notices(asks, answers_path())
                 print(json.dumps([open_ask_view(ask, now, claims) for ask in asks], ensure_ascii=False, indent=2))
             else:
-                for ask in asks:
+                for ask in close_held_notices(asks, answers_path()):
                     age = minutes_since(ask.at, now)
                     claim = ask_claim(ask, claims)
                     print(f"{claim_label(claim) + ' ' if claim else ''}"
