@@ -111,10 +111,20 @@ both on the item's line.
   user now (`inbox_read.py claim`); `--summary` adds 伺い中. Do not ask it again.
 - `stopped_after_answer`: an answer came after the lane's last message and the
   lane has not spoken since. Relay `answer` (the newest) to the lane.
+- `settled`: no ask of the lane is open, and a lead decision key naming the
+  row (`ask:<name>::…`, the item's `name`) has a record after the lane's last
+  message, with no prompt on its screen. `evidence` gives each such key's
+  newest record that decides something, past a later 「中継済み」 that only says
+  it was passed on. Do not ask it again.
 - `unasked`: those asks were answered before the lane's last message, or it
   has none, so `open-asks` does not show its question. `choices_in_info` lists
   choices the lane sent as `info`, and `candidates` answers that may have
   settled it. Put the question in front of the user or the lead.
+- `rejected`: an AskUserQuestion in the `--asked-in` transcripts (and the
+  current directory's) closed without an answer since the newest saved
+  handoff (`--handoffs-dir`). `name` is the worktree that asked it, `questions`
+  the questions with their choices, `since` and `closed_at` when it was asked
+  and closed. Ask it again, or record why it no longer stands.
 
 `show` retains full final messages, asked times, answers, handoff terms, and
 requests with their owners and closure evidence. `pending` lists what is

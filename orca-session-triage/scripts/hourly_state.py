@@ -307,7 +307,9 @@ def blocked_prs(rows: list[dict]) -> dict[str, dict]:
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
                handed: list[lead_decisions.HandOff], prs: dict[str, dict],
-               claimed: dict[str, inbox_read.Claim] | None = None) -> list[dict]:
+               claimed: dict[str, inbox_read.Claim] | None = None,
+               decided: dict[str, list[lead_decisions.Decision]] | None = None,
+               rejected: list[dict] | None = None) -> list[dict]:
     """Waiting rows, rows blocked on the user, and rows an unanswered handoff key names, longest waiting first.
     The lane's asks that count are
     those still open and those it sent in its last turn:
@@ -315,8 +317,13 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
       or was marked answered; the oldest is `ask`;
     - `stopped_after_answer`: they are answered, one after the lane's last message, and the lane has not spoken
       since; `answer` is the newest such answer, `since` the first;
+    - `settled`: none of the above, and a lead decision key naming the row (`ask:<name>::…`) has a record after
+      the lane's last message; `evidence` holds each such key's newest record that decides something, past a
+      later one that only says it was passed on (lead_decisions.substance);
     - `unasked`: they were answered before the lane's last message, or it has none, so open-asks does not show
-      its question; `choices_in_info` lists choices it sent as info since its last turn began.
+      its question; `choices_in_info` lists choices it sent as info since its last turn began;
+    - `rejected`: an AskUserQuestion of `rejected` (answer_evidence.rejected_questions), closed without an
+      answer, with its `questions`, `since` (asked) and `closed_at`; `name` is the worktree that asked it.
     `candidates` holds the newest answers that name only the lane or its PR numbers, for the lead to check: the
     lead may ask the user a waiting row's question itself. An unanswered item's `ask.claimed` names the tab that
     claimed it with `inbox_read.py claim` and is asking the user now: `claimed` holds, by ask id, the claim on each
@@ -389,6 +396,19 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                                   "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                                   "answer": answer_view(answer)}))
             continue
+        # A prompt on the lane's screen asks now, after every record: montly-report asked a new one on 2026-11-06.
+        keyed = [lead_decisions.substance(items) for key, items in (decided or {}).items()
+                 if not scan_sessions.prompt_question(row.get("prompt_waiting") or {})
+                 and key.startswith(f"ask:{view['name']}::") and any(
+                     said_at is None or (at := scan_sessions.parse_time(item.decided_at)) is not None and at > said_at
+                     for item in items)]
+        if keyed:
+            newest = max(keyed, key=lambda item: scan_sessions.parse_time(item.decided_at) or now)
+            found.append((scan_sessions.parse_time(newest.decided_at) or now, {
+                **view, "state": "settled", "since": newest.decided_at,
+                "evidence": [{"decision": item.decision, "decided_at": item.decided_at, "answer": item.answer}
+                             for item in keyed]}))
+            continue
         since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
         asked_directly = answer_evidence.related_to(
             {"worktree": name, "ts": final["at"], "text": f"{view['question']}\n{final['text']}"},
@@ -398,6 +418,13 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         found.append((since, {**view, "state": "unasked", "since": final["at"] or since.isoformat(),
                               "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
+    for item in rejected or []:
+        asked = "\n".join(str(question.get("question") or "") for question in item["questions"]
+                          if isinstance(question, dict))
+        found.append((scan_sessions.parse_time(item["asked_at"]) or now, {
+            "row": None, "name": item["worktree"], "state": "rejected", "id": item["id"], "since": item["asked_at"],
+            "closed_at": item["closed_at"], "question": excerpt(asked), "questions": item["questions"],
+            "ask": None, "answer": None}))
     found.sort(key=itemgetter(0))
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60),
              **({"answer_age_minutes": int((now - scan_sessions.parse_time(item["answer"]["at"])).total_seconds() // 60)}
@@ -684,9 +711,11 @@ def main(argv: list[str] | None = None) -> int:
         "stale-asks", help="print, longest waiting first, waiting rows, rows blocked on Miura, and rows an unanswered "
                            "handed-off ask key names; a question is unasked "
                            "(not in open-asks; choices it sent as info are listed), unanswered (an open or last-turn "
-                           "ask without an answer that proves it, marked or not), or stopped_after_answer (answered "
-                           "after its last message), with the lane's ask, the answer, candidates that name only the "
-                           "lane or its PR numbers, and age_minutes")
+                           "ask without an answer that proves it, marked or not), stopped_after_answer (answered "
+                           "after its last message), or settled (a lead decision key ask:<name>::… has a record "
+                           "after its last message, given as evidence), with the lane's ask, the answer, candidates "
+                           "that name only the lane or its PR numbers, and age_minutes; then each AskUserQuestion of "
+                           "the --asked-in transcripts closed unanswered since the newest saved handoff, as rejected")
     stale.add_argument("--from", dest="from_file", metavar="SCAN_JSON", required=True,
                        help="the rows scan_sessions.py printed as JSON")
     stale.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
@@ -694,6 +723,11 @@ def main(argv: list[str] | None = None) -> int:
     stale.add_argument("--summary", action="store_true", help="print one line per row with its age, ask id, and question")
     stale.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG,
                        help="the handed-off keys whose unanswered asks remain visible (default: %(default)s)")
+    # Imported here: handoff imports this module.
+    import handoff
+    stale.add_argument("--handoffs-dir", type=Path, default=handoff.HANDOFFS,
+                       help="saved handoffs: questions closed unanswered since the newest are listed as rejected "
+                            "(default: %(default)s)")
     answer_evidence.add_arguments(stale)
     stale.epilog = "Without --asked-in, read the appointed lead's worktree from shared state."
     request_open = commands.add_parser("request-open", help="record a user's request and optional assigned lane")
@@ -755,13 +789,18 @@ def main(argv: list[str] | None = None) -> int:
             asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers_log))
             open_ids = frozenset(ask.report["id"] for ask in asks)
             claims = inbox_read.read_claims(inbox_read.claims_path())
-            decided = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
+            decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
             handed = list({item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
                            if item.decision not in decided}.values())
+            since = handoff.last_sent_at(args.handoffs_dir.expanduser())
+            rejected = [{**item, "worktree": worktree.name} for worktree in answer_evidence.asking_worktrees(args)
+                        for item in answer_evidence.rejected_questions(answer_evidence.transcripts_of(
+                            args.claude_projects.expanduser(), [worktree]), since)]
             result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
                                 datetime.now(timezone.utc), state=data, handed=handed, prs=blocked_prs(rows),
                                 claimed={ask.report["id"]: claim for ask in asks
-                                         if (claim := inbox_read.ask_claim(ask, claims))})
+                                         if (claim := inbox_read.ask_claim(ask, claims))},
+                                decided=decided, rejected=rejected)
         except READ_ERRORS as error:
             print(f"hourly state: {error}", file=sys.stderr)
             return 1

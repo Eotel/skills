@@ -82,6 +82,42 @@ class LeadDecisionsTests(unittest.TestCase):
                          [("merge:Eotel/skills#80", "merge する")])
         self.assertEqual(self.log.read_text(encoding="utf-8").splitlines()[0], first_line)
 
+    def test_show_history_prints_the_answers_a_later_record_replaced_with_their_times(self) -> None:
+        # 2026-11-06: show --match montly printed only 「中継済み」, hiding the answer recorded before it.
+        self.run_tool("record-many", stdin="".join(json.dumps(line, ensure_ascii=False) + "\n" for line in [
+            {"decision": "ask:montly-report::spare-24man", "answer": "1,000 万円のまま",
+             "decided_at": "2026-11-05T12:21:00+09:00"},
+            {"decision": "ask:montly-report::spare-24man", "answer": "中継済み（12:2x send montly-report）",
+             "decided_at": "2026-11-05T04:16:40+00:00"}]))
+
+        lines = self.run_tool("show", "--match", "montly", "--history")
+        shown = self.run_tool("show", "--history")
+
+        self.assertEqual(lines.stdout.splitlines(), [
+            "2026-11-05T13:16:40+09:00 ask:montly-report::spare-24man  中継済み（12:2x send montly-report）",
+            "2026-11-05T12:21:00+09:00 ask:montly-report::spare-24man 置き換え済み  1,000 万円のまま"])
+        self.assertEqual([(item["answer"], [(earlier["decided_at"], earlier["answer"]) for earlier in item["replaced"]])
+                          for item in json.loads(shown.stdout)],
+                         [("中継済み（12:2x send montly-report）", [("2026-11-05T12:21:00+09:00", "1,000 万円のまま")])])
+
+    def test_recording_a_delivery_note_over_an_answer_warns_and_still_records_it(self) -> None:
+        self.record("ask:montly-report::spare-24man", "1,000 万円のまま")
+        self.record("merge:Eotel/skills#80", "待つ")
+        relayed = self.root / "relayed.txt"
+        relayed.write_text("中継済み（12:2x send montly-report）", encoding="utf-8")
+
+        single = self.run_tool("record", "--decision", "ask:montly-report::spare-24man", "--answer-file", str(relayed))
+        many = self.run_tool("record-many", stdin="".join(json.dumps(line, ensure_ascii=False) + "\n" for line in [
+            {"decision": "ask:montly-report::spare-24man", "answer": "中継済み"},
+            {"decision": "merge:Eotel/skills#80", "answer": "merge する"}]))
+
+        for result in (single, many):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+            self.assertIn("ask:montly-report::spare-24man", result.stderr)
+            self.assertIn("1,000 万円のまま", result.stderr)
+        self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 5)
+
     def test_an_empty_answer_is_refused_and_nothing_is_written(self) -> None:
         answer_file = self.root / "empty.txt"
         answer_file.write_text("  \n", encoding="utf-8")

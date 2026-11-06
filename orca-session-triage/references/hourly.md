@@ -171,7 +171,9 @@ The lead defaults to the shared state's appointed worktree; `--lead-worktree`
 overrides it, and `--state-file` selects the shared state for both `send` and
 `lead-state`. `handoff.py lead-state` prints the lead's worktree, agent states
 and stop times, latest message, unanswered questions with choices and ask times,
-queued instructions, and tab screen tails as JSON; `--orca` selects its CLI.
+questions closed without an answer since the newest kept handoff (`rejected`,
+with ask and close times), queued instructions, and tab screen tails as JSON;
+`--orca` selects its CLI.
 `--claude-projects` selects the transcript root for both commands.
 Do not sign the body: it ends the
 text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and
@@ -228,7 +230,9 @@ row's situation changes so the answer may no longer fit, ask under a new key.
 ignoring case, and prints one line per answer. `--since-last-handoff` selects
 answers since the newest saved handoff; `--handoffs-dir` selects that directory.
 These views show newest answers first in JST and mark a `remove:` key 未実行
-while its path still exists.
+while its path still exists. `--history` adds the answers a later record of
+the same key replaced, marked 置き換え済み (under `replaced` in the JSON): read
+it when a key's latest record, such as 「中継済み」, does not say the answer.
 The lead records an answer with
 `lead_decisions.py record --decision KEY --answer-file FILE`, and several with
 `lead_decisions.py record-many --file FILE` (or on standard input), one JSON
@@ -239,7 +243,9 @@ names each wrong one, and records nothing until all are right; do not call
 `send --decision <answer> --key KEY` instead (repeat per key, with `--ask <id>`
 for the ask it answers): the key and the ask are recorded answered once the
 send lands. Records are only appended, and a later record for
-a key replaces its earlier answer.
+a key replaces its earlier answer. `record` and `record-many` warn, and still
+record, when a text that only says the answer was passed on (「中継済み（…）」)
+replaces an answer.
 
 When this run leads, read the shared hourly state before the scan. Match the
 saved left rows to their newest final messages, retain pending questions, and
