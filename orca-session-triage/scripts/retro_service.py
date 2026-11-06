@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Render, activate, and inspect the external triage retrospective launchd service."""
 
 from __future__ import annotations

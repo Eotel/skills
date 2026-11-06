@@ -6,7 +6,7 @@ original transcript is never changed.
 ## At the end of a live hourly run
 
 After the handoff, start one Agent with `subagent_type: "fork"` and the prompt
-"Run `python3 ~/.claude/skills/orca-session-triage/scripts/retro.py fork-prompt`
+"Run `~/.claude/skills/orca-session-triage/scripts/retro.py fork-prompt`
 and follow its output." The fork inherits the run's context and cache. It lists
 failures that later succeeded, each with verbatim quotes from the run, and
 pipes them to `retro.py submit`. `submit` keeps only quotes found in the
@@ -113,7 +113,7 @@ profile with the local `USER`, and removes API credentials from the child
 environment. The plist contains no Claude profile path. At startup, the worker
 logs the authentication method and subscription type. It reads transcripts
 under `~/.claude/projects`; Orca profiles link their `projects` there. Run
-`python3 ~/.claude/skills/orca-session-triage/scripts/retro_service.py render`
+`~/.claude/skills/orca-session-triage/scripts/retro_service.py render`
 to inspect the user service and `activate` to start it outside Orca tabs.
 `activate` refuses to replace a different plist: stop the old service with
 `launchctl bootout gui/$(id -u)/com.eotel.orca-session-triage.retro` and move

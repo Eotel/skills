@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Check that an Orca worktree is safe to remove."""
 
 import argparse
@@ -726,7 +726,7 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                             "起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。"
                             % "、".join(outside))
         if busy:
-            closes = sorted({"python3 %s --from SCAN_JSON %s" % (CLOSE_TABS, item["tab"])
+            closes = sorted({"%s --from SCAN_JSON %s" % (CLOSE_TABS, item["tab"])
                              for item in busy if item["tab"]})
             unknown = [str(item["pid"]) for item in busy if not item["tab"]]
             blockers.append("Orca のタブで作業場を使うプロセスがあります。scan の closable にあるタブなら、保存した走査の "
@@ -871,7 +871,7 @@ def merged_pr_head_command(worktree, number):
     host, slug = remote_identity(origin.stdout.strip()) if origin.returncode == 0 else ("", "")
     if host != "github.com" or slug.count("/") != 1 or not head:
         return None
-    return ("python3 ~/.claude/skills/orca-session-triage/scripts/merged_pr_head.py --repo %s --pr %d --head %s"
+    return ("~/.claude/skills/orca-session-triage/scripts/merged_pr_head.py --repo %s --pr %d --head %s"
             % (slug, number, head))
 
 

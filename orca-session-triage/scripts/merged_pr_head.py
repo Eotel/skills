@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Print the rm_check.py arguments for a merged PR, read with gh on a Mac where gh works.
 
 A remote Mac whose gh cannot read GitHub runs rm_check.py with these arguments:

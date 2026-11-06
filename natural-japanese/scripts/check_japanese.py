@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Find Japanese word choices that need contextual review; never rewrite input."""
 
 import argparse

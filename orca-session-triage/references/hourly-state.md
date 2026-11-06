@@ -1,7 +1,7 @@
 # State shared by hourly runs
 
 The hourly automation starts a fresh session each time. Read the single state
-file with `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_state.py show` at the start of the run and
+file with `~/.claude/skills/orca-session-triage/scripts/hourly_state.py show` at the start of the run and
 again immediately before asking or acting on a saved decision. The default is
 `~/.cache/orca-session-triage/hourly-state.json`. The script locks and replaces
 it on writes. Keep the file when changing the automation; it carries decisions

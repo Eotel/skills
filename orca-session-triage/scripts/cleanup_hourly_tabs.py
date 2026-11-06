@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Close idle previous scheduled triage tabs; keep the shared workspace.
 
 Requires Orca run, terminal, agent, question, transcript, and rendered-screen evidence.

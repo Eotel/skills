@@ -39,7 +39,7 @@ on both `read` and `ack`. When appointing a lead, hand over the unresolved
 decisions first, then initialize that cursor once with the same environment
 variable and `scripts/inbox_read.py initialize`. The command refuses to replace
 an existing cursor; never reset it to skip unread entries. Record the appointed
-worktree with `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_state.py
+worktree with `~/.claude/skills/orca-session-triage/scripts/hourly_state.py
 appoint-lead --worktree <the lead's worktree>`.
 Neither tab advances the other's cursor. Both see every
 entry, but the lead owns answers to `ask` and directions to lanes. The hourly
@@ -114,7 +114,7 @@ by hand.
 ## In the run
 
 At the start, run
-`python3 ~/.claude/skills/orca-session-triage/scripts/cleanup_hourly_tabs.py`.
+`~/.claude/skills/orca-session-triage/scripts/cleanup_hourly_tabs.py`.
 This checks Orca's run, terminal and agent records before closing previous
 scheduled tabs. It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
@@ -159,7 +159,7 @@ lane's `done` leaves the user's request open until the lead verifies the
 original symptom is gone. Then do only the
 cleanup allowed before a user choice by the Boundary and `cleanup.md`. Write the
 questions and instructions for other lanes, including any cleanup done, in one
-file and send it with `python3 ~/.claude/skills/orca-session-triage/scripts/handoff.py
+file and send it with `~/.claude/skills/orca-session-triage/scripts/handoff.py
 send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
 --decision KEY (once per question)`
 (`--kind info` with nothing to hand off but cleanup). At the moment it sends,
@@ -290,7 +290,7 @@ until the lead observes that its recorded symptom is gone. Then:
   artifact's `url`. The Stop hook names a watch still running.
 
 Check the external watch with
-`python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py status`.
+`~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py status`.
 The Stop hook names a stopped service. Do not start a replacement Monitor in
 the tab.
 
@@ -329,13 +329,13 @@ After the PR is merged and this skill is installed, get approval for this
 cutover before changing the live watch:
 
 1. Have the lead handle the reports already in the inbox. Then run
-   `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_read.py initialize`
+   `~/.claude/skills/orca-session-triage/scripts/inbox_read.py initialize`
    once while the old Monitor is still running. The new reader starts at that
    byte position; later arrivals are retained.
 2. Ask the lead to stop the old `watch-inbox` Monitor in its tab and end its
    turn. Do not send terminal input to that tab. New inbox lines remain in the
    inbox while the watch is stopped.
-3. Run `python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate`.
+3. Run `~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate`.
    It refuses to start if any process still reads the existing offset. Do not
    reset or copy the offset.
 4. Run the same script with `status`, inspect `triage-watch.log`, and use
@@ -347,7 +347,7 @@ lane name and first line of each new `ask`. It alerts even while the lead tab is
 active: tab-state checks can race with a new report, and the notification does
 not acknowledge or answer it. The main watch and hourly reader keep their own
 cursors. After this change is merged and installed, run
-`python3 ~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate-alerts`
+`~/.claude/skills/orca-session-triage/scripts/inbox_watch_service.py activate-alerts`
 once, then `status-alerts` and inspect `~/.cache/orca-briefs/triage-alert.log`.
 Activation starts at the current complete inbox line; later arrivals are
 notified. Existing reports remain available to the hourly reader.
@@ -370,7 +370,7 @@ once and allow notifications; a request from a terminal tab is refused.
 orca automations create --name "session triage" --trigger hourly \
   --prompt "/orca-session-triage hourly 報告と質問は日本語で" --provider claude \
   --workspace "id:<repoId>::<triage workspace path>" --fresh-session \
-  --precheck "python3 ~/.claude/skills/orca-session-triage/scripts/precheck.py --workspace <triage workspace path>" \
+  --precheck "~/.claude/skills/orca-session-triage/scripts/precheck.py --workspace <triage workspace path>" \
   --json
 ```
 
@@ -379,7 +379,7 @@ orca automations create --name "session triage" --trigger hourly \
 - `scripts/precheck.py` skips while a scheduled turn is still dispatched and
   working, or its completed turn still owns a background job. A later human
   turn in that tab does not hold the next run.
-  `python3 ~/.claude/skills/orca-session-triage/scripts/hourly_runs.py` lists
+  `~/.claude/skills/orca-session-triage/scripts/hourly_runs.py` lists
   the workspace's scheduled runs, newest first: scheduled and start time,
   status, the precheck's reason for a skipped run, the tab pane, and the
   Claude transcript (`--json` for a list). `--tail` adds each run's last

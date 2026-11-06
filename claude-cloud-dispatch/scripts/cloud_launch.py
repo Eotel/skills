@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Start one Claude Code cloud session from a checkout and print its URL.
 
 `claude --cloud "<task>"` needs a terminal, and asks whether to trust a checkout

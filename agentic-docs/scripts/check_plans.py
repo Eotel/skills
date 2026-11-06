@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Fail on kept completed plans, history headings, or oversized active plans."""
 
 from __future__ import annotations

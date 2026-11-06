@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Copy the agentic-docs template scaffold into a target repository."""
 
 from __future__ import annotations

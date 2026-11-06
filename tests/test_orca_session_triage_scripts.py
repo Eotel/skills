@@ -2098,7 +2098,7 @@ class ScanCommandTests(unittest.TestCase):
             " | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
             "fix-login | waiting (scan: stalled) | closable term_2",
             "fix-login | waiting (scan: stalled) | meaningful term_1",
-            f"fix-login | waiting (scan: stalled) | close: python3 {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
+            f"fix-login | waiting (scan: stalled) | close: {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
             "mbp16::app | waiting | card - codex interrupted | draft unknown | composer unknown | - | screen: -",
         ])
 
@@ -2272,7 +2272,7 @@ class ScanCommandTests(unittest.TestCase):
                     if row.get("environment"):
                         expected = [str(scan.RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {number or '-'}"]
                     else:
-                        expected = ["python3", str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
+                        expected = [str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
                                     *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
@@ -3384,7 +3384,7 @@ class RmCheckTests(unittest.TestCase):
         tabs = {item["pid"]: (item["in_orca_tab"], item["idle_tab"], item["tab"]) for item in result["processes"]}
         self.assertEqual(tabs, {21: (True, True, None), 32: (True, False, "term_busy"), 40: (False, False, None)})
         self.assertEqual(len(result["blockers"]), 2)
-        self.assertIn(f"python3 {SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
+        self.assertIn(f"{SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
         self.assertIn("PID 40（node server.js、cwd %s）" % wt, result["blockers"][0])
         self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
 

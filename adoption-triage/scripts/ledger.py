@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Append and read adoption triage events. Use --help for commands and paths."""
 
 import argparse
@@ -560,7 +560,7 @@ def collect(config, imports, events):
             for name, target in targets:
                 try:
                     result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target,
-                                             f"python3 ~/.agents/skills/adoption-triage/scripts/ledger.py receive --name {writer_name}"],
+                                             f"~/.agents/skills/adoption-triage/scripts/ledger.py receive --name {writer_name}"],
                                             input=data, capture_output=True, timeout=20)
                     if result.returncode:
                         raise OSError(f"ssh exit {result.returncode}: "

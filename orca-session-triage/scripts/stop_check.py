@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Stop hook for orca-session-triage: keep the turn open while the review queue is not classed.
 
 `scan_sessions.py --review-out` writes the rows a reader must class (every

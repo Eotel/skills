@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """List and update Asana review tasks; configuration comes from the caller."""
 
 import argparse

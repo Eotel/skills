@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Inventory Orca agent sessions from Orca state and agent transcripts.
 
 GitHub calls per run, for the rows that get PR facts: one GraphQL query per
@@ -2675,7 +2675,7 @@ def rm_check_command(row: dict, scan_file: Path | None = None) -> str:
     pr = pr_number(row)
     if row.get("environment"):
         return shlex.join([str(RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {pr or '-'}"])
-    return shlex.join(["python3", str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
+    return shlex.join([str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
                        *(["--from", str(scan_file)] if scan_file else [])])
 
 
@@ -2701,7 +2701,7 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     lines.extend(f"{lead} | closable {handle}" for handle in row.get("closable") or [])
     lines.extend(f"{lead} | meaningful {handle}" for handle in row.get("meaningful_tabs") or [])
     if scan_file and row.get("closable"):
-        lines.append(f"{lead} | close: " + shlex.join(["python3", str(CLOSE_TABS), "--from", str(scan_file),
+        lines.append(f"{lead} | close: " + shlex.join([str(CLOSE_TABS), "--from", str(scan_file),
                                                       *row["closable"]]))
     if row.get("open_pr_cleanup") or ((row.get("verdict") or {}).get("class") or row["class"]) == "finished":
         lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
