@@ -23,6 +23,10 @@ DEFAULT_HOSTS = Path("~/.config/adoption-triage/hosts.json").expanduser()
 DECISIONS = {"adopt", "reject", "hold", "revoke"}
 # handed_off: the worker left an adopted change to a lane, which records applied when it ships.
 OUTCOMES = {"applied", "reverted", "failed", "handed_off"}
+# The retrospective worker: its handed_off only says the proposal waits for a lane (references/ledger.md).
+RETRO = "triage-retro"
+# spawn-lane's handed_off result: 「担当の handle <handle>・指示書 <brief>」.
+BRIEF = re.compile(r"指示書 (.+)$")
 # merges: this proposal combines the listed ones; retires: it withdraws the listed stale ones.
 # merges and retires close their targets when adopted; confirms records its adopted targets as applied.
 RELATIONS = {"merges": "merged_into", "retires": "retired_by", "confirms": "confirmed_by"}
@@ -248,6 +252,38 @@ def confirming_executions(owner: dict, known: dict[str, dict], actor: str) -> li
              "after_id": target["latest_event_id"]}
             for target in (known[target_id] for target_id in owner["confirms"])
             if target["status"] == "adopted" and not target["implemented_at"]]
+
+
+def owner_view(item: dict) -> dict:
+    """Who holds the proposal under its last adoption, the brief they were given, and whether the work is done.
+
+    The holder is the last applied, or the last handed_off by a lane, under that adoption."""
+    adoption = next((decision["id"] for decision in reversed(item["decisions"]) if decision["decision"] == "adopt"),
+                    None)
+    runs = [run for run in item["executions"] if adoption and run["decision_id"] == adoption]
+    lanes = [run for run in runs if run["outcome"] == "handed_off" and run["actor"] != RETRO]
+    holder = next((run for run in reversed(runs) if run["outcome"] == "applied" or run in lanes), None)
+    brief = found.group(1) if lanes and (found := BRIEF.search(lanes[-1]["result"])) else None
+    current = item["current_execution"] or {}
+    state = (f"戻した {item['reverted_at'][:16]}" if item["reverted_at"]
+             else f"済 {item['implemented_at'][:16]}" if item["implemented_at"]
+             else f"失敗 {current['ts'][:16]}" if current.get("outcome") == "failed" else "未")
+    return {"proposal_id": item["proposal_id"], "status": item["status"], "owner": holder and holder["actor"],
+            "brief": brief, "state": state}
+
+
+def named_proposals(items: list[dict], wanted: list[str]) -> list[dict]:
+    """The proposal each ID names, in order: a full ID or a start of 8 or more characters naming one."""
+    found, errors = [], []
+    for value in wanted:
+        hits = [item for item in items if len(value) >= 8 and item["proposal_id"].startswith(value.lower())]
+        if len(hits) == 1:
+            found.append(hits[0])
+        else:
+            errors.append(f"{value} names {len(hits)} proposals" if hits else f"no proposal has id {value}")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return found
 
 
 def envelope(kind, proposal_id):
@@ -572,6 +608,11 @@ def main():
     listing.add_argument("--json", action="store_true")
     listing.add_argument("--candidates", action="store_true",
                          help="only pending, held, and unimplemented adopted proposals not already in an open consolidation")
+    owning = commands.add_parser("owner", help="print, one line per proposal, its status, the lane holding it "
+                                               "(担当), the brief it was given (指示書), and whether it is done (実施)")
+    owning.add_argument("ids", nargs="+", help="proposal IDs, or their first 8 or more characters")
+    owning.add_argument("--json", action="store_true",
+                        help="print {items: [{proposal_id, status, owner, brief, state}]} instead")
     pulling = commands.add_parser("collect", help="copy remote Mac ledgers")
     pulling.add_argument("--config", type=Path,
                          help=f"hosts to read and send to (default {DEFAULT_HOSTS}, "
@@ -600,6 +641,15 @@ def main():
             else:
                 for item in items:
                     print(f"{item['proposal_id']}\t{item['status']}\t{item['priority']}\t{item['proposal']}")
+        elif args.command == "owner":
+            views = [owner_view(item) for item in named_proposals(project(all_rows(args.events, args.imports)),
+                                                                   args.ids)]
+            if args.json:
+                print(json.dumps({"items": views}, ensure_ascii=False))
+            else:
+                for view in views:
+                    print(f"{view['proposal_id']}\t{view['status']}\t担当 {view['owner'] or 'なし'}\t"
+                          f"指示書 {view['brief'] or 'なし'}\t実施 {view['state']}")
         elif args.command == "collect":
             print(json.dumps({"collected": collect(collect_config(args), args.imports, args.events)}))
         else:

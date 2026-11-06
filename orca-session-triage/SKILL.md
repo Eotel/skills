@@ -92,7 +92,8 @@ board's done cards; close what the user approves.
   `reasons`, `git.dirty`, and `git.unpushed`); `--class CLASS` keeps one class.
   `--row NAME` prints one row as JSON with the fixed keys its `--help` lists: no null strings, the
   newest final message of Claude, Codex, or Orca in `final`, `github` as
-  owner/repo from origin for `gh -R`, the agents' `transcripts`, and the PR's
+  owner/repo from origin for `gh -R`, the agents' `transcripts` (`--transcripts`
+  prints them as `claude <path>` or `codex <path>` lines instead), and the PR's
   completed independent review (`review`: head, verdict, path, and whether it
   asks for changes on the current head) beside `merge_question`. NAME is
   repo/name as `--summary` prints it, the name (a unique one on another Mac
@@ -184,8 +185,8 @@ board's done cards; close what the user approves.
   scan listed, and keeps each one whose worktree's transcripts, triage inbox
   reports, or agent states in Orca, other than the calling session's own,
   changed after the scan started. Close tabs through it.
-- `references/delivery.md`: batching questions, sending answers, and giving
-  lanes work.
+- `references/delivery.md`: batching questions, sending answers, giving
+  lanes work, and handing them meeting or review feedback.
 - `references/next-step.md`: what each `stalled` worktree needs next.
 - `references/answer-page.md`: one page for many answers.
 - `references/cleanup.md`: closing worktrees, tabs, and done cards.

@@ -319,6 +319,37 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNotNone(items[confirmation]["implemented_at"])
         self.assertEqual(self.candidates(), [pending])
 
+    def test_owner_names_the_lane_its_brief_and_whether_the_work_is_done(self) -> None:
+        proposal_id = self.proposal()
+        adoption = json.loads(self.run_ledger(["decide"], {"proposal_id": proposal_id, "decision": "adopt",
+                                                           "actor": "Eotel"}).stdout)["id"]
+
+        def record(outcome: str, actor: str, result: str) -> None:
+            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id, "decision_id": adoption,
+                                                    "outcome": outcome, "actor": actor, "result": result})
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        def owner() -> list[str]:
+            shown = self.run_ledger(["owner", proposal_id[:8]])
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            return shown.stdout.rstrip("\n").split("\t")
+
+        # The retrospective worker's handed_off only says the proposal waits for a lane.
+        record("handed_off", "triage-retro", "worker は skill に書かず、担当へ渡した。")
+        self.assertEqual(owner(), [proposal_id, "adopted", "担当 なし", "指示書 なし", "実施 未"])
+        record("handed_off", "adopt-lane", "担当の handle term_1・指示書 /briefs/brief-1.md")
+        self.assertEqual(owner(), [proposal_id, "adopted", "担当 adopt-lane", "指示書 /briefs/brief-1.md", "実施 未"])
+        # The brief is the current lane's: one handed over without a brief has none, not the previous lane's.
+        record("handed_off", "next-lane", "担当が手で記録した")
+        self.assertEqual(owner(), [proposal_id, "adopted", "担当 next-lane", "指示書 なし", "実施 未"])
+        record("applied", "next-lane", "報告 r1: PR #1 を merge")
+        done = owner()
+        self.assertEqual(done[:4], [proposal_id, "adopted", "担当 next-lane", "指示書 なし"])
+        self.assertRegex(done[4], r"^実施 済 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        unknown = self.run_ledger(["owner", "00000000"])
+        self.assertEqual((unknown.returncode, unknown.stdout), (1, ""))
+        self.assertIn("00000000", unknown.stderr)
+
     def test_closing_a_consolidation_keeps_its_adopted_targets_adopted(self) -> None:
         adopted, pending = self.proposal(), self.proposal()
         merged = json.loads(self.consolidation("merges", [adopted, pending]).stdout)["proposal_id"]
