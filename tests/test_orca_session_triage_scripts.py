@@ -2659,6 +2659,9 @@ class RmCheckTests(unittest.TestCase):
         git(self.main, "commit", "-q", "-m", "init")
         self.wt = Path(self.tmp.name) / "wt"
         git(self.main, "worktree", "add", "-q", "-b", "feature", str(self.wt))
+        recheck = patch.object(rmcheck, "PROCESS_RECHECK_SECONDS", 0)
+        recheck.start()
+        self.addCleanup(recheck.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -2810,6 +2813,61 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["blockers"], ["2 uncommitted changes"])
+
+    def test_reasons_name_every_path_that_stops_the_removal_even_without_blockers(self) -> None:
+        (self.wt / "uploads").mkdir()
+        (self.wt / "uploads" / "export.csv").write_text("hand-made\n")
+        code, review_only = self.run_main()
+        (self.wt / "app.txt").write_text("v2\n")
+        _, both = self.run_main()
+
+        self.assertEqual((code, review_only["blockers"]), (1, []))
+        self.assertEqual(review_only["reasons"], ["ignored path to open: uploads/ (not in main checkout)"])
+        self.assertEqual(both["reasons"], ["1 uncommitted changes: app.txt",
+                                           "ignored path to open: uploads/ (not in main checkout)"])
+
+    def test_a_process_outside_tabs_that_ends_during_the_wait_does_not_block(self) -> None:
+        brief = subprocess.Popen(["sleep", "30"], cwd=self.wt)
+        stays = subprocess.Popen(["sleep", "30"], cwd=self.wt)
+
+        def brief_ends(_seconds: float) -> None:
+            brief.kill()
+            brief.wait()
+
+        try:
+            with patch.object(rmcheck.time, "sleep", side_effect=brief_ends):
+                result = self.check()
+        finally:
+            for process in (brief, stays):
+                process.kill()
+                process.wait()
+
+        self.assertEqual([item["pid"] for item in result["processes"]], [stays.pid])
+        [blocker] = result["blockers"]
+        self.assertIn("PID %d（sleep 30、cwd %s）" % (stays.pid, self.wt.resolve()), blocker)
+        self.assertNotIn(str(brief.pid), blocker)
+
+    def test_a_scheduled_tasks_lock_blocks_only_while_its_holder_runs(self) -> None:
+        (self.main / ".git/info/exclude").write_text("**/.claude/scheduled_tasks.lock\n")
+        lock = self.wt / ".claude/scheduled_tasks.lock"
+        lock.parent.mkdir()
+        ended = subprocess.Popen(["true"])
+        ended.wait()
+        lock.write_text(json.dumps({"sessionId": "s", "pid": ended.pid, "procStart": "Thu Nov  5 01:02:28 2026"}))
+        stale = self.check()
+        holder = subprocess.Popen(["sleep", "30"])
+        try:
+            lock.write_text(json.dumps({"sessionId": "s", "pid": holder.pid, "procStart": self.started_at(holder.pid)}))
+            held = self.check()
+        finally:
+            holder.kill()
+            holder.wait()
+
+        self.assertEqual((stale["ok"], stale["review"], stale["regenerable"]),
+                         (True, [], [".claude/scheduled_tasks.lock"]))
+        self.assertEqual((held["ok"], held["review"]), (False, []))
+        self.assertEqual([(item["pid"], item["lock"]) for item in held["processes"]],
+                         [(holder.pid, ".claude/scheduled_tasks.lock")])
 
     def test_a_commit_whose_patch_reached_the_base_does_not_block(self):
         # A PR rebased before its merge leaves the old commit here; its patch is in the base.
@@ -2987,6 +3045,48 @@ class RmCheckTests(unittest.TestCase):
         self.assertRegex(" ".join(moved), r"^wt-investigate-\d{8} wt-yomiyasu-\d{8}$")
         self.assertEqual((archive / moved[1] / "inputs" / "draft.md").read_text(), "原文\n")
         self.assertEqual(sorted(Path(item["to"]).name for item in result["archived"]), moved)
+
+    def test_archive_path_moves_a_named_path_only_when_named_paths_alone_keep_the_worktree(self) -> None:
+        (self.main / ".git/info/exclude").write_text(".tmp/\n")
+        named = self.wt / ".tmp/pr-descriptions"
+        named.mkdir(parents=True)
+        (named / "917.md").write_text("PR 本文の写し\n")
+        (self.wt / ".tmp/scratch.txt").write_text("not named\n")
+        archive = Path(self.tmp.name) / "archive"
+        args = ("--archive-path", ".tmp/pr-descriptions", "--archive-dir", str(archive))
+
+        kept_code, kept = self.run_main(*args)
+        (self.wt / ".tmp/scratch.txt").unlink()
+        code, result = self.run_main(*args)
+
+        self.assertEqual((kept_code, kept["archived"]), (1, []))
+        self.assertEqual((code, result["ok"], result["review"]), (0, True, []))
+        [moved] = result["archived"]
+        self.assertRegex(Path(moved["to"]).name, r"^wt-pr-descriptions-\d{8}$")
+        self.assertEqual((Path(moved["to"]) / "917.md").read_text(), "PR 本文の写し\n")
+        self.assertFalse(named.exists())
+
+    def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
+        (self.main / ".git/info/exclude").write_text("notes/child/\n")
+        (self.wt / "notes/child").mkdir(parents=True)
+        (self.wt / "notes/other.md").write_text("untracked\n")
+        (self.wt / "notes/child/draft.md").write_text("ignored\n")
+
+        code, result = self.run_main("--archive-path", "notes", "--archive-path", "notes/child",
+                                     "--archive-dir", str(Path(self.tmp.name) / "archive"))
+
+        self.assertEqual((code, [Path(item["from"]).name for item in result["archived"]]), (0, ["notes"]))
+
+    def test_a_named_deletion_moves_nothing_and_keeps_the_worktree(self) -> None:
+        (self.wt / "notes").mkdir()
+        (self.wt / "notes/draft.md").write_text("untracked\n")
+        (self.wt / "app.txt").unlink()
+
+        code, result = self.run_main("--archive-path", "notes", "--archive-path", "app.txt",
+                                     "--archive-dir", str(Path(self.tmp.name) / "archive"))
+
+        self.assertEqual((code, result["archived"]), (1, []))
+        self.assertTrue((self.wt / "notes/draft.md").exists())
 
     def test_archive_scratch_copies_records_main_also_ignores_and_lacks(self) -> None:
         self.ignore_review_records()
@@ -3273,7 +3373,8 @@ class RmCheckTests(unittest.TestCase):
         cwds = {21: wt, 32: wt, 40: wt}
         with patch.object(rmcheck, "process_table", return_value=table), \
                 patch.object(rmcheck, "process_cwds", return_value=cwds), \
-                patch.object(rmcheck, "process_handles", return_value={32: "term_busy"}):
+                patch.object(rmcheck, "process_handles", return_value={32: "term_busy"}), \
+                patch.object(rmcheck, "running", return_value=True):
             result = self.check()
         with patch.object(rmcheck, "process_table", return_value={pid: table[pid] for pid in (1, 11, 20, 21)}), \
                 patch.object(rmcheck, "process_cwds", return_value={21: wt}), \
@@ -3284,7 +3385,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(tabs, {21: (True, True, None), 32: (True, False, "term_busy"), 40: (False, False, None)})
         self.assertEqual(len(result["blockers"]), 2)
         self.assertIn(f"python3 {SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
-        self.assertIn("PID 40 ", result["blockers"][0])
+        self.assertIn("PID 40（node server.js、cwd %s）" % wt, result["blockers"][0])
         self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
 
     def test_a_failed_pr_lookup_names_the_command_for_a_mac_where_gh_works(self):
@@ -3396,6 +3497,28 @@ class RmCheckTests(unittest.TestCase):
         git(deps, "worktree", "add", "-q", "--detach", str(copy), "main")
         (copy / "locale/de/LC_MESSAGES/django.mo").write_bytes(b"recompiled catalog")
         return copy
+
+    def test_a_live_lock_in_a_nested_worktree_keeps_it_attached(self) -> None:
+        copy = self.nested_catalog()
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("**/.claude/scheduled_tasks.lock\n")
+        (copy / ".claude").mkdir()
+        holder = subprocess.Popen(["sleep", "30"])
+        try:
+            (copy / ".claude/scheduled_tasks.lock").write_text(
+                json.dumps({"pid": holder.pid, "procStart": self.started_at(holder.pid)}))
+            code, result = self.run_main("--detach-nested")
+        finally:
+            holder.kill()
+            holder.wait()
+
+        self.assertEqual((code, result["detached"]), (1, []))
+        self.assertTrue(copy.exists())
+        self.assertIn("PID %d" % holder.pid, " ".join(result["blockers"]))
+
+    def started_at(self, pid: int) -> str:
+        """ps's lstart in UTC, as a scheduled tasks lock records its holder's start."""
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                              env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout.strip()
 
     def test_nested_recompiled_catalog_is_restored_and_detached(self) -> None:
         copy = self.nested_catalog()
