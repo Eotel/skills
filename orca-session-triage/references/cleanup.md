@@ -20,6 +20,11 @@ facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
 <host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. The process check below protects work running
 in a tab. To check worktrees of several repositories in one call, give
 `rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory.
+Its `--archive-scratch` passes that option to each `rm_check.py`, and
+`--remove-ok` runs steps 3 and 4 below for each worktree whose check is `ok`
+with no `containers`, putting the result in that worktree's line as `removal`
+(it exits 4 when one did not finish). Give it only rows these rules remove
+without asking.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -43,6 +48,10 @@ Run these per worktree, in order.
    the branch's upstream (a pushed `release/…` branch with no PR), that upstream
    is the base and `notes` say so; such a row gets no `--pr-head` advice.
    Pass `--base` when the output's `base` is not where the work merges.
+   - `reasons` lists everything that keeps the worktree in one place: each
+     blocker, with the uncommitted paths after their count, then each path to
+     review. Read it when `ok` is false: `blockers` alone can be empty while a
+     path to review keeps the worktree.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
      `uncommitted` lists the paths of the changes. Report them and leave the
      worktree. Untracked Python bytecode (`__pycache__/` of `.pyc` files) is
@@ -70,7 +79,12 @@ Run these per worktree, in order.
      those folders alone keep the worktree, it moves them to
      `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/` (listed in
      `archived`) and checks again; it moves nothing while anything else blocks
-     or needs review. Without the option nothing moves. Before that, when only
+     or needs review. Without the option nothing moves. When the lead's answer
+     to `remove:<path>` names another path to archive first (`.tmp/`,
+     `.tmp/pr-descriptions`), pass it as `--archive-path <path>` (repeatable,
+     relative to the worktree): it moves to the same place under the same
+     rule, and an ignored directory holding nothing beyond a named path inside
+     it counts as that path. Before that, when only
      paths to review, those folders, and nested worktrees keep it, the option
      copies each record under `.claude/reviews/` that the main checkout also
      ignores and does not have yet to the same place in main, confirmed with cmp
@@ -87,8 +101,9 @@ Run these per worktree, in order.
      Django's test databases (`test_*.sqlite3`) and `var/test-storage/`,
      taihei-cbm's test uploads (`apps/api/media/files/datafile/storage/`), an
      ignored directory of only `*.log` files (its size and last write in
-     `notes`), and an ignored directory holding only these and empty files
-     (`web/var/`). They do
+     `notes`), an ignored `.claude/scheduled_tasks.lock` whose holder (its
+     `pid`, started at its `procStart`) no longer runs, and an ignored
+     directory holding only these and empty files (`web/var/`). They do
      not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
@@ -111,9 +126,12 @@ Run these per worktree, in order.
      `close_tabs.py --from SCAN_JSON <handle>` that closes it: run it with the
      saved scan when that scan lists the handle in `closable`, then run
      `rm_check.py` again. A
-     process outside Orca tabs blocks with its PID; a `node` server or another
-     job is left running and reported. The commands the check's output is
-     piped into are not listed.
+     process outside Orca tabs is read again after two seconds: one that ended
+     by then is left out, and one still running blocks with its PID, command,
+     and current directory; a `node` server or another job is left running and
+     reported. The live holder of an ignored `.claude/scheduled_tasks.lock` is
+     listed here with `lock`, not as a path to review. The commands the check's
+     output is piped into are not listed.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
      (uncommitted changes, ignored paths to open, HEAD on no remote). A tracked

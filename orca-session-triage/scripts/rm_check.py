@@ -7,7 +7,7 @@ import filecmp
 from functools import partial
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -71,6 +71,14 @@ FETCH_TIMEOUT = 60
 # `orca worktree rm` answers `removing: true` and finishes in the background within about a minute.
 GONE_WAIT_SECONDS = 60
 GONE_POLL_SECONDS = 2
+# A process outside Orca tabs is read again after this wait before it blocks: one that ended by then used the
+# worktree for a moment (2026-11-06, one gone PID blocked all 14 worktrees of a batch).
+PROCESS_RECHECK_SECONDS = 2
+# Claude Code's lock on a session's scheduled tasks, {"pid": …, "procStart": <ps lstart in UTC>, …}: it says only
+# that its holder runs, so a lock whose holder ended is regenerable and a live holder is a process using the worktree.
+SCHEDULED_LOCK = ".claude/scheduled_tasks.lock"
+# How many uncommitted paths `reasons` names after their count.
+REASON_PATHS = 10
 
 
 def git(cwd, *args):
@@ -217,23 +225,57 @@ def nested_worktrees(source: Path) -> list[Path]:
     return sorted(child for child in source.iterdir() if (child / ".git").is_file())
 
 
+def running(pid: int, started: str | None = None) -> bool:
+    """Whether `pid` is a live process, not a zombie, and, given `started` as ps's lstart in UTC (the procStart of
+    a lock), the process that started then rather than a later one given the same PID. True when ps cannot run."""
+    try:
+        fields = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout.split(None, 1)
+    except OSError:
+        return True
+    if len(fields) != 2 or fields[0].startswith("Z"):
+        return False
+    return started is None or fields[1].split() == started.split()
+
+
+class LockHolder(NamedTuple):
+    pid: int
+    running: bool
+
+
+def lock_holder(lock: Path) -> LockHolder | None:
+    """The process a scheduled tasks lock names and whether it still runs; None when the file is no such lock."""
+    try:
+        record = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    pid = record.get("pid") if isinstance(record, dict) else None
+    if type(pid) is not int or pid <= 0:
+        return None
+    started = record.get("procStart")
+    return LockHolder(pid, running(pid, started if isinstance(started, str) else None))
+
+
 class IgnoredPaths(NamedTuple):
     review: list[str]
     regenerable: list[str]
     nested: list[Path]
     # The size and last write of each directory of logs counted as regenerable.
     logs: list[str]
+    # The live PIDs that hold the worktree's scheduled tasks lock.
+    lock_holders: list[int]
 
 
 def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
-    """(review, regenerable, nested, logs): ignored paths that hold something and are neither caches nor
-    copies of the main checkout, split into those to open and those a setup or test run writes again,
-    and the worktrees of other repositories found at them (such as `local-deps/<repo>`).
+    """(review, regenerable, nested, logs, lock_holders): ignored paths that hold something and are neither caches
+    nor copies of the main checkout, split into those to open and those a setup or test run writes again,
+    the worktrees of other repositories found at them (such as `local-deps/<repo>`), and the live holder of a
+    scheduled tasks lock, which is not a path to open.
 
     `--ignored=matching` names each path an ignore pattern matched, so a generated
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
-    review, regenerable, nested, logs = [], [], [], []
+    review, regenerable, nested, logs, holders = [], [], [], [], []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
     for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
@@ -241,6 +283,12 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel
         if holds_nothing(source) or same_tree(source, copy):
+            continue
+        if rel == SCHEDULED_LOCK and not source.is_symlink() and (holder := lock_holder(source)) is not None:
+            if holder.running:
+                holders.append(holder.pid)
+            else:
+                regenerable.append(rel)
             continue
         found = nested_worktrees(source)
         if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
@@ -262,7 +310,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             if keys:
                 where += "; values .env.example does not have: " + ", ".join(keys)
         review.append("%s (%s)" % (rel, where))
-    return IgnoredPaths(review, regenerable, nested, logs)
+    return IgnoredPaths(review, regenerable, nested, logs, holders)
 
 
 def on_remote(worktree: Path, head: str) -> bool:
@@ -290,7 +338,8 @@ def nested_check(copy: Path) -> dict:
     changes = [rel for rel in changes if rel not in regenerable]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
-    review, _, deeper, _ = ignored_paths(copy, repository)
+    ignored = ignored_paths(copy, repository)
+    review, deeper = ignored.review, ignored.nested
     if review or deeper:
         blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
     head = git(copy, "rev-parse", "HEAD").stdout.strip()
@@ -517,10 +566,12 @@ def output_readers() -> set[int]:
 
 
 def processes_using(worktree: str, processes: dict[int, tuple[int, str]], cwds: dict[int, str],
-                    readers: set[int]) -> list[dict]:
-    """The processes of one table whose command names the worktree or whose current directory is inside it,
-    without this process's ancestors and `readers`; several worktrees can share the table and directories."""
+                    readers: set[int], locks: dict[int, str] | None = None) -> list[dict]:
+    """The processes of one table whose command names the worktree, whose current directory is inside it, or
+    that hold a lock in it (`locks`, PID to the lock's path), without this process's ancestors and `readers`;
+    several worktrees can share the table and directories."""
     path = re.compile(r"(?<![\w./-])" + re.escape(worktree) + r"(?=$|[/\s'\";,):])")
+    locks = locks or {}
     ancestors = set()
     pid = os.getpid()
     while pid in processes and pid not in ancestors:
@@ -530,18 +581,20 @@ def processes_using(worktree: str, processes: dict[int, tuple[int, str]], cwds: 
     for pid, (_, command) in processes.items():
         cwd = cwds.get(pid)
         inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
-        if pid not in ancestors and pid not in readers and (path.search(command) or inside):
-            found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {})})
+        if pid not in ancestors and pid not in readers and (path.search(command) or inside or pid in locks):
+            found.append({"pid": pid, "command": command[:160], **({"cwd": cwd} if inside else {}),
+                          **({"lock": locks[pid]} if pid in locks else {})})
     return found
 
 
-def processes_in(worktree):
-    """Processes using the worktree in their command or current directory, excluding ancestors and
-    the commands reading this check's output.
+def processes_in(worktree: str, locks: dict[int, str] | None = None) -> list[dict] | None:
+    """Processes using the worktree in their command or current directory, or holding a lock in it (`locks`),
+    excluding ancestors and the commands reading this check's output.
 
-    Each names whether it runs in an Orca tab (`in_orca_tab`), that tab's handle when the
-    system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`).
-    A process of the tab running this check counts as outside a tab: it must not close itself.
+    Each names its current directory where the system shows it (`cwd`), whether it runs in an Orca tab
+    (`in_orca_tab`), that tab's handle when the system shows it (`tab`), and whether the tab runs nothing but
+    its shell (`idle_tab`). A process of the tab running this check counts as outside a tab: it must not close
+    itself.
     """
     processes = process_table()
     if processes is None:
@@ -549,7 +602,8 @@ def processes_in(worktree):
     cwds = process_cwds(processes)
     if cwds is None:
         return None
-    found = processes_using(worktree, processes, cwds, output_readers())
+    found = [{**item, **({"cwd": cwds[item["pid"]]} if item["pid"] in cwds else {})}
+             for item in processes_using(worktree, processes, cwds, output_readers(), locks)]
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
              if (root := tab_root(item["pid"], processes)) is not None and root != own_tab}
@@ -562,6 +616,15 @@ def processes_in(worktree):
     return [{**item, "in_orca_tab": item["pid"] in roots,
              "idle_tab": tabs[roots[item["pid"]]][0] if item["pid"] in roots else False,
              "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None} for item in found]
+
+
+def without_ended(processes: list[dict]) -> list[dict]:
+    """The processes again after PROCESS_RECHECK_SECONDS when any runs outside Orca tabs, leaving out those
+    outside tabs that ended by then."""
+    if all(item["in_orca_tab"] for item in processes):
+        return processes
+    time.sleep(PROCESS_RECHECK_SECONDS)
+    return [item for item in processes if item["in_orca_tab"] or running(item["pid"])]
 
 
 # Written again by an install or a test run; their churn says nothing about who uses the worktree.
@@ -639,7 +702,7 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested, logs = ignored_paths(worktree, main)
+    review, regenerable, nested, logs, lock_holders = ignored_paths(worktree, main)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
@@ -648,16 +711,18 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
                         "from their repositories first, so none is left as a prunable record" % ", ".join(ready))
     if held:
         blockers.append("worktrees of other repositories inside cannot be detached: " + ", ".join(held))
-    processes = processes_in(str(Path(worktree).resolve()))
+    processes = processes_in(str(Path(worktree).resolve()), {pid: SCHEDULED_LOCK for pid in lock_holders})
     if processes is None:
         blockers.append("processes could not be checked; check running processes before removing the worktree")
     else:
-        outside = [str(item["pid"]) for item in processes if not item["in_orca_tab"]]
+        processes = without_ended(processes)
+        outside = ["PID %d（%s、cwd %s）" % (item["pid"], item["command"], item.get("cwd") or "不明")
+                   for item in processes if not item["in_orca_tab"]]
         busy = [item for item in processes if item["in_orca_tab"] and not item["idle_tab"]]
         if outside:
-            blockers.append("作業場を使うプロセスがあります（Orca のタブの外）。PID %s を止めてから消してください。"
+            blockers.append("作業場を使うプロセスがあります（Orca のタブの外）。%sを止めてから消してください。"
                             "起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。"
-                            % ", ".join(outside))
+                            % "、".join(outside))
         if busy:
             closes = sorted({"python3 %s --from SCAN_JSON %s" % (CLOSE_TABS, item["tab"])
                              for item in busy if item["tab"]})
@@ -850,26 +915,54 @@ def merged_pr_at_head(worktree) -> tuple[dict | None, str | None]:
     return next((pr for pr in prs if pr.get("headRefOid") == head), None), None
 
 
-def scratch_to_archive(worktree: Path, result: dict, *, besides_nested: bool = False) -> list[Path]:
-    """The scratch directories that alone keep the worktree: every blocker is an uncommitted change
-    inside one of them, and every path to review lies in one. Empty when anything else keeps it.
+def within(rel: str, named: str) -> bool:
+    """Whether the worktree path `rel` is `named` or lies inside it."""
+    path, inside = PurePosixPath(rel.rstrip("/")), PurePosixPath(named)
+    return path == inside or inside in path.parents
+
+
+def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
+                   besides_nested: bool = False) -> list[Path]:
+    """The paths of `movable` (scratch directories and --archive-path names) that alone keep the worktree: every
+    blocker is an uncommitted change, and every change and path to review lies in one of them or is a directory
+    holding nothing outside them. Empty when anything else keeps it.
     `besides_nested` also lets nested worktrees ready to detach stay, for --detach-nested to remove."""
     # A review entry is "<path> (<where>)", and <where> holds no " (".
     paths = [*result["uncommitted"], *(entry.rpartition(" (")[0] for entry in result["review"])]
-    tops = {Path(rel).parts[0] for rel in paths}
     others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
               and not (besides_nested and blocker.startswith(NESTED_READY))]
-    if others or not tops or not tops <= set(SCRATCH_DIRS):
+    if others or not paths:
         return []
-    return sorted(worktree / top for top in tops)
+    movers: set[str] = set()
+    for rel in paths:
+        found = {named for named in movable if within(rel, named)}
+        holder = worktree / rel
+        if not found and holder.is_dir() and not holder.is_symlink() and all(
+                any(within(str(child.relative_to(worktree)), named) for named in movable)
+                for child in holder.rglob("*") if child.is_symlink() or not child.is_dir()):
+            found = {named for named in movable if within(named, rel) and (worktree / named).exists()}
+        if not found:
+            return []
+        movers |= found
+    return sorted(worktree / named for named in movers)
 
 
-def holds_only_records(result: dict) -> bool:
-    """Whether only paths to review, changes inside scratch directories, and nested worktrees ready to detach
+def holds_only_records(result: dict, movable: tuple[str, ...]) -> bool:
+    """Whether only paths to review, changes inside the paths that may move, and nested worktrees ready to detach
     keep the worktree, so copying its records to main is a step toward removing it."""
     others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
               and not blocker.startswith(NESTED_READY)]
-    return not others and all(Path(rel).parts[0] in SCRATCH_DIRS for rel in result["uncommitted"])
+    return not others and all(any(within(rel, named) for named in movable) for rel in result["uncommitted"])
+
+
+def reasons(result: dict) -> list[str]:
+    """Every reason the worktree stays, in one list: the blockers, with the uncommitted paths after their count,
+    then each ignored path to open. Empty when nothing keeps it."""
+    uncommitted = result.get("uncommitted") or []
+    listed = ", ".join(uncommitted[:REASON_PATHS]) + (", …" if len(uncommitted) > REASON_PATHS else "")
+    return [*("%s: %s" % (blocker, listed) if uncommitted and re.fullmatch(r"\d+ uncommitted changes", blocker)
+              else blocker for blocker in result["blockers"]),
+            *("ignored path to open: " + entry for entry in result.get("review") or [])]
 
 
 def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str, str]]:
@@ -1000,8 +1093,14 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "<archive-dir>/<worktree>-<name>-<YYYYMMDD>/, then check again; off by default, so "
                              "move them only where the lead's rules say to. With --detach-nested, nested worktrees "
                              "and these records together do not hold each other back" % " and ".join(SCRATCH_DIRS))
+    parser.add_argument("--archive-path", action="append", default=[], metavar="PATH",
+                        help="a path inside the worktree, relative to it, such as .tmp/ when the lead's answer to "
+                             "remove:<path> names it; repeat for more. Moved like --archive-scratch's folders, to "
+                             "<archive-dir>/<worktree>-<last name>-<YYYYMMDD>/, when the named paths (and with "
+                             "--archive-scratch, those folders) alone keep the worktree; an ignored directory holding "
+                             "nothing beyond a named path inside it counts as that path")
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
-                        help="where --archive-scratch moves them (default: %(default)s)")
+                        help="where --archive-scratch and --archive-path move them (default: %(default)s)")
     parser.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
                         help="instead of checking, confirm after `orca worktree rm` that no row of this Mac's "
                              "`orca worktree ps` has the path and the disk lacks it, reading again for up to SECONDS "
@@ -1019,6 +1118,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--pr-head must be a full commit SHA")
     if args.head_ahead_of_pr is not None and (not args.pr_head or args.head_ahead_of_pr < 0):
         parser.error("--head-ahead-of-pr needs --pr-head and a non-negative ahead_by")
+    named = [PurePosixPath(rel) for rel in args.archive_path]
+    if any(path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git" for path in named):
+        parser.error("--archive-path takes a path inside the worktree, relative to it")
+    movable = (*(SCRATCH_DIRS if args.archive_scratch else ()), *(str(path) for path in named))
     if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
         parser.error("PATH and --worktree name different worktrees")
     if not (args.path or args.worktree):
@@ -1036,9 +1139,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         # A gitdir that is there answers on a second try once git's lock or index refresh has passed.
         inside = git(worktree, "rev-parse", "--is-inside-work-tree")
     if inside.stdout.strip() != "true":
-        json.dump({"worktree": worktree, "ok": False,
-                   "blockers": ["not a git worktree: git rev-parse exited %d: %s"
-                                % (inside.returncode, inside.stderr.strip() or "(no stderr)")]},
+        blockers = ["not a git worktree: git rev-parse exited %d: %s"
+                    % (inside.returncode, inside.stderr.strip() or "(no stderr)")]
+        json.dump({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers},
                   sys.stdout, ensure_ascii=False)
         print()
         return 2
@@ -1108,17 +1211,17 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     result = recheck()
     copied = []
     # Nothing is written to main while anything else keeps the worktree.
-    if args.archive_scratch and holds_only_records(result):
+    if args.archive_scratch and holds_only_records(result, movable):
         copied = copy_to_main(Path(worktree), Path(main), result["review"])
         if copied:
             result = recheck()
     if args.detach_nested:
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
-        # Records --archive-scratch moves next do not keep it.
+        # Records --archive-scratch and --archive-path move next do not keep it.
         others = [blocker for blocker in result["blockers"]
                   if not blocker.startswith("worktrees of other repositories")]
-        scratch_next = args.archive_scratch and bool(scratch_to_archive(Path(worktree), result, besides_nested=True))
+        scratch_next = bool(archive_movers(Path(worktree), result, movable, besides_nested=True))
         removable = (nested and (scratch_next or (not others and not result["review"]))
                      and not any(item["blockers"] for item in nested))
         detached = [item["path"] for item in nested if removable
@@ -1131,21 +1234,24 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
                          "paths to review, or a copy with blockers")
         result["detached"] = detached
-    if args.archive_scratch:
+    if movable:
         day = datetime.now().strftime("%Y%m%d")
         archived = []
-        for scratch in scratch_to_archive(Path(worktree), result):
-            target = archive_target(args.archive_dir, Path(worktree), scratch, day)
+        for source in archive_movers(Path(worktree), result, movable):
+            target = archive_target(args.archive_dir, Path(worktree), source, day)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(scratch, target)
-            archived.append({"from": str(scratch), "to": str(target)})
+            shutil.move(source, target)
+            archived.append({"from": str(source), "to": str(target)})
         if archived:
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}
-        elif any((Path(worktree) / name).exists() for name in SCRATCH_DIRS):
-            notes.append("--archive-scratch moved nothing: the worktree is kept for other blockers or paths to review")
+        elif any((Path(worktree) / name).exists() for name in movable):
+            options = " and ".join(name for name, given in (("--archive-scratch", args.archive_scratch),
+                                                            ("--archive-path", bool(named))) if given)
+            notes.append("%s moved nothing: the worktree is kept for other blockers or paths to review" % options)
         result["archived"] = archived
-        result["copied_to_main"] = copied
+        if args.archive_scratch:
+            result["copied_to_main"] = copied
     notes[:0] = result.pop("notes")
     elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
@@ -1187,7 +1293,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("docker compose unavailable: containers not checked")
     if notes:
         result["notes"] = notes
-    json.dump({"worktree": worktree, "main": main, "base": base, **result}, sys.stdout, ensure_ascii=False, indent=2)
+    json.dump({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),
+               **result}, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0 if result["ok"] else 1
 
