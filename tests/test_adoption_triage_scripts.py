@@ -509,6 +509,30 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(empty.returncode, 0, empty.stderr)
         self.assertEqual((self.imports / "remote.jsonl").read_bytes(), b"")
 
+    def test_collect_on_a_ledger_copy_does_not_reach_the_configured_macs(self) -> None:
+        root = Path(self.temp.name)
+        home = root / "home"
+        (home / ".config/adoption-triage").mkdir(parents=True)
+        (home / ".config/adoption-triage/hosts.json").write_text(json.dumps({
+            "decision_writer": True, "name": "board",
+            "hosts": [{"name": "real-mac", "ssh_target": "real-mac", "remote_path": "/real/events.jsonl"}]}))
+        self.proposal()
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        calls = root / "calls.log"
+        for name in ("scp", "ssh"):
+            command = bin_dir / name
+            command.write_text(f"#!{sys.executable}\nimport sys\n"
+                               f"open({str(calls)!r}, 'a').write(' '.join(sys.argv) + '\\n')\nsys.exit(1)\n")
+            command.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run([sys.executable, str(SCRIPT), "--events", str(self.events),
+                                 "--imports", str(self.imports), "collect"],
+                                env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--config", result.stderr)
+        self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+
     def test_writer_snapshot_may_reorder_but_cannot_drop_history(self):
         config = Path(self.temp.name) / "remote-hosts.json"
         config.write_text(json.dumps({"trusted_writer": "board", "hosts": []}))

@@ -536,6 +536,16 @@ def collect(config, imports, events):
     return len(hosts)
 
 
+def collect_config(args: argparse.Namespace) -> Path:
+    """The hosts collect may use: the default hosts.json lists the real Macs, so it pairs only with the real ledger."""
+    if args.config is not None:
+        return args.config
+    if args.events.resolve() != DEFAULT_EVENTS.resolve() or args.imports.resolve() != DEFAULT_IMPORTS.resolve():
+        raise ValueError("collect on a ledger copy needs its own --config; "
+                         f"{DEFAULT_HOSTS} would send the copy to the real Macs")
+    return DEFAULT_HOSTS
+
+
 def require_decision_writer(config):
     try:
         configured = json.loads(config.read_text(encoding="utf-8"))
@@ -563,7 +573,9 @@ def main():
     listing.add_argument("--candidates", action="store_true",
                          help="only pending, held, and unimplemented adopted proposals not already in an open consolidation")
     pulling = commands.add_parser("collect", help="copy remote Mac ledgers")
-    pulling.add_argument("--config", type=Path, default=DEFAULT_HOSTS)
+    pulling.add_argument("--config", type=Path,
+                         help=f"hosts to read and send to (default {DEFAULT_HOSTS}, "
+                              "only with the default --events and --imports)")
     incoming = commands.add_parser("receive", help="accept the configured decision writer's append-only ledger")
     incoming.add_argument("--name", required=True)
     incoming.add_argument("--config", type=Path, default=DEFAULT_HOSTS)
@@ -589,7 +601,7 @@ def main():
                 for item in items:
                     print(f"{item['proposal_id']}\t{item['status']}\t{item['priority']}\t{item['proposal']}")
         elif args.command == "collect":
-            print(json.dumps({"collected": collect(args.config, args.imports, args.events)}))
+            print(json.dumps({"collected": collect(collect_config(args), args.imports, args.events)}))
         else:
             print(json.dumps({"received": receive(args.config, args.imports, args.name)}))
     except (OSError, ValueError, KeyError, RuntimeError, json.JSONDecodeError) as exc:
