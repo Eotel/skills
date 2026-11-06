@@ -263,7 +263,7 @@ def owner_view(item: dict) -> dict:
     runs = [run for run in item["executions"] if adoption and run["decision_id"] == adoption]
     lanes = [run for run in runs if run["outcome"] == "handed_off" and run["actor"] != RETRO]
     holder = next((run for run in reversed(runs) if run["outcome"] == "applied" or run in lanes), None)
-    brief = next((found.group(1) for run in reversed(lanes) if (found := BRIEF.search(run["result"]))), None)
+    brief = found.group(1) if lanes and (found := BRIEF.search(lanes[-1]["result"])) else None
     current = item["current_execution"] or {}
     state = (f"戻した {item['reverted_at'][:16]}" if item["reverted_at"]
              else f"済 {item['implemented_at'][:16]}" if item["implemented_at"]
