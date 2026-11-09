@@ -179,11 +179,13 @@ def row_of(rows: Sequence[dict], handle: str) -> dict | None:
 
 
 def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, inbox: Path,
-              caller: Caller) -> tuple[bool, str]:
+              caller: Caller, state_file: Path = scan_sessions.HOURLY_STATE) -> tuple[bool, str]:
     row = row_of(rows, handle)
     if row is None:
         return False, f"{handle}: KEPT -> not a tab of any row in the scan"
     try:
+        if scan_sessions.pending_handoffs(row, state_file.expanduser()):
+            return False, f"{handle}: KEPT -> 未配信の約束の送り先"
         moved = moved_after_scan(row, host, projects, inbox, caller)
     except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: KEPT -> {error}"
@@ -213,6 +215,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
                         help="triage inbox (default: $TRIAGE_INBOX or %(default)s)")
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")
+    parser.add_argument("--state-file", type=Path, default=scan_sessions.HOURLY_STATE,
+                        help="shared hourly state; reread undelivered destinations before closing")
     args = parser.parse_args(argv)
     if not args.handles and not args.row:
         parser.error("pass HANDLE or --row NAME")
@@ -231,13 +235,13 @@ def main(argv: Sequence[str] | None = None, host: TabHost | None = None) -> int:
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
-    targets = [(row_of(rows, handle), handle) for handle in args.handles]
+    targets = [(row_of(rows, handle), handle) for value in args.handles for handle in value.split()]
     targets.extend((row, handle) for row in selected for handle in row_handles(row))
     unique = {(row.get("environment") if row else None, handle): (row, handle) for row, handle in targets}
     host = host or OrcaTabs(args.orca)
     caller = Caller.from_environment()
     results = [close_one([row] if row else rows, handle, host, args.claude_projects.expanduser(),
-                         args.inbox.expanduser(), caller) for row, handle in unique.values()]
+                         args.inbox.expanduser(), caller, args.state_file) for row, handle in unique.values()]
     print(*(line for _, line in results), sep="\n")
     return 0 if all(closed for closed, _ in results) else 1
 

@@ -1411,6 +1411,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision-config", type=Path,
                         help="adoption ledger decision-writer configuration")
     parser.add_argument("--ignore-load", action="store_true", help="manual processing only")
+    parser.add_argument("--pending", action="store_true",
+                        help="with status, include undecided proposal IDs, titles, and age_minutes")
     parser.add_argument("--session-id", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
                         help="hourly session to retry, prompt, or submit (default: $CLAUDE_CODE_SESSION_ID)")
     args = parser.parse_args(argv)
@@ -1434,6 +1436,14 @@ def main(argv: list[str] | None = None) -> int:
                 data = load(args.state)
                 ingest(data, args.state)
                 save(data, args.state)
+            items = ledger.list()
+            pending = {}
+            if args.pending:
+                current = datetime.now().astimezone()
+                pending = {"pending_proposals": [
+                    {"id": item["proposal_id"], "title": item["proposal"].splitlines()[0],
+                     "age_minutes": max(0, int((current - datetime.fromisoformat(item["ts"])).total_seconds() / 60))}
+                    for item in items if item["status"] == "pending"]}
             print(json.dumps({"sessions": len(data["sessions"]),
                               "pending_sessions": sum(s["status"] == "pending" for s in data["sessions"].values()),
                               "failed_sessions": sum(s["status"] == "failed" for s in data["sessions"].values()),
@@ -1441,7 +1451,7 @@ def main(argv: list[str] | None = None) -> int:
                                                      if session["status"] == "failed"],
                               "failed_actions": sum(n >= 3 for n in data["action_attempts"].values()),
                               "last_failure": (data.get("last_failure") or {}).get("reason"),
-                              "proposals": len(ledger.list())}, ensure_ascii=False))
+                              "proposals": len(items), **pending}, ensure_ascii=False))
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"triage-retro: {exc}", file=sys.stderr)

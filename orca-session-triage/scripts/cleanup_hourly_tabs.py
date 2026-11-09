@@ -29,6 +29,7 @@ BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", 
 QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回答|選んで|教えて|"
                       r"(?:です|ます|でしょう|よろしい|します)か|"
                       r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)
+ENDED_RUNS = frozenset(("completed", "dispatch_failed"))
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
     sessions = sessions or {}
     recorded = [session.transcript for session in sessions.values() if session.transcript]
     transcripts = [(run, transcript_for(run, Path.home(), recorded)) for run in runs
-                   if run.get("status") == "completed" and not run.get("terminalPaneKey")]
+                   if run.get("status") in ENDED_RUNS and not run.get("terminalPaneKey")]
     for term in terminals:
         if hourly_runtime.workspace_path(term.get("worktreeId")) != os.path.realpath(workspace):
             continue
@@ -84,7 +85,7 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
         if not owned_agents and term.get("orphaned") and saved and saved.agent:
             owned_agents = [saved.agent]
         problems = []
-        if run.get("status") != "completed":
+        if run.get("status") not in ENDED_RUNS:
             problems.append("scheduled run is not completed")
         if not term.get("handle") or not term.get("connected"):
             problems.append("terminal is not connected or has no handle")
@@ -93,7 +94,7 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
                                    for agent in owned_agents):
             problems.append("agent or background work is active or unknown")
         if problems:
-            print(f"keep: {term.get('handle') or pane}: " + "; ".join(problems))
+            print(f"keep: {term.get('handle') or pane} (run {run.get('status')}): " + "; ".join(problems))
             continue
         yield {**run, "terminalPaneKey": pane}, term
 
@@ -155,9 +156,10 @@ def newest_activity(transcript: Path) -> datetime | None:
     return newest
 
 
-def latest_exchange(transcript: Path) -> tuple[str | None, bool]:
+def latest_exchange(transcript: Path) -> tuple[str | None, bool, str | None]:
     """The latest exchange's final text, and whether an AskUserQuestion in it still has no answer."""
     final_text = None
+    final_at = None
     pending_tools = set()
     with transcript.open(encoding="utf-8", errors="replace") as stream:
         for raw in stream:
@@ -173,18 +175,19 @@ def latest_exchange(transcript: Path) -> tuple[str | None, bool]:
                     block.get("text", "") for block in blocks if isinstance(block, dict)
                     and block.get("type") == "text")
                 if spoken.strip() and not spoken.lstrip().startswith("<"):
-                    final_text, pending_tools = None, set()
+                    final_text, pending_tools, final_at = None, set(), None
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
                 if entry.get("type") == "assistant":
                     if block.get("type") == "text" and block.get("text", "").strip():
                         final_text = block["text"]
+                        final_at = entry.get("timestamp")
                     elif block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
                         pending_tools.add(block.get("id"))
                 elif block.get("type") == "tool_result":
                     pending_tools.discard(block.get("tool_use_id"))
-    return final_text, bool(pending_tools)
+    return final_text, bool(pending_tools), final_at
 
 
 def requests(text: str) -> list[str]:
@@ -197,7 +200,7 @@ def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes:
     newest = newest_activity(transcript)
     if newest is None or (now - newest).total_seconds() < min_idle_minutes * 60:
         problems.append("recent or unknown transcript activity")
-    final_text, asking = latest_exchange(transcript)
+    final_text, asking, _ = latest_exchange(transcript)
     if asking or not final_text:
         problems.append("unanswered conversation question")
     if (term.get("title") or "")[:1] in SPINNERS:
@@ -258,12 +261,13 @@ def main(argv: list[str] | None = None) -> int:
         recorded = [session.transcript for session in sessions.values() if session.transcript]
         for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current,
                                     sessions):
+            label = f"{term['handle']} (run {run.get('status')})"
             if not no_pending_questions(args.state_file, run["terminalPaneKey"]):
-                print(f"keep: {term['handle']} may have an unanswered question")
+                print(f"keep: {label} may have an unanswered question")
                 continue
             transcript = transcript_for(run, Path.home(), recorded)
             if transcript is None:
-                print(f"keep: {term['handle']} has no unique transcript")
+                print(f"keep: {label} has no unique transcript")
                 continue
             read = hourly_runtime.orca_result(args.orca, "terminal", "read", "--terminal",
                                               term["handle"], "--screen")
@@ -271,13 +275,15 @@ def main(argv: list[str] | None = None) -> int:
             problems = close_blockers(term, transcript, screen, args.min_idle_minutes,
                                       datetime.now(timezone.utc))
             if problems:
-                print(f"keep: {term['handle']}: " + "; ".join(problems))
+                print(f"keep: {label}: " + "; ".join(problems))
                 continue
-            final_text, _ = latest_exchange(transcript)
+            final_text, _, final_at = latest_exchange(transcript)
+            when = scan_sessions.parse_time(final_at)
+            old = " [前日以前]" if when and when.astimezone().date() < datetime.now().astimezone().date() else ""
             for line in requests(final_text or ""):
-                print(f"carry: {term['handle']}: {line}")
+                print(f"carry: {term['handle']}: {final_at or '日時不明'}{old}: {line}")
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
-            print(f"closed: {term['handle']}: completed scheduled run, idle transcript and empty composer")
+            print(f"closed: {term['handle']}: {run['status']} scheduled run, idle transcript and empty composer")
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f"keep: could not verify previous tabs: {error}")
         return 1
