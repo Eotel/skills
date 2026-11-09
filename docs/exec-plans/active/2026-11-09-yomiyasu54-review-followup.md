@@ -14,18 +14,23 @@ distribute the exact verified snapshot to the configured Macs.
 - Python 3.9 WindowsPath reproduced a relative word-list record rejected by
   the real record validator. Native Windows 3.9 run/verify/export now passes.
 - Identical-commit fork CI: https://github.com/Eotel/yomiyasu/actions/runs/42598674574
-- Original-repository CI needs maintainer approval. Three findings have fix/evidence
-  replies and are resolved. The export input-error finding is fixed in `d648f63`;
-  reply to comment `4511480920`, then resolve thread `PRRT_kwDOU1BOZs61NK4g`.
+- Original-repository CI needs maintainer approval:
+  https://github.com/nanaism/yomiyasu/actions/runs/42598648263
+- Review at `d648f63` is complete with no findings. All four earlier findings
+  have fixes/evidence replies and resolved conversations.
 - Native Windows 3.9 drive-relative run/verify/export and empty-home word-list
-  selection pass at `4b34e3f`. Latest CI also exercises the export regression.
+  selection pass at `d648f63`. Ruff/ty and distribution equality also pass.
+  The three full-suite jobs are running.
 - Downstream branch: `codex/yomiyasu-drive-relative`, based on `1d7a23d`.
   Its 42 imported files match the new fix. The prior snapshot was checked before
   replacement. PR: https://github.com/Eotel/skills/pull/154 (assigned to Eotel).
-  CI, code review, security review, and all 582 local tests passed at `2fea184`.
-  The latest source's 21 relevant tests pass. The refreshed downstream CLI returns
-  exit 2 without a traceback for missing and directory-valued export sources.
-  Push this snapshot and obtain checks/reviews on its new head.
+  CI, code review, and security review pass at `581a861`; its code incorporates
+  main `7bbc568`. All 585 local tests and 93 relevant upstream tests pass.
+  The downstream CLI returns exit 2 without a traceback for missing and
+  directory-valued export sources. Only this plan changes after that verified code.
+- Read-only deployment preflight found valid receipts and no broken client links
+  on all three Macs. Managed content matches receipts, with only the documented
+  CMD line-ending representation difference. Inspect fresh state before updating.
 
 ## Scope and Non-Goals
 
@@ -41,10 +46,9 @@ distribute the exact verified snapshot to the configured Macs.
 
 ## Remaining Work
 
-1. Finish fork CI and the new review, fix actual findings, and obtain original
-   CI approval. Keep the PR evidence current.
-2. Push the latest verified downstream snapshot, update PR evidence, and monitor
-   CI and review before requesting merge authorization.
+1. Finish fork CI and obtain original CI approval. Keep the PR evidence current.
+2. Check the final downstream head's CI and review, update both PR descriptions
+   with exact full-suite results, and request merge authorization for #154.
 3. After explicit merge authorization, update the maintained APM pin to the
    merged revision and distribute through the current Mac procedure.
 4. Compare changed deployed files and executable bits through actual client
@@ -53,10 +57,10 @@ distribute the exact verified snapshot to the configured Macs.
 
 ## Now And Next
 
-Inspect all six fork CI jobs and the upstream review at `d648f63`. Do not treat
-the original repository's `action_required` state as successful CI. Review the
-existing word-list record-validator and native Windows regression evidence.
-Push the downstream export fix and reconcile both PRs' descriptions and reviews.
+Inspect the full fork CI jobs at `d648f63` and the final downstream head's checks.
+Do not treat the original repository's `action_required` state as successful CI.
+Fill both PR descriptions with the exact completed job results and distinguish
+the original repository's approval requirement. Then obtain #154 merge approval.
 
 ## Constraints and Human Tasks
 
