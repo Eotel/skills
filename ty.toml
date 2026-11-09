@@ -1,14 +1,3 @@
 [environment]
 python-version = "3.12"
 extra-paths = ["orca-session-triage/scripts"]
-
-[src]
-# Existing errors are tracked in https://github.com/Eotel/skills/issues/78.
-# Exclusions name files so new scripts and tests remain type checked.
-exclude = [
-    "yomiyasu/scripts/markdown_visibility.py", # 20 existing errors
-    "yomiyasu/scripts/yomiyasu_check.py", # 27 existing errors
-    "yomiyasu/scripts/yomiyasu_diff.py", # 54 existing errors
-    "yomiyasu/scripts/yomiyasu_hook.py", # 5 existing errors
-    "yomiyasu/scripts/yomiyasu_lint.py", # 22 existing errors
-]

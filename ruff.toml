@@ -2,12 +2,3 @@ target-version = "py312"
 
 [lint]
 select = ["ANN", "PTH"]
-
-[lint.per-file-ignores]
-# These files are the imported yomiyasu snapshot documented in README.md. Their
-# 252 path diagnostics need an upstream migration before refreshing that snapshot.
-"yomiyasu/scripts/markdown_visibility.py" = ["ANN", "PTH"] # 97 ANN, 17 PTH
-"yomiyasu/scripts/yomiyasu_check.py" = ["ANN", "PTH"] # 713 ANN, 178 PTH
-"yomiyasu/scripts/yomiyasu_diff.py" = ["ANN", "PTH"] # 1495 ANN, 9 PTH
-"yomiyasu/scripts/yomiyasu_hook.py" = ["ANN", "PTH"] # 140 ANN, 43 PTH
-"yomiyasu/scripts/yomiyasu_lint.py" = ["ANN", "PTH"] # 457 ANN, 5 PTH
