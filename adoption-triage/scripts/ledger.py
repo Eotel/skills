@@ -1,6 +1,8 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Append and read adoption triage events. Use --help for commands and paths."""
 
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import fcntl
@@ -15,6 +17,72 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from typing import Literal, TypeGuard, TypedDict
+
+
+class Event(TypedDict, total=False):
+    id: str
+    ts: str
+    host: str
+    type: str
+    proposal_id: str
+    after_id: str
+    source: dict[str, str]
+    fact: str
+    proposal: str
+    reason: str
+    recommendation: str
+    priority: str
+    evidence: list[str]
+    target: str | None
+    merges: list[str]
+    retires: list[str]
+    confirms: list[str]
+    decision: str
+    actor: str
+    result: str
+    undo: str
+    decision_id: str
+    outcome: str
+    closed: list[Event]
+    confirmed: list[Event]
+
+
+class Proposal(Event):
+    status: str
+    adopted_at: str | None
+    rejected_at: str | None
+    held_at: str | None
+    revoked_at: str | None
+    implemented_at: str | None
+    reverted_at: str | None
+    supporting_events: list[Event]
+    decisions: list[Event]
+    executions: list[Event]
+    latest_event_id: str
+    current_execution: Event | None
+    merged_into: list[str]
+    retired_by: list[str]
+    confirmed_by: list[str]
+
+
+def is_event(value: object) -> TypeGuard[Event]:
+    """Validate JSONL fields once, before events enter ordering and projection."""
+    if not isinstance(value, dict):
+        return False
+    required = {"id", "ts", "host", "type", "proposal_id"}
+    strings = required | {"after_id", "fact", "proposal", "reason", "recommendation", "priority",
+                          "decision", "actor", "result", "undo", "decision_id", "outcome"}
+    if not required <= value.keys() or any(not isinstance(value[key], str) for key in strings & value.keys()):
+        return False
+    if any(not isinstance(value[key], list) or any(not isinstance(item, str) for item in value[key])
+           for key in {"evidence", "merges", "retires", "confirms"} & value.keys()):
+        return False
+    source = value.get("source")
+    if "source" in value and (not isinstance(source, dict) or set(source) != {"session", "worktree"}
+                               or any(not isinstance(item, str) for item in source.values())):
+        return False
+    return value.get("target") is None or isinstance(value["target"], str)
 
 
 DEFAULT_EVENTS = Path("~/.local/share/adoption-triage/events.jsonl").expanduser()
@@ -29,29 +97,33 @@ RETRO = "triage-retro"
 BRIEF = re.compile(r"指示書 (.+)$")
 # merges: this proposal combines the listed ones; retires: it withdraws the listed stale ones.
 # merges and retires close their targets when adopted; confirms records its adopted targets as applied.
-RELATIONS = {"merges": "merged_into", "retires": "retired_by", "confirms": "confirmed_by"}
+RELATIONS: dict[Literal["merges", "retires", "confirms"],
+                Literal["merged_into", "retired_by", "confirmed_by"]] = {
+    "merges": "merged_into", "retires": "retired_by", "confirms": "confirmed_by"}
+DECISION_TIMES: dict[str, Literal["adopted_at", "rejected_at", "held_at", "revoked_at"]] = {
+    "adopt": "adopted_at", "reject": "rejected_at", "hold": "held_at", "revoke": "revoked_at"}
 
 
-def required_text(value, name, limit=4000):
+def required_text(value: object, name: str, limit: int = 4000) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
         raise ValueError(f"{name} must be nonempty text (up to {limit} characters)")
     return value.strip()
 
 
-def optional_text(value, name, limit=4000):
+def optional_text(value: object, name: str, limit: int = 4000) -> str | None:
     if value is None:
         return None
     return required_text(value, name, limit)
 
 
-def timestamp(value):
+def timestamp(value: str) -> dt.datetime:
     parsed = dt.datetime.fromisoformat(value)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("ts requires a timezone offset")
     return parsed
 
 
-def read_rows(path):
+def read_rows(path: Path) -> list[Event]:
     if not path.exists():
         return []
     data = path.read_bytes()
@@ -60,14 +132,14 @@ def read_rows(path):
     rows = []
     for number, line in enumerate(data.splitlines(), 1):
         row = json.loads(line)
-        if not isinstance(row, dict) or not all(key in row for key in ("id", "ts", "host", "type", "proposal_id")):
+        if not is_event(row):
             raise ValueError(f"invalid event at {path}:{number}")
         timestamp(row["ts"])
         rows.append(row)
     return rows
 
 
-def all_rows(events, imports):
+def all_rows(events: Path, imports: Path) -> list[Event]:
     paths = [events]
     if imports.exists():
         paths.extend(sorted(imports.glob("*.jsonl")))
@@ -110,8 +182,8 @@ def all_rows(events, imports):
     return ordered
 
 
-def project(rows):
-    proposals = {}
+def project(rows: list[Event]) -> list[Proposal]:
+    proposals: dict[str, Proposal] = {}
     for row in rows:
         proposal_id = row["proposal_id"]
         if row["type"] == "proposal":
@@ -123,8 +195,10 @@ def project(rows):
                                       "evidence": list(row.get("evidence", [])),
                                       "supporting_events": [], "decisions": [], "executions": [],
                                       "latest_event_id": row["id"], "current_execution": None,
-                                      **{relation: list(row.get(relation, [])) for relation in RELATIONS},
-                                      **{reverse: [] for reverse in RELATIONS.values()}}
+                                      "merges": list(row.get("merges", [])),
+                                      "retires": list(row.get("retires", [])),
+                                      "confirms": list(row.get("confirms", [])),
+                                      "merged_into": [], "retired_by": [], "confirmed_by": []}
     for item in list(proposals.values()):
         for relation, reverse in RELATIONS.items():
             for target in item[relation]:
@@ -162,8 +236,7 @@ def project(rows):
                 item["revoked_at"] = None
             item["status"] = {"adopt": "adopted", "reject": "rejected", "hold": "held",
                               "revoke": "revoked"}[decision]
-            item[{"adopt": "adopted_at", "reject": "rejected_at", "hold": "held_at",
-                  "revoke": "revoked_at"}[decision]] = row["ts"]
+            item[DECISION_TIMES[decision]] = row["ts"]
             item["decisions"].append(row)
             item["latest_event_id"] = row["id"]
             item["current_execution"] = None
@@ -198,18 +271,18 @@ def project(rows):
         -timestamp(item["ts"]).timestamp()))
 
 
-def nothing_to_apply(item: dict) -> bool:
+def nothing_to_apply(item: Proposal) -> bool:
     """Whether adopting the proposal is its whole work: it retires or confirms others and merges none."""
     return bool(item["retires"] or item["confirms"]) and not item["merges"]
 
 
-def active_owner(item: dict, known: dict[str, dict], besides: str | None = None) -> str | None:
+def active_owner(item: Proposal, known: dict[str, Proposal], besides: str | None = None) -> str | None:
     """The undecided or adopted proposal, other than `besides`, that already merges, retires, or confirms the item."""
     return next((owner for owner in (*item["merged_into"], *item["retired_by"], *item["confirmed_by"])
                  if owner != besides and known[owner]["status"] in {"pending", "held", "adopted"}), None)
 
 
-def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
+def consolidation_blocker(item: Proposal, known: dict[str, Proposal]) -> str | None:
     """Why a proposal cannot be merged or retired now; None when it is a consolidation candidate."""
     if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"]:
         return "is not open"
@@ -217,7 +290,7 @@ def consolidation_blocker(item: dict, known: dict[str, dict]) -> str | None:
     return f"is already in open proposal {owner}" if owner else None
 
 
-def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
+def closing_decisions(owner: Proposal, known: dict[str, Proposal], actor: str) -> list[Event]:
     """Decisions that close the open targets of an adopted consolidation; re-adopting a target reopens it.
 
     A direct target adopted and not yet applied is revoked. The targets a closed consolidation hands on
@@ -245,7 +318,7 @@ def closing_decisions(owner: dict, known: dict[str, dict], actor: str) -> list[d
     return rows
 
 
-def confirming_executions(owner: dict, known: dict[str, dict], actor: str) -> list[dict]:
+def confirming_executions(owner: Proposal, known: dict[str, Proposal], actor: str) -> list[Event]:
     """Applied records, under each target's adoption, for the adopted and unapplied proposals the owner confirms."""
     return [{**envelope("execution", target["proposal_id"]), "decision_id": target["decisions"][-1]["id"],
              "outcome": "applied", "actor": actor, "result": f"実施の確認「{owner['proposal']}」を採用",
@@ -254,7 +327,7 @@ def confirming_executions(owner: dict, known: dict[str, dict], actor: str) -> li
             if target["status"] == "adopted" and not target["implemented_at"]]
 
 
-def owner_view(item: dict) -> dict:
+def owner_view(item: Proposal) -> dict:
     """Who holds the proposal under its last adoption, the brief they were given, and whether the work is done.
 
     The holder is the last applied, or the last handed_off by a lane, under that adoption."""
@@ -272,7 +345,7 @@ def owner_view(item: dict) -> dict:
             "brief": brief, "state": state}
 
 
-def named_proposals(items: list[dict], wanted: list[str]) -> list[dict]:
+def named_proposals(items: list[Proposal], wanted: list[str]) -> list[Proposal]:
     """The proposal each ID names, in order: a full ID or a start of 8 or more characters naming one."""
     found, errors = [], []
     for value in wanted:
@@ -286,12 +359,12 @@ def named_proposals(items: list[dict], wanted: list[str]) -> list[dict]:
     return found
 
 
-def envelope(kind, proposal_id):
+def envelope(kind: str, proposal_id: str) -> Event:
     return {"id": str(uuid.uuid4()), "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "host": socket.gethostname(), "type": kind, "proposal_id": proposal_id}
 
 
-def validate_proposal(body):
+def validate_proposal(body: object) -> Event:
     if not isinstance(body, dict):
         raise ValueError("proposal must be a JSON object")
     allowed = {"proposal_id", "source", "fact", "proposal", "reason", "recommendation",
@@ -317,7 +390,7 @@ def validate_proposal(body):
             not isinstance(value, str) or len(value) > 1000 for value in evidence):
         raise ValueError("evidence must be a list of short strings")
     target = optional_text(body.get("target"), "target", 500)
-    row = {**body, **envelope("proposal", proposal_id), "source": source,
+    row: Event = {**body, **envelope("proposal", proposal_id), "source": source,
            "evidence": evidence, "target": target}
     for relation in RELATIONS:
         targets = body.get(relation)
@@ -335,7 +408,7 @@ def validate_proposal(body):
     return row
 
 
-def validate_decision(body):
+def validate_decision(body: object) -> Event:
     if not isinstance(body, dict) or set(body) - {"proposal_id", "decision", "actor", "reason", "result", "undo"}:
         raise ValueError("invalid decision object")
     proposal_id = required_text(body.get("proposal_id"), "proposal_id", 80)
@@ -343,7 +416,7 @@ def validate_decision(body):
     decision = body.get("decision")
     if decision not in DECISIONS:
         raise ValueError("decision must be adopt, reject, hold, or revoke")
-    row = {**envelope("decision", proposal_id), "decision": decision,
+    row: Event = {**envelope("decision", proposal_id), "decision": decision,
            "actor": required_text(body.get("actor"), "actor", 120)}
     for key in ("reason", "result", "undo"):
         value = optional_text(body.get(key), key)
@@ -352,7 +425,7 @@ def validate_decision(body):
     return row
 
 
-def validate_execution(body):
+def validate_execution(body: object) -> Event:
     if not isinstance(body, dict) or set(body) - {"proposal_id", "decision_id", "outcome", "actor", "result", "undo"}:
         raise ValueError("invalid execution object")
     proposal_id = required_text(body.get("proposal_id"), "proposal_id", 80)
@@ -362,7 +435,7 @@ def validate_execution(body):
     outcome = body.get("outcome")
     if outcome not in OUTCOMES:
         raise ValueError("outcome must be applied, reverted, failed, or handed_off")
-    row = {**envelope("execution", proposal_id), "decision_id": decision_id, "outcome": outcome,
+    row: Event = {**envelope("execution", proposal_id), "decision_id": decision_id, "outcome": outcome,
            "actor": required_text(body.get("actor"), "actor", 120),
            "result": required_text(body.get("result"), "result")}
     undo = optional_text(body.get("undo"), "undo")
@@ -371,7 +444,7 @@ def validate_execution(body):
     return row
 
 
-def validate_evidence(body):
+def validate_evidence(body: object) -> Event:
     if not isinstance(body, dict) or set(body) != {"proposal_id", "source", "evidence"}:
         raise ValueError("evidence needs proposal_id, source, and evidence")
     proposal_id = required_text(body["proposal_id"], "proposal_id", 80)
@@ -387,7 +460,7 @@ def validate_evidence(body):
     return {**envelope("evidence", proposal_id), "source": source, "evidence": evidence}
 
 
-def append(events, imports, row):
+def append(events: Path, imports: Path, row: Event) -> Event:
     events.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(events, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -458,7 +531,7 @@ def append(events, imports, row):
     return {**row, "closed": closed, "confirmed": confirmed} if adopted else row
 
 
-def replace_import(imports, name, temporary_path, allow_reorder=False):
+def replace_import(imports: Path, name: str, temporary_path: Path, allow_reorder: bool = False) -> list[Event]:
     rows = read_rows(temporary_path)
     path = imports / f"{name}.jsonl"
     lock_fd = os.open(imports / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -477,7 +550,7 @@ def replace_import(imports, name, temporary_path, allow_reorder=False):
     return rows
 
 
-def receive(config, imports, name):
+def receive(config: Path, imports: Path, name: str) -> int:
     settings = json.loads(config.read_text(encoding="utf-8"))
     if not isinstance(settings, dict) or not isinstance(settings.get("hosts"), list):
         raise ValueError("hosts must be a list")
@@ -497,7 +570,7 @@ def receive(config, imports, name):
         temporary_path.unlink(missing_ok=True)
 
 
-def collect(config, imports, events):
+def collect(config: Path, imports: Path, events: Path) -> int:
     settings = json.loads(config.read_text(encoding="utf-8"))
     if not isinstance(settings, dict):
         raise ValueError("host configuration must be an object")
@@ -582,7 +655,7 @@ def collect_config(args: argparse.Namespace) -> Path:
     return DEFAULT_HOSTS
 
 
-def require_decision_writer(config):
+def require_decision_writer(config: Path) -> None:
     try:
         configured = json.loads(config.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -594,7 +667,7 @@ def require_decision_writer(config):
         raise ValueError(f"decision writer needs a stable name: {config}")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS)
     parser.add_argument("--imports", type=Path, default=DEFAULT_IMPORTS)

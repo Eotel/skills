@@ -7,8 +7,11 @@ comments, line comments) for each PR whose updatedAt changed since the copy
 kept in --pr-cache.
 """
 
+from __future__ import annotations
+
 import argparse
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import partial
@@ -70,7 +73,7 @@ class DoneCard(TypedDict):
     composer_empty: bool | None
 
 
-def claude_project_dir(projects_root, worktree_path):
+def claude_project_dir(projects_root: str | Path, worktree_path: str) -> Path:
     """Claude Code stores a cwd's transcripts under the path with non-alphanumerics as '-'.
 
     Names longer than 200 characters are cut to 200 and given a hash suffix; see
@@ -79,7 +82,7 @@ def claude_project_dir(projects_root, worktree_path):
     return Path(projects_root) / re.sub(r"[^A-Za-z0-9]", "-", worktree_path)
 
 
-def records_cwd(directory, worktree_path):
+def records_cwd(directory: Path, worktree_path: str) -> bool:
     for path in directory.glob("*.jsonl"):
         for row in load_jsonl(path):
             if "cwd" in row:
@@ -89,7 +92,7 @@ def records_cwd(directory, worktree_path):
     return False
 
 
-def find_claude_dir(projects_root, worktree_path):
+def find_claude_dir(projects_root: str | Path, worktree_path: str) -> Path:
     exact = claude_project_dir(projects_root, worktree_path)
     if exact.is_dir() or len(exact.name) <= CLAUDE_DIR_LIMIT or not Path(projects_root).is_dir():
         return exact
@@ -100,7 +103,7 @@ def find_claude_dir(projects_root, worktree_path):
     return exact
 
 
-def load_jsonl(path):
+def load_jsonl(path: str | Path) -> list[dict]:
     rows = []
     with Path(path).open(encoding="utf-8") as handle:
         for line in handle:
@@ -113,7 +116,7 @@ def load_jsonl(path):
     return rows
 
 
-def message_of(entry):
+def message_of(entry: dict) -> dict:
     message = entry.get("message")
     return message if isinstance(message, dict) else {}
 
@@ -148,7 +151,7 @@ def queued_input(transcript: Path, now: datetime | None = None) -> list[QueuedIn
     return pending
 
 
-def user_text(entry):
+def user_text(entry: dict) -> str | None:
     content = message_of(entry).get("content")
     if isinstance(content, str):
         return content
@@ -158,7 +161,7 @@ def user_text(entry):
     return None
 
 
-def is_real_user_message(entry):
+def is_real_user_message(entry: dict) -> bool:
     """A message the user typed; meta entries and compaction summaries are Claude Code's own."""
     if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isCompactSummary"):
         return False
@@ -292,7 +295,7 @@ def last_entry_at(path: Path) -> datetime | None:
     return max(times, default=None)
 
 
-def read_claude(projects_root, worktree_path, running=()):
+def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
     """Summarize the newest Claude transcript for a worktree, or None when there is none.
 
     `running` adds transcripts of Claude sessions running under it that live in other project directories.
@@ -305,6 +308,7 @@ def read_claude(projects_root, worktree_path, running=()):
         # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
         path = max(dict.fromkeys([*running, *([path] if path else [])]),
                    key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
+    assert path is not None
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None
@@ -337,7 +341,7 @@ def read_claude(projects_root, worktree_path, running=()):
     }
 
 
-def message_text(payload):
+def message_text(payload: dict) -> str:
     return " ".join(c.get("text", "") for c in payload.get("content") or [] if isinstance(c, dict))
 
 
@@ -346,7 +350,7 @@ API_FAILURE = re.compile(
     r"request failed|connection error|stream error|server error)", re.IGNORECASE)
 
 
-def api_failure(text):
+def api_failure(text: str | None) -> str | None:
     """Return a Codex API failure line, ignoring ordinary discussion of an error."""
     for line in str(text or "").splitlines():
         line = line.strip()
@@ -355,7 +359,7 @@ def api_failure(text):
     return None
 
 
-def summarize_rollout(path):
+def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
     last_assistant = last_assistant_at = api_error = None
@@ -439,7 +443,7 @@ STATE_SURE_FROM = 0.6  # a status confidence below this is unsure
 NO_VERDICT = {"asks": None, "status": None, "confidence": None}
 
 
-def jev_key(env, key_file):
+def jev_key(env: Mapping[str, str], key_file: str | Path) -> str | None:
     """TYPESAFE_API_KEY from the environment, else the key file's content, else None."""
     if env.get("TYPESAFE_API_KEY"):
         return env["TYPESAFE_API_KEY"]
@@ -449,20 +453,20 @@ def jev_key(env, key_file):
         return None
 
 
-def probability(value):
-    value = float(value)
-    if not 0 <= value <= 1:  # also false for NaN
-        raise ValueError(f"probability out of range: {value}")
-    return value
+def probability(value: str | float) -> float:
+    number = float(value)
+    if not 0 <= number <= 1:  # also false for NaN
+        raise ValueError(f"probability out of range: {number}")
+    return number
 
 
-def jev_judge(api_key, opener=None):
+def jev_judge(api_key: str, opener: Callable[..., AbstractContextManager] | None = None) -> Callable[[str], dict | None]:
     """A judge returning Jev's verdict on a message, or None on failure.
 
     The verdict holds `asks` (probability that it waits on the user), `status`
     (in_progress, blocked_on_others, or done), and that status's `confidence`.
     """
-    def judge(message):
+    def judge(message: str) -> dict | None:
         body = {"state": message[-JEV_MAX_CHARS:], "model": "jev-latest", "questions": JEV_QUESTIONS}
         request = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
             "Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
@@ -480,16 +484,16 @@ def jev_judge(api_key, opener=None):
     return judge
 
 
-def is_working(row):
+def is_working(row: dict) -> bool:
     return any(a["state"] == "working" for a in row["agents"])
 
 
-def main_state(agent):
+def main_state(agent: dict) -> str | None:
     main = agent.get("mainAgent")
     return main.get("state") if isinstance(main, dict) else None
 
 
-def turn_runs(row):
+def turn_runs(row: dict) -> bool:
     """An agent is in its own turn, not only holding a background shell, monitor, or helper.
 
     Orca keeps `state` at working while such a job runs after the turn ended;
@@ -498,7 +502,7 @@ def turn_runs(row):
     return any(a["state"] == "working" and a.get("turn") != "done" for a in row["agents"])
 
 
-def latest_message(row):
+def latest_message(row: dict) -> tuple[str, str] | None:
     """(source, text) of the newest final message, Claude's when the times tie or are missing.
 
     A helper's report to its lead comes before the lead's own last word, so only
@@ -593,11 +597,11 @@ def stop_line(stop: StopReason) -> str:
     return "turn ended with an API error: " + stop["error"]
 
 
-def is_sure_ask(asks):
+def is_sure_ask(asks: float | None) -> bool:
     return asks is not None and asks >= ASKS_FROM
 
 
-def unsure_reason(jev):
+def unsure_reason(jev: dict) -> str | None:
     if jev["asks"] is None:
         return "Jev could not judge: read the final message"
     if SETTLED_BELOW <= jev["asks"] < ASKS_FROM:
@@ -653,7 +657,7 @@ OLD_MARKER_REASON = "old decision marker in comment: an agent is in its turn"
 NO_SESSION_REASON = "no agent session in this worktree"
 
 
-def classify(row, decision_marker):
+def classify(row: dict, decision_marker: str) -> tuple[str, list[str]]:
     """Return (class, reasons): waiting > unstarted > working > unsure > finished > stalled.
 
     Jev reads the newest final message of an idle worktree. When it is unsure,
@@ -690,12 +694,15 @@ def classify(row, decision_marker):
         return "stalled", mail
     if is_working(row):
         if jev and (jev["asks"] is None or jev["asks"] >= SETTLED_BELOW):
-            return "unsure", [unsure_reason(jev)]
+            reason = unsure_reason(jev)
+            assert reason is not None
+            return "unsure", [reason]
         return "working", [BACKGROUND_REASON]
-    if jev and unsure_reason(jev):
-        return "unsure", [unsure_reason(jev)]
+    if jev and (reason := unsure_reason(jev)):
+        return "unsure", [reason]
     state = f"{STATE_REASONS[jev['status']]} (Jev {jev['confidence']:.2f})" if jev else None
     if jev and jev["status"] != "done":
+        assert state is not None
         return "stalled", [state]
     if (row["linked_pr"] or {}).get("state") == "merged":
         return "finished", ["PR merged"]
@@ -719,7 +726,7 @@ def shell_is_idle(term: dict, now: float, idle_minutes: float, screen: dict | No
     return bool(lines) and lines[-1] in BARE_PROMPTS and quiet
 
 
-def agents_done(row):
+def agents_done(row: dict) -> bool:
     """Nothing is pending on the agents: closing their tabs loses no work.
 
     An agent whose last message says work continues may be waiting on a
@@ -739,7 +746,7 @@ def closable_terminals(agents_closable: bool, terms: list[dict], now: float, idl
                 t, now, idle_minutes, screens.get((t.get("_environment"), t["handle"]))))]
 
 
-def iso_time(epoch_ms):
+def iso_time(epoch_ms: float | None) -> str | None:
     if epoch_ms is None:
         return None
     return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -964,10 +971,10 @@ def screen_message(screen: dict) -> str:
     lines = screen_lines(screen)
     if screen_agent(screen) == "codex":
         return codex_screen_message(lines)
-    def tool_call(index):
+    def tool_call(index: int) -> bool:
         following = lines[index + 1].strip() if index + 1 < len(lines) else ""
-        return (TOOL_CALL.match(lines[index]) or lines[index].rstrip().endswith(COLLAPSED_CALLS)
-                or following.startswith(TOOL_RESULT))
+        return bool(TOOL_CALL.match(lines[index]) or lines[index].rstrip().endswith(COLLAPSED_CALLS)
+                    or following.startswith(TOOL_RESULT))
 
     starts = [index for index, line in enumerate(lines) if line.startswith("⏺ ") and not tool_call(index)]
     ends = [index for index, line in enumerate(lines) if line.startswith("✻ ")]
@@ -1038,7 +1045,7 @@ HOOK_MISSING = re.compile(r"hook error\b[^\n]*?(?:\n[^\n]*?)??\s(/[^\s:]+): No s
 LOCAL_HOST = socket.gethostname()
 
 
-def hook_errors(terms, screens, environment):
+def hook_errors(terms: list[dict], screens: Screens, environment: str | None) -> list[dict]:
     """Each missing hook file a tab's output or rendered screen shows, once per tab: {host, path, tab}."""
     host = environment or LOCAL_HOST
     shown = ((term.get("handle"), text) for term in terms
@@ -1049,12 +1056,12 @@ def hook_errors(terms, screens, environment):
     return list(found.values())
 
 
-def orca_said(worktree):
+def orca_said(worktree: dict) -> bool:
     """Whether Orca keeps a last message of one of the worktree's agents."""
     return any(agent.get("lastAssistantMessage") for agent in worktree.get("agents") or [])
 
 
-def with_screen_agents(terms, screens, environment):
+def with_screen_agents(terms: list[dict], screens: Screens, environment: str | None) -> tuple[list[dict], str]:
     """(terms, message): the tabs, each without an agent given the one its screen shows, and the last
     Claude or Codex reply read on them. Another Mac's terminal list names a tab's agent on some reads only."""
     found, message = [], ""
@@ -1365,7 +1372,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     return rows
 
 
-def github_slug(remote_url):
+def github_slug(remote_url: str | None) -> str | None:
     """owner/repo of a github.com remote; None for any other host."""
     match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", remote_url or "")
     return match.group(1) if match else None
@@ -1374,7 +1381,7 @@ def github_slug(remote_url):
 PR_URL = re.compile(r"https://github\.com/([^/\s)]+/[^/\s)]+)/pull/(\d+)")
 
 
-def remote_git_hint(row):
+def remote_git_hint(row: dict) -> dict:
     """PR lookup hints from Orca, without claiming the remote checkout was inspected."""
     linked = row.get("linked_pr") or {}
     found = PR_URL.search(linked.get("url") or "")
@@ -1389,12 +1396,12 @@ def remote_git_hint(row):
             "pr_number": int(found.group(2)) if found else linked.get("number")}
 
 
-def git_state(path):
+def git_state(path: str) -> dict | None:
     """Branch, uncommitted paths, commits not pushed to the upstream, and the GitHub repo.
 
     None outside a git checkout; `unpushed` is None without an upstream.
     """
-    def run(*args):
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
 
     try:
@@ -1415,9 +1422,9 @@ def git_state(path):
     }
 
 
-def latest_human_activity(author, reviews=(), comments=(), line_comments=()):
+def latest_human_activity(author: str | None, reviews: Sequence[dict] = (), comments: Sequence[dict] = (), line_comments: Sequence[dict] = ()) -> dict | None:
     """Newest non-author human PR activity from the three GitHub comment surfaces."""
-    candidates = []
+    candidates: list[dict] = []
     for kind, entries, timestamp in (("review", reviews, "submitted_at"),
                                      ("comment", comments, "created_at"),
                                      ("line_comment", line_comments, "created_at")):
@@ -1429,10 +1436,10 @@ def latest_human_activity(author, reviews=(), comments=(), line_comments=()):
                     and (not author or login.casefold() != author.casefold())):
                 candidates.append({"author": login, "kind": kind, "at": at,
                                    **({"state": entry.get("state")} if kind == "review" else {})})
-    return max(candidates, key=lambda item: item["at"], default=None)
+    return max(candidates, key=lambda item: item["at"]) if candidates else None
 
 
-def summarize_pr(data, reviews=(), comments=(), line_comments=()):
+def summarize_pr(data: dict, reviews: Sequence[dict] = (), comments: Sequence[dict] = (), line_comments: Sequence[dict] = ()) -> dict:
     """Reduce `gh pr view --json` output to what decides a stalled worktree's next step."""
     checks = {}
     for check in data.get("statusCheckRollup") or []:
@@ -1448,9 +1455,9 @@ def summarize_pr(data, reviews=(), comments=(), line_comments=()):
     last_commit_at = commits[-1].get("committedDate") if commits else None
     # GitHub exposes commit time here, not the time a commit was pushed. Keep
     # the source visible so a reader does not mistake this for an exact push time.
-    reply_after_commit = bool(activity and last_commit_at and parse_time(activity["at"])
-                              and parse_time(last_commit_at)
-                              and parse_time(activity["at"]) > parse_time(last_commit_at))
+    activity_at = parse_time(activity["at"]) if activity else None
+    commit_at = parse_time(last_commit_at)
+    reply_after_commit = bool(activity_at and commit_at and activity_at > commit_at)
     return {
         "number": data.get("number"), "url": data.get("url"), "state": data.get("state"),
         "head": data.get("headRefName"), "head_oid": data.get("headRefOid"),
@@ -1660,8 +1667,10 @@ def gh_prs(slug: str, refs: list[PrRef],
             if node else None for ref, node in found.items()}
 
 
-def parse_time(value):
+def parse_time(value: str | None) -> datetime | None:
     """An aware datetime; a time without a zone is UTC."""
+    if value is None:
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, ValueError):
@@ -1673,7 +1682,7 @@ WORKER_MAIL = ("worker_done", "question", "escalation")
 MAIL_GRACE_MINUTES = 5  # Orca types its own notice into an idle lead first
 
 
-def unread_worker_mail(messages, runs):
+def unread_worker_mail(messages: list[dict], runs: list[dict]) -> dict[str, list[dict]]:
     """Unread worker reports, questions, and escalations, keyed by the lead terminal they wait on."""
     leads = {run.get("id"): run.get("coordinator_handle") for run in runs}
     mail = {}
@@ -1681,13 +1690,13 @@ def unread_worker_mail(messages, runs):
         run = m.get("run_id")
         if m.get("read") or m.get("type") not in WORKER_MAIL or m.get("to_handle") != f"run:{run}":
             continue
-        if leads.get(run):
-            mail.setdefault(leads[run], []).append(
+        if lead := leads.get(run):
+            mail.setdefault(lead, []).append(
                 {"type": m["type"], "created_at": m.get("created_at"), "subject": m.get("subject")})
     return mail
 
 
-def unread_since_turn(row, mail, now, grace_minutes=MAIL_GRACE_MINUTES):
+def unread_since_turn(row: dict, mail: dict[str, list[dict]], now: float, grace_minutes: float = MAIL_GRACE_MINUTES) -> list[dict]:
     """The lead's unread worker mail that arrived after its last turn began, oldest first.
 
     Orca types a notice into an idle lead, yet has left reports unread for hours.
@@ -1706,19 +1715,19 @@ def unread_since_turn(row, mail, now, grace_minutes=MAIL_GRACE_MINUTES):
     return sorted(arrived, key=lambda m: m["created_at"])
 
 
-def mail_reason(unread):
+def mail_reason(unread: list[dict]) -> str:
     noun = "message" if len(unread) == 1 else "messages"
     return f"{len(unread)} orchestration {noun} unread since its last turn began (oldest {unread[0]['created_at']})"
 
 
-def final_message_at(row):
+def final_message_at(row: dict) -> datetime | None:
     """When the final message Jev read was written, or None."""
     if (row.get("jev") or {}).get("source") == "codex":
         return parse_time((row.get("codex") or [{}])[-1].get("last_assistant_at"))
     return parse_time((row.get("claude") or {}).get("final_at"))
 
 
-def merged_after_final_message(row, pr):
+def merged_after_final_message(row: dict, pr: dict) -> bool:
     """The worktree's own PR merged after a final message that waited on someone else.
 
     That message was written before the merge it was waiting for, often a
@@ -1731,7 +1740,7 @@ def merged_after_final_message(row, pr):
     return said_at is not None and merged_at is not None and merged_at > said_at
 
 
-def merged_with_nothing_left(row, pr):
+def merged_with_nothing_left(row: dict, pr: dict) -> bool:
     """A checkout no agent ran in whose own PR merged at HEAD.
 
     Orca's PR link is often missing or still says open after the merge, so the
@@ -1743,7 +1752,7 @@ def merged_with_nothing_left(row, pr):
             and pr.get("state") == "MERGED" and bool(pr.get("head_matches")))
 
 
-def open_pr_with_no_local_work(row, pr, git):
+def open_pr_with_no_local_work(row: dict, pr: dict, git: dict) -> bool:
     """No current agent or local work remains beyond the published PR head.
 
     `git.unpushed` is relative to the branch's upstream, which can be the PR's
@@ -1926,7 +1935,7 @@ class InboxReport(TypedDict):
 InboxReports = dict[tuple[str, str], dict[str, InboxReport]]
 
 
-def row_final_at(row):
+def row_final_at(row: dict) -> str | None:
     """When the newest final message a reader would class was written (Claude or Codex), or None."""
     codex = row.get("codex") or []
     said = [at for at in ((row.get("claude") or {}).get("final_at"),
@@ -1941,9 +1950,9 @@ def ask_answers(path: Path) -> dict[str, AnsweredAsk]:
         records = load_jsonl(path)
     except (OSError, UnicodeDecodeError):
         return {}
-    timed = sorted((record for record in records if isinstance(record.get("id"), str) and parse_time(record.get("ts"))),
-                   key=lambda record: parse_time(record["ts"]))
-    return {record["id"]: {"at": record["ts"], "note": record.get("note") or ""} for record in timed}
+    timed = sorted(((at, record) for record in records if isinstance(record.get("id"), str)
+                    and (at := parse_time(record.get("ts"))) is not None), key=lambda item: item[0])
+    return {record["id"]: {"at": record["ts"], "note": record.get("note") or ""} for _, record in timed}
 
 
 def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | None:
@@ -1953,7 +1962,7 @@ def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | Non
     covering = ([item["id"]] if item["id"] in answers
                 else questions if questions and all(question in answers for question in questions) else [])
     settled = [answers[key] for key in covering]
-    return max(settled, key=lambda answer: parse_time(answer["at"])) if settled else None
+    return max(settled, key=lambda answer: parse_time(answer["at"]) or EPOCH) if settled else None
 
 
 def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
@@ -1974,11 +1983,11 @@ def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
         except ValueError:
             continue
         if (not isinstance(item, dict) or item.get("kind") not in INBOX_KINDS or not item.get("worktree")
-                or parse_time(item.get("ts")) is None):
+                or (at := parse_time(item.get("ts"))) is None):
             continue
         held = reports.setdefault((item.get("repo") or "", item["worktree"]), {})
         older = held.get(item["kind"])
-        if older is None or parse_time(item["ts"]) >= parse_time(older["at"]):
+        if older is None or at >= (parse_time(older["at"]) or EPOCH):
             held[item["kind"]] = {"at": item["ts"], "host": item.get("host"),
                                   "text": (item.get("text") or "")[-JEV_MAX_CHARS:]}
             if item["kind"] == "ask" and item.get("id"):
@@ -1993,7 +2002,7 @@ def with_inbox(rows: list[dict], reports: InboxReports) -> list[dict]:
     def newest(row: dict) -> dict:
         name = Path(row["path"]).name
         found = [reports.get((row.get("repo") or "", name)) or {}, reports.get(("", name)) or {}]
-        return {kind: max(held, key=lambda report: parse_time(report["at"]))
+        return {kind: max(held, key=lambda report: parse_time(report["at"]) or EPOCH)
                 for kind in INBOX_KINDS if (held := [f[kind] for f in found if kind in f])}
     return [{**row, "inbox": inbox} if (inbox := newest(row)) else row for row in rows]
 
@@ -2002,10 +2011,10 @@ def newest_report(row: dict) -> dict | None:
     """Which came last of the final message and the inbox reports; the Orca comment has no time."""
     said = [("final_message", row_final_at(row)),
             *((f"inbox_{kind}", report["at"]) for kind, report in (row.get("inbox") or {}).items())]
-    timed = [(source, at) for source, at in said if at and parse_time(at)]
+    timed = [(source, at, parsed) for source, at in said if at and (parsed := parse_time(at)) is not None]
     if not timed:
         return None
-    source, at = max(timed, key=lambda pair: parse_time(pair[1]))
+    source, at, _ = max(timed, key=lambda pair: pair[2])
     return {"source": source, "at": at}
 
 
@@ -2031,12 +2040,12 @@ def read_key(row: dict) -> str | None:
                        *([{"comment": row["comment"]}] if row.get("comment") else [])])
 
 
-def row_identity(row):
+def row_identity(row: dict) -> str:
     """Keep equal paths on different Orca servers distinct in the verdict store."""
     return f"{row['environment']}::{row['path']}" if row.get("environment") else row["path"]
 
 
-def current_verdict(row, verdicts):
+def current_verdict(row: dict, verdicts: dict[str, dict]) -> dict | None:
     """The stored verdict for what the row shows now, or None once everything it waits on closed."""
     if row.get("waits_closed"):
         return None
@@ -2074,7 +2083,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
             for row in rows if needs_reader(row)]
 
 
-def read_json_file(path):
+def read_json_file(path: str | Path) -> object:
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -2099,7 +2108,7 @@ def write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
-def load_verdicts(store_path):
+def load_verdicts(store_path: str | Path) -> dict[str, dict]:
     """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
     store = Path(store_path).expanduser()
     if not store.exists():
@@ -2111,7 +2120,7 @@ def load_verdicts(store_path):
     return {}
 
 
-def classed_queue(session):
+def classed_queue(session: Path) -> dict[str, dict]:
     """{path: verdict} from a session directory whose result answers its own queue, else {}.
 
     Each verdict carries `queued_at`, when its queue was written, so a later read wins over an earlier one.
@@ -2131,19 +2140,19 @@ def classed_queue(session):
             and v.get("class") in VERDICT_CLASSES and read[v.get("identity") or v["path"]] is not None}
 
 
-def newer_verdicts(verdicts, incoming):
+def newer_verdicts(verdicts: dict[str, dict], incoming: dict[str, dict]) -> dict[str, dict]:
     """`verdicts` updated with each incoming verdict whose read is not older than the one it replaces.
 
     A session directory keeps its last classed queue, so an old session's read is folded in on every
     scan; it must not undo a later read of the same worktree that another session already stored.
     """
-    def older(path, verdict):
+    def older(path: str, verdict: dict) -> bool:
         held = verdicts.get(path)
         return held is not None and str(verdict.get("queued_at") or "") < str(held.get("queued_at") or "")
     return {**verdicts, **{path: v for path, v in incoming.items() if not older(path, v)}}
 
 
-def absorb_verdicts(store_path, write=True):
+def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dict]:
     """Fold every session's classed queue (the store's sibling directories) into the store and return it."""
     store = Path(store_path).expanduser()
     verdicts = load_verdicts(store)
@@ -2154,9 +2163,9 @@ def absorb_verdicts(store_path, write=True):
     return verdicts
 
 
-def with_verdicts(rows, verdicts):
+def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
-    def marked(row):
+    def marked(row: dict) -> dict:
         # A prompt on the tab's screen is the state now, whatever a reader saved before.
         verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES and not row.get("prompt_waiting")
                    else None)
@@ -2164,7 +2173,7 @@ def with_verdicts(rows, verdicts):
     return [marked(row) for row in rows]
 
 
-def read_codex(session_roots, since=None):
+def read_codex(session_roots: Sequence[str | Path], since: float | None = None) -> dict[str, list[dict]]:
     """Group Codex rollout summaries by the cwd each session ran in.
 
     Rollouts last modified before `since` (epoch seconds) are skipped.
@@ -2180,21 +2189,27 @@ def read_codex(session_roots, since=None):
     return by_cwd
 
 
-def orca_payload(orca: str, args: list[str], json_file: str | None = None, timeout: float | None = None) -> Any:
+def orca_payload(orca: str, args: list[str], json_file: str | None = None, timeout: float | None = None) -> dict:
     if json_file:
         data = json.loads(Path(json_file).read_text())
     else:
         out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True,
                              check=True, timeout=timeout or ORCA_TIMEOUT).stdout
         data = json.loads(out)
-    return data.get("result", data) if isinstance(data, dict) else data
+    result = data.get("result", data) if isinstance(data, dict) else data
+    if not isinstance(result, dict):
+        raise ValueError("Orca response must contain a JSON object")
+    return result
 
 
-def orca_result(orca: str, args: list[str], key: str, json_file: str | None, timeout: float | None = None) -> Any:
-    return orca_payload(orca, args, json_file, timeout)[key]
+def orca_result(orca: str, args: list[str], key: str, json_file: str | None, timeout: float | None = None) -> list[dict]:
+    rows = orca_payload(orca, args, json_file, timeout)[key]
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"Orca {key} must contain an array of JSON objects")
+    return rows
 
 
-def endpoint_diagnostic(environment, environments):
+def endpoint_diagnostic(environment: str, environments: list[dict] | None) -> str:
     """Describe the saved endpoint and whether this Mac can connect to its TCP port."""
     if environments is None:
         return "saved endpoint and TCP port could not be checked"
@@ -2293,10 +2308,10 @@ def screen_targets(worktrees: list[dict], terminals: list[dict]) -> list[dict]:
             and t.get("lastOutputAt") is None))]
 
 
-def read_screens(orca, terms):
+def read_screens(orca: str, terms: list[dict]) -> Screens:
     """Each tab's rendered screen by (environment, handle), read from the Orca server that issued the
     handle; a tab whose read fails is left out."""
-    def read(term):
+    def read(term: dict) -> dict | None:
         where = ["--environment", term["_environment"]] if term.get("_environment") else []
         try:
             result = orca_payload(orca, ["terminal", "read", "--terminal", term["handle"], "--screen", *where])
@@ -2312,7 +2327,7 @@ def read_screens(orca, terms):
             for term, screen in zip(terms, read_back) if isinstance(screen, dict)}
 
 
-def orca_runs(orca):
+def orca_runs(orca: str) -> list[dict]:
     """Every orchestration Run; run-list returns at most 100 a page."""
     runs, cursor, seen = [], None, set()
     while True:
@@ -2326,7 +2341,7 @@ def orca_runs(orca):
             return runs
 
 
-def read_mail(args):
+def read_mail(args: argparse.Namespace) -> dict[str, list[dict]]:
     """Unread worker mail by lead terminal; none when Orca state comes from files without a mailbox file."""
     if args.ps_json and not args.inbox_json:
         return {}
@@ -2341,7 +2356,7 @@ def read_mail(args):
     return unread_worker_mail(messages, runs)
 
 
-def expand_roots(patterns):
+def expand_roots(patterns: list[str]) -> list[str]:
     roots = []
     for pattern in patterns:
         expanded = Path(pattern).expanduser()

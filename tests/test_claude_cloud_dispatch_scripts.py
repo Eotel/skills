@@ -1,5 +1,7 @@
 """cloud_launch.py against a fake `claude` that behaves on a pty as the real one was seen to."""
 
+from __future__ import annotations
+
 import contextlib
 import importlib.util
 import io
@@ -122,7 +124,7 @@ FAKE_CLAUDE = textwrap.dedent(
 
 
 class CloudLaunchTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
@@ -135,37 +137,37 @@ class CloudLaunchTests(unittest.TestCase):
         self.brief = root / "brief.md"
         self.brief.write_text("issue #1 を直して PR を出す\n", encoding="utf-8")
 
-    def fake(self, mode):
+    def fake(self, mode: str) -> None:
         os.environ["FAKE_CLAUDE_MODE"] = mode
         os.environ["FAKE_CLAUDE_LOG"] = str(self.log)
         self.addCleanup(os.environ.pop, "FAKE_CLAUDE_MODE", None)
         self.addCleanup(os.environ.pop, "FAKE_CLAUDE_LOG", None)
 
-    def launch(self, mode, brief=None, **options):
+    def launch(self, mode: str, brief: str | None = None, **options: object) -> dict[str, str]:
         self.fake(mode)
         options.setdefault("timeout", 20.0)
         options.setdefault("claude", str(self.claude))
         return cloud_launch.launch(str(self.checkout), brief or self.brief.read_text(encoding="utf-8"), **options)
 
-    def events(self, name):
+    def events(self, name: str) -> list:
         lines = self.log.read_text(encoding="utf-8").splitlines()
         return [value for event, value in map(json.loads, lines) if event == name]
 
-    def keys(self):
+    def keys(self) -> str:
         return "".join(self.events("key"))
 
-    def assert_claude_is_gone(self):
+    def assert_claude_is_gone(self) -> None:
         with self.assertRaises(ProcessLookupError):
             os.kill(self.events("start")[0]["pid"], 0)
 
-    def main(self, *arguments):
+    def main(self, *arguments: str) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = cloud_launch.main(["--checkout", str(self.checkout), "--brief", str(self.brief),
                                       "--claude", str(self.claude), *arguments])
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_returns_the_session_of_a_trusted_checkout(self):
+    def test_returns_the_session_of_a_trusted_checkout(self) -> None:
         result = self.launch("plain")
 
         self.assertEqual(result, SESSION)
@@ -174,47 +176,47 @@ class CloudLaunchTests(unittest.TestCase):
         self.assertEqual(os.path.realpath(started["cwd"]), os.path.realpath(self.checkout))
         self.assert_claude_is_gone()
 
-    def test_leaves_the_trust_prompt_unanswered_without_the_flag(self):
+    def test_leaves_the_trust_prompt_unanswered_without_the_flag(self) -> None:
         with self.assertRaises(cloud_launch.LaunchError) as raised:
             self.launch("trust")
 
         self.assertIn("--trust-folder", str(raised.exception))
         self.assertEqual(self.keys(), "")
 
-    def test_trusts_the_checkout_with_the_flag(self):
+    def test_trusts_the_checkout_with_the_flag(self) -> None:
         result = self.launch("trust", trust_folder=True)
 
         self.assertEqual(result, SESSION)
         self.assertEqual(self.keys(), DOWN + ENTER)
 
-    def test_does_not_confirm_when_yes_is_not_selected(self):
+    def test_does_not_confirm_when_yes_is_not_selected(self) -> None:
         with self.assertRaises(cloud_launch.LaunchError) as raised:
             self.launch("trust-stuck", trust_folder=True)
 
         self.assertIn("did not show Yes", str(raised.exception))
         self.assertEqual(self.keys(), DOWN)
 
-    def test_reports_a_trust_prompt_that_came_back_after_enter(self):
+    def test_reports_a_trust_prompt_that_came_back_after_enter(self) -> None:
         with self.assertRaises(cloud_launch.LaunchError) as raised:
             self.launch("trust-reverts", trust_folder=True)
 
         self.assertIn("not trusted", str(raised.exception))
 
-    def test_reports_that_no_url_came_within_the_timeout(self):
+    def test_reports_that_no_url_came_within_the_timeout(self) -> None:
         with self.assertRaises(cloud_launch.LaunchError) as raised:
             self.launch("silent", timeout=1.0)
 
         self.assertIn("no session URL appeared in 1 s", str(raised.exception))
         self.assertIn("may still have been created", str(raised.exception))
 
-    def test_reports_a_claude_that_exits_without_a_session(self):
+    def test_reports_a_claude_that_exits_without_a_session(self) -> None:
         with self.assertRaises(cloud_launch.LaunchError) as raised:
             self.launch("exits", timeout=60.0)
 
         self.assertIn("claude exited", str(raised.exception))
         self.assertIn("not logged in", raised.exception.output)
 
-    def test_reports_a_claude_that_cannot_start(self):
+    def test_reports_a_claude_that_cannot_start(self) -> None:
         for options in ({"claude": str(self.claude) + "-missing"}, {"brief": "task\0text"}):
             with self.subTest(options):
                 with self.assertRaises(cloud_launch.LaunchError) as raised:
@@ -222,20 +224,20 @@ class CloudLaunchTests(unittest.TestCase):
 
                 self.assertIn("cannot start", raised.exception.output)
 
-    def test_takes_a_url_that_arrives_in_pieces(self):
+    def test_takes_a_url_that_arrives_in_pieces(self) -> None:
         self.assertEqual(self.launch("split"), SESSION)
 
-    def test_skips_a_session_url_the_brief_quotes(self):
+    def test_skips_a_session_url_the_brief_quotes(self) -> None:
         brief = "https://claude.ai/code/session_01OLDone の続きをする\n"
 
         self.assertEqual(self.launch("echo", brief=brief), SESSION)
 
-    def test_ends_a_claude_that_ignores_sigterm(self):
+    def test_ends_a_claude_that_ignores_sigterm(self) -> None:
         self.assertEqual(self.launch("deaf"), SESSION)
 
         self.assert_claude_is_gone()
 
-    def test_main_prints_the_url_or_json_and_keeps_the_output(self):
+    def test_main_prints_the_url_or_json_and_keeps_the_output(self) -> None:
         self.fake("plain")
         output = Path(self.tmp.name) / "launch.log"
 
@@ -246,7 +248,7 @@ class CloudLaunchTests(unittest.TestCase):
         code, stdout, _ = self.main("--json")
         self.assertEqual((code, json.loads(stdout)), (0, SESSION))
 
-    def test_main_refuses_a_brief_claude_cannot_take(self):
+    def test_main_refuses_a_brief_claude_cannot_take(self) -> None:
         self.fake("plain")
         for text, reason in (("\n", "empty"), ("- 一覧から始まる\n", "starts with '-'")):
             with self.subTest(text):
@@ -258,7 +260,7 @@ class CloudLaunchTests(unittest.TestCase):
                 self.assertIn(reason, stderr)
                 self.assertFalse(self.log.exists())
 
-    def test_main_reports_the_failure_with_what_claude_showed(self):
+    def test_main_reports_the_failure_with_what_claude_showed(self) -> None:
         self.fake("trust")
 
         code, stdout, stderr = self.main()
@@ -267,7 +269,7 @@ class CloudLaunchTests(unittest.TestCase):
         self.assertIn("--trust-folder", stderr)
         self.assertIn("Quick safety check", stderr)
 
-    def test_main_passes_the_trust_flag_and_the_timeout(self):
+    def test_main_passes_the_trust_flag_and_the_timeout(self) -> None:
         self.fake("trust")
         code, stdout, _ = self.main("--trust-folder")
         self.assertEqual((code, stdout), (0, SESSION["url"] + "\n"))

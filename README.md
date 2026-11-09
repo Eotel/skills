@@ -36,9 +36,8 @@ git config extensions.worktreeConfig true
 git config --worktree core.hooksPath "$hook_dir"
 ```
 
-The file-specific exceptions in `ruff.toml` and `ty.toml` record existing
-violations tracked in [issue #78](https://github.com/Eotel/skills/issues/78).
-New Python files are checked without exceptions.
+Ruff ANN/PTH and ty check every Python file without file-specific exceptions.
+The documented PTH115 exception preserves raw symlink targets.
 
 ## Skills
 
@@ -61,10 +60,12 @@ New Python files are checked without exceptions.
 - `natural-japanese`: review and revise human-facing Japanese word choices;
   flag expressions for contextual review with a Python scanner.
 - `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
-  This is the MIT-licensed `nanaism/yomiyasu` v2.4.0 skill at commit
-  `ae258d7a57b335673e30b88a018ae08d4f72c449`. Its 42 files match that
-  tag byte for byte. The `.codex-plugin/plugin.json` metadata is omitted because
-  APM 0.35.0 treats it as a native Codex plugin and refuses the shared
+  This is the MIT-licensed `nanaism/yomiyasu` v2.5.0 skill with the typing and
+  pathlib changes proposed in [upstream PR #54](https://github.com/nanaism/yomiyasu/pull/54),
+  at commit `d6ba9e85c76d6ba570c4c465de63b29cccb671c2`. Its 42 files match
+  that unmerged PR revision byte for byte. The `.codex-plugin/plugin.json`
+  metadata is omitted because APM 0.35.0 treats it as a native Codex plugin and
+  refuses the shared
   `agent-skills` target. `yomiyasu_check.py` stores copies of the original and
   final text in `.yomiyasu/` by default, with private file permissions and a
   local `.gitignore`.

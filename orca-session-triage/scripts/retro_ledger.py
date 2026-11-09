@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Call the adoption-triage ledger's public CLI from the retrospective worker."""
 
+from __future__ import annotations
+
 import json
+import builtins
 from pathlib import Path
 import re
 import subprocess
@@ -13,13 +16,13 @@ DEFAULT_DECISION_CONFIG = Path("~/.config/adoption-triage/hosts.json").expanduse
 
 
 class LedgerClient:
-    def __init__(self, script=DEFAULT_SCRIPT, events=None, imports=None, decision_config=None):
+    def __init__(self, script: str | Path = DEFAULT_SCRIPT, events: str | Path | None = None, imports: str | Path | None = None, decision_config: str | Path | None = None) -> None:
         self.script = Path(script)
         self.events = Path(events) if events else None
         self.imports = Path(imports) if imports else None
         self.decision_config = Path(decision_config) if decision_config else None
 
-    def call(self, action, body=None, *args):
+    def call(self, action: str, body: dict | None = None, *args: str) -> dict:
         if not self.script.is_file():
             raise FileNotFoundError(f"adoption-triage ledger is missing: {self.script}")
         command = [sys.executable, str(self.script)]
@@ -36,22 +39,22 @@ class LedgerClient:
             raise RuntimeError(f"adoption-triage {action}: {result.stderr.strip()[-500:]}")
         return json.loads(result.stdout)
 
-    def list(self):
+    def list(self) -> builtins.list[dict]:
         return self.call("list", None, "--json")["items"]
 
-    def propose(self, body):
+    def propose(self, body: dict) -> dict:
         return self.call("propose", body)
 
-    def decide(self, body):
+    def decide(self, body: dict) -> dict:
         return self.call("decide", body)
 
-    def record(self, body):
+    def record(self, body: dict) -> dict:
         return self.call("record", body)
 
-    def add_evidence(self, body):
+    def add_evidence(self, body: dict) -> dict:
         return self.call("support", body)
 
-    def writer_enabled(self):
+    def writer_enabled(self) -> bool:
         config = self.decision_config or DEFAULT_DECISION_CONFIG
         try:
             values = json.loads(config.read_text(encoding="utf-8"))

@@ -5,6 +5,8 @@ Exit 0 to run, 1 when a turn is working, or 2 when Orca cannot tell. A turn
 waiting for an answer can stay open while the next hourly session starts.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -15,7 +17,7 @@ import sys
 import hourly_runtime
 
 
-def orca_page(orca, ps_json):
+def orca_page(orca: str, ps_json: str | Path | None) -> dict:
     if ps_json:
         data = json.loads(Path(ps_json).read_text())
     else:
@@ -25,30 +27,30 @@ def orca_page(orca, ps_json):
     return data.get("result", data)
 
 
-def workspace_row(page, workspace):
+def workspace_row(page: dict, workspace: str) -> dict | None:
     here = os.path.realpath(workspace)
     return next((w for w in page["worktrees"] if os.path.realpath(w["path"]) == here), None)
 
 
-def working_agents(row):
+def working_agents(row: dict) -> list[dict]:
     """A background job also keeps its agent working in Orca."""
     return [a for a in row.get("agents") or [] if a.get("state") == "working"]
 
 
-def runs_page(orca, workspace, runs_json):
+def runs_page(orca: str, workspace: str, runs_json: str | Path | None) -> list[dict]:
     if runs_json:
         data = json.loads(Path(runs_json).read_text())
         return data.get("result", data)["runs"]
     return hourly_runtime.scheduled_runs(orca, workspace)
 
 
-def scheduled_turn_working(agent, status_by_pane):
+def scheduled_turn_working(agent: dict, status_by_pane: dict[str | None, str | None]) -> bool:
     status = status_by_pane.get(agent.get("paneKey")) or status_by_pane.get(agent.get("parentPaneKey"))
     return status == "dispatched" or (status == "completed" and
                                       (agent.get("mainAgent") or {}).get("state") == "done")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable (default: $ORCA_CLI_COMMAND or orca)")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+
 import json
 import io
 import plistlib
@@ -13,10 +15,21 @@ import pwd
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict, Unpack
 import unittest
 import uuid
 from unittest import mock
+
+
+
+class TextRunOptions(TypedDict):
+    text: Literal[True]
+    capture_output: NotRequired[bool]
+    check: NotRequired[bool]
+    timeout: NotRequired[float | None]
+    cwd: NotRequired[str | Path]
+    env: NotRequired[dict[str, str]]
+    input: NotRequired[str | None]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,28 +61,28 @@ def sample_candidate() -> dict[str, object]:
 
 
 class FakeLedger:
-    def __init__(self):
-        self.items = {}
+    def __init__(self) -> None:
+        self.items: dict[str, dict] = {}
 
-    def list(self):
+    def list(self) -> Sequence[dict]:
         return list(self.items.values())
 
-    def writer_enabled(self):
+    def writer_enabled(self) -> bool:
         return True
 
-    def propose(self, body):
+    def propose(self, body: dict) -> None:
         self.items[body["proposal_id"]] = {**body, "status": "pending", "decisions": [],
                                           "executions": [], "implemented_at": None,
                                           "reverted_at": None, "adopted_at": None, "revoked_at": None}
 
-    def decide(self, body):
+    def decide(self, body: dict) -> None:
         item = self.items[body["proposal_id"]]
         item["decisions"].append({**body, "id": str(uuid.uuid4()), "ts": retro.now()})
         item["status"] = {"adopt": "adopted", "reject": "rejected", "hold": "held",
                           "revoke": "revoked"}[body["decision"]]
         item[item["status"] + "_at"] = retro.now()
 
-    def record(self, body):
+    def record(self, body: dict) -> None:
         item = self.items[body["proposal_id"]]
         decision = next((row for row in item["decisions"] if row["id"] == body["decision_id"]), None)
         if decision is None:
@@ -84,12 +97,12 @@ class FakeLedger:
         if body["outcome"] == "reverted":
             item["reverted_at"] = retro.now()
 
-    def add_evidence(self, body):
+    def add_evidence(self, body: dict) -> None:
         self.items[body["proposal_id"]]["evidence"].extend(body["evidence"])
 
 
 class RetroTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
@@ -136,7 +149,7 @@ class RetroTests(unittest.TestCase):
                     retro.run_claude("prompt", {"type": "object"})
                     self.assertNotIn("CLAUDE_CONFIG_DIR", run.call_args.kwargs["env"])
 
-    def test_stop_capture_is_one_line_only_for_hourly_session(self):
+    def test_stop_capture_is_one_line_only_for_hourly_session(self) -> None:
         hook = {"session_id": self.sid, "transcript_path": str(self.transcript)}
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             self.assertTrue(retro.enqueue(hook, self.state))
@@ -147,7 +160,7 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(lines[0], str(self.transcript.resolve()))
         self.assertFalse(retro.paths(self.state)[1].exists())
 
-    def test_existing_stop_checks_finish_before_capture(self):
+    def test_existing_stop_checks_finish_before_capture(self) -> None:
         hook = {"session_id": self.sid, "transcript_path": str(self.transcript)}
         with mock.patch.object(stop_check.sys, "stdin", io.StringIO(json.dumps(hook))):
             with mock.patch.object(stop_check, "decide", return_value={"decision": "block", "reason": "ask"}):
@@ -161,13 +174,13 @@ class RetroTests(unittest.TestCase):
                     stop_check.main()
                     capture.assert_called_once_with(hook)
 
-    def test_real_transcript_events_have_timestamped_failure_and_success(self):
+    def test_real_transcript_events_have_timestamped_failure_and_success(self) -> None:
         events = retro.extract_events(self.transcript)
         self.assertEqual([e["id"] for e in events], ["E00001", "E00002", "E00003"])
         self.assertEqual(events[2]["at"], "2026-10-26T01:11:00Z")
         self.assertIn("完了を確認", events[2]["text"])
 
-    def test_worker_merges_repeated_lesson_and_undo_changes_only_its_line(self):
+    def test_worker_merges_repeated_lesson_and_undo_changes_only_its_line(self) -> None:
         second = "5235d194-3941-4db2-82bb-cf2d7277c123"
         second_transcript = self.transcript.with_name(second + ".jsonl")
         transcript(second_transcript)
@@ -207,7 +220,7 @@ class RetroTests(unittest.TestCase):
                          ledger.list()[0]["decisions"][-1]["id"])
         self.assertEqual(data["sessions"][self.sid]["status"], "done")
 
-    def test_real_adoption_ledger_records_support_application_and_reversal(self):
+    def test_real_adoption_ledger_records_support_application_and_reversal(self) -> None:
         config = self.home / "hosts.json"
         config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
         ledger = retro.LedgerClient(
@@ -243,7 +256,7 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(retro.facts_path(self.target).exists())
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
-    def test_policy_change_waits_for_a_button(self):
+    def test_policy_change_waits_for_a_button(self) -> None:
         proposal = sample_candidate()
         proposal["category"] = "rule"
         proposal["note"] = "PR の head の祖先なら作業場を削除してよい。"
@@ -252,7 +265,7 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "要確認")
 
-    def test_multiple_adoptions_share_one_reference_and_restore_router(self):
+    def test_multiple_adoptions_share_one_reference_and_restore_router(self) -> None:
         ledger = FakeLedger()
         ids = [str(uuid.uuid4()) for _ in range(3)]
         for index, proposal_id in enumerate(ids):
@@ -270,36 +283,32 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(facts.exists())
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
-    def test_adoption_receipt_timeout_recovers_without_a_second_write(self):
+    def test_adoption_receipt_timeout_recovers_without_a_second_write(self) -> None:
         ledger = FakeLedger()
         proposal_id = str(uuid.uuid4())
         ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
                         "target": "triage-retro:skill:orca-session-triage:fact"})
         ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
-        original_record = ledger.record
-        ledger.record = mock.Mock(side_effect=subprocess.TimeoutExpired("ledger record", 30))
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with mock.patch.object(ledger, "record", side_effect=subprocess.TimeoutExpired("ledger record", 30)), \
+                self.assertRaises(subprocess.TimeoutExpired):
             retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
         self.assertIn(proposal_id, retro.load(self.state)["applied_actions"])
         facts = retro.facts_path(self.target)
         self.assertEqual(facts.read_text().count(retro.MARKER), 1)
-        ledger.record = original_record
         retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
         self.assertTrue(ledger.items[proposal_id]["implemented_at"])
         self.assertEqual(facts.read_text().count(retro.MARKER), 1)
         self.assertNotIn(proposal_id, retro.load(self.state)["applied_actions"])
 
-    def test_revocation_removes_a_note_without_an_applied_receipt(self):
+    def test_revocation_removes_a_note_without_an_applied_receipt(self) -> None:
         ledger = FakeLedger()
         proposal_id = str(uuid.uuid4())
         ledger.propose({"proposal_id": proposal_id, "proposal": "Tool.py returns JSON.",
                         "target": "triage-retro:skill:orca-session-triage:fact"})
         ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "triage-retro"})
-        original_record = ledger.record
-        ledger.record = mock.Mock(side_effect=subprocess.TimeoutExpired("ledger record", 30))
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with mock.patch.object(ledger, "record", side_effect=subprocess.TimeoutExpired("ledger record", 30)), \
+                self.assertRaises(subprocess.TimeoutExpired):
             retro.process_once(self.state, self.root, ignore_load=True, ledger=ledger)
-        ledger.record = original_record
         data = retro.load(self.state)
         data["applied_actions"].clear()  # Simulate losing the receipt checkpoint after the file write.
         data["target_versions"].clear()
@@ -310,7 +319,7 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(retro.facts_path(self.target).exists())
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
-    def test_batch_stops_at_per_skill_note_limit(self):
+    def test_batch_stops_at_per_skill_note_limit(self) -> None:
         data = retro.load(self.state)
         for index in range(2):
             retro.adopt({"id": str(uuid.uuid4()), "note": f"Existing tool {index}.py works.",
@@ -333,7 +342,7 @@ class RetroTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in ledger.list()].count("pending"), 2)
         self.assertEqual(retro.facts_path(self.target).read_text().count(retro.MARKER), 3)
 
-    def test_reference_content_is_available_to_overlap_review(self):
+    def test_reference_content_is_available_to_overlap_review(self) -> None:
         reference = self.target.parent / "references" / "hourly.md"
         reference.parent.mkdir(parents=True)
         note = "scan_sessions.py の scan.json は行の list"
@@ -343,7 +352,7 @@ class RetroTests(unittest.TestCase):
         self.assertIn(str(reference), result)
         self.assertIn(note, result)
 
-    def test_repository_local_skill_is_an_adoption_candidate(self):
+    def test_repository_local_skill_is_an_adoption_candidate(self) -> None:
         project_skill = self.home / "ghq/github.com/example/project/.claude/skills/project-triage/SKILL.md"
         project_skill.parent.mkdir(parents=True)
         project_skill.write_text("# Project triage\n")
@@ -351,7 +360,7 @@ class RetroTests(unittest.TestCase):
             catalog = retro.skill_catalog(self.root)
         self.assertEqual(catalog["example/project/project-triage"], project_skill)
 
-    def test_nightly_cap_keeps_another_supported_fact_for_review(self):
+    def test_nightly_cap_keeps_another_supported_fact_for_review(self) -> None:
         proposal = sample_candidate()
         proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
         today = retro.now()
@@ -362,14 +371,14 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "今夜の自動採用上限")
 
-    def test_nightly_cap_spans_midnight(self):
+    def test_nightly_cap_spans_midnight(self) -> None:
         evening = datetime.fromisoformat("2026-10-26T23:30:00+09:00")
         morning = datetime.fromisoformat("2026-10-27T06:00:00+09:00")
         next_evening = datetime.fromisoformat("2026-10-27T23:30:00+09:00")
         self.assertEqual(retro.night_key(evening), retro.night_key(morning))
         self.assertNotEqual(retro.night_key(evening), retro.night_key(next_evening))
 
-    def test_unversioned_destination_waits_for_review(self):
+    def test_unversioned_destination_waits_for_review(self) -> None:
         proposal = sample_candidate()
         proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
         (self.root / ".git").rename(self.root / "git-fixture-hidden")
@@ -378,7 +387,7 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertIn("Git repository", reason)
 
-    def test_deleted_reference_is_not_recreated_automatically(self):
+    def test_deleted_reference_is_not_recreated_automatically(self) -> None:
         facts = retro.facts_path(self.target)
         facts.parent.mkdir(parents=True)
         facts.write_text(retro.FACTS_HEADER)
@@ -394,7 +403,7 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(reason, "書き込み先に別の変更がある")
 
-    def test_worker_deleted_tracked_reference_allows_a_later_adoption(self):
+    def test_worker_deleted_tracked_reference_allows_a_later_adoption(self) -> None:
         ledger = FakeLedger()
         proposal_id = str(uuid.uuid4())
         ledger.propose({"proposal_id": proposal_id, "proposal": "First_tool.py returns JSON.",
@@ -420,7 +429,7 @@ class RetroTests(unittest.TestCase):
             eligible, reason = retro.eligible_auto(proposal, data, ledger.list(), self.root)
         self.assertTrue(eligible, reason)
 
-    def test_verified_json_shape_fact_can_be_adopted(self):
+    def test_verified_json_shape_fact_can_be_adopted(self) -> None:
         proposal = sample_candidate()
         proposal["note"] = "scan_sessions.py の標準出力は JSON 配列。行ごとに読む。"
         proposal["review"] = {"supported": True, "duplicate": False, "low_risk": True}
@@ -517,11 +526,11 @@ class RetroTests(unittest.TestCase):
         pulls: list[dict[str, int]] = []
         real_run = subprocess.run
 
-        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "git":
-                return real_run([cmd[0], *identity, *cmd[1:]], *args, **kwargs)
+                return real_run([cmd[0], *identity, *cmd[1:]], **kwargs)
             if cmd[0] != "gh":
-                return real_run(cmd, *args, **kwargs)
+                return real_run(cmd, **kwargs)
             if cmd[1:3] == ["pr", "create"]:
                 pulls.append({"number": len(pulls) + 1})
             if cmd[1:3] == ["pr", "close"]:
@@ -683,7 +692,7 @@ class RetroTests(unittest.TestCase):
         self.assertTrue(ledger.items[proposal_id]["implemented_at"])
         self.assertEqual(data["action_attempts"], {})
 
-    def test_load_gate_defers_without_paid_model_call(self):
+    def test_load_gate_defers_without_paid_model_call(self) -> None:
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
         with mock.patch.object(retro.Path, "home", return_value=self.home):
@@ -693,17 +702,17 @@ class RetroTests(unittest.TestCase):
                     model.assert_not_called()
         self.assertEqual(retro.load(self.state)["sessions"][self.sid]["status"], "pending")
 
-    def test_disabled_decision_writer_defers_before_model_call(self):
+    def test_disabled_decision_writer_defers_before_model_call(self) -> None:
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
         ledger = FakeLedger()
-        ledger.writer_enabled = lambda: False
-        with mock.patch.object(retro, "build_proposals") as model:
+        with mock.patch.object(ledger, "writer_enabled", return_value=False), \
+                mock.patch.object(retro, "build_proposals") as model:
             self.assertIn("deferred: adoption ledger", retro.process_once(
                 self.state, self.root, ignore_load=True, ledger=ledger))
             model.assert_not_called()
 
-    def test_decision_writer_needs_a_stable_name(self):
+    def test_decision_writer_needs_a_stable_name(self) -> None:
         config = self.home / "hosts.json"
         ledger = retro.LedgerClient(decision_config=config)
         config.write_text(json.dumps({"decision_writer": True}))
@@ -711,7 +720,7 @@ class RetroTests(unittest.TestCase):
         config.write_text(json.dumps({"decision_writer": True, "name": "board"}))
         self.assertTrue(ledger.writer_enabled())
 
-    def test_failed_session_is_visible_and_can_be_retried(self):
+    def test_failed_session_is_visible_and_can_be_retried(self) -> None:
         with mock.patch.object(retro.Path, "home", return_value=self.home):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
             data = retro.load(self.state)
@@ -739,9 +748,9 @@ class RetroTests(unittest.TestCase):
         calls = []
         real_run = subprocess.run
 
-        def fake_run(cmd: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] != "claude":
-                return real_run(cmd, *args, **kwargs)
+                return real_run(cmd, **kwargs)
             calls.append((cmd, kwargs.get("cwd")))
             output = ({"proposals": [sample_candidate()]} if "--resume" in cmd else
                       {"decisions": [{"index": 0, "supported": True, "duplicate": False,
@@ -836,7 +845,7 @@ class RetroTests(unittest.TestCase):
             retro.enqueue({"session_id": self.sid, "transcript_path": str(self.transcript)}, self.state)
         prompts = []
 
-        def fork(prompt: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        def fork(prompt: str, *args: object, **kwargs: object) -> dict[str, Any]:
             prompts.append(prompt)
             return {"proposals": []}
         with mock.patch.object(retro.Path, "home", return_value=self.home):

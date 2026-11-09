@@ -16,6 +16,8 @@ keeps the entry in memory and writes it back). While fewer than 1000 GraphQL poi
 remain, the cycle prints RATE_LIMIT_LOW and sleeps until the reset.
 """
 
+from __future__ import annotations
+
 import argparse
 from datetime import datetime, timezone
 import json
@@ -37,7 +39,7 @@ CODEX_MARKER = re.compile(r"<!--\s*(codex-review-state|codex-security-review):v1
 CODEX_ROW = re.compile(r"\*\*(Code|Security) Review\*\*\s*\|[^|]*?\*\*(\w+)\*\*[^|]*\|\s*`([0-9a-f]{7,40})`")
 
 
-def finished_checks(checks):
+def finished_checks(checks: list[dict]) -> tuple[bool, list[str]]:
     """Classify a gh statusCheckRollup, including check runs and legacy statuses."""
     failed = []
     for check in checks:
@@ -54,7 +56,7 @@ def finished_checks(checks):
     return bool(checks), failed
 
 
-def codex_reviews(comments):
+def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None]]:
     """Map each Codex review kind to (commit sha, status, has_any_findings) from its summary comment."""
     reviews = {}
     for item in comments:
@@ -152,22 +154,30 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str) -> tuple[lis
     return events, state
 
 
-def gh_json(args):
+def gh_json(args: list[str]) -> dict | list:
     result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise ValueError("gh failed: " + result.stderr.strip())
-    return json.loads(result.stdout)
+    value = json.loads(result.stdout)
+    if not isinstance(value, (dict, list)):
+        raise ValueError("gh response must contain a JSON object or array")
+    return value
 
 
 def graphql_budget() -> tuple[int, int]:
     """Return the GraphQL points remaining and their reset epoch; this read is free."""
-    graphql = gh_json(["api", "rate_limit"])["resources"]["graphql"]
+    budget = gh_json(["api", "rate_limit"])
+    if not isinstance(budget, dict):
+        raise ValueError("gh rate limit response must contain a JSON object")
+    graphql = budget["resources"]["graphql"]
     return int(graphql["remaining"]), int(graphql["reset"])
 
 
 def fetch_snapshot(spec: str, previous: dict) -> dict:
     repo, number = spec.split("#", 1)
     view = gh_json(["pr", "view", number, "--repo", repo, "--json", "state,headRefOid,mergeable,statusCheckRollup,updatedAt"])
+    if not isinstance(view, dict):
+        raise ValueError("gh PR response must contain a JSON object")
     if view.get("updatedAt") and view["updatedAt"] == previous.get("feeds_settled_at"):
         return view
     for feed, endpoint in (
@@ -176,12 +186,14 @@ def fetch_snapshot(spec: str, previous: dict) -> dict:
         ("comments", f"repos/{repo}/issues/{number}/comments"),
     ):
         pages = gh_json(["api", "--paginate", "--slurp", endpoint + "?per_page=100"])
+        if not isinstance(pages, list):
+            raise ValueError("gh paginated response must contain a JSON array")
         view[feed] = [item for page in pages for item in page]
     # A failure in any feed leaves the prior state intact for the next poll.
     return view
 
 
-def load_state(path):
+def load_state(path: Path) -> dict[str, dict]:
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -191,7 +203,7 @@ def load_state(path):
     return state
 
 
-def read_specs(path):
+def read_specs(path: Path) -> list[str]:
     specs = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()

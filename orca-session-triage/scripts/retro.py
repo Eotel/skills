@@ -10,7 +10,7 @@ in a forked copy (``claude -p --resume --fork-session``) that leaves the origina
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import fcntl
@@ -71,29 +71,29 @@ REVIEW_SCHEMA = {"type": "object", "required": ["decisions"], "properties": {
 REWRITE_SCHEMA = {"type": "object", "required": ["note"], "properties": {"note": {"type": "string"}}}
 
 
-def now():
+def now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def night_key(value):
+def night_key(value: datetime) -> str:
     """Group the evening and following morning under one local adoption cap."""
     local = value.astimezone()
     return (local - timedelta(days=1) if local.hour < 12 else local).date().isoformat()
 
 
-def paths(state=STATE):
+def paths(state: Path = STATE) -> tuple[Path, Path, Path]:
     return state / "queue.jsonl", state / "worker-state.json", state / "lock"
 
 
 @contextmanager
-def locked(path):
+def locked(path: Path) -> Generator[None]:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a+b") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         yield
 
 
-def atomic_text(path, content, mode=0o600):
+def atomic_text(path: Path, content: str, mode: int = 0o600) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".retro-", dir=path.parent)
     try:
@@ -123,18 +123,18 @@ def load(state: Path = STATE) -> dict[str, Any]:
     return data
 
 
-def save(data, state=STATE):
+def save(data: dict, state: Path = STATE) -> None:
     atomic_text(paths(state)[1], json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-def transcript_location(path):
+def transcript_location(path: str | Path) -> bool:
     transcript = Path(path).resolve()
     projects = (Path.home() / ".claude/projects").resolve()
     return (transcript.is_relative_to(projects) and transcript.suffix == ".jsonl"
             and bool(SESSION_ID.fullmatch(transcript.stem)))
 
 
-def hourly_transcript(path):
+def hourly_transcript(path: str | Path) -> bool:
     """Accept only a real hourly transcript under Claude's local project store."""
     if not transcript_location(path):
         return False
@@ -158,7 +158,7 @@ def hourly_transcript(path):
     return False
 
 
-def enqueue(hook_input, state=STATE):
+def enqueue(hook_input: dict, state: Path = STATE) -> bool:
     """A tiny, idempotent Stop-hook write. Returns whether a new line was added."""
     transcript = hook_input.get("transcript_path")
     session_id = hook_input.get("session_id")
@@ -186,7 +186,7 @@ def enqueue(hook_input, state=STATE):
     return True
 
 
-def ingest(data, state=STATE):
+def ingest(data: dict, state: Path = STATE) -> None:
     queue = paths(state)[0]
     if not queue.exists():
         return
@@ -422,7 +422,7 @@ def run_claude(prompt: str, schema: dict[str, Any], claude: str = "claude",
     return output
 
 
-def nearby_knowledge(note, root=SOURCE, target_skill=None):
+def nearby_knowledge(note: str, root: Path = SOURCE, target_skill: str | None = None) -> str:
     """Retrieve related skill, memory, and ledger passages for the independent review."""
     files = list(skill_catalog(root).values())
     target = skill_target(target_skill, root) if target_skill else None
@@ -605,17 +605,17 @@ def review_proposals(raw: Sequence[object], transcript: Path, root: Path = SOURC
     return kept
 
 
-def proposal_id(session_id, candidate):
+def proposal_id(session_id: str, candidate: dict) -> str:
     # The same lesson from later hourly runs must add evidence to one ledger row.
     normalized = re.sub(r"\s+", "", candidate["note"]).casefold()
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "triage-retro:" + candidate["target_skill"] + ":" + normalized))
 
 
-def facts_path(target):
+def facts_path(target: Path) -> Path:
     return target.parent / "references" / FACTS_NAME
 
 
-def source_checkout_ready(target, data):
+def source_checkout_ready(target: Path, data: dict) -> str | None:
     checkout = subprocess.run(["git", "-C", str(target.parent), "rev-parse", "--show-toplevel"],
                               capture_output=True, text=True, timeout=10)
     if checkout.returncode:
@@ -643,7 +643,7 @@ def source_checkout_ready(target, data):
     return None
 
 
-def remember_versions(data, *targets):
+def remember_versions(data: dict, *targets: Path) -> None:
     for target in targets:
         key = str(target.resolve())
         if target.exists():
@@ -701,11 +701,11 @@ def eligible_auto(proposal: dict[str, Any], data: dict[str, Any], ledger_items: 
     return True, ""
 
 
-def note_line(proposal):
+def note_line(proposal: dict) -> str:
     return f"- {proposal['note']} {MARKER}{proposal['id']} -->\n"
 
 
-def adopt(proposal, root=SOURCE, auto=False):
+def adopt(proposal: dict, root: Path = SOURCE, auto: bool = False) -> Path:
     router = skill_target(proposal["target_skill"], root)
     if router is None or not router.is_file():
         raise ValueError("target skill is not in the configured source repository")
@@ -756,7 +756,7 @@ def adopt(proposal, root=SOURCE, auto=False):
     return target.resolve()
 
 
-def undo(proposal):
+def undo(proposal: dict) -> bool:
     target = Path(proposal.get("target_path") or "")
     router = Path(proposal.get("router_path") or "")
     changed = False
@@ -793,7 +793,7 @@ def undo(proposal):
     return changed
 
 
-def transcript_worktree(transcript):
+def transcript_worktree(transcript: str | Path) -> str:
     with Path(transcript).open(encoding="utf-8") as stream:
         for _, line in zip(range(300), stream):
             if '"cwd"' not in line or '"type":"user"' not in line.replace(" ", ""):
@@ -804,7 +804,7 @@ def transcript_worktree(transcript):
     raise ValueError("hourly transcript has no worktree path")
 
 
-def evidence_lines(candidate, session_id):
+def evidence_lines(candidate: dict, session_id: str) -> list[str]:
     lines = []
     for event in candidate["evidence"][:100]:
         timestamp = datetime.fromisoformat(event["at"]).astimezone().isoformat(timespec="minutes")
@@ -812,7 +812,7 @@ def evidence_lines(candidate, session_id):
     return lines
 
 
-def ledger_payload(candidate, sid, transcript, auto_reason):
+def ledger_payload(candidate: dict, sid: str, transcript: str | Path, auto_reason: str) -> dict:
     reason = str(candidate["review"].get("reason") or "")
     if auto_reason:
         reason += f" 自動採用しない理由: {auto_reason}。"
@@ -826,7 +826,7 @@ def ledger_payload(candidate, sid, transcript, auto_reason):
             "target": f"triage-retro:skill:{candidate['target_skill']}:{candidate['category']}"}
 
 
-def as_existing(items):
+def as_existing(items: Sequence[dict]) -> list[dict]:
     result = []
     for item in items:
         target = item.get("target") or ""
@@ -1382,7 +1382,7 @@ def run_service(state: Path = STATE, root: Path = SOURCE, ledger: Ledger | None 
         time.sleep(300)
 
 
-def retry_failed(state, session_id):
+def retry_failed(state: Path, session_id: str) -> None:
     if not SESSION_ID.fullmatch(session_id):
         raise ValueError("session ID must be a UUID")
     with locked(state / "worker.lock"):

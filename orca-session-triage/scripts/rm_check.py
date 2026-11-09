@@ -1,7 +1,10 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Check that an Orca worktree is safe to remove."""
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Collection, Sequence
 from datetime import datetime, timedelta, timezone
 import filecmp
 from functools import partial
@@ -14,7 +17,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import NamedTuple, TypedDict
+from typing import NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 import lead_decisions
@@ -81,11 +84,11 @@ SCHEDULED_LOCK = ".claude/scheduled_tasks.lock"
 REASON_PATHS = 10
 
 
-def git(cwd, *args):
+def git(cwd: str | Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
 
 
-def is_cache(relpath):
+def is_cache(relpath: str) -> bool:
     parts = Path(relpath.rstrip("/")).parts
     # pip writes <name>.egg-info beside an editable install's sources again on each install.
     return (bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
@@ -117,7 +120,7 @@ def log_note(rel: str, files: list[Path]) -> str:
         rel, sum(stat.st_size for stat in stats), latest.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
-def working_changes(worktree) -> tuple[list[str], list[str]]:
+def working_changes(worktree: str | Path) -> tuple[list[str], list[str]]:
     """(uncommitted, regenerable): paths `git status` reports, split off the untracked bytecode in them."""
     uncommitted, regenerable = [], []
     # -z gives each path unquoted; a rename's second entry names its source and is skipped.
@@ -135,7 +138,7 @@ def working_changes(worktree) -> tuple[list[str], list[str]]:
     return uncommitted, regenerable
 
 
-def is_regenerable(relpath):
+def is_regenerable(relpath: str) -> bool:
     rel = relpath if relpath.endswith("/") else relpath + "/"
     parts = Path(relpath.rstrip("/")).parts
     return (bool(REGENERABLE_PARTS.intersection(parts)) or rel.startswith(REGENERABLE_PREFIXES)
@@ -155,7 +158,7 @@ def same_tree(left: Path, right: Path) -> bool:
     return all(same_tree(child, right / child.name) for child in left.iterdir())
 
 
-def holds_nothing(path):
+def holds_nothing(path: Path) -> bool:
     """An empty file, or a directory whose files are all empty."""
     if path.is_symlink():
         return False
@@ -180,7 +183,7 @@ def holds_only_regenerable(path: Path, worktree: Path) -> bool:
     return all(holds_nothing(child) or holds_only_regenerable(child, worktree) for child in path.iterdir())
 
 
-def env_values(path):
+def env_values(path: Path) -> dict[str, str] | None:
     """KEY=value pairs, or None when a line is not one (a multiline value such as a PEM key):
     its continuation lines would otherwise vanish or surface as key names."""
     values = {}
@@ -200,7 +203,7 @@ def env_values(path):
     return values
 
 
-def env_keys_beyond_example(env):
+def env_keys_beyond_example(env: Path) -> list[str] | None:
     """Keys whose values the .env.example beside `env` lacks, ports aside; None without an example.
 
     Only key names are returned: the values may be API keys held nowhere else.
@@ -353,7 +356,7 @@ def nested_check(copy: Path) -> dict:
             "detach": ["git", "-C", repository, "worktree", "remove", "--force", str(copy)]}
 
 
-def patches_in_base(worktree, head, base):
+def patches_in_base(worktree: str | Path, head: str, base: str) -> list[str] | None:
     """Commits on HEAD outside base whose patch base already has (`git cherry`), or None.
 
     None when git cannot tell, when any commit's patch is missing from base, or
@@ -371,7 +374,7 @@ def patches_in_base(worktree, head, base):
     return [line[2:] for line in lines]
 
 
-def pr_head_relation(worktree, head, pr_head, head_ahead_of_pr):
+def pr_head_relation(worktree: str | Path, head: str, pr_head: str, head_ahead_of_pr: int | None) -> str:
     """Whether HEAD is in the merged PR head's history; trust compare only if that object is absent."""
     if git(worktree, "cat-file", "-e", pr_head + "^{commit}").returncode != 0:
         if head_ahead_of_pr is not None:
@@ -384,7 +387,7 @@ def pr_head_relation(worktree, head, pr_head, head_ahead_of_pr):
     return "diverged"
 
 
-def compose_in(worktree, compose_projects):
+def compose_in(worktree: str | Path, compose_projects: Sequence[ComposeProject]) -> list[dict]:
     """Compose projects (from `docker compose ls --all --format json`) defined inside the worktree."""
     prefix = str(Path(worktree).resolve()) + "/"
     found = []
@@ -395,7 +398,7 @@ def compose_in(worktree, compose_projects):
     return found
 
 
-def process_cwds(pids):
+def process_cwds(pids: Collection[int]) -> dict[int, str] | None:
     """Current directories by PID, from /proc on Linux or one lsof inventory on macOS."""
     if sys.platform.startswith("linux") and Path("/proc").is_dir():
         found = {}
@@ -415,7 +418,7 @@ def process_cwds(pids):
     for line in output.splitlines():
         if line.startswith("p"):
             pid = int(line[1:]) if line[1:].isdigit() else None
-        elif pid in pids and line.startswith("n"):
+        elif pid is not None and pid in pids and line.startswith("n"):
             found[pid] = line[1:]
     return found
 
@@ -430,7 +433,7 @@ SETUP_WAITS = ("direnv export ", "direnv exec ", "setup-runner.sh")
 TERMINAL_HANDLE = re.compile(r"\bORCA_TERMINAL_HANDLE=(term_[0-9A-Za-z-]+)")
 
 
-def process_table():
+def process_table() -> dict[int, tuple[int, str]] | None:
     """{pid: (ppid, command)} from ps, or None when ps fails."""
     try:
         output = subprocess.run(
@@ -481,7 +484,7 @@ def process_handles(pids: list[int]) -> dict[int, str]:
             if len(fields) == 2 and fields[0].isdigit() and (match := TERMINAL_HANDLE.search(fields[1]))}
 
 
-def tab_root(pid, table):
+def tab_root(pid: int, table: dict[int, tuple[int, str]]) -> int | None:
     """The process Orca's terminal host started for the tab that runs `pid`, or None outside Orca tabs."""
     seen = set()
     while pid in table and pid not in seen:
@@ -493,7 +496,7 @@ def tab_root(pid, table):
     return None
 
 
-def descendants(root, table):
+def descendants(root: int, table: dict[int, tuple[int, str]]) -> list[int]:
     children = {}
     for pid, (parent, _) in table.items():
         children.setdefault(parent, []).append(pid)
@@ -505,7 +508,7 @@ def descendants(root, table):
     return found
 
 
-def runs_nothing(root, members, table):
+def runs_nothing(root: int, members: list[int], table: dict[int, tuple[int, str]]) -> bool:
     return all(pid == root or LOGIN_SHELL.fullmatch(table[pid][1].strip())
                or any(wait in table[pid][1] for wait in SETUP_WAITS) for pid in members)
 
@@ -567,8 +570,15 @@ def output_readers() -> set[int]:
     return readers
 
 
+class UsingProcess(TypedDict):
+    pid: int
+    command: str
+    cwd: NotRequired[str | None]
+    lock: NotRequired[str]
+
+
 def processes_using(worktree: str, processes: dict[int, tuple[int, str]], cwds: dict[int, str],
-                    readers: set[int], locks: dict[int, str] | None = None) -> list[dict]:
+                    readers: set[int], locks: dict[int, str] | None = None) -> list[UsingProcess]:
     """The processes of one table whose command names the worktree, whose current directory is inside it, or
     that hold a lock in it (`locks`, PID to the lock's path), without this process's ancestors and `readers`;
     several worktrees can share the table and directories."""
@@ -579,7 +589,7 @@ def processes_using(worktree: str, processes: dict[int, tuple[int, str]], cwds: 
     while pid in processes and pid not in ancestors:
         ancestors.add(pid)
         pid = processes[pid][0]
-    found = []
+    found: list[UsingProcess] = []
     for pid, (_, command) in processes.items():
         cwd = cwds.get(pid)
         inside = cwd == worktree or (cwd or "").startswith(worktree + os.sep)
@@ -604,7 +614,7 @@ def processes_in(worktree: str, locks: dict[int, str] | None = None) -> list[dic
     cwds = process_cwds(processes)
     if cwds is None:
         return None
-    found = [{**item, **({"cwd": cwds[item["pid"]]} if item["pid"] in cwds else {})}
+    found: list[UsingProcess] = [{**item, **({"cwd": cwds[item["pid"]]} if item["pid"] in cwds else {})}
              for item in processes_using(worktree, processes, cwds, output_readers(), locks)]
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
@@ -663,8 +673,8 @@ def moved_since(worktree: Path, since: datetime) -> list[str]:
     return blockers
 
 
-def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ahead_of_pr=None,
-          *, decided: tuple[str, ...] = (), since: datetime | None = None):
+def check(worktree: str | Path, main: str | Path, base: str | None, compose_projects: Sequence[ComposeProject], pr: dict | None = None, pr_head: str | None = None, head_ahead_of_pr: int | None = None,
+          *, decided: tuple[str, ...] = (), since: datetime | None = None) -> dict:
     """Return the removal verdict, including containers and processes using `worktree`.
 
     `decided` are blockers main found before the check: an Orca comment to keep it, an unanswered docker.
@@ -741,7 +751,7 @@ def check(worktree, main, base, compose_projects, pr=None, pr_head=None, head_ah
             "containers": compose_in(worktree, compose_projects), "processes": processes or [], "notes": logs}
 
 
-def main_checkout(worktree):
+def main_checkout(worktree: str | Path) -> str | None:
     for line in git(worktree, "worktree", "list", "--porcelain").stdout.splitlines():
         if line.startswith("worktree "):
             return line[len("worktree "):]
@@ -751,11 +761,11 @@ def main_checkout(worktree):
 BASE_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
 
 
-def ref_exists(worktree, ref):
+def ref_exists(worktree: str | Path, ref: str) -> bool:
     return git(worktree, "rev-parse", "--verify", "--quiet", ref).returncode == 0
 
 
-def default_base(worktree):
+def default_base(worktree: str | Path) -> str | None:
     """The first existing remote default branch, or None when the repository has none."""
     for ref in BASE_CANDIDATES:
         if ref_exists(worktree, ref):
@@ -763,7 +773,7 @@ def default_base(worktree):
     return None
 
 
-def remote_identity(url):
+def remote_identity(url: str) -> tuple[str, str]:
     """Match FETCH_HEAD's display URL to a remote across HTTPS/SSH URL changes."""
     if "://" in url:
         parsed = urlsplit(url)
@@ -864,7 +874,7 @@ def start_base(worktree: str | Path) -> str | None:
     return ref
 
 
-def merged_pr_head_command(worktree, number):
+def merged_pr_head_command(worktree: str | Path, number: int) -> str | None:
     """The merged_pr_head.py command that prints --pr-head and --head-ahead-of-pr on a Mac whose gh works."""
     origin = git(worktree, "remote", "get-url", "origin")
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -875,14 +885,14 @@ def merged_pr_head_command(worktree, number):
             % (slug, number, head))
 
 
-def pr_base(worktree, pr):
+def pr_base(worktree: str | Path, pr: dict | None) -> str | None:
     """origin/<the PR's base branch> when that ref exists: where the work merges."""
     name = (pr or {}).get("baseRefName")
     ref = "origin/%s" % name if name else None
     return ref if ref and ref_exists(worktree, ref) else None
 
 
-def pull_request(worktree, number):
+def pull_request(worktree: str | Path, number: int) -> tuple[dict | None, str | None]:
     """Return (pr, error): the PR's number/state/head, or why `gh` could not tell."""
     try:
         out = subprocess.run(["gh", "pr", "view", str(number), "--json", "number,state,headRefOid,baseRefName"],
@@ -894,11 +904,11 @@ def pull_request(worktree, number):
         return None, str(error)
 
 
-def head_in(worktree, base) -> bool:
+def head_in(worktree: str | Path, base: str | None) -> bool:
     return base is not None and git(worktree, "merge-base", "--is-ancestor", "HEAD", base).returncode == 0
 
 
-def merged_pr_at_head(worktree) -> tuple[dict | None, str | None]:
+def merged_pr_at_head(worktree: str | Path) -> tuple[dict | None, str | None]:
     """(pr, error): the MERGED PR of the checked-out branch whose head is HEAD, asked of gh for a GitHub origin."""
     origin = git(worktree, "remote", "get-url", "origin")
     branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
@@ -1158,7 +1168,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         since = datetime.fromisoformat(scanned[0]) if scanned else None
     if since is not None and since.tzinfo is None:
         since = since.astimezone()
-    main = str(Path(args.main or main_checkout(worktree)).resolve())
+    checkout = args.main or main_checkout(worktree)
+    if checkout is None:
+        parser.error("could not locate the main checkout; pass --main")
+    main = str(Path(checkout).resolve())
     pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
     notes = []
     keep_blocker = None

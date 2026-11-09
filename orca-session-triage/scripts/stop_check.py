@@ -22,6 +22,8 @@ each answer whose chosen option sends something out (a post, merge, send, push, 
 change) while the same question carries a note. It does not judge whether they disagree.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import json
 import os
@@ -47,7 +49,7 @@ LIVE_SUBSCRIPTIONS = ("arming", "connected")
 WATCH_LIFECYCLE = "<task-type>artifact-watch-lifecycle</task-type>"
 
 
-def read_json(path):
+def read_json(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -158,7 +160,7 @@ def deny(reasons: list[str]) -> dict[str, Any] | None:
                                    "permissionDecisionReason": " ".join(reasons)}}
 
 
-def decide(hook_input, state_dir, orca="orca"):
+def decide(hook_input: dict, state_dir: str | Path, orca: str = "orca") -> dict[str, str] | None:
     """A Stop hook decision ({"decision": "block", "reason": ...}), or None to let the turn end.
 
     Damaged or unexpected files, or an Orca CLI that fails, let the turn end: the hook must
@@ -195,7 +197,7 @@ def unread_ask_reason(workspace: str | None, orca: str) -> str | None:
             "handle the question, then ack its NEXT_OFFSET before ending this turn.")
 
 
-def watched(session, transcript):
+def watched(session: Path, transcript: str | None) -> str | None:
     """Why to stay while an artifact this session published is still watched live, or None.
 
     Reads only the transcript lines written since the last stop. An Artifact publish whose result has a live
@@ -238,7 +240,7 @@ def watched(session, transcript):
             "watch keeps Orca counting this tab as working, so the hourly run is skipped.")
 
 
-def follow_watch(line, urls):
+def follow_watch(line: bytes, urls: dict[str, None]) -> None:
     """Add the URL a publish result starts watching to urls, or drop the one a watch-stop result or notice names."""
     try:
         entry = json.loads(line)
@@ -261,7 +263,7 @@ def follow_watch(line, urls):
         urls[result["url"]] = None
 
 
-def unclassed(session, queue):
+def unclassed(session: Path, queue: dict) -> str | None:
     """Why to stay while a row of this scan's review queue has no verdict, or None."""
     queued = [row["path"] for row in queue.get("rows") or [] if isinstance(row, dict) and row.get("path")]
     if not queued:
@@ -279,13 +281,13 @@ def unclassed(session, queue):
             "the turn: " + ", ".join(missing) + ".")
 
 
-def orca_result(orca, *args):
+def orca_result(orca: str, *args: str) -> dict:
     out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True, check=True, timeout=15).stdout
     data = json.loads(out)
     return data.get("result", data)
 
 
-def triage_automations(orca, workspace):
+def triage_automations(orca: str, workspace: str) -> list[dict]:
     here = Path(os.path.realpath(workspace))
     return [a for a in orca_result(orca, "automations", "list")["automations"]
             if (a.get("workspaceId") or "").split("::", 1)[-1]
@@ -293,14 +295,14 @@ def triage_automations(orca, workspace):
             and (a.get("prompt") or "").startswith(TRIAGE_PROMPT)]
 
 
-def inbox_service_running():
+def inbox_service_running() -> bool:
     script = Path(__file__).with_name("inbox_watch_service.py")
     result = subprocess.run([sys.executable, str(script), "status"], capture_output=True,
                             text=True, timeout=15)
     return result.returncode == 0
 
 
-def missing_inbox_watch(workspace, orca):
+def missing_inbox_watch(workspace: str | None, orca: str) -> str | None:
     if not workspace:
         return None
     try:

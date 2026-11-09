@@ -1,5 +1,7 @@
 """Observable ledger behavior through its command line."""
 
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
@@ -15,7 +17,7 @@ SCRIPT = ROOT / "adoption-triage/scripts/ledger.py"
 
 
 class AdoptionLedgerTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.events = Path(self.temp.name) / "events.jsonl"
@@ -23,14 +25,14 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.writer_config = Path(self.temp.name) / "writer.json"
         self.writer_config.write_text('{"decision_writer": true, "name": "board"}')
 
-    def run_ledger(self, command, body=None):
+    def run_ledger(self, command: list[str], body: dict | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "--events", str(self.events),
                                "--imports", str(self.imports), "--decision-config", str(self.writer_config),
                                *command],
                               input=json.dumps(body, ensure_ascii=False) if body is not None else None,
                               text=True, capture_output=True)
 
-    def proposal(self):
+    def proposal(self) -> str:
         result = self.run_ledger(["propose"], {
             "source": {"session": "triage", "worktree": "triage"},
             "fact": "同じ失敗が続いた", "proposal": "設定を直す", "reason": "使い方に関わる",
@@ -38,7 +40,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)["proposal_id"]
 
-    def test_decisions_are_appended_and_dates_survive_revoke(self):
+    def test_decisions_are_appended_and_dates_survive_revoke(self) -> None:
         proposal_id = self.proposal()
         for decision in ("hold", "adopt", "revoke"):
             result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
@@ -69,14 +71,14 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(len(item["executions"]), 2)
         self.assertEqual(len(self.events.read_text().splitlines()), 6)
 
-    def test_invalid_transition_does_not_append(self):
+    def test_invalid_transition_does_not_append(self) -> None:
         proposal_id = self.proposal()
         result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
                                  "decision": "revoke", "actor": "Eotel"})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.events.read_text().splitlines()), 1)
 
-    def test_only_configured_writer_can_decide(self):
+    def test_only_configured_writer_can_decide(self) -> None:
         proposal_id = self.proposal()
         self.writer_config.write_text('{"decision_writer": false}')
         result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
@@ -84,7 +86,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.events.read_text().splitlines()), 1)
 
-    def test_support_adds_evidence_without_creating_another_proposal(self):
+    def test_support_adds_evidence_without_creating_another_proposal(self) -> None:
         proposal_id = self.proposal()
         result = self.run_ledger(["support"], {"proposal_id": proposal_id,
             "source": {"session": "next triage", "worktree": "triage"},
@@ -96,7 +98,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(items[0]["evidence"], ["2026-10-26 17:00", "2026-10-26 18:10 に再発"])
         self.assertEqual(items[0]["supporting_events"][0]["source"]["session"], "next triage")
 
-    def test_readoption_needs_a_new_execution(self):
+    def test_readoption_needs_a_new_execution(self) -> None:
         proposal_id = self.proposal()
         for decision in ("adopt", "revoke", "adopt"):
             result = self.run_ledger(["decide"], {"proposal_id": proposal_id,
@@ -112,7 +114,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNone(item["implemented_at"])
         self.assertIsNone(item["revoked_at"])
 
-    def test_failed_execution_does_not_describe_a_later_decision(self):
+    def test_failed_execution_does_not_describe_a_later_decision(self) -> None:
         proposal_id = self.proposal()
         adopted = self.run_ledger(["decide"], {"proposal_id": proposal_id,
             "decision": "adopt", "actor": "Eotel"})
@@ -136,7 +138,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         item = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"][0]
         self.assertEqual(item["current_execution"]["result"], "取り消しに失敗")
 
-    def test_late_reversal_stays_with_its_decision(self):
+    def test_late_reversal_stays_with_its_decision(self) -> None:
         proposal_id = self.proposal()
         adopted = self.run_ledger(["decide"], {"proposal_id": proposal_id,
             "decision": "adopt", "actor": "Eotel"})
@@ -161,7 +163,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIsNone(item["reverted_at"])
         self.assertEqual([event["decision_id"] for event in item["executions"]], [revoked_id, revoked_id])
 
-    def test_clock_ahead_decision_precedes_remote_execution(self):
+    def test_clock_ahead_decision_precedes_remote_execution(self) -> None:
         proposal_id = self.proposal()
         decision = self.run_ledger(["decide"], {"proposal_id": proposal_id,
             "decision": "adopt", "actor": "Eotel"})
@@ -361,7 +363,7 @@ class AdoptionLedgerTests(unittest.TestCase):
                          {merged: "reject", pending: "reject"})
         self.assertEqual(self.items()[adopted]["status"], "adopted")
 
-    def test_empty_proposal_id_does_not_append(self):
+    def test_empty_proposal_id_does_not_append(self) -> None:
         result = self.run_ledger(["propose"], {
             "proposal_id": "", "source": {"session": "triage", "worktree": "triage"},
             "fact": "失敗", "proposal": "設定を直す", "reason": "繰り返す",
@@ -369,7 +371,22 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.events.exists())
 
-    def test_imports_are_read_without_changing_local_log(self):
+    def test_invalid_jsonl_field_types_fail_before_projection(self) -> None:
+        self.proposal()
+        original = self.events.read_bytes()
+        event = json.loads(original)
+        for field, value in (("ts", 42), ("evidence", [42]), ("target", []), ("source", None)):
+            with self.subTest(field=field):
+                corrupted = {**event, field: value}
+                self.events.write_text(json.dumps(corrupted) + "\n")
+                result = self.run_ledger(["list", "--json"])
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("invalid event", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.events.read_text(), json.dumps(corrupted) + "\n")
+        self.events.write_bytes(original)
+
+    def test_imports_are_read_without_changing_local_log(self) -> None:
         self.imports.mkdir()
         remote = self.imports / "other-mac.jsonl"
         result = self.run_ledger(["propose"], {
@@ -383,7 +400,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(len(json.loads(view.stdout)["items"]), 1)
         self.assertFalse(self.events.exists())
 
-    def test_collect_keeps_remote_history_and_rejects_truncation(self):
+    def test_collect_keeps_remote_history_and_rejects_truncation(self) -> None:
         proposal_id = self.proposal()
         supported = self.run_ledger(["support"], {"proposal_id": proposal_id,
             "source": {"session": "remote", "worktree": "preview"},
@@ -425,7 +442,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(proposal_id, (self.imports / "other-mac.jsonl").read_text())
 
-    def test_remote_implementer_reads_writer_decision_before_recording(self):
+    def test_remote_implementer_reads_writer_decision_before_recording(self) -> None:
         root = Path(self.temp.name)
         writer = root / "writer"
         remote = root / "remote"
@@ -458,7 +475,7 @@ class AdoptionLedgerTests(unittest.TestCase):
                "FAKE_SCRIPT": str(SCRIPT), "FAKE_REMOTE_EVENTS": str(remote / "events.jsonl"),
                "FAKE_REMOTE_IMPORTS": str(remote / "imports"), "FAKE_REMOTE_CONFIG": str(remote_config)}
 
-        def run(directory, config, command, body=None):
+        def run(directory: Path, config: Path, command: list[str], body: dict | None = None) -> subprocess.CompletedProcess[str]:
             return subprocess.run([sys.executable, str(SCRIPT), "--events", str(directory / "events.jsonl"),
                                    "--imports", str(directory / "imports"), "--decision-config", str(config),
                                    *command], input=json.dumps(body) if body is not None else None,
@@ -515,7 +532,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(item["executions"][-1]["result"], "late commit")
         self.assertEqual(item["executions"][-1]["decision_id"], adopted_id)
 
-    def test_collect_does_not_treat_read_failure_as_missing(self):
+    def test_collect_does_not_treat_read_failure_as_missing(self) -> None:
         root = Path(self.temp.name)
         bin_dir = root / "bin"
         bin_dir.mkdir()
@@ -564,7 +581,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertIn("--config", result.stderr)
         self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
 
-    def test_writer_snapshot_may_reorder_but_cannot_drop_history(self):
+    def test_writer_snapshot_may_reorder_but_cannot_drop_history(self) -> None:
         config = Path(self.temp.name) / "remote-hosts.json"
         config.write_text(json.dumps({"trusted_writer": "board", "hosts": []}))
         rows = [{"id": str(uuid.uuid4()), "ts": "2026-10-26T19:00:00+09:00", "host": "writer",
@@ -573,7 +590,7 @@ class AdoptionLedgerTests(unittest.TestCase):
                  "proposal": f"案 {index}", "reason": "判断待ち", "recommendation": "adopt",
                  "priority": "normal", "evidence": []} for index in range(3)]
 
-        def receive(snapshot):
+        def receive(snapshot: list[dict]) -> subprocess.CompletedProcess[str]:
             return subprocess.run([sys.executable, str(SCRIPT), "--events", str(self.events),
                 "--imports", str(self.imports), "receive", "--name", "board", "--config", str(config)],
                 input="".join(json.dumps(row) + "\n" for row in snapshot), text=True, capture_output=True)

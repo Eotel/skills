@@ -8,6 +8,8 @@ it atomically, so a waiting session and a new run cannot lose each other's edits
 reports and the answers answer_evidence.py finds, and names the questions left in front of no one.
 """
 
+from __future__ import annotations
+
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -429,11 +431,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             "ask": None, "answer": None}))
     found.sort(key=itemgetter(0))
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60),
-             **({"answer_age_minutes": int((now - scan_sessions.parse_time(item["answer"]["at"])).total_seconds() // 60)}
+             **({"answer_age_minutes": int((now - (scan_sessions.parse_time(item["answer"]["at"]) or now)).total_seconds() // 60)}
                 if item["answer"] else {})} for at, item in found]
 
 
-def read(path):
+def read(path: Path) -> dict:
     if not path.exists():
         return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -445,7 +447,7 @@ def read(path):
     return data
 
 
-def save(path, data):
+def save(path: Path, data: dict) -> None:
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
                                      prefix=path.name + ".", delete=False) as output:
         temp = Path(output.name)
@@ -460,11 +462,11 @@ def save(path, data):
     temp.replace(path)
 
 
-def stamp():
+def stamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def recorded_at(value):
+def recorded_at(value: str | None) -> str:
     if value is None:
         return stamp()
     parsed = datetime.fromisoformat(value)
@@ -473,18 +475,18 @@ def recorded_at(value):
     return parsed.isoformat()
 
 
-def identifier(*parts):
+def identifier(*parts: object) -> str:
     return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()[:16]
 
 
-def file_text(path):
+def file_text(path: str | Path) -> str:
     value = Path(path).read_text(encoding="utf-8").strip()
     if not value:
         raise ValueError(f"empty text file: {path}")
     return value
 
 
-def owner_name(value):
+def owner_name(value: str) -> str:
     owner = value.strip()
     environment, separator, path = owner.partition("::")
     if not owner or not Path(path if separator else owner).is_absolute() or (separator and not environment):
@@ -519,14 +521,14 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
         view = {"id": key, **item}
         asked_at = scan_sessions.parse_time(item["asked_at"])
         covered = [decisions[name] for name in item.get("covers") or [] if name in decisions
-                   and asked_at and scan_sessions.parse_time(decisions[name].decided_at)
-                   and scan_sessions.parse_time(decisions[name].decided_at) > asked_at]
+                   and asked_at and (at := scan_sessions.parse_time(decisions[name].decided_at)) is not None
+                   and at > asked_at]
         if item.get("withdrawn_at"):
             settled.append({**view, "state": "withdrawn", "since": item["withdrawn_at"],
                             "reason": item["withdrawal_reason"]})
         elif covered and len(covered) == len(item["covers"]):
             settled.append({**view, "state": "settled", "since": max(
-                covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at)).decided_at,
+                covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
                             "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
                                           "answer": answer.answer} for answer in covered]})
         elif refs := closed_references(item["row"], item["question"]):
@@ -547,7 +549,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
     }
 
 
-def change(data, args):
+def change(data: dict, args: argparse.Namespace) -> dict:
     if args.action == "appoint-lead":
         at = datetime.fromisoformat(recorded_at(args.appointed_at)).astimezone(timezone.utc).isoformat()
         data["lead"] = {"worktree": str(args.worktree.expanduser().resolve()), "appointed_at": at}
