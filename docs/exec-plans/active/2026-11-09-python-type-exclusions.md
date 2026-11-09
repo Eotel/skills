@@ -13,11 +13,24 @@ Remove file-specific ANN/PTH and ty exclusions while preserving script behavior.
 - First-party scripts and tests have annotations; only the five imported
   `yomiyasu` files retain lint/type exclusions. JSONL events and projected
   proposals have distinct schemas, and invalid JSONL field types are rejected.
-- Upstream checkout: `/tmp/skills78-yomiyasu-upstream`, branch
-  `codex/python-annotations-pathlib`, based on upstream
-  `8394e099486aaa2e28cf89992e46f5ebe5ed839d` (v2.5.0).
-- Upstream `markdown_visibility.py` and `yomiyasu_hook.py` have local edits;
-  their copies under `skills/yomiyasu/scripts/` must remain identical.
+- Upstream base: `8394e099486aaa2e28cf89992e46f5ebe5ed839d` (v2.5.0).
+- Upstream implementation is published in nanaism/yomiyasu#54 (draft),
+  commit `453b6135c8cca506ddb9b97d268cc598637d3dc9`.
+- Integration checkout: `/tmp/skills78-yomiyasu-publish`, branch
+  `codex/python-annotations-pathlib`. All five distributed scripts pass Ruff
+  ANN/PTH and ty for Python 3.9. Their root copies are byte-identical.
+- Its local follow-up commit is `d6ba9e85c76d6ba570c4c465de63b29cccb671c2`;
+  publish it after both full suites finish successfully.
+- The six repaired test files pass independently under Python 3.9 and 3.14
+  (113 tests each). First-party cold review returned no findings; its focused
+  independent checks passed 187 tests.
+- Filesystem predicates preserve the prior false-on-OSError behavior without
+  hiding ordinary read/stat/write errors. Real permission regressions pass on
+  Python 3.9, 3.12, and 3.14. Fresh cold review returned no findings; full
+  Python 3.9 and 3.14 suites are running on the repaired result.
+- The lead independently passed the four permission-related files on Python
+  3.12 (`130 passed, 158 subtests passed`) and the final three adapter/source-rule
+  files (`71 passed, 77 subtests passed`).
 
 ## Scope and Non-Goals
 
@@ -35,25 +48,32 @@ Remove file-specific ANN/PTH and ty exclusions while preserving script behavior.
 
 ## Remaining Work
 
-1. Finish and verify upstream yomiyasu changes under upstream conventions.
-2. Refresh the upstream snapshot when the upstream revision is available.
+1. Finish both full upstream suites and publish the verified follow-up commit.
+2. After the version choice, refresh the complete snapshot from its published
+   revision.
 3. Remove all file-specific exclusions; run repository checks and full tests.
 4. Commit and push the change; follow the documented Mac distribution procedure
-   when the merged revision is available for installation.
+   when the merged revision is available for installation. The chezmoi manifest
+   pins `Eotel/skills/yomiyasu` to `c8413a5a2986a5da16af087820348eddfb3b3489`;
+   bump that pin to the merged revision before distribution.
 
 ## Now And Next
 
-Check `/tmp/skills78-yomiyasu-hook-py39.txt` and finish the hook migration.
-Then repair `yomiyasu_check.py`, `yomiyasu_lint.py`, and `yomiyasu_diff.py`.
-Keep Python 3.9 compatible annotations with postponed evaluation. Preserve
-lexical absolute paths without resolving symlinks, raw readlink comparisons,
-and the hook's unregistered fast path. Inspect each JSON boundary before
-choosing its internal type representation.
+Source and tests are frozen while both full upstream suites run against
+`d6ba9e8`. Git and public writes belong to the lead.
+
+1. Inspect both complete suite results.
+2. Publish the follow-up commit and update the upstream PR with final evidence.
+3. After the version choice, verify exact snapshot equality, repository hooks,
+   and all repository unittests.
 
 ## Blockers And Human Tasks
 
-- Upstream integration requires a reviewed upstream revision; do not silently
-  substitute a locally modified vendor snapshot.
+- Upstream CI awaits maintainer approval. The fork has no registered Actions
+  workflows; direct workflow enable/dispatch returns 404.
+- The user is choosing whether to import upstream v2.5.0, which also changes
+  writing checks, or preserve v2.4.0 behavior with a separate backport.
+- Do not merge or close either PR without explicit authorization.
 
 ## Verification
 
