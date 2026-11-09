@@ -79,7 +79,7 @@ def is_event(value: object) -> TypeGuard[Event]:
            for key in {"evidence", "merges", "retires", "confirms"} & value.keys()):
         return False
     source = value.get("source")
-    if source is not None and (not isinstance(source, dict) or set(source) != {"session", "worktree"}
+    if "source" in value and (not isinstance(source, dict) or set(source) != {"session", "worktree"}
                                or any(not isinstance(item, str) for item in source.values())):
         return False
     return value.get("target") is None or isinstance(value["target"], str)

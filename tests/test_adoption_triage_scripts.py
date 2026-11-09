@@ -375,7 +375,7 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.proposal()
         original = self.events.read_bytes()
         event = json.loads(original)
-        for field, value in (("ts", 42), ("evidence", [42]), ("target", [])):
+        for field, value in (("ts", 42), ("evidence", [42]), ("target", []), ("source", None)):
             with self.subTest(field=field):
                 corrupted = {**event, field: value}
                 self.events.write_text(json.dumps(corrupted) + "\n")
