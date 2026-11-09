@@ -64,7 +64,7 @@ resolution on older Windows Python versions without following symlinks.
 - `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
   This is the MIT-licensed `nanaism/yomiyasu` v2.5.0 skill with the typing and
   pathlib changes proposed in [upstream PR #54](https://github.com/nanaism/yomiyasu/pull/54),
-  at commit `1dd70d6062f6757df5666941cd7ee075b19fe342`. Its 42 files match
+  at commit `4b34e3fb2973f2d30800ca15b8d28e358699bfa9`. Its 42 files match
   that unmerged PR revision byte for byte. The `.codex-plugin/plugin.json`
   metadata is omitted because APM 0.35.0 treats it as a native Codex plugin and
   refuses the shared
