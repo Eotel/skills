@@ -9,21 +9,23 @@ distribute the exact verified snapshot to the configured Macs.
 
 - PR: https://github.com/nanaism/yomiyasu/pull/54
 - Review finding: https://github.com/nanaism/yomiyasu/pull/54#discussion_r4509108009
-- Upstream fix: `4b34e3fb2973f2d30800ca15b8d28e358699bfa9`, on
+- Upstream fix: `d648f6339f30842ff095fc0f6d1304a9ad37dd2b`, on
   `codex/python-annotations-pathlib` in `/tmp/skills78-yomiyasu-publish`.
 - Python 3.9 WindowsPath reproduced a relative word-list record rejected by
   the real record validator. Native Windows 3.9 run/verify/export now passes.
-- Identical-commit fork CI: https://github.com/Eotel/yomiyasu/actions/runs/42596440708
-- Original-repository CI needs maintainer approval. The review of `600c0ff`
-  found an unbound fallback import (fixed in `1dd70d6`) and empty Windows home
-  settings (fixed in `4b34e3f`). Reply with evidence and resolve these threads.
-- The drive-relative finding has a fix/evidence reply and is resolved. Native
-  Windows 3.9 run/verify/export passes at `1dd70d6`; latest CI adds native home tests.
+- Identical-commit fork CI: https://github.com/Eotel/yomiyasu/actions/runs/42598674574
+- Original-repository CI needs maintainer approval. Three findings have fix/evidence
+  replies and are resolved. The export input-error finding is fixed in `d648f63`;
+  reply to comment `4511480920`, then resolve thread `PRRT_kwDOU1BOZs61NK4g`.
+- Native Windows 3.9 drive-relative run/verify/export and empty-home word-list
+  selection pass at `4b34e3f`. Latest CI also exercises the export regression.
 - Downstream branch: `codex/yomiyasu-drive-relative`, based on `1d7a23d`.
   Its 42 imported files match the new fix. The prior snapshot was checked before
   replacement. PR: https://github.com/Eotel/skills/pull/154 (assigned to Eotel).
-  Its first revision passed CI and all 582 local tests. The latest source's 75
-  relevant upstream tests pass; rerun downstream checks after the home fix.
+  CI, code review, security review, and all 582 local tests passed at `2fea184`.
+  The latest source's 21 relevant tests pass. The refreshed downstream CLI returns
+  exit 2 without a traceback for missing and directory-valued export sources.
+  Push this snapshot and obtain checks/reviews on its new head.
 
 ## Scope and Non-Goals
 
@@ -31,6 +33,8 @@ distribute the exact verified snapshot to the configured Macs.
   resolving symlinks; keep root/distributed upstream scripts identical.
 - Preserve literal tilde paths when Windows home configuration is empty, for
   both USERPROFILE and the HOMEDRIVE/HOMEPATH fallback.
+- Preserve verification input-error exit codes through export. The dictionary API
+  reports rejected arguments as ValueError instead of an assertion or indexing error.
 - Keep per-file Ruff and ty exclusions absent. Two documented PTH100 line
   exceptions retain native lexical path semantics where pathlib is incomplete.
 - No upstream PR merge or unrelated feature changes.
@@ -49,10 +53,10 @@ distribute the exact verified snapshot to the configured Macs.
 
 ## Now And Next
 
-Inspect all six fork CI jobs and the upstream review at `4b34e3f`. Do not treat
+Inspect all six fork CI jobs and the upstream review at `d648f63`. Do not treat
 the original repository's `action_required` state as successful CI. Review the
 existing word-list record-validator and native Windows regression evidence.
-Push the downstream home fix and reconcile both PRs' descriptions and reviews.
+Push the downstream export fix and reconcile both PRs' descriptions and reviews.
 
 ## Constraints and Human Tasks
 
