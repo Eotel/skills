@@ -211,8 +211,9 @@ when the screen was not read), whether the screen's input line is empty
 of its screen. Orca's draft can be Claude's suggestion rather than the user's
 unsent text (on 2026-10-29 one came with `composer empty`): read its text. Read
 the card's final message (the
-row's transcript; the card's `last_message` when none was read; its
-`screen_tail` when both are empty), then:
+row's `final` in `--row`: the transcript's, or the card's `last_message` when
+Orca recorded it later or no transcript was read; its `screen_tail` when both
+are empty), then:
 
 - Something is left for the user: it is a question (`delivery.md`). An
   `interrupted` card is a request they cut short: ask whether its `prompt`

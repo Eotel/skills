@@ -62,10 +62,12 @@ board's done cards; close what the user approves.
   row's `question`; a notice that a restart dropped background jobs adds a reason,
   and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
   A local row also reads the transcript of each Claude session running under
-  it (its `sessions/<pid>.json`, matched by the first of the process and its
-  ancestors whose cwd is inside the worktree and not in a checkout nested in it,
-  such as a worktree under its `.claude/worktrees`), even after the session moved its
-  cwd elsewhere; among those it takes the transcript with the newest entry.
+  it (its `sessions/<pid>.json`, matched first by the process's or an ancestor's
+  `ORCA_TERMINAL_HANDLE` naming one of the worktree's tabs, else by the first of
+  the process and its ancestors whose cwd is inside the worktree and not in a
+  checkout nested in it, such as a worktree under its `.claude/worktrees`), even
+  when the session started or moved its cwd elsewhere; among those it takes the
+  transcript with the newest entry.
   It also reads the worktree's processes by `rm_check.py`'s rule whose job a
   `sleep` or a shell running a command line or script started (a wait loop, a
   timed wait, an agent's background job; not an MCP server, or a dev server or
@@ -91,7 +93,10 @@ board's done cards; close what the user approves.
   message time, its question, `waits_on`, `next_step`, or message start,
   `reasons`, `git.dirty`, and `git.unpushed`); `--class CLASS` keeps one class.
   `--row NAME` prints one row as JSON with the fixed keys its `--help` lists: no null strings, the
-  newest final message of Claude, Codex, or Orca in `final`, `github` as
+  newest final message of Claude, Codex, or Orca in `final` (a done card Orca
+  recorded after it with other text takes its place as `source` `card`, and the
+  row's final time in `--rows` and `--sort final` follows it), its `done_cards`
+  with whole `prompt` and `last_message`, `github` as
   owner/repo from origin for `gh -R`, the agents' `transcripts` (`--transcripts`
   prints them as `claude <path>` or `codex <path>` lines instead), and the PR's
   completed independent review (`review`: head, verdict, path, and whether it
