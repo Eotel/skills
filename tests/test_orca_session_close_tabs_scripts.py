@@ -67,7 +67,7 @@ class CloseTabsTests(unittest.TestCase):
 
     def run_close(self, tabs: FakeTabs, *handles: str) -> tuple[int, str]:
         argv = ["--from", str(self.scan), "--claude-projects", str(self.projects), "--inbox", str(self.inbox),
-                *handles]
+                "--state-file", str(self.dir / "state.json"), *handles]
         with redirect_stdout(io.StringIO()) as out:
             code = close_tabs.main(argv, tabs)
         return code, out.getvalue()
@@ -123,6 +123,24 @@ class CloseTabsTests(unittest.TestCase):
 
         self.assertEqual((code, tabs.closed), (1, []))
         self.assertIn("走査の後に動いた（", out)
+
+    def test_undelivered_promise_created_after_scan_keeps_its_destination_tab(self) -> None:
+        state = self.dir / "state.json"
+        state.write_text(json.dumps({"handoffs": {"h": {"to": "web/fix-login", "delivered_at": None}}}))
+        tabs = FakeTabs()
+        code, out = self.run_close(tabs, "term_agent")
+        self.assertEqual((code, tabs.closed), (1, []))
+        self.assertIn("未配信の約束", out)
+        state.write_text(json.dumps({"handoffs": {"h": {"to": "web/fix-login", "delivered_at": "done"}}}))
+        self.assertEqual(self.run_close(tabs, "term_agent")[0], 0)
+
+    def test_whitespace_separated_handles_close_known_tabs_and_keep_unknown_ones(self) -> None:
+        tabs = FakeTabs()
+        code, out = self.run_close(tabs, "term_agent\n unknown_handle")
+        self.assertEqual(code, 1)
+        self.assertEqual(tabs.closed, [(None, "term_agent")])
+        self.assertIn("unknown_handle: KEPT", out)
+        self.assertIn("term_agent: CLOSED", out)
 
     def test_a_tab_with_nothing_after_the_scan_closes(self) -> None:
         self.inbox.write_text(json.dumps({"ts": "2026-10-28T13:40:00+0900", "kind": "done",

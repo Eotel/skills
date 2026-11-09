@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import fcntl
@@ -83,9 +83,11 @@ class Claim:
     id: str
     by: str
     at: str
+    inactive_minutes: int | None = None
 
     def view(self) -> dict:
-        return {"by": self.by, "at": self.at}
+        return {"by": self.by, "at": self.at,
+                **({"inactive_minutes": self.inactive_minutes} if self.inactive_minutes is not None else {})}
 
 
 @dataclass(frozen=True)
@@ -536,11 +538,47 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
 
 def claim_label(claim: Claim) -> str:
     """`伺い中 <worktree> <HH:MM>〜`, as open-asks prefixes a claimed ask."""
+    if claim.inactive_minutes is not None:
+        return f"伺っていない（claim のみ、{claim.inactive_minutes} 分）{claim.by}"
     try:
         since = f" {datetime.fromisoformat(claim.at):%H:%M}〜"
     except ValueError:
         since = ""
     return f"伺い中 {claim.by}{since}"
+
+
+def checked_claims(claims: dict[str, Claim], now: datetime, orca: str, projects: Path) -> dict[str, Claim]:
+    """A claim is no proof of a live question after its owner's turn ended fifteen minutes ago."""
+    if not claims:
+        return claims
+    import handoff
+    import scan_sessions
+    try:
+        rows = scan_sessions.orca_payload(orca, ["worktree", "ps"])["worktrees"]
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return claims
+    inactive: dict[str, int] = {}
+    for by in dict.fromkeys(claim.by for claim in claims.values()):
+        matches = [row for row in rows if by in (row["path"], Path(row["path"]).name,
+                                                f"{row.get('repo')}/{Path(row['path']).name}")]
+        if len(matches) != 1:
+            continue
+        try:
+            details = handoff.lead_details(projects.expanduser(), matches[0]["path"], orca, handoff.HANDOFFS)
+        except (OSError, ValueError, KeyError, LookupError, subprocess.SubprocessError):
+            continue
+        agents = cast(list[dict], details["agents"])
+        if details["pending_questions"] or not agents or any(agent["state"] != "done" for agent in agents):
+            continue
+        stopped = [scan_sessions.parse_time(agent.get("stopped_at")) for agent in agents]
+        if any(at is None for at in stopped):
+            continue
+        last = max(at for at in stopped if at is not None)
+        inactive[by] = int((now - last).total_seconds() // 60)
+    return {key: replace(claim, inactive_minutes=min(inactive[claim.by], age))
+            if claim.by in inactive and inactive[claim.by] > 15
+            and (age := minutes_since(scan_sessions.parse_time(claim.at), now)) is not None and age > 15 else claim
+            for key, claim in claims.items()}
 
 
 def open_ask_view(ask: OpenAsk, now: datetime, claims: dict[str, Claim] | None = None) -> dict:
@@ -706,6 +744,9 @@ def main(argv: list[str] | None = None) -> int:
                               help="print a JSON list of {id, ts, host, source, handle, text, open_questions, "
                                    "age_minutes} instead; open_questions holds each unanswered question's "
                                    "number, header, question, options, and recommended")
+    open_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"))
+    open_command.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
+                              help="transcripts used to check whether a claimed question is still being asked")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
                                                    "or no longer asked); send --decision --ask records its own")
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
@@ -752,14 +793,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)
             asks = open_asks(entries, answered_ids(answers_path()))
-            claims = read_claims(claims_path())
+            open_keys = frozenset(key for ask in asks for key in (
+                ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+            claims = {key: claim for key, claim in read_claims(claims_path()).items() if key in open_keys}
             now = datetime.now().astimezone()
             if args.action == "claim":
                 if not args.by.strip():
                     raise ValueError("--by names the worktree asking")
                 ids = checked_answer_ids(args.ids, entries)
-                open_keys = frozenset(key for ask in asks for key in (
-                    ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
                 taken = record_claims(claims_path(), ids, args.by.strip(), open_keys, args.take_over)
                 for claim in taken:
                     print(f"inbox-read: {claim.id} は {claim_label(claim)}。重ねて伺わない"
@@ -797,9 +838,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(question_batch(pending_questions(asks), args.after, order, claims),
                                  ensure_ascii=False, indent=2))
             elif args.json:
+                claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 asks = close_held_notices(asks, answers_path())
                 print(json.dumps([open_ask_view(ask, now, claims) for ask in asks], ensure_ascii=False, indent=2))
             else:
+                claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 for ask in close_held_notices(asks, answers_path()):
                     age = minutes_since(ask.at, now)
                     claim = ask_claim(ask, claims)

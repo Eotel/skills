@@ -677,8 +677,9 @@ def main() -> int:
     commands.add_parser("decide", help="append one decision from stdin JSON")
     commands.add_parser("record", help="append one execution result from stdin JSON")
     commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
-    listing = commands.add_parser("list", help="read current proposals")
-    listing.add_argument("--json", action="store_true")
+    listing = commands.add_parser("list", help="read current proposals",
+                                   description="Without --json, print one proposal per line: id, status, priority, proposal.")
+    listing.add_argument("--json", action="store_true", help='print {"items": [...]} instead of one proposal per line')
     listing.add_argument("--candidates", action="store_true",
                          help="only pending, held, and unimplemented adopted proposals not already in an open consolidation")
     owning = commands.add_parser("owner", help="print, one line per proposal, its status, the lane holding it "

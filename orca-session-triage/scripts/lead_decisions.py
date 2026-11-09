@@ -95,6 +95,7 @@ class PullRequest:
 class PrState:
     state: str | None
     updated_at: str | None
+    head: str | None = None
 
 
 class PrStates(Protocol):
@@ -226,7 +227,7 @@ def pull_requests(key: str) -> list[PullRequest]:
             for number in re.findall(r"\d+", match["numbers"])]
 
 
-def github_pr_states(repo: str, numbers: list[int]) -> Mapping[int, PrState] | None:
+def github_pr_states(repo: str, numbers: list[int], *, include_issues: bool = False) -> Mapping[int, PrState] | None:
     """PrStates read from GitHub with scan_sessions' query, one GraphQL query per GRAPHQL_CHUNK PRs.
 
     A repository gh cannot read gives None, and scan_sessions names it on stderr; a number GitHub has no
@@ -236,15 +237,16 @@ def github_pr_states(repo: str, numbers: list[int]) -> Mapping[int, PrState] | N
     import scan_sessions
 
     owner, _, name = repo.partition("/")
-    refs: list[scan_sessions.PrRef] = list(numbers)
+    refs: list[scan_sessions.PrRef] = [scan_sessions.Item(number) if include_issues else number for number in numbers]
     queries = [scan_sessions.pr_query(owner, name, refs[start:start + scan_sessions.GRAPHQL_CHUNK])
                for start in range(0, len(refs), scan_sessions.GRAPHQL_CHUNK)]
     read = [(scan_sessions.graphql_repository(repo, query), aliases) for query, aliases in queries]
     if any(repository is None for repository, _ in read):
         return None
-    found = {int(ref): PrState(node.get("state"), node.get("updatedAt"))
+    found = {(ref.number if isinstance(ref, scan_sessions.Item) else int(ref)):
+             PrState(node.get("state"), node.get("updatedAt"), node.get("headRefOid"))
              for repository, aliases in read for alias, ref in aliases.items()
-             if isinstance(ref, int) and isinstance(node := (repository or {}).get(alias), dict)}
+             if isinstance(ref, (int, scan_sessions.Item)) and isinstance(node := (repository or {}).get(alias), dict)}
     missing = [f"#{number}" for number in numbers if number not in found]
     if missing:
         print(f"GitHub has no PR {' '.join(missing)} in {repo}, so its fields are null", file=sys.stderr)
@@ -406,6 +408,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")
     unanswered.add_argument("--asana-status", type=Path, help="OUT_JSON already written by asana99_status.py")
+    unanswered.add_argument("--summary", action="store_true",
+                            help="one line per unanswered key, followed by the settled count")
     args = parser.parse_args(argv)
     log = args.decisions_file.expanduser()
     warnings: list[str] = []
@@ -449,6 +453,11 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
                       json.loads(args.asana_status.expanduser().read_text(encoding="utf-8"))} if args.asana_status else {})
             result = open_handoffs(handed_off(args.handed_off_file.expanduser()), latest(records(log)), read_prs,
                                    ask_answers(inbox_read.answers_path().expanduser()), entries, asana, args.decision)
+            if args.summary:
+                for item in result["unanswered"]:
+                    print(item["decision"])
+                print(f"settled: {len(result['settled'])}")
+                return 0
     except (OSError, ValueError, LookupError) as error:
         print(f"lead decisions: {error}", file=sys.stderr)
         return 1

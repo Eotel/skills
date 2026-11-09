@@ -1,5 +1,8 @@
 # 採用台帳
 
+`scripts/ledger.py list` は、案の ID・状態・優先度・提案の順で、1 件を 1 行に出す。
+`list --json` の最上位は `{"items": [...]}` で、`items` に各案の詳細が入る。
+
 各 Mac の `~/.local/share/adoption-triage/events.jsonl` に追記する。`scripts/ledger.py collect` は SSH で別の Mac の記録を読み、`imports/` に Mac 別の写しを原子的に保存する。元の記録は変更しない。接続先は `~/.config/adoption-triage/hosts.json` の `hosts` 配列（`name`, `ssh_target`, `remote_path`）で指定する。`name` は写しのファイル名に使う固定の識別名で、OS のホスト名と一致させる必要はない。Mac の改名後も同じ `name` を使う。`remote_path` はその Mac の記録の絶対パスとする。
 
 画面を動かす Mac の設定だけに、最上位の `"decision_writer": true` と固定の `"name": "board"` を置き、他の Mac を `hosts` に列挙する。提案元の Mac の設定は `{"trusted_writer":"board","hosts":[]}` とし、逆向きの SSH 接続は使わない。画面側の `collect` は他の Mac の記録を取り込んだ後、統合した記録を SSH で各 Mac の `receive` に送って採用判断を配る。採用後に画面側で `collect` を実行すれば、提案元は判断を読み、`record` で実施結果を追記できる。画面側がもう一度 `collect` すると結果が戻る。`receive` は設定済みの判断元だけを受け入れ、既存行の削除と書き換えを拒否する。Mac 間の新着行で並び順が変わっても、内容が同じ行は保持する。その他の Mac に判断の行があれば、収集を拒否する。

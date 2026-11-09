@@ -515,6 +515,19 @@ class ClassifyTests(unittest.TestCase):
         view = scan.row_view(shown)
         self.assertEqual((view["class"], view["question"]), ("waiting", question))
 
+    def test_question_on_a_forked_live_session_carries_its_actual_asked_time(self) -> None:
+        self.claude_says("/w/report", user("go"), {**assistant(text("Parent reply")),
+                                                  "timestamp": "2026-11-02T01:00:00Z"})
+        child = self.projects / "fork" / "child.jsonl"
+        write_jsonl(child, [user("continue"), {**assistant({"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+            "input": {"questions": [{"question": "どちらにしますか？"}]}}), "timestamp": "2026-11-09T02:00:00Z"}])
+        screen = {"source": "screen", "tail": ["← ☐ 方針 ✔ Submit →", "どちらにしますか？", "❯ 1. 続ける",
+                                                 "  2. 待つ", "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]}
+        [row] = scan.build_inventory([worktree("/w/report")], [terminal("/w/report", "claude", "term_q")],
+                                     self.projects, {}, "要判断", now=NOW,
+                                     live_transcripts={"/w/report": [child]}, screens={(None, "term_q"): screen})
+        self.assertEqual(row["prompt_waiting"]["asked_at"], "2026-11-09T02:00:00Z")
+
     def test_a_running_claude_transcript_outside_the_worktree_is_read(self) -> None:
         sessions = Path(self.tmp.name) / "profile/sessions"
         sessions.mkdir(parents=True)
@@ -1274,6 +1287,29 @@ class ClassifyTests(unittest.TestCase):
         # The tab still shows the earlier turn's failure while a new turn runs.
         self.assertEqual((rows["/w/resumed"]["class"], rows["/w/resumed"]["stop"]), ("working", None))
 
+    def test_codex_stream_disconnect_on_screen_is_a_connection_to_wake(self) -> None:
+        [row] = self.inventory([worktree("/w/cut", "done", agent="codex")],
+                               [terminal("/w/cut", "codex", preview="■ stream disconnected before completion\n")])
+        self.assertEqual(row["class"], "stalled")
+        self.assertEqual((row["stop"]["kind"], row["stop"]["action"]), ("connection", "wake"))
+        self.assertFalse(row["closable"])
+
+    def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
+        self.claude_says("/w/scheduled", user("go"),
+            assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",
+                       "input": {"cron": "30 18 9 11 *", "prompt": "Release status", "recurring": False}}),
+            user([{"type": "tool_result", "tool_use_id": "cron1",
+                   "content": "Scheduled one-shot task abc12345 (30 18 9 11 *). Session-only."}]),
+            assistant(text("Scheduled.")))
+        [row] = self.inventory([worktree("/w/scheduled", "done")], [])
+        self.assertTrue(any("予約が消えた:" in reason and "Release status" in reason for reason in row["reasons"]))
+        self.assertEqual(row["class"], "stalled")
+        path = Path(row["claude"]["transcript"])
+        with path.open("a") as stream:
+            stream.write(json.dumps(user("Release status")) + "\n")
+        [fired] = self.inventory([worktree("/w/scheduled", "done")], [])
+        self.assertFalse(fired.get("lost_schedules"))
+
     def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self) -> None:
         # 2026-10-06 a lead ended its turn while workers ran; their reports sat unread for 20 hours.
         def at(minutes_ago: float) -> str:
@@ -1373,6 +1409,19 @@ class JevTests(unittest.TestCase):
 
 
 class NextStepFactTests(unittest.TestCase):
+    def test_graphql_retries_transient_failures_and_reports_stderr_when_exhausted(self) -> None:
+        success = subprocess.CompletedProcess([], 0, '{"data":{"repository":{"name":"app"}}}', '')
+        for failure in (subprocess.CompletedProcess([], 1, '', 'connection reset'),
+                        subprocess.CompletedProcess([], 1, '<html>bad gateway</html>', 'upstream unavailable'),
+                        OSError('connection refused')):
+            with self.subTest(failure=str(failure)), patch.object(scan.subprocess, "run", side_effect=[failure, success]), \
+                    patch.object(scan.time, "sleep"):
+                self.assertEqual(scan.graphql_repository("acme/app", "query"), {"name": "app"})
+        with patch.object(scan.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, '', 'TLS failed')), \
+                patch.object(scan.time, "sleep"), redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(scan.graphql_repository("acme/app", "query"))
+        self.assertIn("TLS failed", err.getvalue())
+
     def test_a_saved_verdict_is_read_again_once_everything_it_waits_on_closed(self) -> None:
         # servicean-87 stayed blocked on masters#731→#732 and masters-ui#125→#126 after all four merged.
         rows = [{"path": "/w/sp", "repo": "taihei-service-project", "class": "stalled", "linked_pr": None,
@@ -1965,6 +2014,21 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_open_pr_cleanup_summary_provides_one_batch_command_with_nested_and_scratch_options(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "stalled",
+                                      "open_pr_cleanup": True, "pr": {"number": 10}, "terminals": [],
+                                      "claude": None, "codex": [], "reasons": []}]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        command = next(line.strip() for line in out.getvalue().splitlines() if "rm-check-batch" in line)
+        args = shlex.split(command)
+        self.assertIn("--detach-nested", args)
+        self.assertIn("--archive-scratch", args)
+        self.assertIn("--remove-ok", args)
+        self.assertEqual(args[args.index("--from") + 1], str(saved))
+        self.assertIn("/w/app/finished 10", args)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
@@ -1973,6 +2037,8 @@ class ScanCommandTests(unittest.TestCase):
                                                 "TRIAGE_REVIEW_DIR": str(self.dir / "reviews"),
                                                 "TRIAGE_ASK_ANSWERS": str(self.dir / "no-answers.jsonl")}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
+                         patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
+                         patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
                          patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
@@ -2063,7 +2129,8 @@ class ScanCommandTests(unittest.TestCase):
              "comment": "", "claude": None, "codex": [], "terminals": []},
         ], ensure_ascii=False))
 
-        with redirect_stdout(io.StringIO()) as out:
+        with patch.object(scan.time, "time", return_value=datetime(2026, 11, 6, tzinfo=timezone.utc).timestamp()), \
+                redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
 
         self.assertEqual(out.getvalue().splitlines(), [
@@ -2071,6 +2138,40 @@ class ScanCommandTests(unittest.TestCase):
             "dns | term_d | 通信断: 起こす | API Error: Can't reach the API server",
             "mbp16::login | term_g | ログイン切れ: 人が /login する | Login expired · Please run /login",
             "mbp16::two | 不明（term_a, term_b） | 通信断: 起こす | API Error: Connection lost"])
+
+    def test_wake_checks_expired_resets_and_names_tabs_that_need_reopening(self) -> None:
+        saved = self.dir / "scan.json"
+        stop = {"kind": "usage_limit", "action": "wait", "agent": "claude", "error": "usage limit"}
+        saved.write_text(json.dumps([
+            {"path": "/w/old", "class": "stalled", "stop": {**stop, "resets": "Nov 7 at 8pm (Asia/Tokyo)"},
+             "terminals": [{"handle": "term_a", "agent": "claude"}]},
+            {"path": "/w/sleeping", "class": "stalled", "stop": {**stop, "resets": "2026-11-08T20:00:00+09:00"}},
+            {"path": "/w/future", "class": "stalled", "stop": {**stop, "resets": "2026-11-10T20:00:00+09:00"}},
+            {"path": "/w/unknown", "class": "stalled", "stop": {**stop, "resets": "sometime"}},
+        ]))
+        with patch.object(scan.time, "time", return_value=datetime(2026, 11, 9, tzinfo=timezone.utc).timestamp()), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+        lines = out.getvalue().splitlines()
+        self.assertIn("解除済み・起こせる", lines[0])
+        self.assertIn("開き直し", lines[1])
+        self.assertIn("まで待つ", lines[2])
+        self.assertIn("まで待つ", lines[3])
+
+    def test_time_only_reset_stays_on_the_date_implied_by_the_failure(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/limit", "class": "stalled", "claude": {
+            "final_at": "2026-11-08T14:00:00Z", "final_text": "usage limit"},
+            "stop": {"kind": "usage_limit", "action": "wait", "agent": "claude", "error": "usage limit",
+                     "resets": "2am (Asia/Tokyo)"}}]))
+        for moment, expired in (("2026-11-08T14:30:00+00:00", False),
+                                ("2026-11-08T18:00:00+00:00", True),
+                                ("2026-11-09T16:00:00+00:00", True)):
+            with self.subTest(moment=moment), patch.object(scan.time, "time", return_value=datetime.fromisoformat(moment).timestamp()), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+            self.assertEqual("解除済み・起こせる" in out.getvalue(), expired)
+
 
     def test_summary_names_each_missing_hook_file_with_its_host(self) -> None:
         saved, _ = self.saved_scan()
@@ -2100,6 +2201,56 @@ class ScanCommandTests(unittest.TestCase):
             "mbp16::fix-login | working | - | tabs 0 | - | "
             " | reasons - | git.dirty null | git.unpushed null",
         ])
+
+    def test_rows_sort_final_puts_newest_messages_first_and_missing_times_last(self) -> None:
+        saved, _ = self.saved_scan()
+        with redirect_stdout(io.StringIO()) as out:
+            code = scan.main(["--from", str(saved), "--rows", "--sort", "final"])
+        self.assertEqual(code, 0)
+        self.assertEqual([line.split(" | ")[0] for line in out.getvalue().splitlines()],
+                         ["mbp16::app", "dotfiles-73", "fix-login", "mbp16::fix-login"])
+
+    def test_cleanup_excludes_undelivered_destinations_and_rows_with_removal_answers(self) -> None:
+        saved = self.dir / "scan.json"
+        state, decisions = self.dir / "state.json", self.dir / "decisions.jsonl"
+        rows = [{"path": f"/w/{name}", "repo": "app", "class": "finished", "terminals": [], "reasons": [],
+                 "closable": [f"term_{name}"], "meaningful_tabs": [], "claude": None, "codex": []}
+                for name in ("promise", "named", "absolute", "remote", "done", "local")]
+        rows[3]["environment"] = "mbp16"
+        saved.write_text(json.dumps(rows))
+        state.write_text(json.dumps({"handoffs": {
+            "h": {"to": "app/promise", "delivered_at": None, "task": "結果を渡す"},
+            "d": {"to": "app/done", "delivered_at": "2026-11-09T01:00:00Z", "task": "済み"}}}))
+        write_jsonl(decisions, [{"id": str(i), "decision": key, "answer": "結果が出るまで残す",
+                                "decided_at": "2026-11-09T01:00:00Z"}
+                               for i, key in enumerate(("remove:app/named", "remove:/w/absolute",
+                                                        "remove:mbp16::/w/remote", "remove:local::/w/local"))])
+        opts = ["--from", str(saved), "--state-file", str(state), "--decisions-file", str(decisions)]
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main([*opts, "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue().strip(), "/w/done -")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(opts), 0)
+        shown = json.loads(out.getvalue())
+        self.assertNotEqual(shown[0]["class"], "finished")
+        self.assertEqual(shown[0]["closable"], [])
+        self.assertEqual(shown[1]["removal_decision"]["answer"], "結果が出るまで残す")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main([*opts, "--summary"]), 0)
+        self.assertIn("結果が出るまで残す", out.getvalue())
+        self.assertIn("2026-11-09T01:00:00Z", out.getvalue())
+
+    def test_pending_delivery_preserves_a_waiting_verdict_and_its_question(self) -> None:
+        saved, state = self.dir / "scan.json", self.dir / "state.json"
+        saved.write_text(json.dumps([{"path": "/w/promise", "repo": "app", "class": "unsure", "reasons": [],
+            "claude": None, "codex": [], "terminals": [], "closable": ["t"],
+            "verdict": {"class": "waiting", "question": "公開しますか？"}}]))
+        state.write_text(json.dumps({"handoffs": {"h": {"to": "app/promise", "delivered_at": None}}}))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--state-file", str(state),
+                                         "--rows", "--class", "waiting"]), 0)
+        self.assertIn("公開しますか？", out.getvalue())
+        self.assertIn("waiting (scan: unsure)", out.getvalue())
 
     def test_rows_class_filter_uses_the_verdict_and_keeps_dirty_and_unpushed_values(self) -> None:
         saved, _ = self.saved_scan()
@@ -2297,7 +2448,10 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
-                    if row.get("environment"):
+                    if view == "--summary" and row.get("open_pr_cleanup"):
+                        expected = [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
+                                    "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {number or '-'}"]
+                    elif row.get("environment"):
                         expected = [str(scan.RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {number or '-'}"]
                     else:
                         expected = [str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
@@ -2634,6 +2788,7 @@ class CloseTabsRowCommandTests(unittest.TestCase):
 
             with patch.object(close_tabs.subprocess, "run", side_effect=orca), redirect_stdout(io.StringIO()) as out:
                 code = close_tabs.main(["--from", str(saved), "--claude-projects", str(root / "projects"),
+                                        "--state-file", str(root / "no-state.json"),
                                         "--inbox", str(root / "inbox"), "--row", "/w/idle",
                                         "--row", "mbp16::idle", "--row", "app/moved"])
 
@@ -4159,6 +4314,100 @@ class HandoffProposalTests(unittest.TestCase):
 
 
 class HourlyStateTests(unittest.TestCase):
+    def test_stale_asks_does_not_reopen_a_shared_question_already_covered_by_answers(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        message = self.source("q.txt", "公開しますか？")
+        self.call("asked", "--row", "/w/reasked", "--decision", "again", "--asked-at", "2026-11-08T01:00:00Z",
+                  "--final-message-file", message, "--question-file", message, "--covers", "ask:reasked::publish")
+        saved.write_text(json.dumps([{"path": "/w/reasked", "repo": "app", "class": "waiting", "claude": {
+            "final_at": "2026-11-08T01:00:00Z", "final_text": "公開しますか？"}}]))
+        write_jsonl(self.root / "decisions.jsonl", [{"id": "a", "decision": "ask:reasked::publish",
+            "answer": "公開する", "decided_at": "2026-11-09T01:00:00Z"}])
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        self.assertEqual(result[0]["state"], "settled")
+
+    def test_stale_asks_keeps_reasked_and_in_progress_questions_and_uses_prompt_time(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        message = self.source("q.txt", "公開しますか？")
+        self.call("asked", "--row", "/w/reasked", "--decision", "again", "--asked-at", "2026-11-09T01:00:00Z",
+                  "--final-message-file", message, "--question-file", message)
+        rows: list[dict] = [{"path": f"/w/{name}", "repo": "app", "class": "waiting", "claude": {
+                    "final_at": "2026-11-02T01:00:00Z", "final_text": "公開しますか？"}}
+                for name in ("reasked", "progress", "prompt")]
+        rows[1]["verdict"] = {"class": "in_progress"}
+        rows[1]["claude"]["pending_questions"] = [{"questions": [{"question": "公開しますか？"}]}]
+        rows[2]["prompt_waiting"] = {"tab": "t", "question": "公開しますか？", "choices": ["1. はい"],
+                                      "asked_at": "2026-11-09T02:00:00Z"}
+        saved.write_text(json.dumps(rows))
+        write_jsonl(self.root / "decisions.jsonl", [{"id": name, "decision": f"ask:{name}::old",
+                    "answer": "旧問への回答", "decided_at": "2026-11-03T01:00:00Z"}
+                    for name in ("reasked", "progress")])
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        by_name = {item["name"]: item for item in result}
+        self.assertEqual(by_name["reasked"]["state"], "unanswered")
+        self.assertEqual(by_name["progress"]["state"], "unanswered")
+        self.assertEqual(by_name["prompt"]["since"], "2026-11-09T02:00:00Z")
+
+    def test_in_progress_without_a_question_is_not_an_unanswered_user_question(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        saved.write_text(json.dumps([{"path": "/w/continuing", "repo": "app", "class": "stalled",
+            "verdict": {"class": "in_progress", "next_step": "Continue implementation"},
+            "claude": {"final_at": "2026-11-09T01:00:00Z", "final_text": "I will continue implementation."}}]))
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        self.assertEqual(result, [])
+
+    def test_stale_asks_reports_pr_state_head_and_update_for_an_unasked_row(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        saved.write_text(json.dumps([{"path": "/w/review", "repo": "app", "class": "waiting",
+                                      "git": {"github": "acme/app"}, "pr": {"number": 10},
+                                      "claude": {"final_at": "2026-11-09T01:00:00Z", "final_text": "Merge #10?"}}]))
+        nodes = {"pr_10": {"state": "OPEN", "updatedAt": "2026-11-09T02:00:00Z", "headRefOid": "new-head"}}
+        with patch.object(scan, "graphql_repository", return_value=nodes) as api:
+            code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        self.assertEqual(result[0]["pr"], {"state": "OPEN", "head": "new-head", "updatedAt": "2026-11-09T02:00:00Z"})
+        self.assertEqual(len(api.call_args_list), 1)
+
+    def test_pending_batches_question_pr_facts_and_reports_current_heads(self) -> None:
+        lane = self.root / "lane"
+        subprocess.run(["git", "init", "-q", str(lane)], check=True)
+        subprocess.run(["git", "-C", str(lane), "remote", "add", "origin", "git@github.com:acme/app.git"], check=True)
+        message = self.source("q.txt", "Merge #10 and #11?")
+        with patch.object(scan, "graphql_repository", return_value={}):
+            _, first = self.call("asked", "--row", str(lane), "--decision", "merge",
+                                 "--final-message-file", message, "--question-file", message)
+        message2 = self.source("q2.txt", "Merge #12?")
+        with patch.object(scan, "graphql_repository", return_value={}):
+            self.call("asked", "--row", str(lane), "--decision", "merge2",
+                      "--final-message-file", message2, "--question-file", message2)
+        nodes = {f"item_{number}": {"state": "OPEN", "updatedAt": "2026-11-09T01:00:00Z", "headRefOid": f"head{number}"}
+                 for number in (10, 11, 12)}
+        with patch.object(scan, "graphql_repository", return_value=nodes) as api:
+            code, result = self.call("pending")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(api.call_args_list), 1)
+        item = next(item for item in result["questions"] if item["id"] == first["id"])
+        self.assertEqual([(pr["number"], pr["state"], pr["head"]) for pr in item["prs"]],
+                         [(10, "OPEN", "head10"), (11, "OPEN", "head11")])
+
+    def test_stale_asks_includes_a_lost_one_shot_schedule(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        saved.write_text(json.dumps([{"path": "/w/scheduled", "class": "stalled", "repo": "app",
+                                      "claude": {"final_at": "2026-11-09T01:00:00Z", "final_text": "Scheduled."},
+                                      "lost_schedules": [{"id": "abc", "cron": "30 18 9 11 *", "prompt": "Release status"}]}]))
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        self.assertEqual(result[0]["state"], "lost_schedule")
+        self.assertIn("Release status", result[0]["question"])
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -4180,6 +4429,8 @@ class HourlyStateTests(unittest.TestCase):
                 self.addCleanup(isolated.stop)
         environment = patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
                                               "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl"),
+                                              "TRIAGE_ASK_CLAIMS": str(self.root / "claims.jsonl"),
+                                              "ORCA_CLI_COMMAND": "missing-orca-for-offline-tests",
                                               "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
                                               "ORCA_WORKTREE_ID": "repo::/w/triage",
                                               "ORCA_WORKTREE_PATH": "/w/triage",
@@ -4810,7 +5061,7 @@ class HourlyStateTests(unittest.TestCase):
         with patch.object(hourly_state.scan_sessions.subprocess, "run", side_effect=github):
             _, stale = self.call("stale-asks", "--from", str(scan_json))
         self.assertEqual(stale[0]["state"], "stopped_after_answer")
-        self.assertEqual(stale[0]["pr"], {"state": "MERGED", "updatedAt": "2026-10-28T03:00:00Z"})
+        self.assertEqual(stale[0]["pr"], {"state": "MERGED", "head": "aaa", "updatedAt": "2026-10-28T03:00:00Z"})
         self.assertEqual(stale[0]["answer_age_minutes"], stale[0]["age_minutes"])
         self.assertEqual(len(github.graphql()), 1)
         rows = json.loads(scan_json.read_text())
@@ -4844,7 +5095,8 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(stale[0]["state"], "unanswered")
         self.assertEqual([item["text"] for item in stale[0]["candidates"]], ["公開日は明日にしましょう"])
         _, explicit = self.call("stale-asks", "--from", str(scan_json), "--asked-in", str(lead))
-        self.assertEqual(explicit, stale)
+        self.assertEqual([{**item, "age_minutes": 0} for item in explicit],
+                         [{**item, "age_minutes": 0} for item in stale])
         _, elsewhere = self.call("stale-asks", "--from", str(scan_json), "--asked-in", str(self.root / "elsewhere"))
         self.assertEqual(elsewhere[0]["candidates"], [])
 
@@ -5074,7 +5326,8 @@ class PrecheckTests(unittest.TestCase):
 
 class HourlyTabCleanupTests(unittest.TestCase):
     def test_detached_scheduled_tabs_match_recorded_panes_and_transcripts(self) -> None:
-        for run_pane in ("old:leaf", None):
+        for run_pane, run_status in (("old:leaf", "completed"), (None, "completed"),
+                                     ("old:leaf", "dispatch_failed"), (None, "dispatch_failed")):
             for final in ("作業を終えました。", "どちらの案にしますか？"):
                 with self.subTest(run_pane=run_pane, final=final), tempfile.TemporaryDirectory() as root:
                     home = Path(root)
@@ -5084,7 +5337,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
                         {**assistant(text(final)), "timestamp": "2026-10-26T09:02:00Z"}])
                     runs = [{"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current:leaf",
                              "workspaceId": "repo::/w/triage", "startedAt": 1793008800000},
-                            {"status": "completed", "trigger": "scheduled", "terminalPaneKey": run_pane,
+                            {"status": run_status, "trigger": "scheduled", "terminalPaneKey": run_pane,
                              "workspaceId": "repo::/w/triage", "startedAt": 1793005200000}]
                     terms = [{"worktreeId": "repo::/w/triage", "tabId": "current", "leafId": "leaf",
                               "handle": "current-handle", "connected": True},
@@ -5129,9 +5382,9 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     self.assertEqual(closed, [
                         ["test-orca", "terminal", "close", "--terminal", "old-handle", "--json"]])
                     lines = out.getvalue().splitlines()
-                    carried = ["carry: old-handle: どちらの案にしますか？"] if "？" in final else []
+                    carried = ["carry: old-handle: 2026-10-26T09:02:00Z [前日以前]: どちらの案にしますか？"] if "？" in final else []
                     self.assertEqual(lines[:len(carried)], carried)
-                    self.assertIn("closed: old-handle: completed scheduled run", lines[len(carried)])
+                    self.assertIn(f"closed: old-handle: {run_status} scheduled run", lines[len(carried)])
                     self.assertIn("other-handle: no unique scheduled run and transcript", lines[-1])
                     self.assertEqual(len(lines), len(carried) + 2)
 
@@ -5358,6 +5611,47 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        external = patch.dict(os.environ, {"ORCA_CLI_COMMAND": "missing-orca-for-offline-tests"})
+        external.start()
+        self.addCleanup(external.stop)
+
+    def test_open_asks_distinguishes_an_old_claim_from_a_question_still_on_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            inbox, claims = base / "inbox.jsonl", base / "claims.jsonl"
+            write_jsonl(inbox, [{"id": "abcd1234", "kind": "ask", "ts": "2026-11-01T01:00:00Z",
+                                 "worktree": "lane", "text": "公開しますか？"}])
+            write_jsonl(claims, [{"id": "abcd1234", "by": "old-lead", "ts": "2026-11-01T02:00:00Z"}])
+
+            def orca(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                result = ({"worktrees": [{"worktreeId": "repo::/w/old-lead", "path": "/w/old-lead",
+                                          "agents": [{"state": "done", "stateStartedAt": 1793498400000}]}]}
+                          if args[1:3] == ["worktree", "ps"] else {"terminals": []})
+                return subprocess.CompletedProcess(args, 0, json.dumps({"ok": True, "result": result}))
+
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_CLAIMS": str(claims),
+                                          "TRIAGE_ASK_ANSWERS": str(base / "answers.jsonl")}), \
+                    patch.object(inbox_read.subprocess, "run", side_effect=orca):
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["open-asks", "--json", "--orca", "test-orca",
+                                                       "--claude-projects", str(base / "projects")]), 0)
+                claim = json.loads(out.getvalue())[0]["claimed"]
+                self.assertGreater(claim["inactive_minutes"], 15)
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["open-asks", "--orca", "test-orca",
+                                                       "--claude-projects", str(base / "projects")]), 0)
+                self.assertIn("伺っていない（claim のみ、", out.getvalue())
+                self.assertNotIn("伺い中", out.getvalue())
+                saved = base / "scan.json"
+                saved.write_text(json.dumps([{"path": "/w/lane", "repo": "app", "class": "waiting",
+                    "claude": {"final_at": "2026-11-01T01:00:00Z", "final_text": "公開しますか？"}}]))
+                with redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(hourly_state.main(["--state-file", str(base / "state.json"), "stale-asks",
+                        "--from", str(saved), "--orca", "test-orca", "--claude-projects", str(base / "projects"),
+                        "--decisions-file", str(base / "decisions.jsonl")]), 0)
+                self.assertGreater(json.loads(out.getvalue())[0]["ask"]["claimed"]["inactive_minutes"], 15)
+
     def test_a_filtered_read_gives_no_offset_to_acknowledge(self) -> None:
         # A filtered watch acknowledged the asks it hid (HOSYU_TEST-329 and 325, 2026-10-27 to 28).
         with tempfile.TemporaryDirectory() as root:

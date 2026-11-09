@@ -13,7 +13,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from itertools import dropwhile, takewhile
 import hashlib
@@ -31,6 +31,7 @@ import time
 from typing import Any, NamedTuple, NotRequired, TypedDict
 import urllib.request
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hourly_runtime
 import inbox_read
@@ -51,6 +52,8 @@ CLAUDE_DIR_LIMIT = 200
 # running program, so they never count.
 BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
 Screens = dict[tuple[str | None, str], dict]
+HOURLY_STATE = Path("~/.cache/orca-session-triage/hourly-state.json")
+LEAD_DECISIONS = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
 
 
 class PromptWaiting(TypedDict):
@@ -58,6 +61,7 @@ class PromptWaiting(TypedDict):
     question: str
     choices: list[str]
     target: NotRequired[str]  # what a permission prompt asks about (prompt_target)
+    asked_at: NotRequired[str]
 
 
 class DoneCard(TypedDict):
@@ -295,6 +299,35 @@ def last_entry_at(path: Path) -> datetime | None:
     return max(times, default=None)
 
 
+def one_shot_schedules(rows: list[dict]) -> list[dict]:
+    """Replay confirmed CronCreate/CronDelete results and prompts already delivered in this conversation."""
+    calls: dict[str, dict] = {}
+    jobs: dict[str, dict] = {}
+    for entry in rows:
+        if entry.get("type") == "user" and (spoken := user_text(entry)):
+            jobs = {key: job for key, job in jobs.items() if job["prompt"] not in spoken}
+        content = message_of(entry).get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in ("CronCreate", "CronDelete"):
+                calls[block["id"]] = block
+            elif block.get("type") == "tool_result" and not block.get("is_error"):
+                call = calls.pop(block.get("tool_use_id"), None)
+                if not call:
+                    continue
+                given = call.get("input") or {}
+                if call["name"] == "CronDelete":
+                    jobs.pop(given.get("id"), None)
+                elif given.get("recurring") is False and given.get("prompt"):
+                    result = block.get("content")
+                    raw = result if isinstance(result, str) else json.dumps(result)
+                    if match := re.search(r"Scheduled one-shot (?:task|job) ([\w-]+)", raw):
+                        jobs[match[1]] = {"id": match[1], "cron": given.get("cron") or "時刻不明",
+                                          "prompt": given["prompt"]}
+    return list(jobs.values())
+
+
 def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
     """Summarize the newest Claude transcript for a worktree, or None when there is none.
 
@@ -312,6 +345,7 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None
+    question_times: dict[str, str] = {}
     for entry in rows[last + 1:]:
         content = message_of(entry).get("content")
         if not isinstance(content, list):
@@ -327,6 +361,8 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
                 api_error_kind = entry.get("error") if api_error else None
             elif kind == "tool_use" and block.get("name") == "AskUserQuestion":
                 asked[block.get("id")] = block.get("input")
+                if entry.get("timestamp"):
+                    question_times[block.get("id")] = entry["timestamp"]
             elif kind == "tool_result":
                 answered.add(block.get("tool_use_id"))
     return {
@@ -336,8 +372,10 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
         "final_text": texts[-1] if texts else None,
         "final_at": final_at,
         "pending_questions": [q for i, q in asked.items() if i not in answered],
+        "pending_question_at": max((at for key, at in question_times.items() if key not in answered), default=None),
         "api_error": api_error,
         "api_error_kind": api_error_kind,
+        "one_shot_schedules": one_shot_schedules(rows),
     }
 
 
@@ -347,7 +385,7 @@ def message_text(payload: dict) -> str:
 
 API_FAILURE = re.compile(
     r"(?:Selected model is at capacity|API Error:|rate limit(?:ed| exceeded)?|usage limit|"
-    r"request failed|connection error|stream error|server error)", re.IGNORECASE)
+    r"request failed|connection error|stream error|stream disconnected before completion|server error)", re.IGNORECASE)
 
 
 def api_failure(text: str | None) -> str | None:
@@ -549,7 +587,7 @@ def cut_off(row: dict) -> str | None:
 
 # The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
 API_ENDED = re.compile(r"(?:API Error:|You['’]ve hit your [\w ]+ limit|Login expired|Not logged in|Please run /login|"
-                       r"Failed to authenticate)")
+                       r"Failed to authenticate|(?:■\s*)?stream disconnected before completion)")
 USAGE_LIMIT = re.compile(r"hit your [\w ]+ limit|usage limit", re.IGNORECASE)
 LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in|Failed to authenticate", re.IGNORECASE)
 # Without Claude Code's tag (Codex, Orca's copy), the text names an error a retry repeats: a safeguard flag, or a
@@ -1342,6 +1380,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         }
         row["queued_input"] = (queued_input(Path(row["claude"]["transcript"]),
                                             datetime.fromtimestamp(now, timezone.utc)) if row["claude"] else [])
+        if row["prompt_waiting"] and "target" not in row["prompt_waiting"] and row["claude"]:
+            if asked_at := row["claude"].get("pending_question_at"):
+                row["prompt_waiting"]["asked_at"] = asked_at
         if remote:
             spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
             if spoken:
@@ -1365,6 +1406,13 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         row["reasons"] = [*row["reasons"], *dict.fromkeys(
             f"hook error on {error['host']}: {error['path']}: No such file or directory" for error in row["hook_errors"])]
         row["reasons"].extend(lost_background_waits(w.get("agents") or [], terms, screens, w.get("_environment")))
+        row["lost_schedules"] = ((row.get("claude") or {}).get("one_shot_schedules") or []
+                                 if not (live_transcripts or {}).get(w["path"])
+                                 and not any(term.get("agentIdentity") == "claude" for term in terms) else [])
+        if row["lost_schedules"]:
+            row["reasons"].extend(f"予約が消えた: {job['cron']} {job['prompt'][:100]}" for job in row["lost_schedules"])
+            if row["class"] in ("finished", "unstarted", "unsure"):
+                row["class"] = "stalled"
         row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
         row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
@@ -1526,7 +1574,7 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
         if isinstance(ref, Item):
             alias = f"item_{ref.number}"
             fields.append(f"{alias}: issueOrPullRequest(number: {ref.number}) "
-                          "{ ... on Issue { state } ... on PullRequest { state } }")
+                          "{ ... on Issue { state updatedAt } ... on PullRequest { state updatedAt headRefOid } }")
         elif isinstance(ref, int):
             alias = f"pr_{ref}"
             fields.append(f"{alias}: pullRequest(number: {ref}) {{ ...PrFacts }}")
@@ -1549,15 +1597,23 @@ def graphql_repository(slug: str, query: str) -> dict | None:
     and gh exits 1 while the other aliases still hold data, so stdout is read
     whatever the exit code.
     """
-    try:
-        out = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query],
-                             capture_output=True, text=True, timeout=GH_TIMEOUT)
-        repository = (json.loads(out.stdout).get("data") or {}).get("repository")
-        failure = out.stderr.strip() or out.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as error:
-        repository, failure = None, repr(error)
-    if isinstance(repository, dict):
-        return repository
+    for attempt in range(3):
+        out = None
+        try:
+            out = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query],
+                                 capture_output=True, text=True, timeout=GH_TIMEOUT)
+            repository = (json.loads(out.stdout).get("data") or {}).get("repository")
+            failure = out.stderr.strip() or out.stdout.strip()
+            if isinstance(repository, dict):
+                return repository
+            # A structured API rejection is not an empty or broken transport response.
+            break
+        except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as error:
+            failure = ((out.stderr.strip() or out.stdout.strip()) if out else "") or repr(error)
+            if out and re.search(r"GraphQL:|HTTP 4\d\d|Bad credentials|gh auth login", failure):
+                break
+        if attempt < 2:
+            time.sleep(attempt + 1)
     print(f"GitHub query for {slug} failed, so its rows have no PR facts: {failure}", file=sys.stderr)
     return None
 
@@ -2045,6 +2101,45 @@ def row_identity(row: dict) -> str:
     return f"{row['environment']}::{row['path']}" if row.get("environment") else row["path"]
 
 
+def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
+    """Undelivered promises addressed to this row, read again before closing its tabs."""
+    if not state_file.exists():
+        return []
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    names = {row_identity(row), row_name(row), row["path"],
+             f"{row.get('repo')}/{Path(row['path']).name}"}
+    if not row.get("environment"):
+        names.add(Path(row["path"]).name)
+    return [item for item in data.get("handoffs", {}).values()
+            if item.get("delivered_at") is None and item.get("to") in names]
+
+
+def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path) -> list[dict]:
+    import lead_decisions
+    decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    for row in rows:
+        promises = pending_handoffs(row, state_file)
+        if promises:
+            row.update(pending_handoffs=promises, closable=[], open_pr_cleanup=False)
+            row["reasons"] = [*row.get("reasons", []), "未配信の約束の送り先: " +
+                              "; ".join(item.get("task") or item.get("condition") or "" for item in promises)]
+            if row.get("class") == "finished":
+                row["class"] = "stalled"
+            if (row.get("verdict") or {}).get("class") == "finished":
+                row.pop("verdict", None)
+        keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}",
+                f"remove:{row['path']}", f"remove:{row_identity(row)}"}
+        if not row.get("environment"):
+            keys.add(f"remove:local::{row['path']}")
+        answered = [decisions[key] for key in keys if key in decisions]
+        if answered:
+            answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or
+                         datetime.min.replace(tzinfo=timezone.utc))
+            row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
+                                       "decided_at": answer.decided_at}
+    return rows
+
+
 def current_verdict(row: dict, verdicts: dict[str, dict]) -> dict | None:
     """The stored verdict for what the row shows now, or None once everything it waits on closed."""
     if row.get("waits_closed"):
@@ -2417,6 +2512,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "next_step, or the final message's start | reasons | git.dirty | git.unpushed")
     parser.add_argument("--class", dest="classes", action="append", metavar="CLASS",
                         help="only --rows of this class (the verdict's, else the scan's); repeatable")
+    parser.add_argument("--sort", choices=("final",), help="with --rows, newest final message first; missing times last")
     views.add_argument("--cards", action="store_true",
                        help="print one line per done card (handle, agent, interrupted, first 60 draft characters, "
                             "whether its screen composer is empty, Orca's last message, and screen end), closable tab, and "
@@ -2452,6 +2548,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pr-cache", default=PR_ACTIVITY_DIR,
                         help="where each PR's reviews and comments are kept between runs, one file per PR; "
                              "they are read again only when the PR's updatedAt moves (default: %(default)s)")
+    parser.add_argument("--state-file", type=Path, default=HOURLY_STATE,
+                        help="shared hourly state; undelivered destinations stay open")
+    parser.add_argument("--decisions-file", type=Path, default=LEAD_DECISIONS,
+                        help="lead answers; rows with remove answers are left out of automatic removal")
     args = parser.parse_args(argv)
     if args.from_file and args.review_out:
         parser.error("--review-out needs a live scan; drop --from")
@@ -2488,12 +2588,17 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        print("    " + rm_check_command(row, scan_file))
+        if not row.get("removal_decision"):
+            print("    " + rm_check_command(row, scan_file))
     open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
-        print("    " + rm_check_command(row, scan_file))
+        if not row.get("removal_decision"):
+            print("    " + rm_check_command(row, scan_file, remove_ok=True))
+    for row in rows:
+        if answer := row.get("removal_decision"):
+            print(f"removal decision: {row_name(row)} {answer['decided_at']} {answer['answer']}")
     hooks = [(row, error) for row in rows for error in row.get("hook_errors") or []]
     print(f"hook errors: {len(hooks)}")
     for row, error in hooks:
@@ -2684,10 +2789,14 @@ def pr_number(row: dict) -> int | None:
     return (row.get("pr") or {}).get("number") or (row.get("linked_pr") or {}).get("number")
 
 
-def rm_check_command(row: dict, scan_file: Path | None = None) -> str:
+def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
     """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it.
     Another Mac's row is checked on that Mac through rm-check-batch --host."""
     pr = pr_number(row)
+    if row.get("open_pr_cleanup") and remove_ok:
+        return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
+                           *(["--from", str(scan_file)] if scan_file else []),
+                           "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {pr or '-'}"])
     if row.get("environment"):
         return shlex.join([str(RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {pr or '-'}"])
     return shlex.join([str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
@@ -2762,7 +2871,9 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as error:
                 print(error, file=sys.stderr)
                 return 1
-        return print_rows(args, with_verdicts(rows, verdicts), verdicts)
+        rows = with_cleanup_constraints(with_verdicts(rows, verdicts), args.state_file.expanduser(),
+                                        args.decisions_file.expanduser())
+        return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
@@ -2804,12 +2915,39 @@ def main(argv: list[str] | None = None) -> int:
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
     rows = with_verdicts(rows, verdicts)
+    rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser())
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)
 
 
 WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する", "other": "その他: 人が読む"}
+
+
+def reset_time(value: str | None, now: datetime, failed_at: datetime | None) -> datetime | None:
+    """Read an absolute reset timestamp or the dated/time-only notice shown by the CLI."""
+    if value and (parsed := parse_time(value)):
+        return parsed
+    match = re.fullmatch(r"(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{1,2}) at )?"
+                         r"(\d{1,2})(?::(\d{2}))?(am|pm) \(([^)]+)\)", value or "", re.IGNORECASE)
+    if not match:
+        return None
+    month, day, hour, minute, period, zone = match.groups()
+    if not month and failed_at is None:
+        return None
+    try:
+        local = (failed_at or now).astimezone(ZoneInfo(zone))
+        hour_number = int(hour)
+        if not 1 <= hour_number <= 12:
+            return None
+        months: Sequence[str] = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+        month_number = next(number for number, label in enumerate(months, 1) if label == month.lower()) if month else local.month
+        reset = local.replace(month=month_number, day=int(day) if day else local.day,
+                              hour=hour_number % 12 + (12 if period.lower() == "pm" else 0),
+                              minute=int(minute or 0), second=0, microsecond=0)
+        return reset + timedelta(days=1) if not month and reset < local else reset
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
 
 
 def wake_line(row: dict, stop: StopReason) -> str:
@@ -2820,6 +2958,11 @@ def wake_line(row: dict, stop: StopReason) -> str:
     tab = tabs[0] if len(tabs) == 1 else f"不明（{', '.join(tabs)}）" if tabs else None
     action = (f"利用上限: {stop['resets'] or '戻る時刻は不明'} まで待つ" if stop["kind"] == "usage_limit"
               else WAKE_ACTIONS[stop["kind"]])
+    if stop["kind"] == "usage_limit":
+        now = datetime.fromtimestamp(time.time(), timezone.utc)
+        resets = reset_time(stop["resets"], now, parse_time(row_final_at(row)))
+        if resets and resets <= now:
+            action = "利用上限: 解除済み・起こせる" + ("（タブの開き直しが必要）" if not tabs else "")
     error = " ".join(stop["error"].split())
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 
@@ -2828,6 +2971,9 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
     if args.row:
         return print_row(rows, args.row, args.transcripts)
     if args.rows:
+        if args.sort == "final":
+            rows = sorted(rows, key=lambda row: parse_time(row_final_at(row)) or
+                          datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         for row in rows:
             if not args.classes or ((row.get("verdict") or {}).get("class") or row["class"]) in args.classes:
                 print(row_line(row_view(row)))
@@ -2835,6 +2981,9 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         remote = 0
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
+            if answer := row.get("removal_decision"):
+                print(f"{row_name(row)}: {answer['decided_at']} {answer['answer']}", file=sys.stderr)
+                continue
             if row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
                 if row.get("environment"):
                     remote += 1

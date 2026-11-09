@@ -89,7 +89,8 @@ worktree> --asked-in <the triage workspace>`; without `--asked-in` it reads the
 worktree `appoint-lead` recorded. It leaves out the calling tab's own row and a
 left row whose final message is unchanged. It reads shared state and sets each
 eligible `waiting` row (the verdict's class, else the scan's), each row blocked on Miura,
-and each row named by an unanswered handed-off ask key against its lane's inbox
+each `in_progress` row with a recorded question, each row with a shared unanswered
+question, and each row named by an unanswered handed-off ask key against its lane's inbox
 reports and the answers `scripts/answer_evidence.py` finds (the lead's latest
 decision per key, AskUserQuestion answers and ordinary user messages in those
 worktrees' transcripts, and `send --decision`), and prints them longest waiting first with `since` and
@@ -101,14 +102,20 @@ question, is listed in `candidates` for you to check. Each item also carries
 the row PR's completed independent review (`review`: head, verdict, path,
 `head_matches`, `changes_requested`, as `scan_sessions.py --row` gives it) and
 whether its question asks about a merge (`merge_question`); `--summary` prints
-both on the item's line.
+both on the item's line. Every entry also carries `pr` (`state`, `head`,
+`updatedAt`), read in one batch per repository. A screen question's `asked_at`,
+from the live session's transcript including a fork, takes priority over the
+parent's last message when reporting its waiting time.
 
 - `unanswered`: an ask of the lane that is open, or was sent in its last turn,
   has no proof, or its handed-off key is still unanswered. `ask.marked: true`
   means it was marked answered anyway and
   left `open-asks`: check `candidates`, then ask it again or record the answer.
   `ask.claimed` (`by`, `at`) means another tab claimed it and is asking the
-  user now (`inbox_read.py claim`); `--summary` adds 伺い中. Do not ask it again.
+  user now (`inbox_read.py claim`); `--summary` adds 伺い中. If lead-state shows
+  no unanswered AskUserQuestion and its turn ended over fifteen minutes ago,
+  `inactive_minutes` and 「伺っていない（claim のみ、N 分）」 identify the old
+  claim. Check that state before `claim --take-over`.
 - `stopped_after_answer`: an answer came after the lane's last message and the
   lane has not spoken since. Relay `answer` (the newest) to the lane.
 - `settled`: no ask of the lane is open, and a lead decision key naming the
@@ -126,6 +133,10 @@ both on the item's line.
   the questions with their choices, `since` and `closed_at` when it was asked
   and closed. Ask it again, or record why it no longer stands.
 
+An unfulfilled one-shot CronCreate whose session no longer runs appears as
+`lost_schedule`, with its schedule and prompt opening. A plain `in_progress`
+verdict without a question is work to resume, not a user question.
+
 `show` retains full final messages, asked times, answers, handoff terms, and
 requests with their owners and closure evidence. `pending` lists what is
 still open (unanswered questions, undelivered handoffs, open requests, and left
@@ -134,7 +145,9 @@ each as a list entry carrying its `id` (`row` for a left row); read the
 open items with it rather than walking `show`'s dictionaries by hand, and
 `get --id ID` for one entry. A question is settled when it was withdrawn, every
 `--covers` key has a lead answer after it was asked, or every `#number` in it is
-CLOSED; an unanswered one lists the answers to the same question found in the
+CLOSED; each unanswered question's `prs` lists the same `#numbers` with their
+current state, head, and update time, read in one batch per repository. An
+unanswered one lists the answers to the same question found in the
 recorded worktrees' transcripts as `unrecorded_answers`. `pending --summary` and
 `stale-asks --summary` print one line per item: name, state, since,
 age_minutes, the ask id (or the entry's id), and the question's start. It

@@ -82,6 +82,17 @@ class LeadDecisionsTests(unittest.TestCase):
                          [("merge:Eotel/skills#80", "merge する")])
         self.assertEqual(self.log.read_text(encoding="utf-8").splitlines()[0], first_line)
 
+    def test_summary_lists_open_keys_without_dumping_settled_answers(self) -> None:
+        self.record("remove:/w/done", "回答の長い本文" * 100)
+        result = self.run_tool("unanswered", "--decision", "remove:/w/done",
+                               "--decision", "ask:/w/waiting", "--summary")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ask:/w/waiting", result.stdout)
+        self.assertIn("settled: 1", result.stdout)
+        self.assertNotIn("回答の長い本文", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 2)
+
     def test_show_history_prints_the_answers_a_later_record_replaced_with_their_times(self) -> None:
         # 2026-11-06: show --match montly printed only 「中継済み」, hiding the answer recorded before it.
         self.run_tool("record-many", stdin="".join(json.dumps(line, ensure_ascii=False) + "\n" for line in [

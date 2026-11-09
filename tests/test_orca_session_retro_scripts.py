@@ -220,6 +220,23 @@ class RetroTests(unittest.TestCase):
                          ledger.list()[0]["decisions"][-1]["id"])
         self.assertEqual(data["sessions"][self.sid]["status"], "done")
 
+    def test_status_pending_identifies_each_undecided_proposal_and_its_wait(self) -> None:
+        events, imports = self.home / "events.jsonl", self.home / "imports"
+        ledger = retro.LedgerClient(script=ROOT / "adoption-triage/scripts/ledger.py", events=events, imports=imports)
+        proposal_id = str(uuid.uuid4())
+        ledger.propose({"proposal_id": proposal_id, "source": {"session": self.sid, "worktree": str(self.root)},
+                        "fact": "The output lacks details.", "proposal": "Show pending proposals.",
+                        "reason": "The user needs to identify the waiting item.", "recommendation": "adopt",
+                        "priority": "normal", "evidence": []})
+        with redirect_stdout(io.StringIO()) as out:
+            code = retro.main(["status", "--pending", "--state", str(self.state), "--events", str(events),
+                               "--imports", str(imports), "--ledger-script", str(ledger.script)])
+        self.assertEqual(code, 0)
+        [item] = json.loads(out.getvalue())["pending_proposals"]
+        self.assertEqual((item["id"], item["title"]), (proposal_id, "Show pending proposals."))
+        self.assertGreaterEqual(item["age_minutes"], 0)
+        self.assertLess(item["age_minutes"], 1)
+
     def test_real_adoption_ledger_records_support_application_and_reversal(self) -> None:
         config = self.home / "hosts.json"
         config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))

@@ -295,20 +295,26 @@ def blocked_by_user(row: dict) -> bool:
         r"三浦|miura", str(verdict.get("waits_on") or row.get("waits_on") or ""), re.IGNORECASE))
 
 
-def blocked_prs(rows: list[dict]) -> dict[str, dict]:
+def row_prs(rows: list[dict]) -> dict[str, dict]:
     wanted = [(scan_sessions.row_identity(row), scan_sessions.github_of(row),
                (row.get("pr") or row.get("linked_pr") or {}).get("number"))
-              for row in rows if blocked_by_user(row)]
+              for row in rows]
     repos = {repo: list(dict.fromkeys(number for _, slug, number in wanted if slug == repo and number))
              for _, repo, _ in wanted if repo}
     states = {repo: lead_decisions.github_pr_states(repo, numbers) for repo, numbers in repos.items() if numbers}
-    return {identity: {"state": found.state, "updatedAt": found.updated_at}
+    return {identity: {"state": found.state, "head": found.head, "updatedAt": found.updated_at}
             for identity, repo, number in wanted if (found := (states.get(repo) or {}).get(number))}
+
+
+def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision]) -> list[lead_decisions.Decision]:
+    asked_at = scan_sessions.parse_time(question.get("asked_at"))
+    return [decisions[key] for key in question.get("covers") or [] if key in decisions
+            and asked_at and (at := scan_sessions.parse_time(decisions[key].decided_at)) is not None and at > asked_at]
 
 
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
-               handed: list[lead_decisions.HandOff], prs: dict[str, dict],
+               handed: list[lead_decisions.HandOff],
                claimed: dict[str, inbox_read.Claim] | None = None,
                decided: dict[str, list[lead_decisions.Decision]] | None = None,
                rejected: list[dict] | None = None) -> list[dict]:
@@ -334,6 +340,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     found: list[tuple[datetime, dict[str, Any]]] = []
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
     shared = answer_evidence.shared_questions(entries)
+    latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
     for row in rows:
         identity = scan_sessions.row_identity(row)
         own_handle = os.environ.get("ORCA_TERMINAL_HANDLE")
@@ -347,18 +354,32 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         began = (scan_sessions.parse_time((row.get("claude") or {}).get("last_user_at"))
                  if final["source"] == "claude" else None) or said_at
         name = Path(row["path"]).name
+        for job in row.get("lost_schedules") or []:
+            since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
+            found.append((since, {"row": identity, "name": scan_sessions.row_name(row),
+                                   "state": "lost_schedule", "since": since.isoformat(),
+                                   "question": f"予約が消えた: {job['cron']} {job['prompt'][:100]}",
+                                   "schedule": job, "ask": None, "answer": None}))
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
         keys = {item["id"]: [handoff.decision for handoff in handed if (key := answer_evidence.key_ask_id(handoff.decision))
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
                 for _, item in lane if item.get("kind") == "ask" and item.get("id")}
-        if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
-                and not blocked_by_user(row) and not any(keys.values())):
-            continue
+        shared_pending = [dict(id=key, **item) for key, item in state.get("questions", {}).items()
+                          if item.get("row") == identity and item.get("answer") is None and not item.get("withdrawn_at")
+                          and not (item.get("covers") and
+                                   len(covering_answers(item, latest_decisions)) == len(item["covers"]))]
+        in_progress = (row.get("verdict") or {}).get("class") == "in_progress"
+        progress_question = in_progress and bool(row.get("prompt_waiting") or
+                                                  (row.get("claude") or {}).get("pending_questions"))
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
+                and not blocked_by_user(row) and not any(keys.values()) and not shared_pending
+                and not (in_progress and (progress_question or counted))):
+            continue
         comment = row.get("comment") or ""
         question = row_question(row, final)
         view = {"row": identity, "name": scan_sessions.row_name(row),
@@ -366,7 +387,6 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         if blocked_by_user(row):
-            view["pr"] = prs.get(identity, {"state": (row.get("pr") or {}).get("state"), "updatedAt": None})
             proven = [answer for _, _, proof in counted for answer in proof]
             if proven:
                 view["answer"] = answer_view(max(proven, key=lambda answer: answer.at))
@@ -385,6 +405,13 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids,
                             "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
+            continue
+        if shared_pending or progress_question:
+            item = min(shared_pending, key=lambda item: item.get("asked_at") or "") if shared_pending else {}
+            since_text = item.get("asked_at") or (row.get("prompt_waiting") or {}).get("asked_at") or final["at"]
+            since = scan_sessions.parse_time(since_text) or now
+            found.append((since, {**view, "state": "unanswered", "since": since_text or since.isoformat(),
+                                   "id": item.get("id"), "question": excerpt(item.get("question")) or view["question"]}))
             continue
         later = [(answer, item) for _, item, proof in counted for answer in proof
                  if said_at is None or answer.at > said_at]
@@ -413,13 +440,14 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 "evidence": [{"decision": item.decision, "decided_at": item.decided_at, "answer": item.answer}
                              for item in keyed]}))
             continue
-        since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
+        prompt_at = (row.get("prompt_waiting") or {}).get("asked_at")
+        since = scan_sessions.parse_time(prompt_at) or said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
         asked_directly = answer_evidence.related_to(
             {"worktree": name, "ts": final["at"], "text": f"{view['question']}\n{final['text']}"},
             answers) if said_at else []
         choices = [report_view(item) for at, item in lane if item.get("kind") == "info" and began and at >= began
                    and CHOICE.search(str(item.get("text") or ""))]
-        found.append((since, {**view, "state": "unasked", "since": final["at"] or since.isoformat(),
+        found.append((since, {**view, "state": "unasked", "since": prompt_at or final["at"] or since.isoformat(),
                               "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
     for item in rejected or []:
@@ -494,20 +522,35 @@ def owner_name(value: str) -> str:
     return owner
 
 
+def question_references(questions: dict[str, dict]) -> dict[str, list[dict]]:
+    """Read all #numbers in their local checkout's origin once per repository."""
+    wanted = {}
+    origins: dict[str, str | None] = {}
+    repos: dict[str, set[int]] = {}
+    for key, item in questions.items():
+        numbers = list(dict.fromkeys(int(number) for number in re.findall(r"#(\d+)\b", item["question"])))
+        if not numbers:
+            continue
+        row = item["row"]
+        if row not in origins:
+            origins[row] = origin_slug(row) if numbers and "::" not in row else None
+        repo = origins[row]
+        if repo and numbers:
+            wanted[key] = (repo, numbers)
+            repos.setdefault(repo, set()).update(numbers)
+    states = {repo: lead_decisions.github_pr_states(repo, sorted(numbers), include_issues=True)
+              for repo, numbers in repos.items()}
+    return {key: [{"repo": repo, "number": number,
+                   "state": found.state if found else None, "head": found.head if found else None,
+                   "updatedAt": found.updated_at if found else None}
+                  for number in numbers for found in [(states.get(repo) or {}).get(number)]]
+            for key, (repo, numbers) in wanted.items()}
+
+
 def closed_references(row: str, question: str) -> list[dict]:
     """The question's #numbers in its checkout's origin, only when every reference is CLOSED. A row on another
     Mac (ENVIRONMENT::path) gives none: the same path here may hold another repository."""
-    numbers = list(dict.fromkeys(int(number) for number in re.findall(r"#(\d+)\b", question)))
-    repo = origin_slug(row) if numbers and "::" not in row else None
-    if not repo:
-        return []
-    owner, name = repo.split("/")
-    fields = " ".join(f"item_{number}: issueOrPullRequest(number: {number}) {{ "
-                      "... on Issue { state updatedAt } ... on PullRequest { state updatedAt } }"
-                      for number in numbers)
-    query = f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {fields} }} }}"
-    found = scan_sessions.graphql_repository(repo, query) or {}
-    refs = [{"repo": repo, "number": number, **(found.get(f"item_{number}") or {})} for number in numbers]
+    refs = question_references({"q": {"row": row, "question": question}}).get("q", [])
     return refs if all(item.get("state") == "CLOSED" for item in refs) else []
 
 
@@ -515,14 +558,14 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             answers: list[answer_evidence.Answer], now: datetime) -> dict[str, list[dict]]:
     """Open items as lists, settled questions with evidence, and transcript answers still missing from state."""
     questions, settled = [], []
+    references = question_references({key: item for key, item in data["questions"].items()
+                                      if item["answer"] is None and not item.get("withdrawn_at")})
     for key, item in data["questions"].items():
         if item["answer"] is not None:
             continue
         view = {"id": key, **item}
         asked_at = scan_sessions.parse_time(item["asked_at"])
-        covered = [decisions[name] for name in item.get("covers") or [] if name in decisions
-                   and asked_at and (at := scan_sessions.parse_time(decisions[name].decided_at)) is not None
-                   and at > asked_at]
+        covered = covering_answers(item, decisions)
         if item.get("withdrawn_at"):
             settled.append({**view, "state": "withdrawn", "since": item["withdrawn_at"],
                             "reason": item["withdrawal_reason"]})
@@ -531,7 +574,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
                             "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
                                           "answer": answer.answer} for answer in covered]})
-        elif refs := closed_references(item["row"], item["question"]):
+        elif (refs := references.get(key, [])) and all(ref.get("state") == "CLOSED" for ref in refs):
             settled.append({**view, "state": "settled", "since": max(ref.get("updatedAt") or "" for ref in refs),
                             "evidence": refs})
         else:
@@ -539,6 +582,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                           for answer in answers if not answer.free_text
                           and asked_at and answer.at >= asked_at and item["question"] in answer.answered]
             questions.append({**view, "state": "unanswered", "since": item["asked_at"],
+                              "prs": references.get(key, []),
                               "age_minutes": int((now - asked_at).total_seconds() // 60) if asked_at else None,
                               "unrecorded_answers": unrecorded})
     return {
@@ -660,9 +704,15 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                 else f"{proof['repo']}#{proof['number']} {proof['state']}@{proof.get('updatedAt') or '-'}"
                 for proof in item["evidence"])
         if item.get("pr"):
-            line += f" | PR {item['pr'].get('state') or '-'}@{item['pr'].get('updatedAt') or '-'}"
+            line += (f" | PR {item['pr'].get('state') or '-'} head={item['pr'].get('head') or '-'}"
+                     f"@{item['pr'].get('updatedAt') or '-'}")
+        for pr in item.get("prs") or []:
+            line += f" | {pr['repo']}#{pr['number']} {pr['state'] or '-'} head={pr['head'] or '-'}@{pr['updatedAt'] or '-'}"
         if claimed := (item.get("ask") or {}).get("claimed"):
-            line += f" | 伺い中 {claimed['by']}（{claimed['at']}〜）。重ねて伺わない"
+            if claimed.get("inactive_minutes") is not None:
+                line += f" | 伺っていない（claim のみ、{claimed['inactive_minutes']} 分）{claimed['by']}"
+            else:
+                line += f" | 伺い中 {claimed['by']}（{claimed['at']}〜）。重ねて伺わない"
         if item.get("merge_question"):
             line += " | merge の問い"
         if review := item.get("review"):
@@ -725,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:
     stale.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
                        help="the careful reads' verdict store whose verdicts the rows take (default: %(default)s)")
     stale.add_argument("--summary", action="store_true", help="print one line per row with its age, ask id, and question")
+    stale.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                       help="Orca CLI used to check the current state of claimed questions")
     stale.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG,
                        help="the handed-off keys whose unanswered asks remain visible (default: %(default)s)")
     # Imported here: handoff imports this module.
@@ -793,6 +845,10 @@ def main(argv: list[str] | None = None) -> int:
             asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers_log))
             open_ids = frozenset(ask.report["id"] for ask in asks)
             claims = inbox_read.read_claims(inbox_read.claims_path())
+            open_keys = {key for ask in asks for key in (
+                ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions))}
+            claims = {key: claim for key, claim in claims.items() if key in open_keys}
+            claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
             handed = list({item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
                            if item.decision not in decided}.values())
@@ -801,10 +857,14 @@ def main(argv: list[str] | None = None) -> int:
                         for item in answer_evidence.rejected_questions(answer_evidence.transcripts_of(
                             args.claude_projects.expanduser(), [worktree]), since)]
             result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
-                                datetime.now(timezone.utc), state=data, handed=handed, prs=blocked_prs(rows),
+                                datetime.now(timezone.utc), state=data, handed=handed,
                                 claimed={ask.report["id"]: claim for ask in asks
                                          if (claim := inbox_read.ask_claim(ask, claims))},
                                 decided=decided, rejected=rejected)
+            identities = {item["row"] for item in result if item.get("row")}
+            prs = row_prs([row for row in rows if scan_sessions.row_identity(row) in identities])
+            for item in result:
+                item["pr"] = prs.get(item.get("row"), {"state": None, "head": None, "updatedAt": None})
         except READ_ERRORS as error:
             print(f"hourly state: {error}", file=sys.stderr)
             return 1

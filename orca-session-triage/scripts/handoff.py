@@ -290,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="Claude Code transcript root (default: %(default)s)")
     state_command = commands.add_parser(
         "lead-state", parents=[kept, lead],
+        description="JSON keys: worktree (path), agents (type, state, state_started_at, stopped_at, main_agent), "
+                    "final (at, text), pending_questions (id, asked_at, questions with choices), "
+                    "rejected (questions closed unanswered since the newest kept handoff, with ask/close times), "
+                    "terminals (handle, screen_tail), queued_input (undelivered instructions and enqueue times).",
         help="print the appointed lead's current state as JSON, with the questions closed unanswered (rejected) "
              "since the newest kept handoff")
     state_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),

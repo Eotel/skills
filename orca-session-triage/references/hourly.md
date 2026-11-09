@@ -62,8 +62,11 @@ id's first 8 or more characters will do, as for `read --id`);
 way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest apart from handoffs, oldest first (`--json` for other tools; the board
 reads it). It first records answered each board adoption notice whose proposals
-already have a lane in the ledger, naming the lane on stderr; `ledger.py owner
+already have a lane in the ledger, naming the lane on stderr; `~/.agents/skills/adoption-triage/scripts/ledger.py owner
 <proposal id>` shows a proposal's lane, brief, and whether it is done.
+`scripts/retro.py status --pending` lists undecided proposal IDs, titles, and
+waiting minutes. `~/.agents/skills/adoption-triage/scripts/ledger.py list` prints one proposal per
+line; `list --json` returns `{"items": [...]}`.
 Before either tab asks the user an inbox ask itself, it records that with
 `scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
 `~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another
@@ -73,7 +76,11 @@ asking). `open-asks`
 then marks the ask 伺い中 with who and since when, the lead's `watch` prints the
 claim once and stops reminding of it, `questions` leaves the claimed questions
 out of its batch (listing them under `claimed`), and `stale-asks` names the
-claim on the ask, so the other tab does not ask it again. Asks from before the record began stay open until the lead marks
+claim on the ask, so the other tab does not ask it again. `open-asks` and
+`stale-asks` read that owner's current lead-state: with no unanswered AskUserQuestion
+and a turn that ended over fifteen minutes ago, they show
+「伺っていない（claim のみ、N 分）」. Inspect that state before taking over.
+Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
 It marks only the asks an answer after them proves answered: a lead decision
 or an AskUserQuestion answer (in the transcripts of the current directory's
@@ -169,10 +176,12 @@ with their enqueue times and elapsed minutes, read again from its transcript.
 `--decision-ask KEY=ID` binds a decision to its inbox ask (repeat per key).
 The lead defaults to the shared state's appointed worktree; `--lead-worktree`
 overrides it, and `--state-file` selects the shared state for both `send` and
-`lead-state`. `handoff.py lead-state` prints the lead's worktree, agent states
-and stop times, latest message, unanswered questions with choices and ask times,
-questions closed without an answer since the newest kept handoff (`rejected`,
-with ask and close times), queued instructions, and tab screen tails as JSON;
+`lead-state`. `handoff.py lead-state` prints JSON with `worktree` (path),
+`agents` (states and stop times), `final` (latest message and time),
+`pending_questions` (unanswered questions, choices, and ask times), `rejected`
+(questions closed without an answer since the newest kept handoff, with ask and
+close times), `queued_input` (undelivered instructions and enqueue times), and
+`terminals` (handles and screen tails);
 `--orca` selects its CLI.
 `--claude-projects` selects the transcript root for both commands.
 Do not sign the body: it ends the
