@@ -42,14 +42,33 @@ def tracked_files(root: Path) -> list[str]:
     return git(root, "ls-files", "-z").split("\0")[:-1]
 
 
-def read_texts(root: Path, files: list[str]) -> dict[str, list[str]]:
+def read_texts(
+    root: Path, files: list[str]
+) -> tuple[dict[str, list[str]], list[str]]:
+    root = root.resolve()
     texts = {}
+    skipped = []
     for relative in files:
         try:
-            texts[relative] = (root / relative).read_text(encoding="utf-8").splitlines()
+            path = root / relative
+            if not path.parent.resolve().is_relative_to(root) or any(
+                parent.is_symlink()
+                for parent in path.parents
+                if parent.is_relative_to(root)
+            ):
+                skipped.append(relative)
+                continue
+            content = (
+                str(path.readlink())
+                if path.is_symlink()
+                else path.read_text(encoding="utf-8")
+            )
+            texts[relative] = content.splitlines()
+        except RuntimeError:
+            skipped.append(relative)
         except (UnicodeDecodeError, OSError):
             continue
-    return texts
+    return texts, skipped
 
 
 def find_references(
@@ -106,7 +125,15 @@ def main() -> int:
     completed = [path for path in files if path.startswith(COMPLETED_DIR)]
 
     active = [path for path in files if path.startswith(f"{PLANS_DIR}/active/")]
-    texts = read_texts(root, files)
+    texts, skipped = read_texts(root, files)
+
+    if skipped:
+        print("## Paths not inventoried: symlinked or unresolved parent directories")
+        for path in skipped:
+            print(path)
+        if args.apply:
+            print("Refusing --apply: resolve the skipped paths first.")
+            return 1
 
     print(f"## Completed plans: {len(completed)}")
     print("\n## References to completed plans")

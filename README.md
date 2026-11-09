@@ -14,6 +14,9 @@ rebuilds the deployment receipt. Install only the directories needed by the targ
 workflow. The Codex orchestration callers also require
 `codex-orchestration-core`.
 
+Before withdrawing `exec-plan-migration` from a shared installation, follow its
+[retirement and distribution gates](exec-plan-migration/references/lifecycle.md).
+
 ## Authoring
 
 Authoring rules, script and test conventions, and validation commands live in
