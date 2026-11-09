@@ -63,16 +63,16 @@ A line-limit failure is recorded separately from a legacy archive or history
 heading.
 
 The existing per-repository inventory command remains useful in a dedicated
-checkout of the default branch:
+checkout at the confirmed default-branch commit:
 
 ```sh
-exec-plan-migration/scripts/migrate_plans.py --root . --base origin/main
+exec-plan-migration/scripts/migrate_plans.py --root . --base HEAD
 ```
 
-Use the actual default-branch ref in place of `origin/main`. Leave `--apply`
-off for inventory. Inspect old enforcement in rules, templates, hooks, and CI in
-addition to the command's report. Read only referenced completed plans when
-resolving their remaining knowledge.
+Keep the literal `HEAD`; do not substitute a repository-supplied branch name into
+the shell command. Leave `--apply` off for inventory. Inspect old enforcement in
+rules, templates, hooks, and CI in addition to the command's report. Read only
+referenced completed plans when resolving their remaining knowledge.
 
 ## Retirement gates
 

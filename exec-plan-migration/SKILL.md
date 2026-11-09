@@ -17,10 +17,12 @@ retirement gates, and coordinated distribution withdrawal conditions.
 
 ## Inventory
 
-Work in a dedicated worktree from the default branch. Run:
+Work in a dedicated worktree at the confirmed default-branch commit. Keep the
+literal `HEAD` as the comparison base; do not insert branch names into the shell
+command. Run:
 
 ```bash
-<skill>/scripts/migrate_plans.py --root . --base origin/<default-branch>
+<skill>/scripts/migrate_plans.py --root . --base HEAD
 ```
 
 The report lists the completed plans, every tracked line that references them
