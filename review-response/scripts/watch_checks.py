@@ -1,5 +1,10 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
-"""Emit DONE owner/repo@sha ok|FAILED [...] once per commit; exit when all finish."""
+"""Emit DONE owner/repo@sha ok|FAILED [...] once per commit; exit when all finish.
+
+A FAILED line ends with 未起動 ["job", ...]: <reason> for the failed check runs whose first annotation says GitHub
+never started them (an Actions budget or the spending limit); only a failed run with annotations is read, one REST
+call each.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +23,40 @@ def classify_checks(runs: list[dict]) -> tuple[bool, list[str]]:
     failed = [run.get("name", "?") for run in runs
               if (run.get("conclusion") or "").lower() not in ("success", "skipped", "neutral")]
     return True, failed
+
+
+# GitHub's annotation on a job it never ran, e.g. "... because an Actions budget is preventing further use."
+NOT_STARTED = "The job was not started because"
+
+
+def not_started_note(reasons: dict[str, str]) -> str:
+    """' 未起動 ["job", ...]: <reason>' per reason the named jobs share; empty without one."""
+    jobs: dict[str, list[str]] = {}
+    for name, reason in reasons.items():
+        jobs.setdefault(reason, []).append(name)
+    return "".join(f" 未起動 {json.dumps(names, ensure_ascii=False)}: {reason}" for reason, names in jobs.items())
+
+
+def unstarted_runs(repo: str, runs: list[dict]) -> dict[str, str]:
+    """{name: reason} of the failed check runs whose first annotation says GitHub never started them.
+
+    A read that fails leaves that run out.
+    """
+    reasons = {}
+    for run in runs:
+        if (run.get("conclusion") or "").lower() in ("success", "skipped", "neutral") or not (
+                (run.get("output") or {}).get("annotations_count")):
+            continue
+        try:
+            result = subprocess.run(["gh", "api", f"repos/{repo}/check-runs/{run.get('id')}/annotations?per_page=1"],
+                                    capture_output=True, text=True, timeout=60)
+            annotations = json.loads(result.stdout) if result.returncode == 0 else []
+        except (ValueError, subprocess.TimeoutExpired):
+            continue
+        message = str((annotations[0] or {}).get("message") or "") if isinstance(annotations, list) and annotations else ""
+        if message.startswith(NOT_STARTED):
+            reasons[run.get("name", "?")] = message
+    return reasons
 
 
 def classify_commit(runs: list[dict], combined: dict, suites: list[dict]) -> tuple[bool, list[str]]:
@@ -121,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if done:
                     count = len(runs) + len(combined["statuses"])
-                    detail = "FAILED " + json.dumps(failed) if failed else f"ok ({count} checks)"
+                    detail = ("FAILED " + json.dumps(failed) + not_started_note(unstarted_runs(repo, runs)) if failed
+                              else f"ok ({count} checks)")
                     print(f"DONE {repo}@{sha[:9]} {detail}", flush=True)
                     pending.remove(spec)
             if pending:

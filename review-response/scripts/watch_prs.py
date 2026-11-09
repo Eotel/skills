@@ -2,7 +2,10 @@
 """Poll a re-read list of owner/repo#N PRs and persist event history as JSON.
 
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,
-and each Codex review's status, which Codex edits into one summary comment.
+and each Codex review's status, which Codex edits into one summary comment. A CI
+FAILURE line ends with 未起動 ["job", ...]: <reason> for the failed GitHub Actions
+jobs whose first annotation says GitHub never started them (an Actions budget or the
+spending limit), read once per failed result with one REST call per failed job.
 
 Cost per cycle: one `gh api rate_limit`, which does not count against the primary
 rate limits (it can count against secondary limits), then one GraphQL `gh pr view`
@@ -19,7 +22,9 @@ remain, the cycle prints RATE_LIMIT_LOW and sleeps until the reset.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from datetime import datetime, timezone
+from functools import partial
 import json
 from pathlib import Path
 import re
@@ -33,6 +38,9 @@ MIN_GRAPHQL_REMAINING = 1000
 TERMINAL = ("MERGED", "CLOSED")
 SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
+# GitHub's annotation on a job it never ran, e.g. "... because an Actions budget is preventing further use."
+NOT_STARTED = "The job was not started because"
+ACTIONS_JOB = re.compile(r"/actions/runs/\d+/job/(\d+)")
 # Codex edits one summary comment in place, so its review progress never arrives as a new comment.
 CODEX_MARKER = re.compile(r"<!--\s*(codex-review-state|codex-security-review):v1\s*(\{.*?\})\s*-->", re.S)
 # The visible table row, e.g. "| 📝 **Code Review** | ✅ **Completed** ... | `38e31d6` |".
@@ -54,6 +62,34 @@ def finished_checks(checks: list[dict]) -> tuple[bool, list[str]]:
         if result in FAILURE:
             failed.append(check.get("name") or check.get("context") or "?")
     return bool(checks), failed
+
+
+def not_started_note(reasons: dict[str, str]) -> str:
+    """' 未起動 ["job", ...]: <reason>' per reason the named jobs share; empty without one."""
+    jobs: dict[str, list[str]] = {}
+    for name, reason in reasons.items():
+        jobs.setdefault(reason, []).append(name)
+    return "".join(f" 未起動 {json.dumps(names, ensure_ascii=False)}: {reason}" for reason, names in jobs.items())
+
+
+def unstarted_jobs(repo: str, checks: list[dict]) -> dict[str, str]:
+    """{name: reason} of the failed GitHub Actions jobs whose first annotation says GitHub never started them.
+
+    The job id in a check's detailsUrl is its check-run id. A read that fails leaves that job out.
+    """
+    reasons = {}
+    for check in checks:
+        job = ACTIONS_JOB.search(check.get("detailsUrl") or "")
+        if not job or (check.get("conclusion") or "").upper() not in FAILURE:
+            continue
+        try:
+            annotations = gh_json(["api", f"repos/{repo}/check-runs/{job[1]}/annotations?per_page=1"])
+        except (ValueError, subprocess.TimeoutExpired):
+            continue
+        message = str((annotations[0] or {}).get("message") or "") if isinstance(annotations, list) and annotations else ""
+        if message.startswith(NOT_STARTED):
+            reasons[check.get("name") or "?"] = message
+    return reasons
 
 
 def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None]]:
@@ -81,8 +117,12 @@ def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None
     return reviews
 
 
-def diff_events(spec: str, previous: dict, snapshot: dict, me: str) -> tuple[list[str], dict]:
-    """Pure diff: return (event lines, new state) without mutating either input.
+def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
+                unstarted: Callable[[list[dict]], dict[str, str]] = lambda checks: {}) -> tuple[list[str], dict]:
+    """Diff: return (event lines, new state) without mutating either input.
+
+    `unstarted(checks)` names the failed jobs GitHub never started, with the reason (see unstarted_jobs); it is
+    called only for a new CI FAILURE.
 
     snapshot contains the gh PR view fields plus reviews, line_comments and
     comments arrays, which are absent when they were not read. Absent feeds report
@@ -115,7 +155,8 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str) -> tuple[lis
         )
         signature = json.dumps([head, result, terminal_results], ensure_ascii=False, separators=(",", ":"))
         if state.get("ci") != signature:
-            detail = " failed=" + json.dumps(failed, ensure_ascii=False) if failed else ""
+            detail = (" failed=" + json.dumps(failed, ensure_ascii=False) + not_started_note(unstarted(checks))
+                      if failed else "")
             events.append(f"{spec} CI {result} ({len(checks)} checks, {len(failed)} failed, head {head[:9]}){detail}")
         state["ci"] = signature
     mergeable = snapshot.get("mergeable") or ""
@@ -262,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 try:
                     snapshot = fetch_snapshot(spec, previous)
-                    events, updated = diff_events(spec, previous, snapshot, args.me)
+                    events, updated = diff_events(spec, previous, snapshot, args.me,
+                                                  partial(unstarted_jobs, spec.split("#", 1)[0]))
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:

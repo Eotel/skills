@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -459,6 +460,8 @@ class WatchPrsTests(unittest.TestCase):
                 body = {"resources": {"graphql": {"remaining": remaining, "reset": reset}}}
             elif args[:2] == ["pr", "view"]:
                 body = views[args[2]]
+            elif args[-1].split("?")[0].endswith("/annotations"):
+                body = feeds.get(args[-1].split("?")[0], [])
             else:
                 body = [feeds.get(args[-1].split("?")[0], [])]
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
@@ -671,6 +674,33 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(per_cycle, [1 + 4 + 4, 1 + 4, 1 + 1, 1 + 4])
         self.assertEqual(output.getvalue().splitlines(), ["acme/api#13 MERGED", "acme/api#12 NEW COMMENT by reviewer  :: please fix"])
 
+    def test_ci_failure_names_the_jobs_github_never_started_and_why(self) -> None:
+        # 2026-10-26 to 11-09: an Actions budget and a spending limit left jobs unstarted, and each lane read the
+        # annotation by hand because the watcher named only the red checks.
+        reason = "The job was not started because an Actions budget is preventing further use."
+        job = "https://github.com/acme/api/actions/runs/1/job/{}"
+        view = {"state": "OPEN", "headRefOid": "a" * 40, "mergeable": "MERGEABLE", "updatedAt": "2026-11-09T01:00:00Z",
+                "statusCheckRollup": [
+                    {"name": "unit", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": job.format(11)},
+                    {"name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": job.format(12)},
+                    {"name": "docs", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": job.format(13)}]}
+        calls, run = self.fake_gh({"12": view}, {
+            "repos/acme/api/check-runs/11/annotations": [{"message": reason}],
+            "repos/acme/api/check-runs/12/annotations": [{"message": "Process completed with exit code 1."}]})
+        with tempfile.TemporaryDirectory() as temporary:
+            listing = Path(temporary) / "prs.txt"
+            listing.write_text(self.spec + "\n", encoding="utf-8")
+            output = io.StringIO()
+            with patch.object(prs.subprocess, "run", side_effect=run), redirect_stdout(output):
+                code = prs.main([str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me,
+                                 "--once"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            f'acme/api#12 CI FAILURE (3 checks, 2 failed, head aaaaaaaaa) failed=["unit", "lint"] 未起動 ["unit"]: {reason}'])
+        self.assertEqual([args[-1] for args in calls if "annotations" in args[-1]],
+                         ["repos/acme/api/check-runs/11/annotations?per_page=1",
+                          "repos/acme/api/check-runs/12/annotations?per_page=1"])
+
     def test_low_graphql_budget_waits_for_reset_without_reading_prs(self) -> None:
         reset = 1793160542
         calls, run = self.fake_gh({}, {}, remaining=999, reset=reset)
@@ -774,7 +804,8 @@ class WatchChecksTests(unittest.TestCase):
                     suites = [{"status": status, "latest_check_runs_count": 1, "app": app}]
                     self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (False, []))
 
-    def poll_commit(self, runs: list[dict], status_pages: list[dict], suite_pages: list[dict] | None = None) -> tuple[int, str, list, Mock]:
+    def poll_commit(self, runs: list[dict], status_pages: list[dict], suite_pages: list[dict] | None = None,
+                    annotations: dict[int, list[dict]] | None = None) -> tuple[int, str, list, Mock]:
         output = io.StringIO()
         errors = io.StringIO()
         if suite_pages is None:
@@ -787,6 +818,8 @@ class WatchChecksTests(unittest.TestCase):
                 payload = status_pages
             elif command[-1] == "repos/example/api/commits/abcdef123/check-suites?per_page=100":
                 payload = suite_pages
+            elif (found := re.fullmatch(r"repos/example/api/check-runs/(\d+)/annotations\?per_page=1", command[-1])):
+                payload = (annotations or {})[int(found[1])]
             else:
                 self.fail(f"unexpected API command: {command}")
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
@@ -821,6 +854,18 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, 'DONE example/api@abcdef123 FAILED ["legacy", "security"]\n')
         sleep.assert_not_called()
+
+    def test_failed_runs_github_never_started_are_named_with_the_reason(self) -> None:
+        reason = ("The job was not started because recent account payments have failed or your spending limit needs "
+                  "to be increased. Please check the 'Billing & plans' section in your settings")
+        runs = [{"id": 11, "name": "unit", "status": "completed", "conclusion": "failure", "output": {"annotations_count": 1}},
+                {"id": 12, "name": "lint", "status": "completed", "conclusion": "failure", "output": {"annotations_count": 0}},
+                {"id": 13, "name": "docs", "status": "completed", "conclusion": "success", "output": {"annotations_count": 2}}]
+        code, output, calls, _ = self.poll_commit(runs, [{"state": "pending", "statuses": []}],
+                                                  annotations={11: [{"message": reason}]})
+        self.assertEqual(code, 0)
+        self.assertEqual(output, f'DONE example/api@abcdef123 FAILED ["unit", "lint"] 未起動 ["unit"]: {reason}\n')
+        self.assertEqual(len(calls), 4)
 
     def test_statuses_only_commit_finishes(self) -> None:
         for state, expected in (("success", "ok (1 checks)"), ("failure", 'FAILED ["legacy"]'), ("error", 'FAILED ["legacy"]')):
