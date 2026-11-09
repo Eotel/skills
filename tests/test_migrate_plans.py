@@ -74,6 +74,66 @@ class MigratePlansTest(unittest.TestCase):
         self.assertIn("AGENTS.md:1", result.stdout)
         self.assertTrue((self.root / COMPLETED).exists())
 
+    def test_inventory_does_not_read_symlink_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "data.txt"
+            secret.write_text("external payload value\n", encoding="utf-8")
+            write(self.root, "docs/exec-plans/completed/e", "# Done\n")
+            (self.root / "linked-outside.md").symlink_to(secret)
+            (self.root / "linked-untracked.md").symlink_to("untracked-data.txt")
+            write(self.root, "replaced.md", "ordinary tracked file\n")
+            write(self.root, "working.md", "ordinary tracked file\n")
+            self.commit()
+            write(self.root, "untracked-data.txt", "untracked payload value\n")
+            (self.root / "replaced.md").unlink()
+            (self.root / "replaced.md").symlink_to(secret)
+            write(self.root, "working.md", f"See {COMPLETED}.\n")
+
+            result = self.run_script()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("external payload value", result.stdout)
+        self.assertNotIn("untracked payload value", result.stdout)
+        self.assertIn("working.md:1", result.stdout)
+
+    def test_inventory_does_not_follow_parent_directory_outside_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside)
+            (external / "note.md").write_text(
+                f"external directory payload value: {COMPLETED}\n", encoding="utf-8"
+            )
+            write(self.root, "notes/note.md", "ordinary tracked file\n")
+            self.commit()
+            write(
+                self.root,
+                "untracked-notes/note.md",
+                f"untracked directory payload value: {COMPLETED}\n",
+            )
+            (self.root / "notes/note.md").unlink()
+            (self.root / "notes").rmdir()
+            for target in (external, self.root / "untracked-notes"):
+                with self.subTest(target=target.name):
+                    (self.root / "notes").symlink_to(target, target_is_directory=True)
+
+                    result = self.run_script("--apply")
+                    (self.root / "notes").unlink()
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertNotIn("external directory payload value", result.stdout)
+                    self.assertNotIn("untracked directory payload value", result.stdout)
+                    self.assertIn("notes/note.md", result.stdout)
+                    self.assertTrue((self.root / COMPLETED).exists())
+
+    def test_apply_refuses_when_symlink_points_to_completed_plan(self) -> None:
+        (self.root / "plan-link.md").symlink_to(COMPLETED)
+        self.commit()
+
+        result = self.run_script("--apply")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"plan-link.md:1: {COMPLETED}", result.stdout)
+        self.assertTrue((self.root / COMPLETED).exists())
+
     def test_apply_removes_unreferenced_completed_plans(self) -> None:
         self.commit()
 

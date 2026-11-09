@@ -11,12 +11,18 @@ results recorded in the PR. This skill requires `plan-exec` and `agentic-docs`
 (`scripts/check_plans.py`). Delete this skill once the repositories that still
 use the legacy shape have migrated.
 
+For a cross-repository inventory or a retirement decision, read
+[references/lifecycle.md](references/lifecycle.md) for the target records,
+retirement gates, and coordinated distribution withdrawal conditions.
+
 ## Inventory
 
-Work in a dedicated worktree from the default branch. Run:
+Work in a dedicated worktree at the confirmed default-branch commit. Keep the
+literal `HEAD` as the comparison base; do not insert branch names into the shell
+command. Run:
 
 ```bash
-<skill>/scripts/migrate_plans.py --root . --base origin/<default-branch>
+<skill>/scripts/migrate_plans.py --root . --base HEAD
 ```
 
 The report lists the completed plans, every tracked line that references them
@@ -24,6 +30,8 @@ The report lists the completed plans, every tracked line that references them
 date and its references, and unmerged branches that touch plan files. Only
 tracked files are inventoried; untracked plans belong to in-flight sessions, so
 leave them alone.
+Symlinks contribute their link text, never the target contents. Paths beneath
+symlinked directories are reported as skipped and block `--apply`.
 
 ## Migrate
 
