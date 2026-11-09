@@ -30,6 +30,8 @@ The report lists the completed plans, every tracked line that references them
 date and its references, and unmerged branches that touch plan files. Only
 tracked files are inventoried; untracked plans belong to in-flight sessions, so
 leave them alone.
+Symlinks contribute their link text, never the target contents. Paths beneath
+symlinked directories are reported as skipped and block `--apply`.
 
 ## Migrate
 
