@@ -1,5 +1,9 @@
 """Offline behavior tests for the public review-response command line tools."""
 
+from __future__ import annotations
+
+from types import ModuleType
+
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 import copy
@@ -22,7 +26,7 @@ SCRIPTS = ROOT / "review-response" / "scripts"
 WORKTREE_SETUP = ROOT / "codex-tdd-orchestration" / "scripts" / "worktree-setup.sh"
 
 
-def load_script(name):
+def load_script(name: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / (name + ".py"))
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -39,54 +43,54 @@ renderer = load_script("render_status")
 class RenderStatusTests(unittest.TestCase):
     repos = {"api": "acme/api", "ui": "acme/ui", "api-tools": "acme/api-tools"}
 
-    def assert_link(self, text, expected, row_repo=None):
+    def assert_link(self, text: str, expected: str, row_repo: str | None = None) -> None:
         self.assertEqual(renderer.linkify(text, row_repo, self.repos), expected)
 
-    def test_full_repo(self):
+    def test_full_repo(self) -> None:
         self.assert_link("acme/api#12", "[acme/api#12](https://github.com/acme/api/issues/12)")
 
-    def test_alias(self):
+    def test_alias(self) -> None:
         self.assert_link("api#12", "[api#12](https://github.com/acme/api/issues/12)")
 
-    def test_alias_with_hyphen(self):
+    def test_alias_with_hyphen(self) -> None:
         self.assert_link("api-tools#12", "[api-tools#12](https://github.com/acme/api-tools/issues/12)")
 
-    def test_pr_uses_row_repo_and_pull_path(self):
+    def test_pr_uses_row_repo_and_pull_path(self) -> None:
         self.assert_link("PR#12", "[PR#12](https://github.com/acme/api/pull/12)", "api")
         self.assert_link("PR#12", "PR#12")
 
-    def test_bare_uses_row_repo(self):
+    def test_bare_uses_row_repo(self) -> None:
         self.assert_link("#1", "[#1](https://github.com/acme/api/issues/1)", "acme/api")
 
-    def test_bare_without_context_stays_unlinked(self):
+    def test_bare_without_context_stays_unlinked(self) -> None:
         self.assert_link("#12", "#12")
         self.assert_link("unknown#12", "unknown#12", "api")
 
-    def test_bare_uses_last_alias_without_row_repo(self):
+    def test_bare_uses_last_alias_without_row_repo(self) -> None:
         self.assert_link("api#12 and #13", "[api#12](https://github.com/acme/api/issues/12) and [#13](https://github.com/acme/api/issues/13)")
 
-    def test_full_repo_sets_context_for_bare_and_continuation(self):
+    def test_full_repo_sets_context_for_bare_and_continuation(self) -> None:
         self.assert_link("acme/api#12/#13 and #14", "[acme/api#12](https://github.com/acme/api/issues/12)/[#13](https://github.com/acme/api/issues/13) and [#14](https://github.com/acme/api/issues/14)")
 
-    def test_row_repo_wins_for_bare_but_continuation_uses_last_named_repo(self):
+    def test_row_repo_wins_for_bare_but_continuation_uses_last_named_repo(self) -> None:
         self.assert_link("ui#12/#13 and #14", "[ui#12](https://github.com/acme/ui/issues/12)/[#13](https://github.com/acme/ui/issues/13) and [#14](https://github.com/acme/api/issues/14)", "api")
 
-    def test_japanese_adjacency(self):
+    def test_japanese_adjacency(self) -> None:
         self.assert_link("#201は完了", "[#201](https://github.com/acme/api/issues/201)は完了", "api")
         self.assert_link("api#201は確認済み", "[api#201](https://github.com/acme/api/issues/201)は確認済み")
         self.assert_link("対象#201は", "対象[#201](https://github.com/acme/api/issues/201)は", "api")
 
-    def test_ascii_word_char_before_number_prevents_link(self):
+    def test_ascii_word_char_before_number_prevents_link(self) -> None:
         for text in ("word#201", "a#201は", "_#201", "1#201", "xapi#201"):
             with self.subTest(text=text):
                 self.assert_link(text, text, "api")
 
-    def test_alias_does_not_match_inside_longer_repository_token(self):
+    def test_alias_does_not_match_inside_longer_repository_token(self) -> None:
         for text in ("unknown-api#12", "unknown.api#12", "unknown_api#12", "unknownapi#12", "1api#12", "/api#12"):
             with self.subTest(text=text):
                 self.assert_link(text, text, "api")
 
-    def test_code_spans_with_multiple_backticks_are_preserved(self):
+    def test_code_spans_with_multiple_backticks_are_preserved(self) -> None:
         for width in (2, 3, 4, 8, 20):
             delimiter = "`" * width
             text = delimiter + "api#12" + delimiter
@@ -97,12 +101,12 @@ class RenderStatusTests(unittest.TestCase):
                 self.assert_link(text, text, "api")
         self.assert_link("``api#12`` #13", "``api#12`` [#13](https://github.com/acme/api/issues/13)", "api")
 
-    def test_existing_markdown_urls_and_code_are_preserved(self):
+    def test_existing_markdown_urls_and_code_are_preserved(self) -> None:
         for text in ("[#12](https://github.com/acme/api/issues/12)", "`api#12`", "https://example.invalid/api#12"):
             with self.subTest(text=text):
                 self.assert_link(text, text, "api")
 
-    def data(self):
+    def data(self) -> dict:
         return {
             "repos": self.repos,
             "units": [
@@ -113,7 +117,7 @@ class RenderStatusTests(unittest.TestCase):
             "out_of_scope": ["ui#20/#21 and #22: another author's work", "acme/api#23 and #24: deferred"],
         }
 
-    def test_done_count_uses_state_prefix_and_out_of_scope_links(self):
+    def test_done_count_uses_state_prefix_and_out_of_scope_links(self) -> None:
         rendered = renderer.render_status(self.data())
         self.assertEqual(rendered.splitlines()[0], "# Review response: 2/3 done")
         self.assertIn("[#201](https://github.com/acme/api/issues/201)は", rendered)
@@ -122,22 +126,22 @@ class RenderStatusTests(unittest.TestCase):
         self.assertIn("https://github.com/acme/api/issues/24", rendered)
         self.assertIn("https://github.com/acme/api/pull/12", rendered)
 
-    def test_configurable_done_prefix(self):
+    def test_configurable_done_prefix(self) -> None:
         data = self.data()
         data["units"][1]["state"] = "完了: 確認済み"
         self.assertEqual(renderer.render_status(data, "完了").splitlines()[0], "# Review response: 1/3 done")
 
-    def test_cells_escape_pipes_and_newlines(self):
+    def test_cells_escape_pipes_and_newlines(self) -> None:
         data = self.data()
         data["units"][0]["what"] = "one | two\nthree"
         self.assertIn(r"one \| two<br>three", renderer.render_status(data))
 
-    def test_context_does_not_leak_between_cells(self):
+    def test_context_does_not_leak_between_cells(self) -> None:
         data = self.data()
         data["units"][0].update(repo="", target="api#12", what="#201")
         self.assertIn(" | #201 | ", renderer.render_status(data))
 
-    def render_with_tracker(self, data, tasks):
+    def render_with_tracker(self, data: dict, tasks: list[dict]) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "status.json"
             tracker = Path(temporary) / "tracker.jsonl"
@@ -145,7 +149,7 @@ class RenderStatusTests(unittest.TestCase):
             tracker.write_text("".join(json.dumps(task) + "\n" for task in tasks), encoding="utf-8")
             return subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), str(source), "--tracker", str(tracker)], capture_output=True, text=True)
 
-    def test_tracker_recognizes_markdown_destinations_with_titles_and_angles(self):
+    def test_tracker_recognizes_markdown_destinations_with_titles_and_angles(self) -> None:
         tasks = [{"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False}]
         for target in (
             '[pull](https://github.com/acme/api/pull/12 "Review")',
@@ -163,7 +167,7 @@ class RenderStatusTests(unittest.TestCase):
                 self.assertIn(" | " + target + " | ", row)
                 self.assertTrue(row.endswith(" | acme/api#12 Alex · open |"), row)
 
-    def test_tracker_reads_asana_jsonl_with_unicode_line_separators(self):
+    def test_tracker_reads_asana_jsonl_with_unicode_line_separators(self) -> None:
         for separator in ("\u2028", "\u2029", "\u0085"):
             with self.subTest(separator=repr(separator)), tempfile.TemporaryDirectory() as temporary:
                 task = {
@@ -185,7 +189,7 @@ class RenderStatusTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
 
-    def test_tracker_lists_duplicate_url_tasks_in_file_order(self):
+    def test_tracker_lists_duplicate_url_tasks_in_file_order(self) -> None:
         data = self.data()
         data["units"][0].update(target="PR#12 PR#13 PR#12", next="PR#12")
         result = self.render_with_tracker(data, [
@@ -203,7 +207,7 @@ class RenderStatusTests(unittest.TestCase):
         )
         self.assertTrue(result.stdout.splitlines()[4].endswith(" | " + expected + " |"), result.stdout)
 
-    def test_tracker_matches_task_urls_with_trailing_slashes(self):
+    def test_tracker_matches_task_urls_with_trailing_slashes(self) -> None:
         for suffix in ("/", "///"):
             with self.subTest(suffix=suffix):
                 result = self.render_with_tracker(self.data(), [
@@ -214,7 +218,7 @@ class RenderStatusTests(unittest.TestCase):
                 expected = "acme/api#12 Alex · open<br>acme/api#12 Blair · done"
                 self.assertTrue(result.stdout.splitlines()[4].endswith(" | " + expected + " |"), result.stdout)
 
-    def test_tracker_skips_blank_jsonl_lines(self):
+    def test_tracker_skips_blank_jsonl_lines(self) -> None:
         task = {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False}
         for newline in ("\n", "\r\n"):
             with self.subTest(newline=repr(newline)), tempfile.TemporaryDirectory() as temporary:
@@ -226,7 +230,7 @@ class RenderStatusTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
 
-    def test_tracker_ignores_records_without_url(self):
+    def test_tracker_ignores_records_without_url(self) -> None:
         result = self.render_with_tracker(self.data(), [
             {"name": "Review #12", "assignee": "Ignored", "completed": False},
             {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False},
@@ -236,7 +240,7 @@ class RenderStatusTests(unittest.TestCase):
         self.assertNotIn("Ignored", result.stdout)
         self.assertTrue(all(line.endswith(" | — |") for line in result.stdout.splitlines()[5:7]), result.stdout)
 
-    def test_tracker_skips_url_less_records_before_validating_other_fields(self):
+    def test_tracker_skips_url_less_records_before_validating_other_fields(self) -> None:
         ignored_records = [
             {"name": "ignored"},
             {"url": None, "completed": "done", "assignee": 12, "permalink_url": 12},
@@ -252,13 +256,13 @@ class RenderStatusTests(unittest.TestCase):
                 self.assertTrue(result.stdout.splitlines()[4].endswith(" | acme/api#12 Alex · open |"), result.stdout)
                 self.assertNotIn("ignored", result.stdout)
 
-    def test_help_names_tracker_option(self):
+    def test_help_names_tracker_option(self) -> None:
         result = subprocess.run([sys.executable, str(SCRIPTS / "render_status.py"), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--tracker FILE", result.stdout)
         self.assertIn("Tracker column", result.stdout)
 
-    def test_cli_tracker_column_lists_open_and_done_tasks(self):
+    def test_cli_tracker_column_lists_open_and_done_tasks(self) -> None:
         result = self.render_with_tracker(self.data(), [
             {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False,
              "permalink_url": "https://app.asana.com/0/1200000000000001/1200000000000002"},
@@ -273,7 +277,7 @@ class RenderStatusTests(unittest.TestCase):
         self.assertTrue(lines[5].endswith(" | [acme/api#13](https://app.asana.com/0/1200000000000001/1200000000000003) Blair · done |"), lines[5])
         self.assertTrue(lines[6].endswith(" | — |"), lines[6])
 
-    def test_tracker_resolves_references_in_first_seen_order_with_cell_context(self):
+    def test_tracker_resolves_references_in_first_seen_order_with_cell_context(self) -> None:
         data = self.data()
         data["units"][0].update(
             id="PR#97", state="pending PR#98",
@@ -321,7 +325,7 @@ class RenderStatusTests(unittest.TestCase):
         self.assertTrue(lines[5].endswith(" | — |"), lines[5])
         self.assertTrue(lines[6].endswith(" | " + third + " |"), lines[6])
 
-    def test_tracker_falls_back_for_missing_metadata_and_escapes_cell_text(self):
+    def test_tracker_falls_back_for_missing_metadata_and_escapes_cell_text(self) -> None:
         data = self.data()
         data["units"][0]["target"] = "PR#12 PR#13 PR#14 PR#15"
         result = self.render_with_tracker(data, [
@@ -345,7 +349,7 @@ class RenderStatusTests(unittest.TestCase):
         self.assertIn("| Next | Tracker |", empty.stdout)
         self.assertTrue(all(line.endswith(" | — |") for line in empty.stdout.splitlines()[4:7]))
 
-    def test_cli_tracker_input_errors_write_nothing(self):
+    def test_cli_tracker_input_errors_write_nothing(self) -> None:
         valid = {"url": "https://github.com/acme/api/pull/12", "assignee": "Alex", "completed": False,
                  "permalink_url": "https://example.invalid/task/12"}
         malformed = [
@@ -382,7 +386,7 @@ class RenderStatusTests(unittest.TestCase):
                     else:
                         self.assertFalse(output.exists())
 
-    def test_cli_renders_read_only_input(self):
+    def test_cli_renders_read_only_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "status.json"
             output = Path(temporary) / "status.md"
@@ -393,7 +397,7 @@ class RenderStatusTests(unittest.TestCase):
             self.assertEqual(output.read_text(encoding="utf-8"), renderer.render_status(self.data()))
             self.assertEqual(source.read_bytes(), original)
 
-    def test_cli_rejects_output_aliases_without_changing_input(self):
+    def test_cli_rejects_output_aliases_without_changing_input(self) -> None:
         for alias in ("same", "normalized", "symlink", "hardlink"):
             with self.subTest(alias=alias), tempfile.TemporaryDirectory() as temporary:
                 source = Path(temporary) / "status.json"
@@ -422,7 +426,7 @@ class WatchPrsTests(unittest.TestCase):
     spec = "acme/api#12"
     me = "author"
 
-    def snapshot(self, **changes):
+    def snapshot(self, **changes: object) -> dict:
         result = {
             "state": "OPEN", "headRefOid": "a" * 40, "mergeable": "MERGEABLE",
             "statusCheckRollup": [{"name": "unit", "status": "IN_PROGRESS", "conclusion": None}],
@@ -431,7 +435,7 @@ class WatchPrsTests(unittest.TestCase):
         result.update(changes)
         return result
 
-    def transition(self, before, after):
+    def transition(self, before: dict, after: dict) -> tuple[list[str], dict]:
         _, previous = prs.diff_events(self.spec, {}, before, self.me)
         preserved = copy.deepcopy(previous)
         snapshot_copy = copy.deepcopy(after)
@@ -461,12 +465,12 @@ class WatchPrsTests(unittest.TestCase):
 
         return calls, run
 
-    def codex_summary(self, status, findings=None):
+    def codex_summary(self, status: str, findings: bool | None = None) -> list[dict]:
         state = {"commit_sha": "a" * 40, "status": status, "has_any_findings": findings}
         body = "<!-- codex-review-state:v1 " + json.dumps({"code_review": state, "security_review": state}) + " -->"
         return [{"id": 7, "user": {"login": "chatgpt-codex-connector[bot]"}, "body": body}]
 
-    def test_codex_summary_edited_in_place_reports_each_review(self):
+    def test_codex_summary_edited_in_place_reports_each_review(self) -> None:
         events, _ = self.transition(
             self.snapshot(comments=self.codex_summary("running")),
             self.snapshot(comments=self.codex_summary("completed", findings=False)),
@@ -476,8 +480,8 @@ class WatchPrsTests(unittest.TestCase):
             "acme/api#12 CODEX security_review COMPLETED (head aaaaaaaaa, no findings)",
         ])
 
-    def test_codex_summary_table_reports_reviews_without_the_state_marker(self):
-        def summary(word):
+    def test_codex_summary_table_reports_reviews_without_the_state_marker(self) -> None:
+        def summary(word: str) -> list[dict]:
             marker = json.dumps({"headSha": "a" * 40, "status": word.lower()})
             body = (
                 f"<!-- codex-security-review:v1 {marker} -->\n"
@@ -492,7 +496,7 @@ class WatchPrsTests(unittest.TestCase):
             "acme/api#12 CODEX security_review COMPLETED (head aaaaaaaaa)",
         ])
 
-    def test_success_and_failure_completion_events(self):
+    def test_success_and_failure_completion_events(self) -> None:
         for conclusion, word in (("SUCCESS", "SUCCESS"), ("FAILURE", "FAILURE")):
             with self.subTest(conclusion=conclusion):
                 after = self.snapshot(statusCheckRollup=[{"name": "unit", "status": "COMPLETED", "conclusion": conclusion}])
@@ -502,7 +506,7 @@ class WatchPrsTests(unittest.TestCase):
                 self.assertIn("1 checks", events[0])
                 self.assertIn(f"{int(word == 'FAILURE')} failed", events[0])
 
-    def test_new_head_is_a_new_completion_even_with_same_result(self):
+    def test_new_head_is_a_new_completion_even_with_same_result(self) -> None:
         finished = [{"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"}]
         before = self.snapshot(statusCheckRollup=finished)
         # The entire SHA is the identity, even when the displayed prefix matches.
@@ -511,7 +515,7 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertIn("CI SUCCESS", events[0])
 
-    def test_same_head_reports_changed_failing_checks(self):
+    def test_same_head_reports_changed_failing_checks(self) -> None:
         before = self.snapshot(statusCheckRollup=[
             {"name": "unit", "status": "COMPLETED", "conclusion": "FAILURE"},
             {"name": "security", "status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -525,7 +529,7 @@ class WatchPrsTests(unittest.TestCase):
         self.assertIn('CI FAILURE (2 checks, 1 failed', events[0])
         self.assertIn('failed=["security"]', events[0])
 
-    def test_same_head_reports_changed_commit_statuses(self):
+    def test_same_head_reports_changed_commit_statuses(self) -> None:
         before = self.snapshot(statusCheckRollup=[
             {"context": "unit", "state": "FAILURE"},
             {"context": "security", "state": "SUCCESS"},
@@ -538,7 +542,7 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertIn('failed=["security"]', events[0])
 
-    def test_same_head_reports_changed_terminal_conclusion(self):
+    def test_same_head_reports_changed_terminal_conclusion(self) -> None:
         for before_check, after_check in (
             ({"name": "unit", "status": "COMPLETED", "conclusion": "FAILURE"},
              {"name": "unit", "status": "COMPLETED", "conclusion": "TIMED_OUT"}),
@@ -550,7 +554,7 @@ class WatchPrsTests(unittest.TestCase):
                 self.assertEqual(len(events), 1)
                 self.assertIn("CI FAILURE", events[0])
 
-    def test_reordered_terminal_checks_and_statuses_emit_nothing(self):
+    def test_reordered_terminal_checks_and_statuses_emit_nothing(self) -> None:
         terminal = [
             {"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"context": "legacy", "state": "ERROR"},
@@ -558,7 +562,7 @@ class WatchPrsTests(unittest.TestCase):
         events, _ = self.transition(self.snapshot(statusCheckRollup=terminal), self.snapshot(statusCheckRollup=list(reversed(terminal))))
         self.assertEqual(events, [])
 
-    def test_pending_then_unchanged_terminal_result_does_not_duplicate(self):
+    def test_pending_then_unchanged_terminal_result_does_not_duplicate(self) -> None:
         terminal = self.snapshot(statusCheckRollup=[{"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"}])
         _, previous = prs.diff_events(self.spec, {}, terminal, self.me)
         events, pending = prs.diff_events(self.spec, previous, self.snapshot(), self.me)
@@ -566,11 +570,11 @@ class WatchPrsTests(unittest.TestCase):
         events, _ = prs.diff_events(self.spec, pending, terminal, self.me)
         self.assertEqual(events, [])
 
-    def test_conflicting_event(self):
+    def test_conflicting_event(self) -> None:
         events, _ = self.transition(self.snapshot(), self.snapshot(mergeable="CONFLICTING"))
         self.assertEqual(events, [self.spec + " CONFLICTING with base"])
 
-    def test_each_comment_feed_and_ignore_self(self):
+    def test_each_comment_feed_and_ignore_self(self) -> None:
         for feed, kind in (("reviews", "REVIEW"), ("line_comments", "LINE"), ("comments", "COMMENT")):
             with self.subTest(feed=feed):
                 items = [
@@ -584,27 +588,27 @@ class WatchPrsTests(unittest.TestCase):
                 self.assertNotIn("\n", events[0])
                 self.assertIn(kind + ":2", state["seen"])
 
-    def test_existing_comments_are_not_reemitted(self):
+    def test_existing_comments_are_not_reemitted(self) -> None:
         old = {"id": 1, "user": {"login": "reviewer"}, "body": "old"}
         new = {"id": 2, "user": {"login": "reviewer"}, "body": "new"}
         events, _ = self.transition(self.snapshot(comments=[old]), self.snapshot(comments=[old, new]))
         self.assertEqual(len(events), 1)
         self.assertIn(" :: new", events[0])
 
-    def test_pending_review_waits_for_submission(self):
+    def test_pending_review_waits_for_submission(self) -> None:
         draft = {"id": 1, "user": {"login": "reviewer"}, "state": "PENDING", "body": "draft"}
         submitted = dict(draft, state="CHANGES_REQUESTED")
         events, _ = self.transition(self.snapshot(reviews=[draft]), self.snapshot(reviews=[submitted]))
         self.assertEqual(len(events), 1)
         self.assertIn("NEW REVIEW", events[0])
 
-    def test_terminal_states(self):
+    def test_terminal_states(self) -> None:
         for terminal in ("MERGED", "CLOSED"):
             with self.subTest(terminal=terminal):
                 events, _ = self.transition(self.snapshot(), self.snapshot(state=terminal))
                 self.assertEqual(events, [self.spec + " " + terminal])
 
-    def test_legacy_statuses_and_incomplete_checks(self):
+    def test_legacy_statuses_and_incomplete_checks(self) -> None:
         self.assertEqual(prs.finished_checks([{ "context": "legacy", "state": "SUCCESS"}]), (True, []))
         self.assertEqual(prs.finished_checks([{ "context": "legacy", "state": "ERROR"}]), (True, ["legacy"]))
         self.assertEqual(prs.finished_checks([]), (False, []))
@@ -616,7 +620,7 @@ class WatchPrsTests(unittest.TestCase):
             with self.subTest(check=check):
                 self.assertEqual(prs.finished_checks([check]), (False, []))
 
-    def test_re_reads_list_each_cycle_and_persists_baseline(self):
+    def test_re_reads_list_each_cycle_and_persists_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             listing = Path(temporary) / "prs.txt"
             state_file = Path(temporary) / "state.json"
@@ -625,7 +629,7 @@ class WatchPrsTests(unittest.TestCase):
             output = io.StringIO()
             cycles = iter((True, False))
 
-            def next_cycle(_):
+            def next_cycle(_: float) -> None:
                 if not next(cycles):
                     raise KeyboardInterrupt
                 listing.write_text("# list updated\n" + self.spec + "\n" + extra + "\n", encoding="utf-8")
@@ -694,7 +698,7 @@ class WatchPrsTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("at least 60", errors.getvalue())
 
-    def test_api_pagination_is_flattened(self):
+    def test_api_pagination_is_flattened(self) -> None:
         item = {"id": 1, "user": {"login": "reviewer"}}
         with patch.object(prs, "gh_json", side_effect=[self.snapshot(), [[item], [{"id": 2}]], [[]], [[]]]) as gh:
             snapshot = prs.fetch_snapshot(self.spec, {})
@@ -702,7 +706,7 @@ class WatchPrsTests(unittest.TestCase):
         self.assertIn("--paginate", gh.call_args_list[1].args[0])
         self.assertIn("--slurp", gh.call_args_list[1].args[0])
 
-    def test_invalid_state_file_is_not_silently_reset(self):
+    def test_invalid_state_file_is_not_silently_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             listing = Path(temporary) / "prs.txt"
             state_file = Path(temporary) / "state.json"
@@ -713,7 +717,7 @@ class WatchPrsTests(unittest.TestCase):
             fetch.assert_not_called()
             self.assertEqual(state_file.read_text(), "invalid-json")
 
-    def test_failed_poll_does_not_advance_state_or_report_success(self):
+    def test_failed_poll_does_not_advance_state_or_report_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             listing = Path(temporary) / "prs.txt"
             state_file = Path(temporary) / "state.json"
@@ -728,7 +732,7 @@ class WatchPrsTests(unittest.TestCase):
 
 
 class WatchChecksTests(unittest.TestCase):
-    def test_classify_commit_missing_non_actions_metadata_does_not_block(self):
+    def test_classify_commit_missing_non_actions_metadata_does_not_block(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         for count in (0, None, "missing"):
             for app in ({"slug": "some-app"}, {}, None, "missing"):
@@ -740,20 +744,20 @@ class WatchChecksTests(unittest.TestCase):
                         suite["app"] = app
                     self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, [suite]), (True, []))
 
-    def test_help_explains_suite_pending_rule(self):
+    def test_help_explains_suite_pending_rule(self) -> None:
         result = subprocess.run([sys.executable, str(SCRIPTS / "watch_checks.py"), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = " ".join(result.stdout.split())
         self.assertIn("Non-completed suites block only with check runs or a GitHub Actions slug.", help_text)
         self.assertIn("Missing counts mean zero; missing app metadata means non-Actions.", help_text)
 
-    def test_classify_commit_ignores_empty_other_app_suites(self):
+    def test_classify_commit_ignores_empty_other_app_suites(self) -> None:
         runs = [{"name": name, "status": "completed", "conclusion": "success"} for name in ("unit", "lint", "smoke")]
         suites = [{"status": "queued", "conclusion": None, "latest_check_runs_count": 0, "app": {"slug": "some-app"}}]
         suites.extend({"status": "completed", "conclusion": "success", "latest_check_runs_count": 1, "app": {"slug": "github-actions"}} for _ in runs)
         self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (True, []))
 
-    def test_classify_commit_empty_actions_suite_is_pending(self):
+    def test_classify_commit_empty_actions_suite_is_pending(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         for count in (0, None, "missing"):
             with self.subTest(count=count):
@@ -762,7 +766,7 @@ class WatchChecksTests(unittest.TestCase):
                     suite["latest_check_runs_count"] = count
                 self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, [suite]), (False, []))
 
-    def test_classify_commit_rerequested_suite_with_runs_is_pending(self):
+    def test_classify_commit_rerequested_suite_with_runs_is_pending(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         for app in ({"slug": "some-app"}, None):
             for status in ("queued", "in_progress"):
@@ -770,13 +774,13 @@ class WatchChecksTests(unittest.TestCase):
                     suites = [{"status": status, "latest_check_runs_count": 1, "app": app}]
                     self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (False, []))
 
-    def poll_commit(self, runs, status_pages, suite_pages=None):
+    def poll_commit(self, runs: list[dict], status_pages: list[dict], suite_pages: list[dict] | None = None) -> tuple[int, str, list, Mock]:
         output = io.StringIO()
         errors = io.StringIO()
         if suite_pages is None:
             suite_pages = [{"check_suites": [{"status": "completed"}] if runs else []}]
 
-        def api_response(command, **kwargs):
+        def api_response(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             if command[-1] == "repos/example/api/commits/abcdef123/check-runs?per_page=100":
                 payload = [{"check_runs": runs}]
             elif command[-1] == "repos/example/api/commits/abcdef123/status?per_page=100":
@@ -792,7 +796,7 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         return code, output.getvalue(), api.call_args_list, sleep
 
-    def test_incomplete_check_suites_with_runs_keep_completed_runs_pending(self):
+    def test_incomplete_check_suites_with_runs_keep_completed_runs_pending(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         statuses = [{"state": "success", "statuses": [{"context": "legacy", "state": "success"}]}]
         for state in ("queued", "in_progress"):
@@ -803,14 +807,14 @@ class WatchChecksTests(unittest.TestCase):
                 self.assertEqual(output, "")
                 sleep.assert_called_once_with(60)
 
-    def test_pending_commit_status_prevents_completion(self):
+    def test_pending_commit_status_prevents_completion(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         code, output, _, sleep = self.poll_commit(runs, [{"state": "pending", "statuses": [{"context": "legacy", "state": "pending"}], "total_count": 1}])
         self.assertEqual(code, 130)
         self.assertEqual(output, "")
         sleep.assert_called_once_with(60)
 
-    def test_failed_and_errored_commit_statuses_are_reported(self):
+    def test_failed_and_errored_commit_statuses_are_reported(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         statuses = [{"context": "legacy", "state": "failure"}, {"context": "security", "state": "error"}]
         code, output, _, sleep = self.poll_commit(runs, [{"state": "failure", "statuses": statuses, "total_count": 2}])
@@ -818,7 +822,7 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(output, 'DONE example/api@abcdef123 FAILED ["legacy", "security"]\n')
         sleep.assert_not_called()
 
-    def test_statuses_only_commit_finishes(self):
+    def test_statuses_only_commit_finishes(self) -> None:
         for state, expected in (("success", "ok (1 checks)"), ("failure", 'FAILED ["legacy"]'), ("error", 'FAILED ["legacy"]')):
             with self.subTest(state=state):
                 combined_state = "success" if state == "success" else "failure"
@@ -827,7 +831,7 @@ class WatchChecksTests(unittest.TestCase):
                 self.assertEqual(output, f"DONE example/api@abcdef123 {expected}\n")
                 sleep.assert_not_called()
 
-    def test_check_runs_only_commit_finishes_with_empty_pending_status(self):
+    def test_check_runs_only_commit_finishes_with_empty_pending_status(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         code, output, calls, sleep = self.poll_commit(runs, [{"state": "pending", "statuses": [], "total_count": 0}])
         self.assertEqual(code, 0)
@@ -835,13 +839,13 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         sleep.assert_not_called()
 
-    def test_successful_status_does_not_finish_incomplete_check_run(self):
+    def test_successful_status_does_not_finish_incomplete_check_run(self) -> None:
         code, output, _, sleep = self.poll_commit([{"name": "unit", "status": "queued"}], [{"state": "success", "statuses": [{"context": "legacy", "state": "success"}], "total_count": 1}])
         self.assertEqual(code, 130)
         self.assertEqual(output, "")
         sleep.assert_called_once_with(60)
 
-    def test_combined_failure_does_not_hide_pending_status(self):
+    def test_combined_failure_does_not_hide_pending_status(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         statuses = [{"context": "legacy", "state": "failure"}, {"context": "security", "state": "pending"}]
         code, output, _, sleep = self.poll_commit(runs, [{"state": "failure", "statuses": statuses, "total_count": 2}])
@@ -849,7 +853,7 @@ class WatchChecksTests(unittest.TestCase):
         self.assertEqual(output, "")
         sleep.assert_called_once_with(60)
 
-    def test_status_pagination_includes_failures_on_later_pages(self):
+    def test_status_pagination_includes_failures_on_later_pages(self) -> None:
         runs = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         pages = [
             {"state": "failure", "statuses": [{"context": "legacy", "state": "success"}], "total_count": 2},
@@ -861,22 +865,22 @@ class WatchChecksTests(unittest.TestCase):
         self.assertIn("--paginate", calls[1].args[0])
         self.assertIn("--slurp", calls[1].args[0])
 
-    def test_empty_or_incomplete_is_not_done(self):
+    def test_empty_or_incomplete_is_not_done(self) -> None:
         for runs in ([], [{"status": "queued"}], [{"status": "in_progress"}], [{"status": "completed", "conclusion": "success"}, {"status": "queued"}]):
             with self.subTest(runs=runs):
                 self.assertEqual(checks.classify_checks(runs), (False, []))
 
-    def test_success_skipped_neutral_are_ok(self):
+    def test_success_skipped_neutral_are_ok(self) -> None:
         runs = [{"name": result, "status": "completed", "conclusion": result} for result in ("success", "skipped", "neutral")]
         self.assertEqual(checks.classify_checks(runs), (True, []))
 
-    def test_failed_classification(self):
+    def test_failed_classification(self) -> None:
         runs: list[dict[str, str | None]] = [{"name": result, "status": "completed", "conclusion": result}
                                             for result in ("failure", "cancelled", "timed_out", "action_required")]
         runs.append({"name": "unknown", "status": "completed", "conclusion": None})
         self.assertEqual(checks.classify_checks(runs), (True, ["failure", "cancelled", "timed_out", "action_required", "unknown"]))
 
-    def test_main_emits_once_per_commit_and_exits_without_final_sleep(self):
+    def test_main_emits_once_per_commit_and_exits_without_final_sleep(self) -> None:
         ok = [{"name": "unit", "status": "completed", "conclusion": "success"}]
         bad = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
         output = io.StringIO()
@@ -887,7 +891,7 @@ class WatchChecksTests(unittest.TestCase):
         sleep.assert_called_once_with(60)
         self.assertEqual(output.getvalue().splitlines(), ["DONE acme/api@abcdef123 ok (1 checks)", 'DONE acme/ui@fedcba321 FAILED ["lint"]'])
 
-    def test_api_pagination_covers_all_check_runs(self):
+    def test_api_pagination_covers_all_check_runs(self) -> None:
         completed = {"name": "unit", "status": "completed", "conclusion": "success"}
         queued = {"name": "lint", "status": "queued"}
         result = subprocess.CompletedProcess([], 0, json.dumps([{"check_runs": [completed]}, {"check_runs": [queued]}]), "")
@@ -897,12 +901,12 @@ class WatchChecksTests(unittest.TestCase):
         self.assertIn("--paginate", run.call_args.args[0])
         self.assertIn("--slurp", run.call_args.args[0])
 
-    def test_failed_api_cannot_be_classified_as_empty_success(self):
+    def test_failed_api_cannot_be_classified_as_empty_success(self) -> None:
         with patch.object(checks.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "not authorized")):
             with self.assertRaisesRegex(ValueError, "gh api failed"):
                 checks.check_runs("acme/api", "abcdef123")
 
-    def test_status_api_error_does_not_emit_completion(self):
+    def test_status_api_error_does_not_emit_completion(self) -> None:
         completed = {"name": "unit", "status": "completed", "conclusion": "success"}
         responses = [
             subprocess.CompletedProcess([], 0, json.dumps([{"check_runs": [completed]}]), ""),
@@ -917,12 +921,12 @@ class WatchChecksTests(unittest.TestCase):
 
 
 class AsanaTasksTests(unittest.TestCase):
-    def test_help_names_index_subcommand(self):
+    def test_help_names_index_subcommand(self) -> None:
         result = subprocess.run([sys.executable, str(SCRIPTS / "asana_tasks.py"), "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"(?m)^\s+index\s+list open and completed project tasks")
 
-    def test_missing_pat_cli_exits_without_echoing_secrets(self):
+    def test_missing_pat_cli_exits_without_echoing_secrets(self) -> None:
         environment = dict(os.environ)
         environment.pop("ASANA_PAT", None)
         environment["UNRELATED_SECRET"] = "unrelated-test-secret"
@@ -931,7 +935,7 @@ class AsanaTasksTests(unittest.TestCase):
         self.assertIn("Missing ASANA_PAT", result.stderr)
         self.assertNotIn("unrelated-test-secret", result.stdout + result.stderr)
 
-    def test_env_file_reads_only_pat_and_does_not_execute_assignments(self):
+    def test_env_file_reads_only_pat_and_does_not_execute_assignments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env_file = Path(temporary) / "test.env"
             marker = Path(temporary) / "must-not-exist"
@@ -941,10 +945,10 @@ class AsanaTasksTests(unittest.TestCase):
                 self.assertNotIn("ASANA_PROJECT", os.environ)
             self.assertFalse(marker.exists())
 
-    def test_environment_pat_precedes_file(self):
+    def test_environment_pat_precedes_file(self) -> None:
         self.assertEqual(asana.read_pat("missing.env", {"ASANA_PAT": "environment-token"}), "environment-token")
 
-    def test_env_file_quotes_and_unquoted_values(self):
+    def test_env_file_quotes_and_unquoted_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env_file = Path(temporary) / "test.env"
             for assignment in ('ASANA_PAT="test-token"', "ASANA_PAT='test-token'", " ASANA_PAT = test-token # comment", "ASANA_PAT=test=token"):
@@ -953,7 +957,7 @@ class AsanaTasksTests(unittest.TestCase):
                     expected = "test=token" if "test=token" in assignment else "test-token"
                     self.assertEqual(asana.read_pat(env_file, {}), expected)
 
-    def test_malformed_or_missing_file_assignment_never_echoes_content(self):
+    def test_malformed_or_missing_file_assignment_never_echoes_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             env_file = Path(temporary) / "test.env"
             for content in ("OTHER=unrelated-test-secret\n", 'ASANA_PAT="malformed-test-secret\n', "ASANA_PAT=\n"):
@@ -963,16 +967,16 @@ class AsanaTasksTests(unittest.TestCase):
                         asana.read_pat(env_file, {})
                     self.assertNotIn("test-secret", str(context.exception))
 
-    def task(self, gid="task-id", assignee="user-id", completed=False, url="https://github.com/acme/api/pull/12"):
+    def task(self, gid: str = "task-id", assignee: str = "user-id", completed: bool = False, url: str = "https://github.com/acme/api/pull/12") -> dict:
         return {"gid": gid, "name": "Review #12", "completed": completed, "assignee": {"gid": assignee, "name": "reviewer"}, "custom_fields": [{"gid": "url-field", "text_value": url}]}
 
-    def run_mocked(self, args, client):
+    def run_mocked(self, args: list[str], client: Mock) -> list[dict]:
         output = io.StringIO()
         with patch.dict(os.environ, {"ASANA_PAT": "test-token", "ASANA_PROJECT": "project-id", "ASANA_URL_FIELD": "url-field"}, clear=True), patch.object(asana, "Asana", return_value=client), redirect_stdout(output):
             self.assertEqual(asana.main(args), 0)
         return [json.loads(line) for line in output.getvalue().splitlines()]
 
-    def test_returned_filters_assignee_and_completion_and_outputs_json_lines(self):
+    def test_returned_filters_assignee_and_completion_and_outputs_json_lines(self) -> None:
         client = Mock()
         client.project_tasks.return_value = [self.task(), self.task(gid="completed-id", completed=True), self.task(gid="other-id", assignee="other-user-id")]
         rows = self.run_mocked(["returned", "--assignee", "user-id"], client)
@@ -980,14 +984,14 @@ class AsanaTasksTests(unittest.TestCase):
         self.assertEqual([row["gid"] for row in rows], ["task-id"])
         self.assertEqual(rows[0]["url"], "https://github.com/acme/api/pull/12")
 
-    def test_find_uses_url_not_title_or_number_and_includes_completed(self):
+    def test_find_uses_url_not_title_or_number_and_includes_completed(self) -> None:
         client = Mock()
         client.project_tasks.return_value = [self.task(completed=True), self.task(gid="other-repo", url="https://github.com/acme/ui/pull/12")]
         rows = self.run_mocked(["find", "https://github.com/acme/api/pull/12/"], client)
         client.project_tasks.assert_called_once_with("project-id", incomplete=False)
         self.assertEqual([row["gid"] for row in rows], ["task-id"])
 
-    def test_index_lists_all_project_tasks_with_links_and_global_options(self):
+    def test_index_lists_all_project_tasks_with_links_and_global_options(self) -> None:
         first = self.task(gid="1200000000000002")
         first["permalink_url"] = "https://app.asana.com/0/1200000000000001/1200000000000002"
         second = self.task(gid="1200000000000003", completed=True)
@@ -1023,7 +1027,7 @@ class AsanaTasksTests(unittest.TestCase):
                     self.assertIn("permalink_url", params["opt_fields"][0].split(","))
                 self.assertIn("offset=next-page", urls[1])
 
-    def test_create_keeps_full_title_and_accepts_options_after_subcommand(self):
+    def test_create_keeps_full_title_and_accepts_options_after_subcommand(self) -> None:
         client = Mock()
         client.call.return_value = {"data": {"gid": "task-id"}}
         client.show.return_value = self.task()
@@ -1031,13 +1035,13 @@ class AsanaTasksTests(unittest.TestCase):
         self.run_mocked(["create", url, "Full title #12", "--assignee", "user-id", "--project", "override-project", "--url-field", "url-field"], client)
         client.call.assert_called_once_with("POST", "/tasks", {"name": "Full title #12", "projects": ["override-project"], "assignee": "user-id", "notes": "", "custom_fields": {"url-field": url}})
 
-    def test_common_options_also_work_before_subcommand(self):
+    def test_common_options_also_work_before_subcommand(self) -> None:
         client = Mock()
         client.project_tasks.return_value = []
         self.run_mocked(["--project", "override-project", "returned", "--assignee", "user-id"], client)
         client.project_tasks.assert_called_once_with("override-project", incomplete=True)
 
-    def test_show_and_complete_accept_multiple_ids(self):
+    def test_show_and_complete_accept_multiple_ids(self) -> None:
         for command in ("show", "complete"):
             with self.subTest(command=command):
                 client = Mock()
@@ -1051,7 +1055,7 @@ class AsanaTasksTests(unittest.TestCase):
                         ("PUT", "/tasks/second-id", {"completed": True}),
                     ])
 
-    def test_project_pagination_retains_fields_and_offset(self):
+    def test_project_pagination_retains_fields_and_offset(self) -> None:
         client = asana.Asana("test-token")
         with patch.object(client, "call", side_effect=[{"data": [self.task()], "next_page": {"offset": "next-page"}}, {"data": [self.task("second-id")], "next_page": None}]) as call:
             rows = list(client.project_tasks("project-id"))
@@ -1060,7 +1064,7 @@ class AsanaTasksTests(unittest.TestCase):
         self.assertIn("custom_fields.text_value", call.call_args.kwargs["params"]["opt_fields"])
         self.assertNotEqual(call.call_args.kwargs["params"]["completed_since"], "now")
 
-    def test_http_error_redacts_pat_and_response_body(self):
+    def test_http_error_redacts_pat_and_response_body(self) -> None:
         client = asana.Asana("test-token")
         error = urllib.error.HTTPError("https://app.asana.com/api/1.0/tasks", 401, "test-token", Message(), io.BytesIO(b"test-token"))
         with patch.object(asana.urllib.request, "urlopen", side_effect=error):
@@ -1068,7 +1072,7 @@ class AsanaTasksTests(unittest.TestCase):
                 client.call("GET", "/tasks/task-id")
         self.assertNotIn("test-token", str(context.exception))
 
-    def test_header_validation_error_cannot_echo_pat(self):
+    def test_header_validation_error_cannot_echo_pat(self) -> None:
         client = asana.Asana("test-token")
         with patch.object(asana.urllib.request, "urlopen", side_effect=ValueError("Invalid header value: test-token")):
             with self.assertRaisesRegex(ValueError, "Invalid Asana response or request") as context:
@@ -1077,7 +1081,7 @@ class AsanaTasksTests(unittest.TestCase):
 
 
 class WorktreeSetupTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -1090,11 +1094,11 @@ class WorktreeSetupTests(unittest.TestCase):
         self.git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "initial fixture")
         self.git(self.repo, "push", "-q", "origin", "main")
 
-    def git(self, cwd, *args):
+    def git(self, cwd: Path, *args: str) -> str:
         environment = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
         return subprocess.run(["git", *args], cwd=cwd, env=environment, capture_output=True, text=True, check=True).stdout
 
-    def setup(self, **options):
+    def setup(self, **options: str) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ)
         for name in ("WORKTREE_LOCAL_FILES", "WORKTREE_SMOKE", "TOPIC_BRANCH"):
             environment.pop(name, None)
@@ -1102,7 +1106,7 @@ class WorktreeSetupTests(unittest.TestCase):
         environment.update(options)
         return subprocess.run(["bash", str(WORKTREE_SETUP), "topic", "main"], cwd=self.repo, env=environment, capture_output=True, text=True)
 
-    def test_copies_untracked_local_files_reports_missing_and_smoke_sees_them(self):
+    def test_copies_untracked_local_files_reports_missing_and_smoke_sees_them(self) -> None:
         (self.repo / "config").mkdir()
         (self.repo / "config" / "local.env").write_text("LOCAL_OPTION=example\n", encoding="utf-8")
         (self.repo / "extra.txt").write_text("extra\n", encoding="utf-8")
@@ -1114,14 +1118,14 @@ class WorktreeSetupTests(unittest.TestCase):
         self.assertIn("missing file: missing.env (skipped)", result.stderr)
         self.assertEqual(Path(result.stdout.splitlines()[-1]).resolve(), worktree.resolve())
 
-    def test_smoke_failure_aborts_with_clear_message(self):
+    def test_smoke_failure_aborts_with_clear_message(self) -> None:
         result = self.setup(WORKTREE_SMOKE="test -f README.md || exit 2; exit 7")
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertIn("WORKTREE_SMOKE failed", result.stderr)
         self.assertIn("exit 7", result.stderr)
         self.assertNotEqual(result.stdout.splitlines()[-1], str(self.repo / ".worktrees" / "topic"))
 
-    def test_smoke_failing_pipeline_aborts_before_following_command(self):
+    def test_smoke_failing_pipeline_aborts_before_following_command(self) -> None:
         result = self.setup(WORKTREE_SMOKE="false | cat; touch smoke-passed")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("WORKTREE_SMOKE failed", result.stderr)
@@ -1129,7 +1133,7 @@ class WorktreeSetupTests(unittest.TestCase):
         self.assertFalse((self.repo / ".worktrees" / "topic" / "smoke-passed").exists())
         self.assertNotEqual(result.stdout.splitlines()[-1], str(self.repo / ".worktrees" / "topic"))
 
-    def test_default_behavior_does_not_copy_local_files(self):
+    def test_default_behavior_does_not_copy_local_files(self) -> None:
         (self.repo / "local.env").write_text("LOCAL_OPTION=example\n", encoding="utf-8")
         result = self.setup()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

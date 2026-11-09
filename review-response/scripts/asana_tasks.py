@@ -1,6 +1,10 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """List and update Asana review tasks; configuration comes from the caller."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping
+
 import argparse
 import http.client
 import json
@@ -19,7 +23,7 @@ FIELDS = (
 )
 
 
-def read_pat(env_file=None, environ=None):
+def read_pat(env_file: str | Path | None = None, environ: Mapping[str, str] | None = None) -> str:
     """Prefer ASANA_PAT in the environment; read only its assignment from a file."""
     environ = os.environ if environ is None else environ
     if environ.get("ASANA_PAT", "").strip():
@@ -47,7 +51,7 @@ def read_pat(env_file=None, environ=None):
     raise ValueError("Missing ASANA_PAT; set ASANA_PAT or pass --env-file")
 
 
-def task_record(task, url_field):
+def task_record(task: dict, url_field: str) -> dict:
     field = next(
         (field for field in task.get("custom_fields") or [] if field.get("gid") == url_field),
         {},
@@ -67,10 +71,10 @@ def task_record(task, url_field):
 
 
 class Asana:
-    def __init__(self, pat):
+    def __init__(self, pat: str) -> None:
         self.pat = pat
 
-    def call(self, method, path, data=None, params=None):
+    def call(self, method: str, path: str, data: dict | None = None, params: dict[str, str | int] | None = None) -> dict:
         url = "https://app.asana.com/api/1.0" + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -94,7 +98,7 @@ class Asana:
             # HTTP header validation can include the token in its exception text.
             raise ValueError("Invalid Asana response or request") from None
 
-    def project_tasks(self, project, incomplete=False):
+    def project_tasks(self, project: str, incomplete: bool = False) -> Iterator[dict]:
         params = {"limit": 100, "opt_fields": FIELDS,
                   "completed_since": "now" if incomplete else "1970-01-01T00:00:00Z"}
         while True:
@@ -105,18 +109,18 @@ class Asana:
                 return
             params["offset"] = offset
 
-    def show(self, gid):
+    def show(self, gid: str) -> dict:
         return self.call("GET", "/tasks/" + urllib.parse.quote(gid, safe=""), params={"opt_fields": FIELDS})["data"]
 
 
-def add_options(parser):
+def add_options(parser: argparse.ArgumentParser) -> None:
     # SUPPRESS lets these options appear before or after the subcommand.
     parser.add_argument("--env-file", default=argparse.SUPPRESS, help="read only ASANA_PAT from this file (environment takes precedence)")
     parser.add_argument("--project", default=argparse.SUPPRESS, help="project ID (default: ASANA_PROJECT)")
     parser.add_argument("--url-field", default=argparse.SUPPRESS, help="URL custom field ID (default: ASANA_URL_FIELD)")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, epilog="All results are JSON lines. No task title suffix is added.")
     add_options(parser)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -144,10 +148,11 @@ def main(argv=None):
             raise ValueError("Missing project; pass --project or set ASANA_PROJECT")
         client = Asana(pat)
 
-        def emit(task):
+        def emit(task: dict) -> None:
             print(json.dumps(task_record(task, url_field), ensure_ascii=False))
 
         if args.command in ("returned", "find", "index"):
+            assert project is not None
             for task in client.project_tasks(project, incomplete=args.command == "returned"):
                 record = task_record(task, url_field)
                 if args.command == "returned":

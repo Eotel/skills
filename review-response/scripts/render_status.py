@@ -1,6 +1,8 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Render caller-supplied review status JSON as a Markdown table."""
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -11,12 +13,12 @@ import sys
 REPO = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 
 
-def resolve_repo(value, repos):
+def resolve_repo(value: str | None, repos: dict[str, str]) -> str | None:
     value = repos.get(value, value) if value else None
     return value if value and re.fullmatch(REPO, value) else None
 
 
-def linkify(text, default_repo=None, repos=None, references=None):
+def linkify(text: str, default_repo: str | None = None, repos: dict[str, str] | None = None, references: list[tuple[str, str]] | None = None) -> str:
     """Link references using the row repo, aliases and explicit repos in this cell.
 
     PR#N uses /pull/ and the row repo. Other references use /issues/. Bare #N
@@ -39,7 +41,7 @@ def linkify(text, default_repo=None, repos=None, references=None):
         r"|(?<![A-Za-z0-9_\[/#])#(?P<bare>[0-9]+)"
     )
 
-    def replace(match):
+    def replace(match: re.Match[str]) -> str:
         nonlocal last_repo
         reference = match[0]
         if match["protected"]:
@@ -77,7 +79,7 @@ def linkify(text, default_repo=None, repos=None, references=None):
     return pattern.sub(replace, text)
 
 
-def read_tracker(path):
+def read_tracker(path: Path) -> list[dict]:
     """Read and validate task records before any status output is written."""
     tasks = []
     for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
@@ -100,7 +102,7 @@ def read_tracker(path):
     return tasks
 
 
-def render_status(data, done_prefix="done", tracker=None):
+def render_status(data: dict, done_prefix: str = "done", tracker: list[dict] | None = None) -> str:
     units = data["units"]
     repos = data.get("repos", {})
     done = sum(unit["state"].startswith(done_prefix) for unit in units)
@@ -140,7 +142,7 @@ def render_status(data, done_prefix="done", tracker=None):
     return "\n".join(lines) + "\n"
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog='JSON keys: units (id/repo/target/what/state/next), out_of_scope, repos (e.g. {"api": "acme/api"}).',

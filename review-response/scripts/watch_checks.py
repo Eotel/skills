@@ -1,6 +1,8 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Emit DONE owner/repo@sha ok|FAILED [...] once per commit; exit when all finish."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -9,7 +11,7 @@ import sys
 import time
 
 
-def classify_checks(runs):
+def classify_checks(runs: list[dict]) -> tuple[bool, list[str]]:
     """Return (done, failed_names). Empty or incomplete lists are not done."""
     if not runs or any(run.get("status", "").lower() != "completed" for run in runs):
         return False, []
@@ -18,7 +20,7 @@ def classify_checks(runs):
     return True, failed
 
 
-def classify_commit(runs, combined, suites):
+def classify_commit(runs: list[dict], combined: dict, suites: list[dict]) -> tuple[bool, list[str]]:
     """Non-completed suites block only with check runs or a GitHub Actions slug.
     Missing counts mean zero; missing app metadata means non-Actions.
     """
@@ -46,7 +48,7 @@ def classify_commit(runs, combined, suites):
     return True, failed
 
 
-def check_runs(repo, sha):
+def check_runs(repo: str, sha: str) -> list[dict]:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"],
         capture_output=True, text=True, timeout=60,
@@ -57,7 +59,7 @@ def check_runs(repo, sha):
     return [run for page in pages for run in page["check_runs"]]
 
 
-def combined_status(repo, sha):
+def combined_status(repo: str, sha: str) -> dict:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/status?per_page=100"],
         capture_output=True, text=True, timeout=60,
@@ -68,7 +70,7 @@ def combined_status(repo, sha):
     return {"state": pages[0]["state"], "statuses": [status for page in pages for status in page["statuses"]]}
 
 
-def check_suites(repo, sha):
+def check_suites(repo: str, sha: str) -> list[dict]:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-suites?per_page=100"],
         capture_output=True, text=True, timeout=60,
@@ -79,20 +81,20 @@ def check_suites(repo, sha):
     return [suite for page in pages for suite in page["check_suites"]]
 
 
-def commit_spec(value):
+def commit_spec(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Fa-f0-9]{7,40}", value):
         raise argparse.ArgumentTypeError("expected owner/repo@sha (7 to 40 hex digits)")
     return value
 
 
-def positive_interval(value):
-    value = float(value)
-    if not 0 < value < float("inf"):
+def positive_interval(value: str) -> float:
+    interval = float(value)
+    if not 0 < interval < float("inf"):
         raise argparse.ArgumentTypeError("interval must be positive and finite")
-    return value
+    return interval
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="Non-completed suites block only with check runs or a GitHub Actions slug. "

@@ -4,6 +4,8 @@
 Requires Orca run, terminal, agent, question, transcript, and rendered-screen evidence.
 """
 
+from __future__ import annotations
+
 import argparse
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -136,7 +138,7 @@ def transcript_for(run: dict[str, Any], home: Path, recorded: Iterable[Path] = (
     return matches[0] if len(matches) == 1 else None
 
 
-def newest_activity(transcript):
+def newest_activity(transcript: Path) -> datetime | None:
     newest = None
     with transcript.open(encoding="utf-8", errors="replace") as stream:
         for raw in deque(stream, maxlen=400):
@@ -190,7 +192,7 @@ def requests(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if QUESTION.search(line)]
 
 
-def close_blockers(term, transcript, screen, min_idle_minutes, now):
+def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes: float, now: datetime) -> list[str]:
     problems = []
     newest = newest_activity(transcript)
     if newest is None or (now - newest).total_seconds() < min_idle_minutes * 60:
@@ -216,7 +218,7 @@ def close_blockers(term, transcript, screen, min_idle_minutes, now):
     return problems
 
 
-def no_pending_questions(state_file, pane):
+def no_pending_questions(state_file: Path, pane: str) -> bool:
     if not state_file.exists():
         return True
     data = json.loads(state_file.read_text())

@@ -1,5 +1,12 @@
 """Offline behavior tests for the orca-session-triage command line tools."""
 
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from email.message import Message
+from types import ModuleType
+from typing import Literal, NotRequired, TypedDict, Unpack
+
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -20,6 +27,18 @@ import time
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.request
+
+
+
+class TextRunOptions(TypedDict):
+    text: Literal[True]
+    capture_output: NotRequired[bool]
+    check: NotRequired[bool]
+    timeout: NotRequired[float | None]
+    cwd: NotRequired[str | Path]
+    env: NotRequired[dict[str, str]]
+    input: NotRequired[str | None]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +46,11 @@ SCRIPTS = ROOT / "orca-session-triage" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 
-def load_script(name):
+def load_script(name: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / (name + ".py"))
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -51,29 +72,29 @@ close_tabs = importlib.import_module("close_tabs")
 handoff = importlib.import_module("handoff")
 
 
-def write_jsonl(path, rows):
+def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
 
 
-def user(text):
+def user(text: str | list[dict]) -> dict:
     return {"type": "user", "message": {"role": "user", "content": text}}
 
 
-def assistant(*blocks):
+def assistant(*blocks: dict) -> dict:
     return {"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}}
 
 
-def text(value):
+def text(value: str) -> dict[str, str]:
     return {"type": "text", "text": value}
 
 
-def each_ref(lookup):
+def each_ref(lookup: Callable[[str, object], dict | None]) -> Callable[[str, list], dict]:
     """A repository's PR lookup built from one that answers a single ref."""
     return lambda slug, refs: {ref: lookup(slug, ref) for ref in refs}
 
 
-def pr_node(number, branch="fix", state="OPEN", updated_at="2026-10-28T00:00:00Z", **fields):
+def pr_node(number: int, branch: str = "fix", state: str = "OPEN", updated_at: str = "2026-10-28T00:00:00Z", **fields: object) -> dict:
     """A PullRequest node as scan_sessions' GraphQL query returns it."""
     return {"number": number, "url": f"https://github.com/acme/app/pull/{number}", "state": state,
             "updatedAt": updated_at, "isCrossRepository": False, "headRefName": branch, "headRefOid": "aaa",
@@ -93,19 +114,22 @@ class FakeGitHub:
     PR nodes. A REST read answers from `activity` by endpoint.
     """
 
-    def __init__(self, repos, activity=None):
+    def __init__(self, repos: dict[str, list[dict]], activity: dict[str, list[dict]] | None = None) -> None:
         self.repos, self.activity, self.calls = repos, activity or {}, []
 
-    def __call__(self, argv, **kwargs):
+    def __call__(self, argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
         if argv[:3] != ["gh", "api", "graphql"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps([self.activity.get(argv[-1], [])]), "")
         query = next(arg for arg in argv if arg.startswith("query=")).removeprefix("query=")
         if "fragment PrFacts" in query and "...PrFacts" not in query:
             return subprocess.CompletedProcess(argv, 1, "", "gh: Fragment PrFacts was defined, but not used")
-        owner, name = re.search(r'repository\(owner: ("[^"]*"), name: ("[^"]*")\)', query).groups()
+        repository_match = re.search(r'repository\(owner: ("[^"]*"), name: ("[^"]*")\)', query)
+        assert repository_match is not None
+        owner, name = repository_match.groups()
         nodes = sorted(self.repos.get(json.loads(owner) + "/" + json.loads(name), []), key=lambda n: -n["number"])
-        repository, errors = {"defaultBranchRef": {"name": "main"}}, []
+        repository: dict = {"defaultBranchRef": {"name": "main"}}
+        errors = []
         for alias, number in re.findall(r"(\w+): pullRequest\(number: (\d+)\)", query):
             repository[alias] = next((n for n in nodes if n["number"] == int(number)), None)
             if repository[alias] is None:
@@ -117,28 +141,28 @@ class FakeGitHub:
         body = {"data": {"repository": repository}, **({"errors": errors} if errors else {})}
         return subprocess.CompletedProcess(argv, 1 if errors else 0, json.dumps(body), "")
 
-    def graphql(self):
+    def graphql(self) -> list[list[str]]:
         return [call for call in self.calls if call[:3] == ["gh", "api", "graphql"]]
 
-    def rest(self):
+    def rest(self) -> list[list[str]]:
         return [call for call in self.calls if call[:3] != ["gh", "api", "graphql"]]
 
 
 class ClaudeTranscriptTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.projects = Path(self.tmp.name)
         self.worktree = "/Users/me/orca/workspaces/app/fix.login_2"
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def transcript(self, rows, name="s1.jsonl"):
+    def transcript(self, rows: list[dict], name: str = "s1.jsonl") -> Path:
         path = self.projects / "-Users-me-orca-workspaces-app-fix-login-2" / name
         write_jsonl(path, rows)
         return path
 
-    def test_reads_final_answer_after_last_real_user_message(self):
+    def test_reads_final_answer_after_last_real_user_message(self) -> None:
         self.transcript([
             user("first request"),
             assistant(text("old answer")),
@@ -156,7 +180,7 @@ class ClaudeTranscriptTests(unittest.TestCase):
         self.assertEqual(result["final_at"], "2026-10-01T01:08:00Z")
         self.assertEqual(result["pending_questions"], [])
 
-    def test_a_compaction_summary_is_not_the_users_last_word(self):
+    def test_a_compaction_summary_is_not_the_users_last_word(self) -> None:
         self.transcript([
             user("sync the partner master"),
             assistant(text("devel is filled; stage waits for the 12:00 import.")),
@@ -170,7 +194,7 @@ class ClaudeTranscriptTests(unittest.TestCase):
         self.assertEqual((result["last_user"], result["final_text"]),
                          ("sync the partner master", "devel is filled; stage waits for the 12:00 import."))
 
-    def test_lists_ask_user_question_without_a_result(self):
+    def test_lists_ask_user_question_without_a_result(self) -> None:
         answered = {"questions": [{"question": "Which base?", "options": []}]}
         pending = {"questions": [{"question": "Merge now?", "options": [{"label": "Yes"}]}]}
         self.transcript([
@@ -184,7 +208,7 @@ class ClaudeTranscriptTests(unittest.TestCase):
 
         self.assertEqual(result["pending_questions"], [pending])
 
-    def test_skips_entries_whose_message_is_not_an_object(self):
+    def test_skips_entries_whose_message_is_not_an_object(self) -> None:
         self.transcript([
             user("go"),
             {"type": "assistant", "message": None},
@@ -194,14 +218,14 @@ class ClaudeTranscriptTests(unittest.TestCase):
 
         self.assertEqual(scan.read_claude(self.projects, self.worktree)["final_text"], "still readable")
 
-    def test_ignores_lines_that_are_json_but_not_objects(self):
+    def test_ignores_lines_that_are_json_but_not_objects(self) -> None:
         path = self.transcript([user("go"), assistant(text("answer"))])
         with Path(path).open("a") as handle:
             handle.write("null\n5\n\"text\"\n")
 
         self.assertEqual(scan.read_claude(self.projects, self.worktree)["final_text"], "answer")
 
-    def test_finds_the_truncated_directory_of_a_long_path(self):
+    def test_finds_the_truncated_directory_of_a_long_path(self) -> None:
         long_path = "/Users/me/" + "deep-directory/" * 16 + "wt"
         folder = self.projects / (scan.claude_project_dir("", long_path).name[:200] + "-x1y2z3")
         write_jsonl(folder / "s.jsonl", [dict(user("go"), cwd=long_path), assistant(text("found"))])
@@ -210,7 +234,7 @@ class ClaudeTranscriptTests(unittest.TestCase):
 
         self.assertEqual(scan.read_claude(self.projects, long_path)["final_text"], "found")
 
-    def test_returns_none_without_a_transcript(self):
+    def test_returns_none_without_a_transcript(self) -> None:
         self.assertIsNone(scan.read_claude(self.projects, "/nowhere"))
 
     def test_queued_input_replays_all_operations_and_reaches_the_scan_row(self) -> None:
@@ -229,40 +253,40 @@ class ClaudeTranscriptTests(unittest.TestCase):
         self.assertEqual(rows[0]["queued_input"], expected)
 
 
-def codex_row(ts, kind, payload):
+def codex_row(ts: str, kind: str, payload: dict) -> dict:
     return {"timestamp": ts, "type": kind, "payload": payload}
 
 
-def codex_user(ts, value):
+def codex_user(ts: str, value: str) -> dict:
     return codex_row(ts, "response_item", {
         "type": "message", "role": "user", "content": [{"type": "input_text", "text": value}]})
 
 
-def codex_assistant(ts, value):
+def codex_assistant(ts: str, value: str) -> dict:
     return codex_row(ts, "response_item", {
         "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": value}]})
 
 
-def codex_ask(ts, call_id, questions):
+def codex_ask(ts: str, call_id: str, questions: list[dict]) -> dict:
     return codex_row(ts, "response_item", {
         "type": "function_call", "name": "request_user_input_async", "call_id": call_id,
         "arguments": json.dumps({"questions": questions})})
 
 
 class CodexRolloutTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "sessions"
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def rollout(self, name, cwd, rows):
+    def rollout(self, name: str, cwd: str, rows: list[dict]) -> Path:
         path = self.root / "2026" / "10" / "01" / name
         write_jsonl(path, [codex_row("2026-10-01T00:00:00Z", "session_meta", {"cwd": cwd})] + rows)
         return path
 
-    def test_groups_rollouts_by_cwd_and_keeps_unanswered_requests(self):
+    def test_groups_rollouts_by_cwd_and_keeps_unanswered_requests(self) -> None:
         self.rollout("rollout-a.jsonl", "/w/app/one", [
             codex_user("2026-10-01T01:00:00Z", "<environment_context>ignored</environment_context>"),
             codex_user("2026-10-01T01:00:01Z", "fix the login page"),
@@ -297,7 +321,7 @@ class CodexRolloutTests(unittest.TestCase):
             "answered_in_chat_later": True,
         }])
 
-    def test_api_failure_in_rollout_is_cleared_by_a_later_assistant_message(self):
+    def test_api_failure_in_rollout_is_cleared_by_a_later_assistant_message(self) -> None:
         path = self.rollout("rollout-error.jsonl", "/w/cut", [
             codex_user("2026-10-01T01:00:00Z", "finish the work"),
             codex_row("2026-10-01T01:01:00Z", "event_msg", {
@@ -308,7 +332,7 @@ class CodexRolloutTests(unittest.TestCase):
             handle.write(json.dumps(codex_assistant("2026-10-01T01:02:00Z", "Recovered.")) + "\n")
         self.assertIsNone(scan.summarize_rollout(path)[1]["api_error"])
 
-    def test_a_codex_task_the_usage_limit_ended_waits_for_the_reset(self):
+    def test_a_codex_task_the_usage_limit_ended_waits_for_the_reset(self) -> None:
         limit = ("You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits "
                  "or try again at Nov 4th, 2026 3:35 PM.")
         path = self.rollout("rollout-limit.jsonl", "/w/cut", [
@@ -326,8 +350,8 @@ class CodexRolloutTests(unittest.TestCase):
         self.assertIsNone(scan.stop_reason({"claude": None, "codex": [scan.summarize_rollout(path)[1]]}))
 
 
-def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, status="in-progress",
-             turn=None):
+def worktree(path: str, state: str | None = None, agent: str = "claude", comment: str = "", pr: dict | None = None, main: bool = False, status: str = "in-progress",
+             turn: str | None = None) -> dict:
     """`turn` is the main agent's own state; Orca's `state` stays working while a background job runs."""
     return {
         "worktreeId": "repo::" + path, "path": path, "repo": "app", "branch": "refs/heads/x",
@@ -338,13 +362,13 @@ def worktree(path, state=None, agent="claude", comment="", pr=None, main=False, 
     }
 
 
-def with_agents(row, *agents):
+def with_agents(row: dict, *agents: tuple[str, str, str | None]) -> dict:
     """The worktree row holding these Orca agents, each (type, state, main agent's state or None)."""
     return {**row, "agents": [{"agentType": kind, "state": state, **({"mainAgent": {"state": turn}} if turn else {})}
                               for kind, state, turn in agents]}
 
 
-def terminal(path, agent, handle="term_1", title="t", preview="", quiet_minutes=0, orphaned=False):
+def terminal(path: str, agent: str | None, handle: str = "term_1", title: str | None = "t", preview: str = "", quiet_minutes: float = 0, orphaned: bool = False) -> dict:
     return {"worktreeId": "repo::" + path, "handle": handle, "agentIdentity": agent,
             "title": title, "connected": not orphaned, "orphaned": orphaned, "preview": preview,
             "lastOutputAt": (NOW - quiet_minutes * 60) * 1000}
@@ -354,50 +378,50 @@ NOW = 1_800_000_000
 PROMPT = "app on main via python\n❯"
 
 
-def done_agent(kind, pane, said="", asked="", minutes_ago=0, interrupted=False):
+def done_agent(kind: str, pane: str, said: str = "", asked: str = "", minutes_ago: float = 0, interrupted: bool = False) -> dict:
     """An agent Orca shows as a done card: its turn ended `minutes_ago` in the pane `tab:leaf`."""
     return {"agentType": kind, "state": "done", "paneKey": pane, "interrupted": interrupted,
             "stateStartedAt": (NOW - minutes_ago * 60) * 1000,
             "lastAssistantMessage": said, "prompt": asked}
 
 
-def in_pane(term, pane):
+def in_pane(term: dict, pane: str) -> dict:
     tab, leaf = pane.split(":")
     return {**term, "tabId": tab, "leafId": leaf}
 
 
-def verdict(asks=0.0, status="done", confidence=0.9):
+def verdict(asks: float | None = 0.0, status: str | None = "done", confidence: float | None = 0.9) -> dict:
     return {"asks": asks, "status": status, "confidence": confidence}
 
 
-def judging(table):
+def judging(table: dict[str, dict]) -> Callable[[str], dict]:
     """A judge reading Jev's verdict from table, sure the work is done otherwise."""
     return lambda message: table.get(message, verdict())
 
 
 class ClassifyTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.projects = Path(self.tmp.name)
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def claude_says(self, path, *rows):
+    def claude_says(self, path: str, *rows: dict) -> None:
         write_jsonl(scan.claude_project_dir(self.projects, path) / "s.jsonl", list(rows))
 
-    def inventory(self, worktrees, terminals, codex=None, judge=None, processes=None, now=NOW):
+    def inventory(self, worktrees: list[dict], terminals: list[dict], codex: dict | None = None, judge: Callable[[str], dict | None] | None = None, processes: dict | None = None, now: float = NOW) -> list[dict]:
         return scan.build_inventory(worktrees, terminals, self.projects, codex or {}, "要判断", now=now,
                                     judge=judge or judging({}), processes=processes)
 
-    def classes(self, worktrees, terminals, codex=None, judge=None):
+    def classes(self, worktrees: list[dict], terminals: list[dict], codex: dict | None = None, judge: Callable[[str], dict | None] | None = None) -> dict:
         rows = self.inventory(worktrees, terminals, codex, judge)
         return {r["path"]: (r["class"], r["reasons"]) for r in rows}
 
-    def closable(self, worktrees, terminals, codex=None):
+    def closable(self, worktrees: list[dict], terminals: list[dict], codex: dict | None = None) -> dict:
         return {r["path"]: r["closable"] for r in self.inventory(worktrees, terminals, codex)}
 
-    def test_a_finished_setup_shell_is_closable_while_the_agent_works(self):
+    def test_a_finished_setup_shell_is_closable_while_the_agent_works(self) -> None:
         result = self.closable(
             [worktree("/w/a", "working")],
             [terminal("/w/a", "claude", "term_agent"),
@@ -417,7 +441,7 @@ class ClassifyTests(unittest.TestCase):
 
     def test_another_macs_shells_without_output_close_when_their_screen_ends_at_a_bare_prompt(self) -> None:
         # MBP16 lists 23 of its 24 shell tabs with neither preview nor output time.
-        remote = {**worktree("/remote/shells", "working"), "_environment": "macbook-pro-16"}
+        remote: dict = {**worktree("/remote/shells", "working"), "_environment": "macbook-pro-16"}
         terms = [{**terminal(remote["path"], None, handle), "_environment": "macbook-pro-16", "lastOutputAt": None}
                  for handle in ("idle", "busy")]
         screens = {("macbook-pro-16", "idle"): {"source": "screen", "tail": ["direnv: loading .envrc", "➜", ""]},
@@ -429,7 +453,7 @@ class ClassifyTests(unittest.TestCase):
 
     def test_a_permission_prompt_on_screen_keeps_a_memory_save_reply_waiting(self) -> None:
         self.claude_says("/w/prompt", user("go"), assistant(text("Saved the session memory.")))
-        tree = {**worktree("/w/prompt", "waiting", status="completed"),
+        tree: dict = {**worktree("/w/prompt", "waiting", status="completed"),
                 "agents": [{**done_agent("claude", "tab1:leaf1"), "state": "waiting"}]}
         term = in_pane(terminal(tree["path"], "claude", "term_prompt"), "tab1:leaf1")
         question = "Do you want to make this edit to settings.py?"
@@ -556,7 +580,7 @@ class ClassifyTests(unittest.TestCase):
 
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
-        tree = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
+        tree: dict = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
         term = in_pane(terminal(tree["path"], "claude", "term_lost"), "tab1:leaf1")
 
         row = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW,
@@ -565,7 +589,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertIn("background waits lost when the session was replaced (tab term_lost, agent state since "
                       "2027-01-15T08:00:00Z): " + line, row["reasons"])
 
-    def test_a_stalled_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self):
+    def test_a_stalled_worktree_offers_its_agents_but_not_a_busy_or_recent_shell(self) -> None:
         self.claude_says("/w/b", user("go"), assistant(text("PR #2 is open for review.")))
         result = self.closable(
             [worktree("/w/b", "done", pr={"number": 2, "state": "open"})],
@@ -584,14 +608,14 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/b"], ["term_lead", "term_helper"])
 
-    def test_an_agent_orca_reports_waiting_is_never_closable(self):
+    def test_an_agent_orca_reports_waiting_is_never_closable(self) -> None:
         self.claude_says("/w/p", user("go"), assistant(text("Running the migration now.")))
         result = self.inventory([worktree("/w/p", "waiting")], [terminal("/w/p", "claude", "term_blocked")])
 
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("waiting", ["Orca agent waiting"], [])])
 
-    def test_finished_work_with_only_closable_tabs_has_no_meaningful_tab(self):
+    def test_finished_work_with_only_closable_tabs_has_no_meaningful_tab(self) -> None:
         self.claude_says("/w/m", user("go"), assistant(text("Merged.")))
         self.claude_says("/w/n", user("go"), assistant(text("Done; board set to completed.")))
         rows = self.inventory(
@@ -606,7 +630,7 @@ class ClassifyTests(unittest.TestCase):
             ("finished", ["PR merged"], []),
             ("finished", ["board status completed"], ["term_dev"])])
 
-    def test_a_completed_board_never_hides_an_open_pr_or_a_working_agent(self):
+    def test_a_completed_board_never_hides_an_open_pr_or_a_working_agent(self) -> None:
         self.claude_says("/w/o", user("go"), assistant(text("PR #3 is open.")))
         self.claude_says("/w/k", user("go"), assistant(text("Working on it.")))
         rows = self.inventory(
@@ -616,7 +640,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([r["class"] for r in rows], ["stalled", "working"])
 
-    def test_a_tab_without_a_handle_still_counts_as_meaningful(self):
+    def test_a_tab_without_a_handle_still_counts_as_meaningful(self) -> None:
         self.claude_says("/w/h", user("go"), assistant(text("Merged.")))
         rows = self.inventory(
             [worktree("/w/h", "done", pr={"number": 1, "state": "merged"})],
@@ -626,7 +650,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["meaningful_tabs"], ["(no handle) dev server"])
 
-    def test_orphaned_terminal_records_are_ignored(self):
+    def test_orphaned_terminal_records_are_ignored(self) -> None:
         result = self.inventory(
             [worktree("/w/c", None)],
             [terminal("/w/c", "codex", "term_gone", orphaned=True)])
@@ -634,7 +658,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["terminals"], r["closable"]) for r in result],
                          [("stalled", [], [])])
 
-    def test_unreadable_orphaned_shell_is_not_a_meaningful_tab(self):
+    def test_unreadable_orphaned_shell_is_not_a_meaningful_tab(self) -> None:
         stale = {**terminal("/w/s", None, "term_stale", title=None, orphaned=True),
                  "connected": True, "lastOutputAt": None}
         visible = {**terminal("/w/s", None, "term_visible", title=None, preview="server ready", orphaned=True),
@@ -659,14 +683,14 @@ class ClassifyTests(unittest.TestCase):
              "interrupted": False, "prompt": "fix #4", "last_message": "PR #5 is open for review.",
              "screen_tail": [], "draft": None, "draft_text": None, "composer_empty": None}])
 
-    def test_a_done_card_whose_tab_sleeps_has_no_handle(self):
+    def test_a_done_card_whose_tab_sleeps_has_no_handle(self) -> None:
         rows = self.inventory(
             [{**worktree("/w/s"), "agents": [done_agent("claude", "tab9:leaf9", interrupted=True)]}], [])
 
         self.assertEqual([(c["agent"], c["handle"], c["interrupted"]) for c in rows[0]["done_cards"]],
                          [("claude", None, True)])
 
-    def test_a_reopened_tab_closes_its_card_when_it_is_the_only_tab_of_that_agent(self):
+    def test_a_reopened_tab_closes_its_card_when_it_is_the_only_tab_of_that_agent(self) -> None:
         reopened = {"tabId": "pty:new", "leafId": "pty:new"}
         rows = self.inventory(
             [{**worktree("/w/r"), "agents": [done_agent("claude", "tab1:leaf1"),
@@ -680,7 +704,7 @@ class ClassifyTests(unittest.TestCase):
                          [("claude", "term_reopened"), ("codex", None)])
         self.assertTrue(rows[0]["unread"])
 
-    def test_a_main_checkout_is_read_only_while_it_hosts_an_agent(self):
+    def test_a_main_checkout_is_read_only_while_it_hosts_an_agent(self) -> None:
         rows = self.inventory(
             [{**worktree("/repo/hosting", main=True), "agents": [done_agent("codex", "tab1:leaf1")]},
              worktree("/repo/shell-only", main=True), worktree("/w/t", "working")],
@@ -710,9 +734,9 @@ class ClassifyTests(unittest.TestCase):
         screen["tail"][4:5] = ["❯", "  2 行目から書いた指示"]
         self.assertFalse(scan.composer_empty(screen))
 
-    def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self):
+    def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self) -> None:
         # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
-        remote = {**worktree("/remote/lane-241", "working"), "_environment": "macbook-pro-16"}
+        remote: dict = {**worktree("/remote/lane-241", "working"), "_environment": "macbook-pro-16"}
         term = {**terminal("/remote/lane-241", "claude", "term_r", preview="\n".join([
             "⏺ CI is all green.", "  ⎿  PreToolUse:Bash hook error",
             "  ⎿  Failed with non-blocking status code: /bin/sh: /Users/me/.claude/hooks/git-hook-guard.sh: "
@@ -734,9 +758,9 @@ class ClassifyTests(unittest.TestCase):
                       by_path["/remote/lane-241"]["reasons"])
         self.assertEqual(by_path["/w/app"]["hook_errors"], [])
 
-    def test_a_remote_tab_without_agent_details_is_read_from_its_screen(self):
+    def test_a_remote_tab_without_agent_details_is_read_from_its_screen(self) -> None:
         # MBP16's terminal list gave test-338 no agent, title, or preview while a Claude waited after worker_done.
-        remote = {**worktree("/remote/test-338"), "_environment": "macbook-pro-16"}
+        remote: dict = {**worktree("/remote/test-338"), "_environment": "macbook-pro-16"}
         term = {**terminal("/remote/test-338", None, "term_r", title=None), "_environment": "macbook-pro-16",
                 "orphaned": True, "connected": True, "lastOutputAt": None}
         screen = {"source": "screen", "tail": [
@@ -769,7 +793,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((rows[0]["class"], rows[0]["reasons"]), ("stalled", ["final message says done (Jev 0.90)"]))
         self.assertEqual(rows[2]["class"], "working")
 
-    def test_a_remote_codex_tab_is_read_from_its_reply_bullet_or_the_recap_under_its_turn_end(self):
+    def test_a_remote_codex_tab_is_read_from_its_reply_bullet_or_the_recap_under_its_turn_end(self) -> None:
         # 2026-11-04: MBP16's and the Mac mini's Codex tabs came back with an empty final message and question.
         def remote(name: str, handle: str) -> tuple[dict, dict]:
             return ({**worktree("/remote/" + name, agent="codex"), "_environment": "macbook-pro-16"},
@@ -810,7 +834,7 @@ class ClassifyTests(unittest.TestCase):
             "  Worked for 1m 2s • 10:00"]}), "Added regression tests and pushed the fix. Shall I merge?")
         self.assertNotIn("orca_message", rows[2])
 
-    def test_a_tab_orca_detached_but_still_runs_is_read(self):
+    def test_a_tab_orca_detached_but_still_runs_is_read(self) -> None:
         detached = {**terminal("/w/u", "claude", "term_detached"), "orphaned": True, "connected": True,
                     "tabId": "pty:u", "leafId": "pty:u"}
         rows = self.inventory([{**worktree("/w/u"), "agents": [done_agent("claude", "tab1:leaf1")]}], [detached])
@@ -828,7 +852,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([c["handle"] for c in rows[0]["done_cards"]], ["term_one", "term_two"])
 
-    def test_waiting_comes_from_transcripts_and_the_decision_marker(self):
+    def test_waiting_comes_from_transcripts_and_the_decision_marker(self) -> None:
         self.claude_says("/w/a", user("go"), assistant(
             {"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": []}}))
         self.claude_says("/w/b", user("go"), assistant(text("PR is up.\nShall I merge it?")))
@@ -856,7 +880,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/old"], ("working", ["old decision marker in comment: an agent is in its turn"]))
         self.assertNotIn("/w/main", result)
 
-    def test_a_final_message_jev_judges_as_waiting_on_the_user_is_waiting(self):
+    def test_a_final_message_jev_judges_as_waiting_on_the_user_is_waiting(self) -> None:
         asks = "devel の通しは終わりました。\n調べるか issue にするかは、ご判断ください。"
         done = "確認しました。\n残りはありません。"
         self.claude_says("/w/j", user("go"), assistant(text(asks)))
@@ -870,7 +894,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/j"], ("waiting", ["final message asks (Jev 0.79)"]))
         self.assertEqual(result["/w/s"], ("finished", ["PR merged"]))
 
-    def test_a_final_message_jev_is_unsure_about_is_read_before_anything_closes(self):
+    def test_a_final_message_jev_is_unsure_about_is_read_before_anything_closes(self) -> None:
         maybe = "PR は merge しました。\n残っている判断: 表記をどちらにそろえるかは別に決める必要があります。"
         leaning = "Once the other agent reports, I'll decide how to handle these."
         terse = "commit・push はしていません。"
@@ -889,7 +913,7 @@ class ClassifyTests(unittest.TestCase):
             ("unsure", ["Jev unsure whether it asks (0.69): read the final message"], []),
             ("unsure", ["Jev unsure of the state (done 0.59): read the final message"], [])])
 
-    def test_the_state_jev_reads_decides_what_an_idle_worktree_needs(self):
+    def test_the_state_jev_reads_decides_what_an_idle_worktree_needs(self) -> None:
         says = {"/w/p": ("Codex に修正を渡しました。終わったら確かめます。", "in_progress", "open"),
                 "/w/m": ("merge しました。#850 に取りかかります。", "in_progress", "merged"),
                 "/w/r": ("レビューは hdknr に依頼しました。", "blocked_on_others", "open"),
@@ -909,7 +933,7 @@ class ClassifyTests(unittest.TestCase):
             "/w/d": ("stalled", ["final message says done (Jev 0.93)"]),
             "/w/f": ("finished", ["PR merged"])})
 
-    def test_an_agent_whose_message_says_work_continues_keeps_its_tab(self):
+    def test_an_agent_whose_message_says_work_continues_keeps_its_tab(self) -> None:
         waiting_on_job = "push（pre-push の full pytest）の完了を待っています。"
         waiting_on_review = "レビューは hdknr に依頼しました。"
         self.claude_says("/w/j", user("go"), assistant(text(waiting_on_job)))
@@ -923,7 +947,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["closable"], r["meaningful_tabs"]) for r in rows],
                          [("stalled", [], ["term_j"]), ("stalled", ["term_r"], [])])
 
-    def test_only_the_latest_final_message_is_judged(self):
+    def test_only_the_latest_final_message_is_judged(self) -> None:
         lead = "Codex の修正を確かめました。テストは通っています。"
         helper = "commit・push はしていません。"
         self.claude_says("/w/l", user("go"), {**assistant(text(lead)), "timestamp": "2026-10-01T02:00:00Z"})
@@ -934,7 +958,7 @@ class ClassifyTests(unittest.TestCase):
                  for path in ("/w/l", "/w/h")}
         judged = []
 
-        def judge(message):
+        def judge(message: str) -> dict:
             judged.append(message)
             return verdict(0.1, "blocked_on_others")
 
@@ -946,7 +970,7 @@ class ClassifyTests(unittest.TestCase):
             {"source": "claude", **verdict(0.1, "blocked_on_others")},
             {"source": "codex", **verdict(0.1, "blocked_on_others")}])
 
-    def test_claude_speaks_for_the_worktree_when_either_time_is_missing(self):
+    def test_claude_speaks_for_the_worktree_when_either_time_is_missing(self) -> None:
         self.claude_says("/w/t", user("go"), assistant(text("Done.")))
         codex = {"/w/t": [{"rollout": "r", "last_user": "fix", "last_role": "assistant", "last_assistant": "ok",
                            "last_assistant_at": "2026-10-01T01:30:00Z", "pending_requests": []}]}
@@ -955,12 +979,12 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["jev"]["source"], "claude")
 
-    def test_an_unjudged_final_message_is_read_before_anything_closes(self):
+    def test_an_unjudged_final_message_is_read_before_anything_closes(self) -> None:
         self.claude_says("/w/u", user("go"), assistant(text("Merged.")))
         self.claude_says("/w/v", user("go"), assistant(text("Running the suite.")))
         judged = []
 
-        def unavailable(message):
+        def unavailable(message: str) -> None:
             judged.append(message)
             return None
 
@@ -972,7 +996,7 @@ class ClassifyTests(unittest.TestCase):
             ("unsure", ["Jev could not judge: read the final message"], []), ("working", [], [])])
         self.assertEqual(judged, ["Merged."])
 
-    def test_a_question_is_found_while_only_a_background_job_keeps_the_agent_working(self):
+    def test_a_question_is_found_while_only_a_background_job_keeps_the_agent_working(self) -> None:
         asks = "PR #220 を出しました。merge には許可が必要です。進めてよいですか。"
         self.claude_says("/w/bg", user("go"), assistant(text(asks)))
 
@@ -981,7 +1005,7 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual(result["/w/bg"], ("waiting", ["final message asks (Jev 0.90)"]))
 
-    def test_a_background_job_keeps_the_worktree_working_whatever_the_final_message_says(self):
+    def test_a_background_job_keeps_the_worktree_working_whatever_the_final_message_says(self) -> None:
         self.claude_says("/w/watch", user("go"), assistant(text("Merged. Watching the 12:00 import on stage.")))
 
         result = self.inventory(
@@ -991,16 +1015,18 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual([(r["class"], r["reasons"], r["closable"]) for r in result],
                          [("working", ["a background job runs after the agent's turn"], [])])
 
-    def processes(self, table, now, clocks, tcp="", path="/w/p", elsewhere=()):
+    def processes(self, table: dict[int, tuple[int, str]], now: float, clocks: dict[int, tuple[str, str]], tcp: str | Exception = "", path: str = "/w/p", elsewhere: tuple[int, ...] = ()) -> dict:
         """worktree_processes of `path` over a process table whose processes sit in /w/p, or /tmp for `elsewhere`;
         `clocks` maps a pid to ps's elapsed and CPU columns, and `tcp` is lsof's output, or the error it fails
         with."""
         ps = "".join(f"{pid} {elapsed} {cpu}\n" for pid, (elapsed, cpu) in clocks.items())
 
-        def run(args, **kwargs):
+        def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             if args[0] == "lsof" and isinstance(tcp, Exception):
                 raise tcp
-            return subprocess.CompletedProcess(args, 0, ps if args[0] == "ps" else tcp, "")
+            output = ps if args[0] == "ps" else tcp
+            assert isinstance(output, str)
+            return subprocess.CompletedProcess(args, 0, output, "")
 
         with patch.object(scan.rm_check, "process_table", return_value=table), \
                 patch.object(scan.rm_check, "process_cwds",
@@ -1009,7 +1035,7 @@ class ClassifyTests(unittest.TestCase):
                 patch.object(scan.subprocess, "run", side_effect=run):
             return scan.worktree_processes([path], Path(self.tmp.name) / "cpu.json", now)
 
-    def test_a_wait_loop_left_running_keeps_a_worktree_without_an_agent_working(self):
+    def test_a_wait_loop_left_running_keeps_a_worktree_without_an_agent_working(self) -> None:
         table = {9101: (1, "bash /tmp/wait-merge.sh"), 9102: (9101, "sleep 60"),
                  9103: (1, "node /Users/me/.claude/plugins/cache/codex/scripts/broker.mjs serve"),
                  9104: (1, "pnpm dev"), 9105: (9104, "sh -c while read -r line; do echo \"$line\"; done")}
@@ -1029,13 +1055,13 @@ class ClassifyTests(unittest.TestCase):
         [row] = self.inventory([worktree("/w/p")], [], processes=found)
         self.assertEqual((row["class"], row["reasons"]), ("stalled", [scan.NO_SESSION_REASON]))
 
-    def test_background_work_whose_cpu_time_stays_still_for_an_hour_or_whose_connection_closed_is_stalled(self):
+    def test_background_work_whose_cpu_time_stays_still_for_an_hour_or_whose_connection_closed_is_stalled(self) -> None:
         self.claude_says("/w/p", user("go"), assistant(text("Watching the run.")))
         table = {9201: (1, "-zsh"), 9202: (9201, "claude"), 9203: (9202, "node mcp-server.js"),
                  9204: (9202, "/bin/zsh -c source snapshot.sh && eval 'gh run watch 7'"), 9205: (9204, "gh run watch 7")}
         clocks = {9204: ("02:00:00", "0:00.01"), 9205: ("02:00:00", "0:00.40")}
 
-        def classify(found, now=NOW):
+        def classify(found: dict, now: float = NOW) -> tuple[str, list[str]]:
             [row] = self.inventory([worktree("/w/p", "working", turn="done")], [terminal("/w/p", "claude")],
                                    processes=found, now=now)
             return row["class"], row["reasons"]
@@ -1066,7 +1092,7 @@ class ClassifyTests(unittest.TestCase):
                                    elsewhere=(9207,))
         self.assertEqual(classify(found, NOW + 3600)[0], "working")
 
-    def test_an_unsure_question_behind_a_background_job_is_read(self):
+    def test_an_unsure_question_behind_a_background_job_is_read(self) -> None:
         maybe = "PR は出しました。表記をどちらにそろえるかは別に決める必要があります。"
         self.claude_says("/w/m", user("go"), assistant(text(maybe)))
         self.claude_says("/w/n", user("go"), assistant(text("Watching CI.")))
@@ -1079,13 +1105,13 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/m"], ("unsure", ["Jev unsure whether it asks (0.50): read the final message"]))
         self.assertEqual(result["/w/n"], ("working", ["a background job runs after the agent's turn"]))
 
-    def test_agents_sharing_a_worktree_are_read_together(self):
+    def test_agents_sharing_a_worktree_are_read_together(self) -> None:
         asks = "merge してよいですか。"
         for path in ("/w/turn", "/w/wait", "/w/pair"):
             self.claude_says(path, user("go"), assistant(text(asks)))
         judged = []
 
-        def judge(message):
+        def judge(message: str) -> dict:
             judged.append(message)
             return verdict(0.1, "in_progress")
 
@@ -1102,7 +1128,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/pair"], ("working", ["a background job runs after the agent's turn"], []))
         self.assertEqual(judged, [asks, asks])
 
-    def test_an_agent_without_a_readable_main_state_counts_as_in_its_turn(self):
+    def test_an_agent_without_a_readable_main_state_counts_as_in_its_turn(self) -> None:
         self.claude_says("/w/odd", user("go"), assistant(text("merge してよいですか。")))
         odd = worktree("/w/odd", "working")
         for main_agent in (None, {"state": None}, "done", ["done"], True):
@@ -1114,7 +1140,7 @@ class ClassifyTests(unittest.TestCase):
 
                 self.assertEqual(result["/w/odd"], ("working", []))
 
-    def test_a_codex_final_message_that_asks_is_waiting(self):
+    def test_a_codex_final_message_that_asks_is_waiting(self) -> None:
         asks = "PR #1 is green.\nPR #1 をマージしてよいですか？\nAGENTS.md で確認が必要と定めているため、ここで確認しています。"
         codex = {"/w/q": [{"rollout": "r", "last_user": "ship it", "last_role": "assistant",
                            "last_assistant": asks, "pending_requests": []}],
@@ -1128,7 +1154,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/q"], ("waiting", ["Codex final message asks (Jev 0.80)"]))
         self.assertEqual(result["/w/r"], ("working", []))
 
-    def test_codex_requests_unstarted_agents_and_merged_work(self):
+    def test_codex_requests_unstarted_agents_and_merged_work(self) -> None:
         pending = {"asked_at": "t", "questions": [], "answered_in_chat_later": False}
         stale = {"asked_at": "t", "questions": [], "answered_in_chat_later": True}
         codex = {
@@ -1151,14 +1177,14 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/g"], ("finished", ["PR merged"]))
         self.assertEqual(result["/w/h"], ("stalled", ["final message waits on someone else (Jev 0.90)"]))
 
-    def test_a_turn_cut_off_by_an_api_error_is_stalled_even_behind_a_background_job(self):
+    def test_a_turn_cut_off_by_an_api_error_is_stalled_even_behind_a_background_job(self) -> None:
         # 2026-10-06 the Mac slept mid-response; a CI monitor kept Orca at working and the lead sat for 16 hours.
         cut = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
         self.claude_says("/w/cut", user("go"), assistant(text("critic の判定待ちです。")),
                          {**assistant(text(cut)), "isApiErrorMessage": True})
         judged = []
 
-        def judge(message):
+        def judge(message: str) -> dict:
             judged.append(message)
             return verdict(0.1, "done" if message == "Merged." else "in_progress", 1.0)
 
@@ -1180,10 +1206,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(result["/w/resumed"][0], "finished")
         self.assertEqual(judged, ["Merged."])
 
-    def test_a_turn_the_api_ended_says_whether_to_wake_it_wait_for_the_reset_or_ask_a_person(self):
+    def test_a_turn_the_api_ended_says_whether_to_wake_it_wait_for_the_reset_or_ask_a_person(self) -> None:
         # 2026-11-04: an EPM lane hit its weekly limit at 15:26 while Orca still showed it working; a DNS outage and
         # an expired login stopped other lanes, and every one was woken the same way.
-        def ended(path, line, kind):
+        def ended(path: str, line: str, kind: str) -> None:
             self.claude_says(path, user("go"), {**assistant(text(line)), "isApiErrorMessage": True, "error": kind})
         ended("/w/limit", "You've hit your weekly limit · resets Nov 7 at 8pm (Asia/Tokyo)", "rate_limit")
         ended("/w/login", "Login expired · Please run /login", "authentication_failed")
@@ -1218,9 +1244,9 @@ class ClassifyTests(unittest.TestCase):
         [back] = self.inventory([worktree("/w/back", "working")], [terminal("/w/back", "claude", "term_b")], failed)
         self.assertEqual((back["class"], back["stop"]["agent"], back["stop"]["kind"]), ("stalled", "claude", "connection"))
 
-    def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self):
+    def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self) -> None:
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.
-        def stop(line):
+        def stop(line: str) -> tuple[str, str, str | None] | None:
             found = scan.stop_reason({"claude": None, "codex": [], "orca_message": {"text": line}})
             return found and (found["kind"], found["action"], found["resets"])
 
@@ -1231,7 +1257,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(stop("API Error: Connection lost mid-response. The response above may be incomplete."),
                          ("connection", "wake", None))
 
-    def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self):
+    def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self) -> None:
         failure = "■ Selected model is at capacity"
         codex = {"/w/cut": [{"rollout": "r", "last_user": "finish", "last_role": "assistant",
                               "last_assistant": "Done.", "last_assistant_at": "2026-10-01T01:00:00Z",
@@ -1248,12 +1274,12 @@ class ClassifyTests(unittest.TestCase):
         # The tab still shows the earlier turn's failure while a new turn runs.
         self.assertEqual((rows["/w/resumed"]["class"], rows["/w/resumed"]["stop"]), ("working", None))
 
-    def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self):
+    def test_a_lead_that_left_its_workers_reports_unread_is_stalled_or_says_so_with_its_question(self) -> None:
         # 2026-10-06 a lead ended its turn while workers ran; their reports sat unread for 20 hours.
-        def at(minutes_ago):
+        def at(minutes_ago: float) -> str:
             return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - minutes_ago * 60))
 
-        def message(kind, minutes_ago, read=0, run="run_a"):
+        def message(kind: str, minutes_ago: float, read: int = 0, run: str = "run_a") -> dict:
             return {"run_id": run, "to_handle": "run:" + run, "type": kind, "read": read,
                     "created_at": at(minutes_ago), "subject": kind}
 
@@ -1284,14 +1310,14 @@ class ClassifyTests(unittest.TestCase):
                         []),
         })
 
-    def test_a_worktree_no_agent_ever_worked_in_says_so(self):
+    def test_a_worktree_no_agent_ever_worked_in_says_so(self) -> None:
         result = self.classes([worktree("/w/shell", None, pr={"number": 3, "state": "open"}, status="in-review")],
                               [terminal("/w/shell", None)])
 
         self.assertEqual(result["/w/shell"], ("stalled", ["no agent session in this worktree"]))
 
 
-def jev_answer(asks, status="done", confidence=0.9):
+def jev_answer(asks: float | str, status: str = "done", confidence: float = 0.9) -> io.BytesIO:
     return io.BytesIO(json.dumps({"model": "jev-1.13.0", "answers": {
         "asks_user": {"type": "noul", "noul": asks},
         "status": {"type": "choice", "choice": status, "confidence": confidence,
@@ -1301,15 +1327,16 @@ def jev_answer(asks, status="done", confidence=0.9):
 class CutShort(io.BytesIO):
     """A response whose connection closes mid-body."""
 
-    def read(self, *args):
+    def read(self, *args: object) -> bytes:
         raise http.client.IncompleteRead(b"{")
 
 
 class JevTests(unittest.TestCase):
-    def test_asks_jev_whether_the_tail_of_a_message_waits_on_the_user_and_how_the_work_stands(self):
+    def test_asks_jev_whether_the_tail_of_a_message_waits_on_the_user_and_how_the_work_stands(self) -> None:
         sent = []
 
-        def opener(request, timeout):
+        def opener(request: urllib.request.Request, timeout: float) -> io.BytesIO:
+            assert isinstance(request.data, bytes)
             sent.append((request.full_url, request.get_header("Authorization"), json.loads(request.data)))
             return jev_answer(0.86, "blocked_on_others", 0.62)
 
@@ -1327,14 +1354,14 @@ class JevTests(unittest.TestCase):
         self.assertTrue(body["state"].endswith("やるかどうか指示をください。"))
         self.assertEqual(len(body["state"]), scan.JEV_MAX_CHARS)
 
-    def test_a_failed_jev_call_judges_nothing_and_says_why(self):
-        failures = [urllib.error.HTTPError("u", 401, "Unauthorized", None, None),
+    def test_a_failed_jev_call_judges_nothing_and_says_why(self) -> None:
+        failures = [urllib.error.HTTPError("u", 401, "Unauthorized", Message(), None),
                     TimeoutError("timed out"), urllib.error.URLError("offline"),
                     io.BytesIO(b"not json"), io.BytesIO(b'{"answers": {}}'), jev_answer(float("nan")),
                     jev_answer(1.5), jev_answer("nan"), CutShort(), jev_answer(0.1, "asks_user"),
                     jev_answer(0.1, "done", float("nan")), jev_answer(0.1, "done", 1.2)]
         for failure in failures:
-            def opener(request, timeout, failure=failure):
+            def opener(request: urllib.request.Request, timeout: float, failure: Exception | io.BytesIO = failure) -> io.BytesIO:
                 if isinstance(failure, Exception):
                     raise failure
                 return failure
@@ -1346,7 +1373,7 @@ class JevTests(unittest.TestCase):
 
 
 class NextStepFactTests(unittest.TestCase):
-    def test_a_saved_verdict_is_read_again_once_everything_it_waits_on_closed(self):
+    def test_a_saved_verdict_is_read_again_once_everything_it_waits_on_closed(self) -> None:
         # servicean-87 stayed blocked on masters#731→#732 and masters-ui#125→#126 after all four merged.
         rows = [{"path": "/w/sp", "repo": "taihei-service-project", "class": "stalled", "linked_pr": None,
                  "jev": {"asks": 0.1}, "claude": {"final_at": "t1"}, "codex": [], "reasons": []},
@@ -1381,7 +1408,7 @@ class NextStepFactTests(unittest.TestCase):
                                              "spin-dd/taihei-coresys-masters#731, spin-dd/taihei-coresys-masters#732, "
                                              "spin-dd/taihei-masters-ui#125, spin-dd/taihei-masters-ui#126"])
 
-    def test_summarizes_review_merge_and_check_state_of_a_pr(self):
+    def test_summarizes_review_merge_and_check_state_of_a_pr(self) -> None:
         data = {"number": 11263, "state": "OPEN", "reviewDecision": "APPROVED",
                 "reviewRequests": [{"login": "k-mizokami"}, {"name": "backend"}],
                 "latestReviews": [{"author": {"login": "hdknr"}, "state": "APPROVED"},
@@ -1402,7 +1429,7 @@ class NextStepFactTests(unittest.TestCase):
             "merge_state": "CLEAN", "merged_at": None,
             "checks": {"SUCCESS": 2, "IN_PROGRESS": 1, "FAILURE": 1}})
 
-    def test_latest_human_review_ignores_newer_bot_reviews(self):
+    def test_latest_human_review_ignores_newer_bot_reviews(self) -> None:
         reviews = [
             {"user": {"login": "reviewer", "type": "User"}, "state": "APPROVED",
              "submitted_at": "2026-10-21T01:00:00Z"},
@@ -1418,7 +1445,7 @@ class NextStepFactTests(unittest.TestCase):
                          {"author": "reviewer", "state": "CHANGES_REQUESTED",
                           "submitted_at": "2026-10-21T02:00:00Z"})
 
-    def test_pr_authors_comment_is_not_an_external_review(self):
+    def test_pr_authors_comment_is_not_an_external_review(self) -> None:
         review = {"user": {"login": "author", "type": "User"}, "state": "COMMENTED",
                   "submitted_at": "2026-10-21T07:39:59Z"}
 
@@ -1426,7 +1453,7 @@ class NextStepFactTests(unittest.TestCase):
 
         self.assertIsNone(pr["latest_human_review"])
 
-    def test_each_human_comment_surface_returns_the_wait_to_us_after_the_last_commit(self):
+    def test_each_human_comment_surface_returns_the_wait_to_us_after_the_last_commit(self) -> None:
         data = {"number": 42, "author": {"login": "Author"},
                 "commits": [{"committedDate": "2026-10-21T02:00:00Z"}]}
         reviewer = {"user": {"login": "reviewer", "type": "User"},
@@ -1451,7 +1478,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertFalse(pr["reply_after_last_commit"])
         self.assertEqual(pr["latest_human_activity"]["at"], earlier["created_at"])
 
-    def test_remote_pr_comment_marks_the_row_as_our_turn(self):
+    def test_remote_pr_comment_marks_the_row_as_our_turn(self) -> None:
         row = {"path": "/remote/w", "class": "stalled", "environment": "macbook-pro-16",
                "branch": "refs/heads/fix-a", "linked_pr": None,
                "orca_message": {"text": "PR https://github.com/acme/app/pull/42", "at": "2026-10-21T01:00:00Z"},
@@ -1463,7 +1490,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["waits_on"], "self")
         self.assertIn("human PR response after the latest commit", result["reasons"])
 
-    def test_gh_prs_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self):
+    def test_gh_prs_reads_human_reviews_and_keeps_pr_when_review_lookup_fails(self) -> None:
         review = {"user": {"login": "reviewer", "type": "User"}, "state": "CHANGES_REQUESTED",
                   "submitted_at": "2026-10-21T02:00:00Z"}
         github = FakeGitHub({"acme/app": [pr_node(42)]}, {"repos/acme/app/pulls/42/reviews": [review]})
@@ -1475,7 +1502,7 @@ class NextStepFactTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[1].args[0],
                              ["gh", "api", "--paginate", "--slurp", "repos/acme/app/pulls/42/reviews"])
         for failure in (subprocess.CompletedProcess([], 1, ""), subprocess.TimeoutExpired("gh", 15)):
-            def failing_reviews(argv, failure=failure, **kwargs):
+            def failing_reviews(argv: list[str], failure: Exception | subprocess.CompletedProcess[str] = failure, **kwargs: object) -> subprocess.CompletedProcess[str]:
                 if not argv[-1].endswith("/reviews"):
                     return github(argv, **kwargs)
                 github.calls.append(argv)
@@ -1491,7 +1518,7 @@ class NextStepFactTests(unittest.TestCase):
                 scan.gh_prs("acme/app", [42], cache_dir=Path(cache))
                 self.assertEqual(sum(call[-1].endswith("/reviews") for call in github.calls), 2)
 
-    def test_a_failed_or_missing_gh_degrades_to_no_pr(self):
+    def test_a_failed_or_missing_gh_degrades_to_no_pr(self) -> None:
         with tempfile.TemporaryDirectory() as cache, redirect_stderr(io.StringIO()) as err:
             with patch.object(scan.subprocess, "run", side_effect=FileNotFoundError("gh")):
                 self.assertEqual(scan.gh_prs("acme/app", [7], cache_dir=Path(cache)), {7: None})
@@ -1505,7 +1532,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertIn("acme/app", err.getvalue())
         self.assertIn("API rate limit exceeded", err.getvalue())
 
-    def test_a_run_asks_github_once_per_repository_and_rereads_activity_only_for_updated_prs(self):
+    def test_a_run_asks_github_once_per_repository_and_rereads_activity_only_for_updated_prs(self) -> None:
         # 2026-10-28: a `gh pr view` per PR plus three REST reads on every run used up the shared
         # GraphQL budget. Before this change these 6 PRs in 2 repositories cost 6 + 18 calls each run.
         refs = [("acme/app", 7), ("acme/app", 8), ("acme/app", "fix-c"),
@@ -1521,7 +1548,7 @@ class NextStepFactTests(unittest.TestCase):
         reply = {"user": {"login": "reviewer", "type": "User"}, "created_at": "2026-10-28T01:00:00Z"}
 
         with tempfile.TemporaryDirectory() as cache:
-            def run():
+            def run() -> tuple[list[dict], tuple[int, int]]:
                 github.calls.clear()
                 with patch.object(scan.subprocess, "run", side_effect=github):
                     result = scan.add_next_step_facts(
@@ -1543,21 +1570,21 @@ class NextStepFactTests(unittest.TestCase):
             (Path(cache) / "acme/lib/3.json").write_text("{")
             self.assertEqual(run()[1], (2, 3))
 
-    def test_a_repository_with_more_prs_than_one_query_holds_is_read_25_at_a_time(self):
+    def test_a_repository_with_more_prs_than_one_query_holds_is_read_25_at_a_time(self) -> None:
         github = FakeGitHub({"acme/app": [pr_node(number) for number in range(1, 31)]})
         with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
             found = scan.gh_prs("acme/app", list(range(1, 31)), cache_dir=Path(cache))
         self.assertEqual(sorted(pr["number"] for pr in found.values()), list(range(1, 31)))
         self.assertEqual([len(re.findall(r"pullRequest\(", call[-1])) for call in github.graphql()], [25, 5])
 
-    def test_a_missing_pr_leaves_the_others_in_its_query(self):
+    def test_a_missing_pr_leaves_the_others_in_its_query(self) -> None:
         github = FakeGitHub({"acme/app": [pr_node(7)]})
         with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
             found = scan.gh_prs("acme/app", [7, 404], cache_dir=Path(cache))
         self.assertEqual((found[7]["number"], found[404]), (7, None))
         self.assertEqual((len(github.graphql()), len(github.rest())), (1, 3))
 
-    def test_a_branch_finds_its_pr_as_gh_pr_view_does(self):
+    def test_a_branch_finds_its_pr_as_gh_pr_view_does(self) -> None:
         # gh puts an open PR first and the rest newest first, skips a fork's branch of the same
         # name, and skips a closed or merged PR whose head is the default branch.
         github = FakeGitHub({"acme/app": [
@@ -1570,7 +1597,7 @@ class NextStepFactTests(unittest.TestCase):
                          {"fix-a": 11, "fix-b": 22, "fork": None, "main": None})
         self.assertEqual(len(github.graphql()), 1)
 
-    def test_names_are_checked_before_they_go_into_a_query(self):
+    def test_names_are_checked_before_they_go_into_a_query(self) -> None:
         github = FakeGitHub({"acme/app": [pr_node(5, 'say-"hi"')]})
         with tempfile.TemporaryDirectory() as cache, patch.object(scan.subprocess, "run", side_effect=github):
             found = scan.gh_prs("acme/app", ['say-"hi"', "two words", "x\ny"], cache_dir=Path(cache))
@@ -1580,7 +1607,7 @@ class NextStepFactTests(unittest.TestCase):
         [query] = github.graphql()
         self.assertNotIn("two words", query[-1])
 
-    def test_a_pr_read_by_graphql_summarizes_as_its_gh_pr_view_json_did(self):
+    def test_a_pr_read_by_graphql_summarizes_as_its_gh_pr_view_json_did(self) -> None:
         checks = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
                   {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": None},
                   {"__typename": "StatusContext", "state": "FAILURE"}]
@@ -1615,7 +1642,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertTrue(found["reply_after_last_commit"])
 
 
-    def test_reads_uncommitted_and_unpushed_work_and_the_github_repo(self):
+    def test_reads_uncommitted_and_unpushed_work_and_the_github_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             origin, work = Path(tmp) / "origin.git", Path(tmp) / "work"
             git(tmp, "init", "-q", "--bare", "-b", "main", str(origin))
@@ -1641,11 +1668,11 @@ class NextStepFactTests(unittest.TestCase):
         self.assertIsNone(scan.github_slug("https://git.disroot.org/usvdh/collect.git"))
 
 
-    def test_a_pr_merged_after_the_final_message_ends_the_wait_it_reported(self):
+    def test_a_pr_merged_after_the_final_message_ends_the_wait_it_reported(self) -> None:
         numbers = {name: number for number, name in enumerate(
             ("merged-later", "codex-merged-later", "merged-before", "continues", "other-head"), 7)}
 
-        def stalled(path, said_at, status="blocked_on_others", source="claude"):
+        def stalled(path: str, said_at: str, status: str = "blocked_on_others", source: str = "claude") -> dict:
             transcripts = ({"claude": {"final_text": "PR を出しました。レビュー待ちです。", "final_at": said_at},
                             "codex": []} if source == "claude" else
                            {"claude": None, "codex": [{"last_assistant": "PR を出しました。",
@@ -1663,11 +1690,11 @@ class NextStepFactTests(unittest.TestCase):
         git = {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
         heads = {numbers["other-head"]: "zzz"}
 
-        def pr_lookup(slug, ref):
+        def pr_lookup(slug: str, ref: object) -> dict:
             return {"number": ref, "state": "MERGED", "merged_at": "2026-10-06T07:35:27Z",
                     "head_oid": heads.get(ref, "aaa")}
 
-        def git_lookup(path):
+        def git_lookup(path: str) -> dict:
             return git
 
         result = {r["path"]: (r["class"], r["reasons"])
@@ -1679,9 +1706,9 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/continues"][0], "stalled")
         self.assertEqual(result["/w/other-head"][0], "stalled")
 
-    def test_a_merged_pr_finishes_a_row_no_agent_ran_in(self):
+    def test_a_merged_pr_finishes_a_row_no_agent_ran_in(self) -> None:
         # Orca's PR link is often missing or stale; the lookup by branch sees the merge.
-        def row(path, reasons, jev=None, link=None):
+        def row(path: str, reasons: list[str], jev: dict | None = None, link: dict | None = None) -> dict:
             return {"path": path, "class": "stalled", "linked_pr": link, "reasons": reasons, "jev": jev,
                     "claude": None, "codex": []}
 
@@ -1696,11 +1723,11 @@ class NextStepFactTests(unittest.TestCase):
         heads = {"no-session-other-head": "zzz"}
         states = {"no-session-open": "OPEN"}
 
-        def git_lookup(path):
+        def git_lookup(path: str) -> dict:
             return {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
                     "unpushed": 0, "github": "acme/app"}
 
-        def pr_lookup(slug, ref):
+        def pr_lookup(slug: str, ref: object) -> dict:
             return {"number": 7, "state": states.get(ref, "MERGED"), "merged_at": "2026-10-06T07:35:27Z",
                     "head_oid": heads.get(ref, "aaa")}
 
@@ -1714,18 +1741,18 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/no-session-other-head"][0], "stalled")
         self.assertEqual(result["/w/no-session-open"], ("finished", ["no local work beyond open PR head"]))
 
-    def test_open_pr_cleanup_uses_published_head_not_upstream(self):
+    def test_open_pr_cleanup_uses_published_head_not_upstream(self) -> None:
         names = ("clean", "human-replied", "dirty", "unpushed", "other-head", "unknown-unpushed")
         rows = [{"path": "/w/" + name, "class": "stalled", "reasons": [scan.NO_SESSION_REASON],
                  "linked_pr": None, "claude": None, "codex": []} for name in names]
 
-        def git_lookup(path):
+        def git_lookup(path: str) -> dict:
             name = path.rsplit("/", 1)[-1]
             return {"branch": name, "head": "aaa", "dirty": int(name == "dirty"),
                     "unpushed": None if name == "unknown-unpushed" else int(name == "unpushed"),
                     "github": "acme/app"}
 
-        def pr_lookup(slug, ref):
+        def pr_lookup(slug: str, ref: object) -> dict:
             return {"number": 7, "state": "OPEN", "head_oid": "bbb" if ref == "other-head" else "aaa",
                     "reply_after_last_commit": ref == "human-replied"}
 
@@ -1750,13 +1777,14 @@ class NextStepFactTests(unittest.TestCase):
                 log = Path(reviews) / f"acme-app-{numbers[name]}.log"
                 log.write_text("codex review\n")
                 if name == "idle":
-                    os.utime(log, (now.timestamp() - 7200,) * 2)
+                    older = now.timestamp() - 7200
+                    os.utime(log, (older, older))
             result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
                 rows,
                 git_lookup=lambda path: {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
                                          "unpushed": 0, "github": "acme/app",
                                          "head_at": head_at[path.rsplit("/", 1)[-1]]},
-                pr_lookup=each_ref(lambda slug, ref: {"number": numbers[ref], "state": "OPEN", "head_oid": "aaa"}))}
+                pr_lookup=each_ref(lambda slug, ref: {"number": numbers[str(ref)], "state": "OPEN", "head_oid": "aaa"}))}
 
         self.assertEqual({name: row.get("open_pr_cleanup", False) for name, row in result.items()},
                          {"committed": False, "reviewed": False, "idle": True})
@@ -1780,7 +1808,7 @@ class NextStepFactTests(unittest.TestCase):
                 self.assertNotEqual(result["class"], "finished")
                 self.assertIn(comment, " ".join(result["reasons"]))
 
-    def test_open_pr_cleanup_preserves_a_historical_transcript_question(self):
+    def test_open_pr_cleanup_preserves_a_historical_transcript_question(self) -> None:
         rows = [
             {"path": "/w/history", "class": "waiting", "reasons": ["final message asks"],
              "agents": [], "terminals": [], "linked_pr": None, "claude": {"final_text": "merge?"}},
@@ -1790,11 +1818,11 @@ class NextStepFactTests(unittest.TestCase):
              "agents": [], "terminals": [{"agent": "codex"}], "linked_pr": None},
         ]
 
-        def git_lookup(path):
+        def git_lookup(path: str) -> dict:
             return {"branch": path.rsplit("/", 1)[-1], "head": "aaa", "dirty": 0,
                     "unpushed": 1, "github": "acme/app"}
 
-        def pr_lookup(slug, ref):
+        def pr_lookup(slug: str, ref: object) -> dict:
             return {"number": 7, "state": "OPEN", "head_oid": "aaa"}
 
         result = {row["path"].rsplit("/", 1)[-1]: row for row in scan.add_next_step_facts(
@@ -1805,7 +1833,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertNotIn("open_pr_cleanup", result["agent"])
         self.assertNotIn("open_pr_cleanup", result["agent-tab"])
 
-    def test_completed_board_without_agent_still_checks_open_pr_for_cleanup(self):
+    def test_completed_board_without_agent_still_checks_open_pr_for_cleanup(self) -> None:
         row = {"path": "/w/completed", "class": "finished", "reasons": ["board status completed"],
                "agents": [], "terminals": [{"agent": None, "handle": "shell1"}],
                "meaningful_tabs": ["shell1"], "linked_pr": None}
@@ -1882,7 +1910,7 @@ class NextStepFactTests(unittest.TestCase):
                                                     "text": "復旧と一時 RDS の削除が済みました"}})
         self.assertEqual(queued["newest_report"], {"source": "inbox_done", "at": "2026-10-27T13:14:00+0900"})
 
-    def test_rows_a_reader_classes_get_git_and_pr_facts(self):
+    def test_rows_a_reader_classes_get_git_and_pr_facts(self) -> None:
         # A waiting row is read too: its decision marker may be answered by a merge.
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
                 {"path": "/w/branch", "class": "stalled", "linked_pr": None},
@@ -1895,7 +1923,7 @@ class NextStepFactTests(unittest.TestCase):
                 "/w/asks": {"branch": "fix-d", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}}
         asked = []
 
-        def pr_lookup(slug, ref):
+        def pr_lookup(slug: str, ref: object) -> dict:
             asked.append((slug, ref))
             return {"number": ref, "head_oid": "aaa"}
 
@@ -1909,7 +1937,7 @@ class NextStepFactTests(unittest.TestCase):
             (gits["/w/asks"], {"number": 8, "head_oid": "aaa", "head_matches": True}), (None, None)])
         self.assertNotIn("git", rows[0])
 
-    def test_a_repository_timeout_does_not_hold_other_repositories_and_a_duplicate_pr_is_read_once(self):
+    def test_a_repository_timeout_does_not_hold_other_repositories_and_a_duplicate_pr_is_read_once(self) -> None:
         rows = [{"path": path, "class": "unsure", "linked_pr": {"number": number}}
                 for path, number in (("/w/slow", 7), ("/w/fast", 8), ("/w/fast-again", 8))]
         gits = {"/w/slow": {"branch": "a", "head": "aaa", "github": "acme/slow"},
@@ -1918,7 +1946,7 @@ class NextStepFactTests(unittest.TestCase):
         fast_started = Event()
         calls = []
 
-        def pr_lookup(slug, refs):
+        def pr_lookup(slug: str, refs: list[object]) -> dict:
             calls.append((slug, refs))
             if slug == "acme/slow":
                 parallel = fast_started.wait(2)
@@ -1951,10 +1979,10 @@ class ScanCommandTests(unittest.TestCase):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_expand_roots_accepts_absolute_patterns_with_spaces(self):
+    def test_expand_roots_accepts_absolute_patterns_with_spaces(self) -> None:
         accounts = self.dir / "Application Support" / "accounts"
         (accounts / "first" / "sessions").mkdir(parents=True)
         (accounts / "first" / "nested" / "sessions").mkdir(parents=True)
@@ -1971,10 +1999,10 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(sorted(scan.expand_roots([str(accounts / "**" / "sessions")])),
                          sorted(scan.expand_roots([pattern])))
 
-    def test_expand_roots_accepts_literal_current_and_absolute_roots(self):
+    def test_expand_roots_accepts_literal_current_and_absolute_roots(self) -> None:
         self.assertEqual(scan.expand_roots([".", "./", "/"]), [".", ".", "/"])
 
-    def saved_scan(self):
+    def saved_scan(self) -> tuple[Path, Path]:
         """Rows in the shapes that were misread by hand: null titles, a codex list, a verdict, an Orca message."""
         checkout = self.dir / "dotfiles-73"
         checkout.mkdir()
@@ -2012,8 +2040,8 @@ class ScanCommandTests(unittest.TestCase):
         path.write_text(json.dumps(rows, ensure_ascii=False))
         return path, checkout
 
-    def test_wake_names_each_lane_the_api_stopped_with_its_tab_and_what_it_needs(self):
-        def stopped(path, environment, handle, kind, action, error, resets=None):
+    def test_wake_names_each_lane_the_api_stopped_with_its_tab_and_what_it_needs(self) -> None:
+        def stopped(path: str, environment: str | None, handle: str, kind: str, action: str, error: str, resets: str | None = None) -> dict:
             return {"path": path, "repo": "app", "environment": environment, "class": "stalled", "reasons": [],
                     "comment": "", "claude": None, "codex": [], "terminals": [{"handle": handle, "agent": "claude"}],
                     "stop": {"kind": kind, "action": action, "agent": "claude", "error": error, "resets": resets}}
@@ -2044,7 +2072,7 @@ class ScanCommandTests(unittest.TestCase):
             "mbp16::login | term_g | ログイン切れ: 人が /login する | Login expired · Please run /login",
             "mbp16::two | 不明（term_a, term_b） | 通信断: 起こす | API Error: Connection lost"])
 
-    def test_summary_names_each_missing_hook_file_with_its_host(self):
+    def test_summary_names_each_missing_hook_file_with_its_host(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
         rows[2]["hook_errors"] = [{"host": "mbp16", "path": "/Users/me/.claude/hooks/git-hook-guard.sh",
@@ -2056,7 +2084,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("hook errors: 1\n  mbp16 /Users/me/.claude/hooks/git-hook-guard.sh (mbp16::app term_9)",
                       out.getvalue())
 
-    def test_rows_print_one_line_per_saved_row_without_rescanning(self):
+    def test_rows_print_one_line_per_saved_row_without_rescanning(self) -> None:
         saved, checkout = self.saved_scan()
         with patch.object(scan, "collect_worktrees_and_terminals", side_effect=AssertionError("rescanned")), \
                 redirect_stdout(io.StringIO()) as out:
@@ -2120,7 +2148,7 @@ class ScanCommandTests(unittest.TestCase):
     def test_waiting_worktrees_and_remote_shells_missing_output_get_screens(self) -> None:
         waiting = worktree("/w/waiting", "waiting")
         working = worktree("/w/working", "working")
-        remote = {**worktree("/remote/working", "working"), "_environment": "macbook-pro-16"}
+        remote: dict = {**worktree("/remote/working", "working"), "_environment": "macbook-pro-16"}
         remote["agents"][0]["lastAssistantMessage"] = "Saved session memory."
         terms = [terminal(waiting["path"], "claude", "waiting"),
                  terminal(working["path"], "claude", "working"),
@@ -2135,7 +2163,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual([term["handle"] for term in scan.screen_targets([waiting, working, remote], terms)],
                          ["waiting", "remote_shell"])
 
-    def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self):
+    def test_row_prints_one_row_with_its_newest_final_message_and_plain_strings(self) -> None:
         saved, checkout = self.saved_scan()
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--row", "dotfiles-73"]), 0)
@@ -2276,7 +2304,7 @@ class ScanCommandTests(unittest.TestCase):
                                     *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
-    def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self):
+    def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self) -> None:
         local = {"worktrees": [worktree("/local/w", "done")],
                  "hostScope": {"omittedHostSelectors": [
                      {"hostId": "remote-1", "selector": "--environment macbook-pro-16"}]}}
@@ -2286,7 +2314,7 @@ class ScanCommandTests(unittest.TestCase):
                              {"id": "ws-1", "endpoint": "ws://remote.example:6768"}]}]
         calls = []
 
-        def payload(orca, args, json_file=None, timeout=None):
+        def payload(orca: str, args: list[str], json_file: str | None = None, timeout: float | None = None) -> dict:
             calls.append(args)
             if args == ["environment", "list"]:
                 return {"environments": environments}
@@ -2319,10 +2347,10 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("cannot read terminals", err.getvalue())
         self.assertIn("ws://remote.example:6768", err.getvalue())
 
-    def test_screens_are_read_from_the_server_that_issued_each_handle(self):
+    def test_screens_are_read_from_the_server_that_issued_each_handle(self) -> None:
         calls = []
 
-        def orca(cmd, *args, **kwargs):
+        def orca(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
             calls.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stderr="", stdout=json.dumps(
                 {"result": {"terminal": {"source": "screen", "tail": [cmd[cmd.index("--terminal") + 1]]}}}))
@@ -2336,7 +2364,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn(["orca", "terminal", "read", "--terminal", "term_r", "--screen", "--environment",
                        "macbook-pro-16", "--json"], calls)
 
-    def test_removed_host_id_is_named_when_no_environment_selector_exists(self):
+    def test_removed_host_id_is_named_when_no_environment_selector_exists(self) -> None:
         local = {"worktrees": [], "hostScope": {"omittedHostSelectors": [
             {"hostId": "runtime:deleted-id", "selector": None}]}}
         with patch.object(scan, "orca_payload", return_value=local), \
@@ -2346,8 +2374,8 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("runtime:deleted-id", err.getvalue())
         self.assertIn("not in orca environment list", err.getvalue())
 
-    def test_remote_orca_final_message_is_classified_without_a_local_transcript(self):
-        remote = {**worktree("/remote/w", "done", agent="codex"), "_environment": "macbook-pro-16"}
+    def test_remote_orca_final_message_is_classified_without_a_local_transcript(self) -> None:
+        remote: dict = {**worktree("/remote/w", "done", agent="codex"), "_environment": "macbook-pro-16"}
         remote["agents"][0].update({"lastAssistantMessage": "PR を出しました。レビュー待ちです。",
                                      "updatedAt": 1792567646152})
         term = {**terminal("/remote/w", "codex"), "_environment": "macbook-pro-16"}
@@ -2357,7 +2385,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(rows[0]["jev"]["source"], "orca")
         self.assertEqual(rows[0]["environment"], "macbook-pro-16")
 
-    def test_reads_orca_json_files_and_skips_old_rollouts(self):
+    def test_reads_orca_json_files_and_skips_old_rollouts(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/new", "working", agent="codex"),
                                                            worktree("/w/old", None)]}}))
@@ -2382,7 +2410,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(rows, {"/w/new": "working", "/w/old": "unstarted"})
 
 
-    def test_each_row_carries_when_the_scan_started_for_the_tool_that_closes_its_tabs(self):
+    def test_each_row_carries_when_the_scan_started_for_the_tool_that_closes_its_tabs(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/new", "working", agent="codex")]}}))
         terms = self.dir / "terms.json"
@@ -2396,7 +2424,7 @@ class ScanCommandTests(unittest.TestCase):
         started = datetime.fromisoformat(json.loads(out.getvalue())[0]["scanned_at"])
         self.assertTrue(before.replace(microsecond=0) <= started <= datetime.now().astimezone())
 
-    def test_writes_the_review_queue_when_asked(self):
+    def test_writes_the_review_queue_when_asked(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/idle", "done")]}}))
         terms = self.dir / "terms.json"
@@ -2439,7 +2467,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual([(row["path"], row["class"]) for row in json.loads(queue.read_text())["rows"]],
                          [(selected, "working")])
 
-    def test_summary_lists_review_rows_and_finished_worktree_tabs(self):
+    def test_summary_lists_review_rows_and_finished_worktree_tabs(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [
             worktree("/w/idle", "done"), worktree("/w/finished", "done", status="completed")]}}))
@@ -2459,7 +2487,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("review queue: 1\n  app/idle [unsure]", out.getvalue())
         self.assertIn("finished: 1 worktrees, 2 tabs\n  app/finished (2 tabs)", out.getvalue())
 
-    def test_reads_the_orchestration_mailbox_from_json_files(self):
+    def test_reads_the_orchestration_mailbox_from_json_files(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/lead", "done")]}}))
         terms = self.dir / "terms.json"
@@ -2484,15 +2512,15 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual((row["class"], row["reasons"]), ("stalled", [
             "1 orchestration message unread since its last turn began (oldest 2026-10-06T07:04:31Z)"]))
 
-    def test_follows_every_page_of_runs_and_survives_an_orca_without_a_mailbox(self):
+    def test_follows_every_page_of_runs_and_survives_an_orca_without_a_mailbox(self) -> None:
         inbox = self.dir / "inbox.json"
         inbox.write_text(json.dumps({"result": {"messages": [
             {"run_id": run, "to_handle": "run:" + run, "type": "question", "read": 0,
              "created_at": "2026-10-07T03:09:00Z", "subject": "Question"} for run in ("run_1", "run_2")]}}))
-        pages = {(): {"runs": [{"id": "run_1", "coordinator_handle": "term_1"}], "nextCursor": "c2"},
+        pages: dict[tuple[str, ...], dict] = {(): {"runs": [{"id": "run_1", "coordinator_handle": "term_1"}], "nextCursor": "c2"},
                  ("--cursor", "c2"): {"runs": [{"id": "run_2", "coordinator_handle": "term_2"}], "nextCursor": None}}
 
-        def run_list(argv, **kwargs):
+        def run_list(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             cursor = tuple(argv[argv.index("100") + 1:-1])
             return subprocess.CompletedProcess(argv, 0, json.dumps({"ok": True, "result": pages[cursor]}), "")
 
@@ -2507,7 +2535,7 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.read_mail(scan.parse_args(args)), {})
         self.assertIn("unread worker mail is not checked", err.getvalue())
 
-    def test_shell_idle_minutes_sets_when_a_quiet_shell_becomes_closable(self):
+    def test_shell_idle_minutes_sets_when_a_quiet_shell_becomes_closable(self) -> None:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [worktree("/w/s", None)]}}))
         shell = {**terminal("/w/s", None, "term_shell", preview=PROMPT),
@@ -2515,7 +2543,7 @@ class ScanCommandTests(unittest.TestCase):
         terms = self.dir / "terms.json"
         terms.write_text(json.dumps({"result": {"terminals": [shell]}}))
 
-        def closable(*extra):
+        def closable(*extra: str) -> list[str]:
             out = io.StringIO()
             with redirect_stdout(out):
                 scan.main(["--ps-json", str(ps), "--terminals-json", str(terms),
@@ -2526,7 +2554,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(closable(), [])
         self.assertEqual(closable("--shell-idle-minutes", "5"), ["term_shell"])
 
-    def scan_merged_worktree(self, *extra):
+    def scan_merged_worktree(self, *extra: str) -> tuple[tuple[str, list[str], dict], str]:
         ps = self.dir / "ps.json"
         ps.write_text(json.dumps({"result": {"worktrees": [
             worktree("/w/m", "done", pr={"number": 1, "state": "merged"})]}}))
@@ -2542,19 +2570,19 @@ class ScanCommandTests(unittest.TestCase):
         row = json.loads(out.getvalue())[0]
         return (row["class"], row["reasons"], row["jev"]), err.getvalue()
 
-    def test_without_a_jev_key_idle_final_messages_come_back_unjudged(self):
+    def test_without_a_jev_key_idle_final_messages_come_back_unjudged(self) -> None:
         result, err = self.scan_merged_worktree()
 
         self.assertEqual(result, ("unsure", ["Jev could not judge: read the final message"],
                                   {"source": "claude", "asks": None, "status": None, "confidence": None}))
         self.assertIn("TYPESAFE_API_KEY", err)
 
-    def test_judges_with_the_key_file(self):
+    def test_judges_with_the_key_file(self) -> None:
         key = self.dir / "api_key"
         key.write_text("key-2\n")
         sent = []
 
-        def urlopen(request, timeout):
+        def urlopen(request: urllib.request.Request, timeout: float) -> io.BytesIO:
             sent.append(request.get_header("Authorization"))
             return jev_answer(0.7)
 
@@ -2565,7 +2593,7 @@ class ScanCommandTests(unittest.TestCase):
                                   {"source": "claude", **verdict(0.7)}))
         self.assertEqual(sent, ["Bearer key-2"])
 
-    def test_the_environment_key_wins_over_the_key_file(self):
+    def test_the_environment_key_wins_over_the_key_file(self) -> None:
         key = self.dir / "api_key"
         key.write_text("from-file\n")
         garbled = self.dir / "garbled"
@@ -2620,7 +2648,7 @@ class CloseTabsRowCommandTests(unittest.TestCase):
             self.assertIn("mbp16::idle", err.getvalue())
 
 
-def git(cwd, *args):
+def git(cwd: str | Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
@@ -2646,7 +2674,7 @@ class FakeWorktreeNotes:
 
 
 class RmCheckTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.main = Path(self.tmp.name) / "main"
         self.main.mkdir()
@@ -2663,13 +2691,13 @@ class RmCheckTests(unittest.TestCase):
         recheck.start()
         self.addCleanup(recheck.stop)
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def check(self, **kwargs):
+    def check(self, **kwargs: object) -> dict:
         return rmcheck.check(self.wt, self.main, base="main", compose_projects=[], **kwargs)
 
-    def test_clean_worktree_contained_in_base_is_ok(self):
+    def test_clean_worktree_contained_in_base_is_ok(self) -> None:
         result = self.check()
 
         self.assertTrue(result["ok"])
@@ -2704,13 +2732,14 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(comment, " ".join(result["blockers"]))
         self.assertTrue(copy.exists())
 
-    def test_running_process_using_the_worktree_blocks_removal(self):
+    def test_running_process_using_the_worktree_blocks_removal(self) -> None:
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)",
              str(self.wt.resolve())],
             stdout=subprocess.PIPE, text=True,
         )
         try:
+            assert process.stdout is not None
             self.assertEqual(process.stdout.readline().strip(), "ready")
             code, result = self.run_main()
 
@@ -2727,12 +2756,13 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main()
         self.assertEqual((code, result["processes"]), (0, []))
 
-    def test_process_running_from_worktree_blocks_without_path_in_command(self):
+    def test_process_running_from_worktree_blocks_without_path_in_command(self) -> None:
         process = subprocess.Popen(
             [sys.executable, "-c", "print('ready', flush=True); import time; time.sleep(30)"],
             cwd=self.wt, stdout=subprocess.PIPE, text=True,
         )
         try:
+            assert process.stdout is not None
             self.assertEqual(process.stdout.readline().strip(), "ready")
             code, result = self.run_main()
 
@@ -2766,7 +2796,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"], completed.stderr)
         self.assertEqual(len(result["processes"]), 1)
 
-    def test_check_does_not_count_itself_or_its_shell(self):
+    def test_check_does_not_count_itself_or_its_shell(self) -> None:
         binary = Path(self.tmp.name) / "bin/orca"
         binary.parent.mkdir()
         binary.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"ok":false,"error":{"code":"selector_not_found"}}\'\nexit 1\n')
@@ -2781,7 +2811,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["processes"], [])
 
-    def test_process_in_a_sibling_with_the_same_name_prefix_does_not_block(self):
+    def test_process_in_a_sibling_with_the_same_name_prefix_does_not_block(self) -> None:
         sibling = self.wt.with_name(self.wt.name + "-other")
         sibling.mkdir()
         process = subprocess.Popen(
@@ -2790,6 +2820,7 @@ class RmCheckTests(unittest.TestCase):
             cwd=sibling, stdout=subprocess.PIPE, text=True,
         )
         try:
+            assert process.stdout is not None
             self.assertEqual(process.stdout.readline().strip(), "ready")
             code, result = self.run_main()
 
@@ -2799,13 +2830,13 @@ class RmCheckTests(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
-    def test_the_main_checkout_is_never_removable(self):
+    def test_the_main_checkout_is_never_removable(self) -> None:
         result = rmcheck.check(self.main, self.main, base="main", compose_projects=[])
 
         self.assertEqual((result["ok"], result["blockers"]),
                          (False, ["this is the repository's main checkout: close its tabs and keep it"]))
 
-    def test_uncommitted_changes_block_removal(self):
+    def test_uncommitted_changes_block_removal(self) -> None:
         (self.wt / "app.txt").write_text("v2\n")
         (self.wt / "new.txt").write_text("draft\n")
 
@@ -2869,7 +2900,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual([(item["pid"], item["lock"]) for item in held["processes"]],
                          [(holder.pid, ".claude/scheduled_tasks.lock")])
 
-    def test_a_commit_whose_patch_reached_the_base_does_not_block(self):
+    def test_a_commit_whose_patch_reached_the_base_does_not_block(self) -> None:
         # A PR rebased before its merge leaves the old commit here; its patch is in the base.
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
@@ -2886,7 +2917,7 @@ class RmCheckTests(unittest.TestCase):
         git(self.wt, "commit", "-q", "-m", "unmerged")
         self.assertEqual(len(self.check()["blockers"]), 1)
 
-    def test_a_merge_commit_s_own_changes_still_block(self):
+    def test_a_merge_commit_s_own_changes_still_block(self) -> None:
         # git cherry skips merge commits, so an edit made while merging the base must not pass.
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
@@ -2900,7 +2931,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(len(self.check()["blockers"]), 1)
 
-    def test_only_regenerable_output_left_is_ok(self):
+    def test_only_regenerable_output_left_is_ok(self) -> None:
         (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\ne2e/screenshots/\n")
         git(self.main, "commit", "-q", "-am", "ignore screenshots")
         git(self.wt, "merge", "-q", "--ff-only", "main")
@@ -2912,7 +2943,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual((result["review"], result["regenerable"]), ([], ["e2e/screenshots/"]))
 
-    def test_generated_sources_and_test_output_do_not_hold_up_removal(self):
+    def test_generated_sources_and_test_output_do_not_hold_up_removal(self) -> None:
         (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n__generated__/\nsrc/paraglide/\n"
                                                "e2e/screenshots/\ne2e/.state/\ne2e/.auth/\ndocs/screenshots/\n")
         git(self.main, "commit", "-q", "-am", "ignore generated")
@@ -2929,7 +2960,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/web/src/api/__generated__/", "e2e/.auth/",
                                                         "e2e/.state/", "e2e/screenshots/", "src/paraglide/"])
 
-    def test_untracked_python_bytecode_is_regenerable_not_uncommitted(self):
+    def test_untracked_python_bytecode_is_regenerable_not_uncommitted(self) -> None:
         (self.wt / "tool").mkdir()
         (self.wt / "tool" / "run.py").write_text("print(1)\n")
         git(self.wt, "add", "tool/run.py")
@@ -2947,7 +2978,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(result["uncommitted"], ["notes/"])
         self.assertEqual(sorted(result["regenerable"]), ["stale.pyc", "tool/__pycache__/"])
 
-    def test_tool_output_the_repository_ignores_does_not_hold_up_removal(self):
+    def test_tool_output_the_repository_ignores_does_not_hold_up_removal(self) -> None:
         # Seen in Orca worktrees: hook managers' install output, test reports and coverage, codegen, tool caches.
         (self.main / ".gitignore").write_text(".env\nnode_modules/\nuploads\n.vite-hooks/_/\nplaywright-report-real/\n"
                                                ".coverage\nsrc/graphql/generated/\n.cache/\n")
@@ -2971,7 +3002,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), [".husky/_/.gitignore", ".husky/_/h", ".vite-hooks/_/",
                                                         "src/graphql/generated/"])
 
-    def test_the_apm_installation_identity_does_not_hold_up_removal(self):
+    def test_the_apm_installation_identity_does_not_hold_up_removal(self) -> None:
         # APM 0.35 writes these into each checkout it installs to, ignoring them with their own .gitignore.
         (self.wt / ".apm-local").mkdir()
         (self.wt / ".apm-local" / ".gitignore").write_text("*\n")
@@ -2983,7 +3014,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((result["review"], sorted(result["regenerable"])),
                          ([], [".apm-local/.gitignore", ".apm-local/installation"]))
 
-    def test_unmerged_commit_blocks_unless_it_is_the_pr_head(self):
+    def test_unmerged_commit_blocks_unless_it_is_the_pr_head(self) -> None:
         (self.wt / "app.txt").write_text("v2\n")
         git(self.wt, "commit", "-q", "-am", "change")
         head = git(self.wt, "rev-parse", "HEAD")
@@ -2996,7 +3027,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(squashed["ok"])
         self.assertTrue(reopened["ok"])
 
-    def test_a_merged_pr_of_the_branch_at_head_counts_without_pr(self):
+    def test_a_merged_pr_of_the_branch_at_head_counts_without_pr(self) -> None:
         git(self.main, "remote", "add", "origin", "git@github.com:acme/app.git")
         (self.wt / "app.txt").write_text("squashed\n")
         git(self.wt, "commit", "-q", "-am", "change")
@@ -3004,12 +3035,12 @@ class RmCheckTests(unittest.TestCase):
         real_run = subprocess.run
         lookups = []
 
-        def gh_lists(prs):
-            def fake_run(cmd, *args, **kwargs):
+        def gh_lists(prs: list[dict]) -> Callable[..., subprocess.CompletedProcess[str]]:
+            def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
                 if cmd[0] == "gh":
                     lookups.append(cmd)
                     return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(prs), stderr="")
-                return real_run(cmd, *args, **kwargs)
+                return real_run(cmd, **kwargs)
             return fake_run
 
         merged = {"number": 7, "state": "MERGED", "headRefOid": head, "baseRefName": "main"}
@@ -3023,7 +3054,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(lookups[0][:5], ["gh", "pr", "list", "--head", "feature"])
         self.assertEqual((other_code, other["blockers"]), (1, ["HEAD %s is not in main" % head[:8]]))
 
-    def test_archive_scratch_moves_records_only_when_they_alone_keep_the_worktree(self):
+    def test_archive_scratch_moves_records_only_when_they_alone_keep_the_worktree(self) -> None:
         (self.wt / ".yomiyasu" / "inputs").mkdir(parents=True)
         (self.wt / ".yomiyasu" / ".gitignore").write_text("*\n")
         (self.wt / ".yomiyasu" / "inputs" / "draft.md").write_text("原文\n")
@@ -3179,7 +3210,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/api/media/", "logs/"])
         self.assertRegex(" ".join(result["notes"]), r"logs/ holds only logs: 12 bytes, last written \d{4}-")
 
-    def test_open_pr_at_clean_checkout_head_is_removable(self):
+    def test_open_pr_at_clean_checkout_head_is_removable(self) -> None:
         (self.wt / "app.txt").write_text("pushed change\n")
         git(self.wt, "commit", "-q", "-am", "change")
         head = git(self.wt, "rev-parse", "HEAD")
@@ -3194,7 +3225,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(result["blockers"], [])
         self.assertEqual(dirty["blockers"], ["1 uncommitted changes"])
 
-    def test_an_ignored_path_that_holds_nothing_needs_no_review(self):
+    def test_an_ignored_path_that_holds_nothing_needs_no_review(self) -> None:
         (self.main / "uploads").write_text("rows from the main checkout\n")
         (self.wt / "uploads").write_text("")
         (self.wt / "node_modules").mkdir()
@@ -3203,7 +3234,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(self.check()["review"], [])
 
-    def test_ignored_files_need_review_unless_cache_or_same_as_main(self):
+    def test_ignored_files_need_review_unless_cache_or_same_as_main(self) -> None:
         (self.main / ".env").write_text("A=1\n")
         (self.wt / ".env").write_text("A=1\n")
         (self.wt / "node_modules").mkdir()
@@ -3270,7 +3301,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(linked["review"], [".claude/reviews/ (differs from main checkout)"])
         self.assertEqual(changed["review"], [".claude/reviews/ (differs from main checkout)"])
 
-    def test_an_env_is_regenerable_when_it_moves_only_ports_from_its_example(self):
+    def test_an_env_is_regenerable_when_it_moves_only_ports_from_its_example(self) -> None:
         (self.main / ".env.example").write_text("# local\nDB_HOST_PORT=5432\nAPI_KEY=\nDEBUG=1\n")
         git(self.main, "add", ".env.example")
         git(self.main, "commit", "-q", "-m", "env example")
@@ -3286,7 +3317,7 @@ class RmCheckTests(unittest.TestCase):
                          [".env (not in main checkout; values .env.example does not have: API_KEY, EXTRA)"])
         self.assertNotIn("from-the-vendor", json.dumps(with_values))
 
-    def test_an_env_with_a_multiline_value_stays_in_review_without_key_names(self):
+    def test_an_env_with_a_multiline_value_stays_in_review_without_key_names(self) -> None:
         (self.main / ".env.example").write_text('PORT=8000\nSIGNING_KEY="-----BEGIN KEY-----\nexample\n-----END KEY-----"\n')
         git(self.main, "add", ".env.example")
         git(self.main, "commit", "-q", "-m", "env example")
@@ -3298,7 +3329,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((result["review"], result["regenerable"]), ([".env (not in main checkout)"], []))
         self.assertNotIn("c2VjcmV0", json.dumps(result))
 
-    def test_reports_compose_projects_defined_in_the_worktree(self):
+    def test_reports_compose_projects_defined_in_the_worktree(self) -> None:
         projects = [
             {"Name": "app-wt", "Status": "running(2)", "ConfigFiles": str(self.wt / "compose.yaml")},
             {"Name": "app-main", "Status": "running(1)", "ConfigFiles": str(self.main / "compose.yaml")},
@@ -3312,7 +3343,7 @@ class RmCheckTests(unittest.TestCase):
     def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:
         real_run = subprocess.run
 
-        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "docker":
                 raise subprocess.TimeoutExpired(cmd, rmcheck.DOCKER_TIMEOUT)
             return real_run(cmd, **kwargs)
@@ -3332,7 +3363,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(with_compose[0], 1)
         self.assertIn("docker が 20 秒応答しません", " ".join(with_compose[1]["blockers"]))
 
-    def test_a_dangling_symlink_is_reported_instead_of_crashing(self):
+    def test_a_dangling_symlink_is_reported_instead_of_crashing(self) -> None:
         (self.main / "uploads").mkdir()
         (self.main / "uploads" / "a.png").write_text("png")
         (self.wt / "uploads").symlink_to(Path(self.tmp.name) / "gone")
@@ -3341,7 +3372,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(result["review"], ["uploads (differs from main checkout)"])
 
-    def test_same_tree_compares_raw_symlink_targets(self):
+    def test_same_tree_compares_raw_symlink_targets(self) -> None:
         left = self.wt / "link"
         right = self.main / "link"
         left.symlink_to("file/")
@@ -3349,7 +3380,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertFalse(rmcheck.same_tree(left, right))
 
-    def test_compose_placeholder_entries_never_match_the_worktree(self):
+    def test_compose_placeholder_entries_never_match_the_worktree(self) -> None:
         projects = [{"Name": "elsewhere", "Status": "running(1)", "ConfigFiles": "/other/compose.yaml,-"}]
         cwd = Path.cwd()
         os.chdir(self.wt)
@@ -3360,7 +3391,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(result["containers"], [])
 
-    def test_processes_in_orca_tabs_name_their_tab_and_idle_shells_do_not_block(self):
+    def test_processes_in_orca_tabs_name_their_tab_and_idle_shells_do_not_block(self) -> None:
         wt = str(self.wt.resolve())
         host = "/Applications/Orca Terminal Host.app/Contents/MacOS/orca-terminal-host --socket s"
         older_host = "/Applications/Orca.app/Contents/Frameworks/Orca Helper.app/Contents/MacOS/Orca Helper " \
@@ -3388,15 +3419,15 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("PID 40（node server.js、cwd %s）" % wt, result["blockers"][0])
         self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
 
-    def test_a_failed_pr_lookup_names_the_command_for_a_mac_where_gh_works(self):
+    def test_a_failed_pr_lookup_names_the_command_for_a_mac_where_gh_works(self) -> None:
         git(self.main, "remote", "add", "origin", "git@github.com:acme/app.git")
         head = git(self.wt, "rev-parse", "HEAD")
         real_run = subprocess.run
 
-        def fake_run(cmd, *args, **kwargs):
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "gh":
                 raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 401: Bad credentials")
-            return real_run(cmd, *args, **kwargs)
+            return real_run(cmd, **kwargs)
 
         with patch.object(rmcheck.subprocess, "run", side_effect=fake_run):
             code, result = self.run_main("--pr", "7")
@@ -3404,11 +3435,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("merged_pr_head.py --repo acme/app --pr 7 --head " + head, " ".join(result["notes"]))
 
-    def test_merged_pr_head_prints_rm_check_arguments_only_for_a_merged_pr(self):
+    def test_merged_pr_head_prints_rm_check_arguments_only_for_a_merged_pr(self) -> None:
         pr_head, head = "a" * 40, "b" * 40
 
-        def gh(state):
-            def run(cmd, *args, **kwargs):
+        def gh(state: str) -> Callable[..., subprocess.CompletedProcess[str]]:
+            def run(cmd: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
                 if cmd[:3] == ["gh", "pr", "view"]:
                     out = {"state": state, "headRefOid": pr_head}
                 else:
@@ -3428,7 +3459,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
         self.assertIn("OPEN", err.getvalue())
 
-    def test_nested_worktrees_on_a_remote_are_detached_and_others_block(self):
+    def test_nested_worktrees_on_a_remote_are_detached_and_others_block(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(Path(self.tmp.name), "init", "--bare", "-q", str(remote))
         deps = Path(self.tmp.name) / "deps"
@@ -3540,13 +3571,13 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(result["nested_worktrees"][0]["blockers"], ["2 uncommitted changes"])
         self.assertTrue(copy.exists())
 
-    def test_a_failed_pr_lookup_blocks_with_a_reason(self):
+    def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
 
-        def fake_run(cmd, *args, **kwargs):
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "gh":
                 raise FileNotFoundError("gh")
-            return real_run(cmd, *args, **kwargs)
+            return real_run(cmd, **kwargs)
 
         with patch.object(rmcheck.subprocess, "run", side_effect=fake_run):
             code, result = self.run_main("--pr", "7")
@@ -3555,7 +3586,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(result["blockers"], ["PR #7 lookup failed: gh"])
         self.assertIn("--pr-head", " ".join(result["notes"]))
 
-    def test_command_accepts_a_merged_pr_head_without_fetched_base(self):
+    def test_command_accepts_a_merged_pr_head_without_fetched_base(self) -> None:
         (self.wt / "app.txt").write_text("merged change\n")
         git(self.wt, "commit", "-q", "-am", "merged change")
         head = git(self.wt, "rev-parse", "HEAD")
@@ -3565,7 +3596,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"], result["blockers"]), (0, True, []))
         self.assertIn("git fetch failed", " ".join(result["notes"]))
 
-    def test_command_accepts_an_ancestor_of_the_merged_pr_head(self):
+    def test_command_accepts_an_ancestor_of_the_merged_pr_head(self) -> None:
         (self.wt / "app.txt").write_text("earlier PR commit\n")
         git(self.wt, "commit", "-q", "-am", "earlier PR commit")
         earlier = git(self.wt, "rev-parse", "HEAD")
@@ -3579,7 +3610,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["ok"], result["blockers"]), (0, True, []))
 
-    def test_command_blocks_unpushed_commit_after_the_merged_pr_head(self):
+    def test_command_blocks_unpushed_commit_after_the_merged_pr_head(self) -> None:
         (self.wt / "app.txt").write_text("merged change\n")
         git(self.wt, "commit", "-q", "-am", "merged change")
         pr_head = git(self.wt, "rev-parse", "HEAD")
@@ -3593,7 +3624,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("ahead of merged PR head", " ".join(result["blockers"]))
 
-    def test_a_commit_after_pr_head_blocks_even_if_its_patch_is_in_base(self):
+    def test_a_commit_after_pr_head_blocks_even_if_its_patch_is_in_base(self) -> None:
         (self.wt / "app.txt").write_text("merged change\n")
         git(self.wt, "commit", "-q", "-am", "merged change")
         pr_head = git(self.wt, "rev-parse", "HEAD")
@@ -3611,7 +3642,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ahead of merged PR head", " ".join(result["blockers"]))
 
-    def test_command_uses_compare_when_the_pr_head_object_is_missing(self):
+    def test_command_uses_compare_when_the_pr_head_object_is_missing(self) -> None:
         (self.wt / "app.txt").write_text("older PR commit\n")
         git(self.wt, "commit", "-q", "-am", "older PR commit")
         missing_pr_head = "a" * 40
@@ -3665,20 +3696,20 @@ class RmCheckTests(unittest.TestCase):
                                 worktree_notes=notes or FakeWorktreeNotes())
         return code, json.loads(out.getvalue())
 
-    def run_main_without_base(self, *argv, pr=None):
+    def run_main_without_base(self, *argv: str, pr: dict | None = None) -> tuple[int, dict]:
         real_run = subprocess.run
 
-        def fake_run(cmd, *args, **kwargs):
+        def fake_run(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "gh":
                 return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(pr), stderr="")
-            return real_run(cmd, *args, **kwargs)
+            return real_run(cmd, **kwargs)
 
         out = io.StringIO()
         with patch.object(rmcheck.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
             code = rmcheck.main(["--worktree", str(self.wt), "--no-docker", *argv], worktree_notes=FakeWorktreeNotes())
         return code, json.loads(out.getvalue())
 
-    def remote_default_and_working_base(self):
+    def remote_default_and_working_base(self) -> str:
         """origin/HEAD -> origin/main at the first commit; origin/develop holds the worktree's commit."""
         first = git(self.main, "rev-parse", "main")
         git(self.main, "update-ref", "refs/remotes/origin/main", first)
@@ -3689,7 +3720,7 @@ class RmCheckTests(unittest.TestCase):
         git(self.main, "update-ref", "refs/remotes/origin/develop", head)
         return head
 
-    def test_command_checks_against_the_base_branch_of_the_pr(self):
+    def test_command_checks_against_the_base_branch_of_the_pr(self) -> None:
         # A repository whose default branch is not where the work merges (cxc merges into feat/nature).
         head = self.remote_default_and_working_base()
         pr = {"number": 7, "state": "OPEN", "headRefOid": head, "baseRefName": "develop"}
@@ -3700,7 +3731,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((default_code, default["base"]), (1, "origin/HEAD"))
         self.assertEqual((pr_code, by_pr["base"], by_pr["blockers"]), (0, "origin/develop", []))
 
-    def test_a_pr_base_branch_missing_locally_is_named_in_the_notes(self):
+    def test_a_pr_base_branch_missing_locally_is_named_in_the_notes(self) -> None:
         head = self.remote_default_and_working_base()
         pr = {"number": 7, "state": "OPEN", "headRefOid": head, "baseRefName": "release"}
 
@@ -3709,7 +3740,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["base"]), (0, "origin/HEAD"))
         self.assertEqual(result["notes"], ["PR #7 base origin/release is not fetched: fetch it or pass --base"])
 
-    def test_command_checks_against_the_remote_branch_the_worktree_started_from(self):
+    def test_command_checks_against_the_remote_branch_the_worktree_started_from(self) -> None:
         first = git(self.main, "rev-parse", "main")
         for ref in ("refs/remotes/origin/main", "refs/remotes/origin/develop"):
             git(self.main, "update-ref", ref, first)
@@ -3760,7 +3791,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertNotIn("--pr-head", " ".join(result.get("notes", [])))
         self.assertEqual((local_code, local["base"]), (1, "origin/HEAD"))
 
-    def test_command_finds_the_main_checkout_and_fails_when_blocked(self):
+    def test_command_finds_the_main_checkout_and_fails_when_blocked(self) -> None:
         (self.main / ".env").write_text("A=1\n")
         (self.wt / ".env").write_text("A=1\n")
         clean_code, clean = self.run_main()
@@ -3770,7 +3801,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((clean_code, clean["ok"], clean["main"]), (0, True, str(self.main.resolve())))
         self.assertEqual((dirty_code, dirty["blockers"]), (1, ["1 uncommitted changes"]))
 
-    def test_command_without_a_base_ref_says_so(self):
+    def test_command_without_a_base_ref_says_so(self) -> None:
         (self.wt / "app.txt").write_text("v2\n")
         out = io.StringIO()
         with redirect_stdout(out):
@@ -3829,7 +3860,7 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, json.loads(out.getvalue())["worktree"]), (0, str(self.wt.resolve())))
 
-    def test_command_rejects_a_path_that_is_not_a_git_worktree(self):
+    def test_command_rejects_a_path_that_is_not_a_git_worktree(self) -> None:
         plain = Path(self.tmp.name) / "plain"
         plain.mkdir()
         out = io.StringIO()
@@ -3878,7 +3909,7 @@ class RmCheckConfirmGoneTests(unittest.TestCase):
 NOTHING_OWED = {"needs_owner": [], "closed_issues": []}
 
 
-def gh_issue(url, number, closing_prs=()):
+def gh_issue(url: str, number: int, closing_prs: tuple[int, ...] = ()) -> dict:
     return {"number": number, "title": f"issue {number}", "url": url + str(number), "assignees": [],
             "closedByPullRequestsReferences": [{"number": pr} for pr in closing_prs]}
 
@@ -4082,7 +4113,7 @@ class HandoffProposalTests(unittest.TestCase):
         os.utime(self.projects / "-w-lead" / "old.jsonl", (1, 1))
         agent = done_agent("claude", "tab:leaf")
         row = {**worktree("/w/lead"), "agents": [agent]}
-        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/other"), row]},
+        replies: dict[tuple[str, ...], dict] = {("worktree", "ps"): {"worktrees": [worktree("/w/other"), row]},
                    ("terminal", "list"): {"terminals": [terminal("/w/other", "claude", "other"),
                                                            terminal("/w/lead", "claude", "lead-tab")]},
                    ("terminal", "read", "--terminal", "lead-tab", "--screen"):
@@ -4156,18 +4187,18 @@ class HourlyStateTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
-    def source(self, name, content):
+    def source(self, name: str, content: str) -> str:
         path = self.root / name
         path.write_text(content)
         return str(path)
 
-    def call(self, *args):
+    def call(self, *args: str) -> tuple[int, dict]:
         out = io.StringIO()
         with redirect_stdout(out):
             code = hourly_state.main(["--state-file", str(self.state), *args])
         return code, json.loads(out.getvalue())
 
-    def test_pending_lists_only_open_items_each_with_its_id(self):
+    def test_pending_lists_only_open_items_each_with_its_id(self) -> None:
         message = self.source("message.txt", "Should B start?\n")
         question = self.source("question.txt", "Send B the task?\n")
         answer = self.source("answer.txt", "Yes.\n")
@@ -4188,7 +4219,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(pending["requests"], [])
         self.assertEqual([item["row"] for item in pending["left"]], ["/w/c"])
 
-    def test_left_row_only_stays_left_for_the_saved_final_message(self):
+    def test_left_row_only_stays_left_for_the_saved_final_message(self) -> None:
         old = self.source("old.txt", "Work complete; leave it.\n")
         new = self.source("new.txt", "New work needed.\n")
         self.assertEqual(self.call("leave", "--row", "/w/a", "--final-message-file", old)[0], 0)
@@ -4197,7 +4228,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(self.call("left-now", "--row", "/w/a", "--final-message-file", new),
                          (1, {"left": False}))
 
-    def test_question_and_handoff_survive_a_new_session(self):
+    def test_question_and_handoff_survive_a_new_session(self) -> None:
         message = self.source("message.txt", "Should B start?\n")
         question = self.source("question.txt", "Send B the task?\n")
         answer = self.source("answer.txt", "Yes, when A finishes.\n")
@@ -4226,7 +4257,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(state["questions"][asked["id"]]["answered_at"], "2026-10-25T13:00:00+09:00")
         self.assertEqual(state["handoffs"][promise["id"]]["delivery"], "turn_started")
 
-    def test_question_records_its_tab_for_later_cleanup(self):
+    def test_question_records_its_tab_for_later_cleanup(self) -> None:
         message = self.source("message.txt", "Ready.\n")
         question = self.source("question.txt", "Proceed?\n")
         with patch.dict(os.environ, {"ORCA_PANE_KEY": "tab:leaf"}):
@@ -4414,7 +4445,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertIn("Release B", found["unrecorded_answers"][0]["text"])
         self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
 
-    def test_same_question_for_a_later_pr_is_a_new_decision(self):
+    def test_same_question_for_a_later_pr_is_a_new_decision(self) -> None:
         message = self.source("message.txt", "Ready to merge.\n")
         question = self.source("question.txt", "Merge this PR?\n")
         no = self.source("no.txt", "No\n")
@@ -4431,7 +4462,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(state["questions"][earlier["id"]]["answer"], "No")
         self.assertEqual(state["questions"][later["id"]]["answer"], "Yes")
 
-    def test_malformed_state_is_not_overwritten(self):
+    def test_malformed_state_is_not_overwritten(self) -> None:
         self.state.write_text("broken")
         message = self.source("message.txt", "hello")
         with redirect_stderr(io.StringIO()):
@@ -4440,7 +4471,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.state.read_text(), "broken")
 
-    def test_request_stays_open_after_worker_done_until_symptom_is_verified(self):
+    def test_request_stays_open_after_worker_done_until_symptom_is_verified(self) -> None:
         original = self.source("original.txt", "direnv が固まって開発に支障がある\n")
         symptom = self.source("symptom.txt", "各 session の direnv が固まる\n")
         evidence = self.source("evidence.txt", "実 session で direnv が止まらないことを確認\n")
@@ -4464,7 +4495,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(self.call("show")[1]["requests"][request["id"]]["symptom"],
                          "各 session の direnv が固まる")
 
-    def test_open_issues_of_listed_repos_without_a_checkout_become_requests_needing_owner(self):
+    def test_open_issues_of_listed_repos_without_a_checkout_become_requests_needing_owner(self) -> None:
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
         local = self.root / "app-1"
         subprocess.run(["git", "init", "-q", str(local)], check=True)
@@ -4495,7 +4526,7 @@ class HourlyStateTests(unittest.TestCase):
                   for request in self.call("show")[1]["requests"].values()}
         self.assertEqual(owners, {url + "1": str(local), url + "2": "mbp16::/remote/app-pr7", url + "3": None})
 
-    def test_saved_scan_names_live_owners_and_links_issues_without_reading_orca(self):
+    def test_saved_scan_names_live_owners_and_links_issues_without_reading_orca(self) -> None:
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
         url = "https://github.com/acme/app/issues/"
         # A lane at work: its agent tab makes it a live owner, and Orca links it to issue 1.
@@ -4527,9 +4558,9 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([request["source"]["url"] if request.get("source") else request["owner"]
                           for request in report["needs_owner"]], ["/w/done", "mbp16::/w/shell", url + "2"])
 
-    def test_stale_asks_names_waiting_rows_whose_question_is_unasked_unanswered_or_answered_and_left(self):
+    def test_stale_asks_names_waiting_rows_whose_question_is_unasked_unanswered_or_answered_and_left(self) -> None:
         # 2026-10-29: a choice sent as info waited 14 hours, and an ask marked answered without an answer 25 hours.
-        def waiting(name, asked_at, said_at):
+        def waiting(name: str, asked_at: str, said_at: str) -> dict:
             return {"path": f"/w/{name}", "environment": None, "repo": "app", "class": "waiting", "codex": [],
                     "claude": {"last_user_at": asked_at, "final_at": said_at, "final_text": "返事を待ちます"},
                     "terminals": [{"handle": f"term_{name}", "agent": "claude"}]}
@@ -4593,7 +4624,7 @@ class HourlyStateTests(unittest.TestCase):
                          ["lead_decisions answer:orca-deeplink-pr::photos"])
         self.assertTrue(all(isinstance(item["age_minutes"], int) for item in stale))
 
-    def test_stale_asks_settles_a_row_its_key_answered_after_its_last_message_past_a_delivery_note(self):
+    def test_stale_asks_settles_a_row_its_key_answered_after_its_last_message_past_a_delivery_note(self) -> None:
         # 2026-11-06: montly-report was unasked although ask:montly-report::spare-24man held the answer under 「中継済み」.
         scan_json = self.root / "scan.json"
         scan_json.write_text(json.dumps([
@@ -4629,15 +4660,15 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(settled["evidence"], [{"decision": "ask:montly-report::spare-24man",
                                                 "decided_at": "2026-11-05T12:21:00+09:00", "answer": "1,000 万円のまま"}])
 
-    def test_stale_asks_and_lead_state_name_questions_closed_unanswered_since_the_last_handoff(self):
+    def test_stale_asks_and_lead_state_name_questions_closed_unanswered_since_the_last_handoff(self) -> None:
         # 2026-11-06: the lead's two questions closed unanswered while lead-state showed no pending question.
         question = {"questions": [{"question": "ECR の tag を付けますか？", "options": [{"label": "付ける"}]}]}
 
-        def asked(tool_id, at):
+        def asked(tool_id: str, at: str) -> dict:
             return {**assistant({"type": "tool_use", "id": tool_id, "name": "AskUserQuestion", "input": question}),
                     "timestamp": at}
 
-        def rejected(tool_id, at):
+        def rejected(tool_id: str, at: str) -> dict:
             return {"type": "user", "timestamp": at, "toolUseResult": "User rejected tool use", "message": {
                 "role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": True,
                                              "content": "The user doesn't want to proceed with this tool use."}]}}
@@ -4658,7 +4689,7 @@ class HourlyStateTests(unittest.TestCase):
         scan_json = self.root / "scan.json"
         scan_json.write_text("[]")
         write_jsonl(self.root / "inbox.jsonl", [])
-        replies = {("worktree", "ps"): {"worktrees": [{**worktree(str(lead)), "agents": []}]},
+        replies: dict[tuple[str, ...], dict] = {("worktree", "ps"): {"worktrees": [{**worktree(str(lead)), "agents": []}]},
                    ("terminal", "list"): {"terminals": []}}
 
         _, stale = self.call("stale-asks", "--from", str(scan_json))
@@ -4710,7 +4741,7 @@ class HourlyStateTests(unittest.TestCase):
         message = self.source("message.txt", "Leave this message.")
         self.call("leave", "--row", "/w/left", "--final-message-file", message)
         self.call("leave", "--row", "/w/changed", "--final-message-file", message)
-        rows = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
+        rows: list[dict] = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
                  "claude": {"final_text": final, "final_at": "2026-10-28T01:00:00Z"}}
                 for name, final in (("triage", "Own question"), ("left", "Leave this message."),
                                     ("changed", "A new question"), ("comment", ""), ("screen", ""))]
@@ -4730,7 +4761,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertTrue(all(item["state"] == "unasked" for item in stale))
 
     def test_a_decision_naming_an_old_ask_does_not_answer_the_new_id_in_its_body(self) -> None:
-        rows = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
+        rows: list[dict] = [{"path": f"/w/{name}", "class": "waiting", "repo": "app",
                  "claude": {"final_text": "Waiting.", "final_at": "2026-10-28T01:00:00Z"}}
                 for name in ("old-lane", "new-lane")]
         scan_json = self.root / "scan.json"
@@ -4817,7 +4848,7 @@ class HourlyStateTests(unittest.TestCase):
         _, elsewhere = self.call("stale-asks", "--from", str(scan_json), "--asked-in", str(self.root / "elsewhere"))
         self.assertEqual(elsewhere[0]["candidates"], [])
 
-    def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self):
+    def test_a_saved_scan_takes_the_verdicts_classed_after_it_was_saved(self) -> None:
         # The hourly run saves the scan before orca-row-classify reads its queue; that verdict lands in the store.
         row = {"path": "/w/classed", "environment": None, "repo": "app", "class": "unsure", "linked_pr": None,
                "claude": {"final_at": "2026-10-28T01:00:00Z"}, "codex": [],
@@ -4837,7 +4868,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([request["owner"] for request in report["needs_owner"]], ["/w/classed"])
 
-    def test_recorded_issue_no_longer_open_is_set_apart_as_a_closure_candidate(self):
+    def test_recorded_issue_no_longer_open_is_set_apart_as_a_closure_candidate(self) -> None:
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app", "acme/lib"]}))
         app, lib = "https://github.com/acme/app/issues/", "https://github.com/acme/lib/issues/"
         opened = {"acme/app": [gh_issue(app, 1), gh_issue(app, 2)], "acme/lib": [gh_issue(lib, 3)]}
@@ -4845,7 +4876,7 @@ class HourlyStateTests(unittest.TestCase):
                 patch.object(hourly_state, "orca_worktrees", return_value=[]):
             self.call("requests-needing-owner")
 
-        def later(repo):
+        def later(repo: str) -> list[dict]:
             if repo == "acme/lib":
                 raise subprocess.CalledProcessError(1, ["gh", "issue", "list"])
             return [gh_issue(app, 1)]  # app#2 was closed
@@ -4866,13 +4897,13 @@ class HourlyStateTests(unittest.TestCase):
         # A list cut at gh's limit may leave out open issues, so it closes nothing.
         self.assertEqual(truncated["closed_issues"], [])
 
-    def test_issue_list_is_read_once_more_after_a_failure(self):
+    def test_issue_list_is_read_once_more_after_a_failure(self) -> None:
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app", "acme/lib"]}))
         app, lib = "https://github.com/acme/app/issues/", "https://github.com/acme/lib/issues/"
         outcomes = {"acme/app": [subprocess.CalledProcessError(1, "gh"), [gh_issue(app, 1)]],
                     "acme/lib": [subprocess.TimeoutExpired("gh", 60), ValueError("bad JSON"), [gh_issue(lib, 2)]]}
 
-        def gh(repo):
+        def gh(repo: str) -> list[dict]:
             outcome = outcomes[repo].pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
@@ -4889,23 +4920,23 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(outcomes, {"acme/app": [], "acme/lib": [[gh_issue(lib, 2)]]})
         self.assertIn("acme/lib", err.getvalue())
 
-    def test_unreachable_paired_mac_is_given_up_on_quickly(self):
+    def test_unreachable_paired_mac_is_given_up_on_quickly(self) -> None:
         (self.root / "issue-repos.json").write_text(json.dumps({"repos": ["acme/app"]}))
         url = "https://github.com/acme/app/issues/"
         local = {"worktrees": [{"path": "/w/app", "repo": "app", "linkedIssue": 1, "linkedItems": [],
                                 "linkedPR": {"number": 4, "url": "https://github.com/acme/app/pull/4"}}],
                  "hostScope": {"omittedHostSelectors": [
                      {"hostId": "remote-1", "selector": "--environment office-mac-mini"}]}}
-        replies = {("worktree", "ps"): local, ("terminal", "list"): {"terminals": []},
+        replies: dict[tuple[str, ...], dict] = {("worktree", "ps"): local, ("terminal", "list"): {"terminals": []},
                    ("environment", "list"): {"environments": []}}
         remote_waits = []
 
-        def run(cmd, **kwargs):
+        def run(cmd: list[str], *, timeout: float, **kwargs: object) -> subprocess.CompletedProcess[str]:
             if cmd[0] == "gh":
                 return subprocess.CompletedProcess(cmd, 0, json.dumps([gh_issue(url, 1), gh_issue(url, 2)]), "")
             if "--environment" in cmd:
-                remote_waits.append(kwargs["timeout"])
-                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+                remote_waits.append(timeout)
+                raise subprocess.TimeoutExpired(cmd, timeout)
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": replies[tuple(cmd[1:3])]}), "")
 
         with patch.object(hourly_state.subprocess, "run", side_effect=run), \
@@ -4918,7 +4949,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertTrue(remote_waits)
         self.assertLessEqual(max(remote_waits), 15)
 
-    def test_request_commands_accept_existing_state_without_requests(self):
+    def test_request_commands_accept_existing_state_without_requests(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {}}))
         self.assertEqual(self.call("requests-needing-owner"), (0, NOTHING_OWED))
         self.assertIn("requests", self.call("show")[1])
@@ -4928,7 +4959,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertIsNone(request["owner"])
         self.assertEqual(self.call("requests-needing-owner")[1]["needs_owner"][0]["id"], request["id"])
 
-    def test_same_path_on_another_mac_does_not_hide_an_unowned_request(self):
+    def test_same_path_on_another_mac_does_not_hide_an_unowned_request(self) -> None:
         original = self.source("original.txt", "動作が遅い")
         symptom = self.source("symptom.txt", "起動が止まる")
         local_owner = scan.row_identity({"path": "/w/shared", "environment": None})
@@ -4943,7 +4974,7 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([request["id"] for request in needs_owner["needs_owner"]], [local["id"]])
         self.assertNotEqual(local["owner"], remote["owner"])
 
-    def test_request_owner_requires_scan_row_identity(self):
+    def test_request_owner_requires_scan_row_identity(self) -> None:
         original = self.source("original.txt", "動作が遅い")
         symptom = self.source("symptom.txt", "起動が止まる")
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -4955,13 +4986,13 @@ class HourlyStateTests(unittest.TestCase):
 
 
 class PrecheckTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ps = Path(self.tmp.name) / "ps.json"
         self.runs = Path(self.tmp.name) / "runs.json"
 
-    def run_precheck(self, worktrees, runs=(), workspace="/w/triage", truncated=False):
+    def run_precheck(self, worktrees: list[dict], runs: Sequence[dict] = (), workspace: str = "/w/triage", truncated: bool = False) -> tuple[int, str]:
         self.ps.write_text(json.dumps({"result": {"worktrees": worktrees, "truncated": truncated}}))
         self.runs.write_text(json.dumps({"result": {"runs": runs}}))
         out = io.StringIO()
@@ -4970,7 +5001,7 @@ class PrecheckTests(unittest.TestCase):
                                   "--workspace", workspace])
         return code, out.getvalue()
 
-    def test_a_working_turn_holds_the_next_run(self):
+    def test_a_working_turn_holds_the_next_run(self) -> None:
         for turn in ("working", "done"):
             with self.subTest(turn=turn):
                 row = worktree("/w/triage", "working", turn=turn)
@@ -4981,7 +5012,7 @@ class PrecheckTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("skip: a scheduled turn in /w/triage is working", out)
 
-    def test_completed_scheduled_run_with_working_human_followup_allows_next_run(self):
+    def test_completed_scheduled_run_with_working_human_followup_allows_next_run(self) -> None:
         row = worktree("/w/triage", "working")
         row["agents"][0]["paneKey"] = "old-pane"
         row["agents"][0]["mainAgent"] = {"state": "working"}
@@ -4991,14 +5022,14 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("run: start a fresh session", out)
 
-    def test_background_job_from_completed_run_still_blocks(self):
+    def test_background_job_from_completed_run_still_blocks(self) -> None:
         row = worktree("/w/triage", "working", turn="done")
         row["agents"][0]["paneKey"] = "old-pane"
         runs = [{"status": "completed", "trigger": "scheduled", "terminalPaneKey": "old-pane",
                  "workspaceId": "repo::/w/triage"}]
         self.assertEqual(self.run_precheck([row], runs)[0], 1)
 
-    def test_working_agent_without_pane_identity_is_unverifiable(self):
+    def test_working_agent_without_pane_identity_is_unverifiable(self) -> None:
         row = worktree("/w/triage", "working")
         code, out = self.run_precheck([row], [{"status": "completed", "trigger": "scheduled",
                                               "terminalPaneKey": "old-pane",
@@ -5006,7 +5037,7 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("could not identify", out)
 
-    def test_waiting_blocked_and_done_turns_allow_a_fresh_session(self):
+    def test_waiting_blocked_and_done_turns_allow_a_fresh_session(self) -> None:
         for state in ("waiting", "blocked", "done"):
             with self.subTest(state=state):
                 code, out = self.run_precheck([worktree("/w/triage", state),
@@ -5014,7 +5045,7 @@ class PrecheckTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertIn("run: start a fresh session", out)
 
-    def test_matches_a_symlinked_workspace(self):
+    def test_matches_a_symlinked_workspace(self) -> None:
         real = Path(self.tmp.name) / "real"
         real.mkdir()
         link = Path(self.tmp.name) / "link"
@@ -5022,7 +5053,7 @@ class PrecheckTests(unittest.TestCase):
         code, _ = self.run_precheck([worktree(str(link), "waiting")], workspace=str(real))
         self.assertEqual(code, 0)
 
-    def test_requires_a_known_workspace(self):
+    def test_requires_a_known_workspace(self) -> None:
         code, out = self.run_precheck([worktree("/w/lane", "done")])
         self.assertEqual(code, 2)
         self.assertIn("not an Orca worktree", out)
@@ -5030,7 +5061,7 @@ class PrecheckTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("before cutting the list short", out)
 
-    def test_failure_to_read_orca_skips_the_run(self):
+    def test_failure_to_read_orca_skips_the_run(self) -> None:
         refusing = Path(self.tmp.name) / "refusing-orca"
         refusing.write_text("#!/bin/sh\necho 'runtime not reachable' >&2\nexit 3\n")
         refusing.chmod(0o755)
@@ -5104,7 +5135,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     self.assertIn("other-handle: no unique scheduled run and transcript", lines[-1])
                     self.assertEqual(len(lines), len(carried) + 2)
 
-    def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self):
+    def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             home = Path(root)
             project = home / ".claude/projects/-w-triage"
@@ -5122,7 +5153,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
             (project / "collision.jsonl").write_text(target.read_text())
             self.assertIsNone(cleanup_hourly.transcript_for(run, home))
 
-    def test_only_completed_idle_older_scheduled_tab_is_a_candidate(self):
+    def test_only_completed_idle_older_scheduled_tab_is_a_candidate(self) -> None:
         runs = [{"status": "dispatched", "terminalPaneKey": "current"},
                 {"status": "completed", "terminalPaneKey": "old"}]
         terms = [{"worktreeId": "repo::/w/triage", "tabId": "old", "leafId": "leaf",
@@ -5137,7 +5168,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
         runs[1]["status"] = "dispatched"
         self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
 
-    def test_pending_shared_question_keeps_previous_tabs(self):
+    def test_pending_shared_question_keeps_previous_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             state = Path(root) / "hourly-state.json"
             state.write_text(json.dumps({"questions": {"q1": {"answer": None,
@@ -5149,7 +5180,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
             state.write_text(json.dumps({"questions": {"q1": {"answer": "yes"}}}))
             self.assertTrue(cleanup_hourly.no_pending_questions(state, "old-pane"))
 
-    def test_rendered_screen_and_draft_must_be_safe_to_close(self):
+    def test_rendered_screen_and_draft_must_be_safe_to_close(self) -> None:
         from datetime import timezone
         with tempfile.TemporaryDirectory() as root:
             transcript = Path(root) / "session.jsonl"
@@ -5197,15 +5228,15 @@ class HourlyTabCleanupTests(unittest.TestCase):
                 term, transcript, {"source": "screen", "tail": ["❯"]}, 5, now), [])
 
 
-def triage_automation(automation_id, workspace, prompt="/orca-session-triage hourly"):
+def triage_automation(automation_id: str, workspace: str, prompt: str = "/orca-session-triage hourly") -> dict:
     return {"id": automation_id, "prompt": prompt, "workspaceId": "repo1::" + workspace}
 
 
-def automation_run(status, started):
+def automation_run(status: str, started: str) -> dict:
     return {"status": status, "startedAt": int(datetime.fromisoformat(started).timestamp() * 1000)}
 
 
-def tool_result(content, result):
+def tool_result(content: str, result: dict) -> dict:
     """A transcript entry holding a tool's result, as Claude Code writes it."""
     return {"type": "user", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": content}]}, "toolUseResult": result}
@@ -5243,7 +5274,7 @@ class HourlyRunsTests(unittest.TestCase):
                           answered["questions"][0]["answered_at"]),
                          ("Which release?", "Release B", "2026-10-28T02:00:00Z"))
 
-    def test_lists_each_scheduled_run_with_its_precheck_reason_and_transcript(self):
+    def test_lists_each_scheduled_run_with_its_precheck_reason_and_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             home = Path(root) / "Application Support" / "home"
             transcript = home / ".claude/projects/-w-triage/sid-1.jsonl"
@@ -5258,7 +5289,7 @@ class HourlyRunsTests(unittest.TestCase):
                     patch.object(Path, "home", return_value=home), redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(hourly_runs.main(["--workspace", "/w/triage"]), 0)
 
-        def local(ms):
+        def local(ms: float) -> str:
             return datetime.fromtimestamp(ms / 1000).astimezone().isoformat(timespec="seconds")
         self.assertEqual(out.getvalue().splitlines(), [
             f"{local(1793084400000)} | completed | started {local(1793084415827)} | - | pane tab:leaf | {transcript}",
@@ -5268,7 +5299,7 @@ class HourlyRunsTests(unittest.TestCase):
 
 
 class InboxWatchServiceTests(unittest.TestCase):
-    def test_plist_runs_the_existing_watch_with_the_existing_offset(self):
+    def test_plist_runs_the_existing_watch_with_the_existing_offset(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             payload = inbox_service.plistlib.loads(inbox_service.plist_bytes(
                 root, python="/test/bin/python3", orca="/app/bin/orca"))
@@ -5279,7 +5310,7 @@ class InboxWatchServiceTests(unittest.TestCase):
             self.assertTrue(payload["KeepAlive"])
             self.assertIn("/app/bin", payload["EnvironmentVariables"]["PATH"])
 
-    def test_activation_refuses_a_second_reader_of_the_offset(self):
+    def test_activation_refuses_a_second_reader_of_the_offset(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             plist, watch, offset, _ = inbox_service.paths(root)
             watch.parent.mkdir(parents=True)
@@ -5291,7 +5322,7 @@ class InboxWatchServiceTests(unittest.TestCase):
                     inbox_service.activate(root)
             self.assertFalse(plist.exists())
 
-    def test_status_requires_launchd_pid_to_own_the_offset(self):
+    def test_status_requires_launchd_pid_to_own_the_offset(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             with patch.object(inbox_service, "launchd_pid", return_value=42), \
                     patch.object(inbox_service, "offset_readers", return_value=[43]):
@@ -5303,7 +5334,7 @@ class InboxWatchServiceTests(unittest.TestCase):
                     patch.object(inbox_service, "offset_readers", return_value=[42]):
                 self.assertTrue(inbox_service.status(root)[0])
 
-    def test_alert_service_uses_a_separate_cursor_and_notifier(self):
+    def test_alert_service_uses_a_separate_cursor_and_notifier(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             payload = inbox_service.plistlib.loads(inbox_service.alert_plist_bytes(
                 root, python="/test/bin/python3", tools=("/o/bin/orca", "/n/bin/terminal-notifier")))
@@ -5315,7 +5346,7 @@ class InboxWatchServiceTests(unittest.TestCase):
                                  set(payload["EnvironmentVariables"]["PATH"].split(":")))
             self.assertNotIn("close-done-triage.offset", str(payload))
 
-    def test_alert_activation_starts_after_existing_inbox_records(self):
+    def test_alert_activation_starts_after_existing_inbox_records(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             _, inbox, cursor, _ = inbox_service.alert_paths(root)
             write_jsonl(inbox, [{"kind": "ask", "worktree": "old", "text": "already handled"}])
@@ -5327,7 +5358,7 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
-    def test_a_filtered_read_gives_no_offset_to_acknowledge(self):
+    def test_a_filtered_read_gives_no_offset_to_acknowledge(self) -> None:
         # A filtered watch acknowledged the asks it hid (HOSYU_TEST-329 and 325, 2026-10-27 to 28).
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
@@ -5452,8 +5483,8 @@ class InboxReadTests(unittest.TestCase):
                 self.assertIn("id=since", out.getvalue())
             self.assertEqual(cursor.read_text(), acknowledged)
 
-    def test_questions_come_four_at_a_time_ready_for_ask_user_question(self):
-        def question(n, **extra):
+    def test_questions_come_four_at_a_time_ready_for_ask_user_question(self) -> None:
+        def question(n: int, **extra: object) -> dict:
             return {"question": f"Q{n} をどうしますか？", "header": f"判断{n}", "multiSelect": False,
                     "options": [{"label": "残す", "description": "今の帳票のまま"},
                                 {"label": "直す", "description": "移した帳票に合わせる"}],
@@ -5473,7 +5504,7 @@ class InboxReadTests(unittest.TestCase):
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset"),
                            "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
 
-            def run(*argv):
+            def run(*argv: str) -> str:
                 with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
                     self.assertEqual(inbox_read.main(list(argv)), 0)
                 return out.getvalue()
@@ -5496,7 +5527,7 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in rest["items"]], ["r3:2"])
         self.assertEqual([item["id"] for item in after_answered["items"]], ["r3:2"])
 
-    def test_open_asks_lists_unanswered_asks_oldest_first_until_answered(self):
+    def test_open_asks_lists_unanswered_asks_oldest_first_until_answered(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             two = [{"question": f"Q{n}？", "header": f"Q{n}", "recommended": "A", "multiSelect": False,
@@ -5514,7 +5545,7 @@ class InboxReadTests(unittest.TestCase):
             ])
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
 
-            def run(*argv):
+            def run(*argv: str) -> tuple[int, str, str]:
                 with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out, \
                         redirect_stderr(io.StringIO()) as err:
                     code = inbox_read.main(list(argv))
@@ -5608,11 +5639,11 @@ class InboxReadTests(unittest.TestCase):
                 self.assertEqual([item["id"] for item in json.loads(out.getvalue())["items"]], ["normal:1"])
             self.assertFalse(answers.exists())
 
-    def test_answered_before_marks_only_asks_an_answer_proves_and_names_the_rest(self):
+    def test_answered_before_marks_only_asks_an_answer_proves_and_names_the_rest(self) -> None:
         # 2026-10-29: a bulk mark took an unanswered ask out of open-asks, and it waited 25 hours.
         options = [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}]
         # JSON escapes the quotes and the line break; the question is read from the parsed answers.
-        two = [{"question": text, "header": f"Q{n}", "recommended": "A", "options": options}
+        two: list[dict] = [{"question": text, "header": f"Q{n}", "recommended": "A", "options": options}
                for n, text in enumerate(('"dry-run" で進めてよいですか？', "2 行に\nわたる質問ですか？"), 1)]
         merge = {"question": "この PR を merge してよいですか？", "header": "merge", "recommended": "A", "options": options}
         alike = {**merge, "question": "同じ問いですか？"}
@@ -5678,7 +5709,7 @@ class InboxReadTests(unittest.TestCase):
             self.assertIn("lead_decisions merge:acme/app#4512", refused)
             self.assertNotIn("remove:", refused)
 
-    def test_watch_shows_every_ask_and_done_and_reminds_of_asks_left_unanswered(self):
+    def test_watch_shows_every_ask_and_done_and_reminds_of_asks_left_unanswered(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "watch.offset"
@@ -5703,7 +5734,7 @@ class InboxReadTests(unittest.TestCase):
             self.assertIn("TRIAGE_READ_OFFSET", shared.getvalue())
             cursor.write_text("0")
 
-            def watch():
+            def watch() -> list[str]:
                 with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
                     self.assertEqual(inbox_read.main(["watch", "--once"]), 0)
                 return out.getvalue().splitlines()
@@ -5800,7 +5831,7 @@ class InboxReadTests(unittest.TestCase):
                          [("a1:1", "triage"), ("a1:2", "triage"), ("a2:1", "triage"), ("a2:2", "triage")])
         self.assertEqual([ask["claimed"]["by"] for ask in json.loads(listed.getvalue())], ["triage", "triage"])
 
-    def test_summary_prints_one_short_line_per_entry(self):
+    def test_summary_prints_one_short_line_per_entry(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "read.offset"
@@ -5823,7 +5854,7 @@ class InboxReadTests(unittest.TestCase):
                     f"NEXT_OFFSET={inbox.stat().st_size}",
                 ])
 
-    def test_summary_names_each_entry_and_id_reads_only_those_in_full(self):
+    def test_summary_names_each_entry_and_id_reads_only_those_in_full(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "read.offset"
@@ -5854,7 +5885,7 @@ class InboxReadTests(unittest.TestCase):
                 self.assertIn("zz", error.getvalue())
                 self.assertFalse(cursor.exists())
 
-    def test_id_reads_an_8_character_prefix_and_acknowledged_lines_without_moving_the_cursor(self):
+    def test_id_reads_an_8_character_prefix_and_acknowledged_lines_without_moving_the_cursor(self) -> None:
         # 2026-10-27 20:10: a handoff named "id c8f79c0f"; the full UUID copied by hand was mistyped.
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
@@ -5872,7 +5903,7 @@ class InboxReadTests(unittest.TestCase):
                 stream.write(json.dumps({"id": done, "ts": "t3", "kind": "done", "host": "h", "worktree": "c",
                                          "text": "完了"}, ensure_ascii=False) + "\n")
 
-            def run(*argv):
+            def run(*argv: str) -> tuple[int, str, str]:
                 with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
                         redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
                     return inbox_read.main(["read", *argv]), out.getvalue(), err.getvalue()
@@ -5890,7 +5921,7 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual(short[0], 1)
         self.assertEqual(position, acknowledged)
 
-    def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self):
+    def test_an_ask_s_questions_show_in_full_reads_and_in_summaries(self) -> None:
         # 2026-10-28: read --id of epm-11432-review-fix's ask d57cdf88 showed only its one-line text.
         asked = [{"context": "二重送信を止める直しです。", "question": "どちらで直しますか？", "header": "方針",
                   "multiSelect": False, "recommended": "A", "issue": "spin-dd/taihei-epm-server#11432",
@@ -5902,7 +5933,7 @@ class InboxReadTests(unittest.TestCase):
             write_jsonl(inbox, [{"id": "d57cdf88-1111-4222-8333-444455556666", "ts": "t1", "kind": "ask", "host": "h",
                                  "worktree": "epm-11432-review-fix", "text": "伺い直します", "questions": asked}])
 
-            def run(*argv):
+            def run(*argv: str) -> str:
                 with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox),
                                              "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset")}), \
                         redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
@@ -5917,7 +5948,7 @@ class InboxReadTests(unittest.TestCase):
                       "Q2 id=d57cdf88-1111-4222-8333-444455556666:2 [時期]", full)
         self.assertIn("伺い直します  [質問 2 件: 方針・時期]", summary.splitlines()[0])
 
-    def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self):
+    def test_brief_keeps_asks_and_done_full_and_shortens_only_info(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "read.offset"
@@ -5942,7 +5973,7 @@ class InboxReadTests(unittest.TestCase):
                 self.assertEqual(rendered.splitlines()[-1], f"NEXT_OFFSET={inbox.stat().st_size}")
                 self.assertFalse(cursor.exists())
 
-    def test_live_tab_of_a_run_marked_dispatch_failed_keeps_the_default_cursor(self):
+    def test_live_tab_of_a_run_marked_dispatch_failed_keeps_the_default_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "default.offset"
@@ -5968,12 +5999,12 @@ class InboxReadTests(unittest.TestCase):
         # A failed dispatch whose tab is gone still leaves the cursor with the newest live run.
         self.assertEqual(hourly_runtime.latest_pane(runs, frozenset({"tab14:leaf"})), "tab14:leaf")
 
-    def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self):
+    def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self) -> None:
         runs = [{"status": "completed", "terminalPaneKey": None},
                 {"status": "completed", "terminalPaneKey": "old-pane"}]
         self.assertIsNone(hourly_runtime.latest_pane(runs))
 
-    def test_only_latest_scheduled_pane_advances_default_cursor(self):
+    def test_only_latest_scheduled_pane_advances_default_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "default.offset"
@@ -6001,7 +6032,7 @@ class InboxReadTests(unittest.TestCase):
                     self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 0)
                 self.assertEqual(int(cursor.read_text()), inbox.stat().st_size)
 
-    def test_late_remote_report_is_read_even_with_an_old_timestamp(self):
+    def test_late_remote_report_is_read_even_with_an_old_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "read.offset"
@@ -6027,7 +6058,7 @@ class InboxReadTests(unittest.TestCase):
 
 
 class InboxAlertTests(unittest.TestCase):
-    def test_alerts_only_new_complete_asks_and_advances_its_own_cursor(self):
+    def test_alerts_only_new_complete_asks_and_advances_its_own_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
             cursor = Path(root) / "alert.offset"
@@ -6043,7 +6074,7 @@ class InboxAlertTests(unittest.TestCase):
             self.assertEqual(inbox_alert.process(inbox, cursor, seen.append), int(cursor.read_text()))
             self.assertEqual(len(seen), 1)
 
-    def test_notification_uses_the_first_line_as_arguments(self):
+    def test_notification_uses_the_first_line_as_arguments(self) -> None:
         item = {"kind": "ask", "worktree": "sample-lane", "text": "first line\nprivate second line"}
         with patch.object(inbox_alert.subprocess, "run") as run, redirect_stdout(io.StringIO()):
             inbox_alert.notify(item, NoTab(), inbox_alert.AppleScript())
@@ -6053,7 +6084,7 @@ class InboxAlertTests(unittest.TestCase):
         self.assertEqual(args[-1], "first line")
         self.assertTrue(run.call_args.kwargs["check"])
 
-    def test_pressing_the_notification_runs_the_senders_click_action(self):
+    def test_pressing_the_notification_runs_the_senders_click_action(self) -> None:
         item = {"kind": "ask", "worktree": "sample-lane", "text": "first line\nprivate second line"}
         notifier = inbox_alert.TerminalNotifier("/n/terminal-notifier")
         switch = inbox_alert.Command(("/o/orca", "terminal", "switch", "--terminal", "term a"))
@@ -6076,7 +6107,7 @@ class InboxAlertTests(unittest.TestCase):
             inbox_alert.notify(item, NoTab(switch), notifier)
         self.assertEqual(run.call_args.args[0][0], "/usr/bin/osascript")
 
-    def test_orca_switches_to_the_sender_tab_on_the_mac_that_sent_the_ask(self):
+    def test_orca_switches_to_the_sender_tab_on_the_mac_that_sent_the_ask(self) -> None:
         terminals = {
             None: [{"handle": "term_a", "connected": True, "agentIdentity": "claude", "worktreePath": "/w/repo/lane-a"},
                    {"handle": "term_b", "connected": True, "agentIdentity": "codex", "worktreePath": "/w/repo/lane-b"},
@@ -6108,15 +6139,15 @@ class InboxAlertTests(unittest.TestCase):
             None,
         ])
 
-    def test_a_slow_paired_server_still_switches_to_the_reported_tab(self):
+    def test_a_slow_paired_server_still_switches_to_the_reported_tab(self) -> None:
         answer = fake_orca({}, {"laptop": "Laptop-16"})
         calls = []
 
-        def run(args, **kwargs):
+        def run(args: list[str], *, timeout: float, **kwargs: object) -> subprocess.CompletedProcess[str]:
             calls.append(tuple(args[1:3]))
             if calls[-1] == ("terminal", "list"):
-                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
-            return answer(args, **kwargs)
+                raise subprocess.TimeoutExpired(args, timeout)
+            return answer(args, timeout=timeout, **kwargs)
 
         tabs = inbox_alert.OrcaTabs("/o/orca", local_host="this-mac")
         item = {"host": "Laptop-16.local", "worktree": "lane-c", "handle": "term_c"}
@@ -6130,16 +6161,16 @@ class InboxAlertTests(unittest.TestCase):
 
 
 class NoTab:
-    def __init__(self, action=None):
+    def __init__(self, action: str | None = None) -> None:
         self.result = action
 
-    def action(self, item):
+    def action(self, item: dict) -> str | None:
         return self.result
 
 
-def fake_orca(terminals, machines):
+def fake_orca(terminals: Mapping[str | None, list[dict]], machines: Mapping) -> Callable[..., subprocess.CompletedProcess[str]]:
     """Answer the Orca CLI calls the alert makes, keyed by the --environment they target."""
-    def run(args, **kwargs):
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         environment = args[args.index("--environment") + 1] if "--environment" in args else None
         command = tuple(args[1:3])
         if command == ("terminal", "list"):
@@ -6154,17 +6185,17 @@ def fake_orca(terminals, machines):
     return run
 
 
-def published(url, live="arming"):
+def published(url: str, live: str = "arming") -> dict:
     return tool_result(f"Published page.html at {url} (Version 1)\n\nLive subscription: {live} in the background",
                        {"url": url, "liveSubscription": live})
 
 
-def unwatched(url):
+def unwatched(url: str) -> dict:
     return tool_result(f"Stopped watching {url}; republishes of it will no longer be reported in this session.",
                        {"unwatch": {"url": url, "was_watching": True}})
 
 
-def watch_ended(url):
+def watch_ended(url: str) -> dict:
     """Claude Code's notice that a watch ended on its own, as the connection kept failing."""
     return {"type": "attachment", "attachment": {"type": "queued_command", "prompt": (
         "<task-notification>\n<task-type>artifact-watch-lifecycle</task-type>\n"
@@ -6172,10 +6203,15 @@ def watch_ended(url):
         "</task-notification>")}}
 
 
+def blocking_decision(value: dict | None) -> dict:
+    assert value is not None
+    return value
+
+
 class StopCheckTests(unittest.TestCase):
     """The Stop hook keeps a triage turn open while its review queue is not classed."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.dir = self.root / "s1"
@@ -6183,18 +6219,18 @@ class StopCheckTests(unittest.TestCase):
         (self.root / "inbox.jsonl").write_text("")
         (self.root / "read.offset").write_text("0")
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def queue(self, *paths, at="2026-10-07T10:00:00+00:00"):
+    def queue(self, *paths: str, at: str = "2026-10-07T10:00:00+00:00") -> None:
         (self.dir / "review-queue.json").write_text(json.dumps(
             {"generated_at": at, "rows": [{"path": p} for p in paths]}))
 
-    def result(self, *paths, at="2026-10-07T10:00:00+00:00"):
+    def result(self, *paths: str, at: str = "2026-10-07T10:00:00+00:00") -> None:
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": at, "rows": [{"path": p, "class": "blocked"} for p in paths]}))
 
-    def check(self, active=False, cwd=None, orca="false", transcript=None, watch_running=True):
+    def check(self, active: bool = False, cwd: str | None = None, orca: str = "false", transcript: Path | None = None, watch_running: bool = True) -> dict | None:
         hook = {"session_id": "s1", "stop_hook_active": active}
         if cwd:
             hook["cwd"] = cwd
@@ -6205,7 +6241,7 @@ class StopCheckTests(unittest.TestCase):
         with patch.dict(os.environ, paths), patch.object(stopcheck, "inbox_service_running", return_value=watch_running):
             return stopcheck.decide(hook, self.root, orca=orca)
 
-    def fake_orca(self, automations, runs):
+    def fake_orca(self, automations: list[dict], runs: dict[str, list[dict]]) -> str:
         """An Orca CLI that answers `automations list` and `automations runs --id <id>`."""
         script = self.root / "orca"
         script.write_text(
@@ -6220,7 +6256,7 @@ class StopCheckTests(unittest.TestCase):
         script.chmod(0o755)
         return str(script)
 
-    def test_lets_the_turn_end_without_a_queue_or_with_an_empty_one(self):
+    def test_lets_the_turn_end_without_a_queue_or_with_an_empty_one(self) -> None:
         self.assertIsNone(self.check())
         self.queue()
         self.assertIsNone(self.check())
@@ -6328,28 +6364,29 @@ class StopCheckTests(unittest.TestCase):
                     decision = stopcheck.question_decision(hook, orca, config, self.root)
                     self.assertEqual(decision is None, sent.hour == 9)
 
-    def test_blocks_while_queued_rows_are_not_classed(self):
+    def test_blocks_while_queued_rows_are_not_classed(self) -> None:
         self.queue("/w/a", "/w/b")
         blocked = self.check()
+        assert blocked is not None
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("/w/a", blocked["reason"])
         self.assertIn("orca-row-classify", blocked["reason"])
 
         self.result("/w/a")
-        self.assertIn("/w/b", self.check()["reason"])
-        self.assertNotIn("/w/a", self.check()["reason"])
+        self.assertIn("/w/b", blocking_decision(self.check())["reason"])
+        self.assertNotIn("/w/a", blocking_decision(self.check())["reason"])
 
-    def test_a_result_for_an_older_queue_does_not_count(self):
+    def test_a_result_for_an_older_queue_does_not_count(self) -> None:
         self.result("/w/a", at="2026-10-07T09:00:00+00:00")
         self.queue("/w/a")
-        self.assertEqual(self.check()["decision"], "block")
+        self.assertEqual(blocking_decision(self.check())["decision"], "block")
 
-    def test_lets_the_turn_end_once_every_row_is_classed(self):
+    def test_lets_the_turn_end_once_every_row_is_classed(self) -> None:
         self.queue("/w/a", "/w/b")
         self.result("/w/a", "/w/b")
         self.assertIsNone(self.check())
 
-    def test_unread_ask_blocks_even_on_repeated_stop_until_ack(self):
+    def test_unread_ask_blocks_even_on_repeated_stop_until_ack(self) -> None:
         inbox = self.root / "inbox.jsonl"
         cursor = self.root / "read.offset"
         first = {"kind": "info", "worktree": "earlier", "text": "progress"}
@@ -6365,6 +6402,7 @@ class StopCheckTests(unittest.TestCase):
                                   "ORCA_PANE_KEY": "new-pane", "ORCA_WORKTREE_ID": "repo1::/w/triage"}):
             for active in (False, True):
                 result = self.check(active=active, cwd="/w/triage", orca=orca)
+                assert result is not None
                 self.assertEqual(result["decision"], "block")
                 self.assertIn("sample-lane", result["reason"])
                 self.assertNotIn("partial", result["reason"])
@@ -6374,7 +6412,7 @@ class StopCheckTests(unittest.TestCase):
             cursor.write_text(str(inbox.stat().st_size - len('{"kind":"ask","worktree":"partial"')))
             self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
 
-    def test_an_ask_the_scheduled_tab_sent_itself_is_not_unread(self):
+    def test_an_ask_the_scheduled_tab_sent_itself_is_not_unread(self) -> None:
         inbox = self.root / "inbox.jsonl"
         cursor = self.root / "read.offset"
         write_jsonl(inbox, [{"kind": "ask", "host": "mac-a", "worktree": "triage", "text": "定時の引き継ぎ"}])
@@ -6388,34 +6426,34 @@ class StopCheckTests(unittest.TestCase):
             self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
             with inbox.open("a") as stream:
                 stream.write(json.dumps({"kind": "ask", "host": "mac-b", "worktree": "triage", "text": "別の Mac"}) + "\n")
-            self.assertEqual(self.check(active=True, cwd="/w/triage", orca=orca)["decision"], "block")
+            self.assertEqual(blocking_decision(self.check(active=True, cwd="/w/triage", orca=orca))["decision"], "block")
 
-    def test_blocks_once_then_lets_a_repeated_stop_through(self):
+    def test_blocks_once_then_lets_a_repeated_stop_through(self) -> None:
         self.queue("/w/a")
-        self.assertEqual(self.check()["decision"], "block")
+        self.assertEqual(blocking_decision(self.check())["decision"], "block")
         self.assertIsNone(self.check(active=True))
 
-    def test_a_verdict_without_a_known_class_does_not_count(self):
+    def test_a_verdict_without_a_known_class_does_not_count(self) -> None:
         self.queue("/w/a")
         (self.dir / "review-result.json").write_text(json.dumps(
             {"queue_generated_at": "2026-10-07T10:00:00+00:00", "rows": [{"path": "/w/a", "class": "maybe"}]}))
-        self.assertEqual(self.check()["decision"], "block")
+        self.assertEqual(blocking_decision(self.check())["decision"], "block")
 
-    def test_warns_when_the_external_inbox_service_is_stopped(self):
+    def test_warns_when_the_external_inbox_service_is_stopped(self) -> None:
         self.queue()
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": []})
-        reason = self.check(cwd="/w/triage", orca=orca, watch_running=False)["reason"]
+        reason = blocking_decision(self.check(cwd="/w/triage", orca=orca, watch_running=False))["reason"]
         self.assertIn("watch-inbox", reason)
         self.assertIn("~/.cache/orca-briefs/offsets/close-done-triage.offset", reason)
         self.assertIsNone(self.check(cwd="/w/triage", orca=orca, watch_running=True))
 
-    def test_monitor_in_another_tab_does_not_replace_external_service(self):
+    def test_monitor_in_another_tab_does_not_replace_external_service(self) -> None:
         with patch.object(stopcheck, "triage_automations", return_value=[{"id": "a1"}]), \
                 patch.object(stopcheck, "inbox_service_running", return_value=False):
             reason = stopcheck.missing_inbox_watch("/w/triage", "orca")
         self.assertIn("external triage inbox service", reason)
 
-    def test_external_service_status_controls_stop_notice(self):
+    def test_external_service_status_controls_stop_notice(self) -> None:
         with patch.object(stopcheck.subprocess, "run",
                           return_value=subprocess.CompletedProcess([], 0, "running")) as run:
             self.assertTrue(stopcheck.inbox_service_running())
@@ -6424,12 +6462,13 @@ class StopCheckTests(unittest.TestCase):
                           return_value=subprocess.CompletedProcess([], 1, "stopped")):
             self.assertFalse(stopcheck.inbox_service_running())
 
-    def test_blocks_while_an_artifact_this_session_published_is_still_watched(self):
+    def test_blocks_while_an_artifact_this_session_published_is_still_watched(self) -> None:
         transcript = self.root / "session.jsonl"
         write_jsonl(transcript, [published("https://claude.ai/artifact/A"),
                                  published("https://claude.ai/artifact/B", live="flag_off")])
 
         blocked = self.check(transcript=transcript)
+        assert blocked is not None
 
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("https://claude.ai/artifact/A", blocked["reason"])
@@ -6437,22 +6476,22 @@ class StopCheckTests(unittest.TestCase):
         self.assertIn("ArtifactComments", blocked["reason"])
         self.assertIsNone(self.check(active=True, transcript=transcript))
 
-        def append(entry):
+        def append(entry: dict) -> None:
             with transcript.open("a") as f:
                 f.write(json.dumps(entry) + "\n")
 
         append(user("a later turn that never stops the watch"))
-        self.assertEqual(self.check(transcript=transcript)["decision"], "block")
+        self.assertEqual(blocking_decision(self.check(transcript=transcript))["decision"], "block")
         append(unwatched("https://claude.ai/artifact/A"))
         self.assertIsNone(self.check(transcript=transcript))
 
-    def test_a_watch_that_ended_on_its_own_lets_the_turn_end(self):
+    def test_a_watch_that_ended_on_its_own_lets_the_turn_end(self) -> None:
         transcript = self.root / "session.jsonl"
         write_jsonl(transcript, [published("https://claude.ai/artifact/A"), watch_ended("https://claude.ai/artifact/A")])
 
         self.assertIsNone(self.check(transcript=transcript))
 
-    def test_a_damaged_queue_or_result_lets_the_turn_end(self):
+    def test_a_damaged_queue_or_result_lets_the_turn_end(self) -> None:
         (self.dir / "review-queue.json").write_text(json.dumps({"generated_at": "g", "rows": [{"nopath": 1}]}))
         self.assertIsNone(self.check())
         (self.dir / "review-queue.json").write_text("[]")
@@ -6492,21 +6531,21 @@ class BashTimeoutHookTests(unittest.TestCase):
 class VerdictStoreTests(unittest.TestCase):
     """A careful read is kept only while what it read still holds."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.store = self.root / "verdicts.json"
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         self.tmp.cleanup()
 
     @staticmethod
-    def row(path, final_at="t1", pr=None, dirty=0, cls="stalled", codex_at=None):
+    def row(path: str, final_at: str | None = "t1", pr: dict | None = None, dirty: int = 0, cls: str = "stalled", codex_at: str | None = None) -> dict:
         return {"path": path, "class": cls, "jev": {"asks": 0.1}, "pr": pr, "git": {"dirty": dirty},
                 "claude": {"final_at": final_at} if final_at else None,
                 "codex": [{"last_assistant_at": codex_at}] if codex_at else []}
 
-    def test_a_verdict_lapses_when_the_pr_or_the_tree_changed_or_nothing_was_read(self):
+    def test_a_verdict_lapses_when_the_pr_or_the_tree_changed_or_nothing_was_read(self) -> None:
         open_pr = {"state": "OPEN", "number": 7, "head_oid": "a"}
         read = self.row("/w/a", pr=open_pr)
         verdicts = {"/w/a": {"read": scan.read_key(read), "class": "blocked"},
@@ -6557,7 +6596,7 @@ class VerdictStoreTests(unittest.TestCase):
 
         self.assertIn("blocked (scan: unsure)", out.getvalue())
 
-    def test_a_new_human_review_returns_a_row_to_the_review_queue(self):
+    def test_a_new_human_review_returns_a_row_to_the_review_queue(self) -> None:
         pr = {"state": "OPEN", "number": 42, "head_oid": "a",
               "latest_human_review": {"author": "reviewer", "state": "COMMENTED",
                                       "submitted_at": "2026-10-21T01:00:00Z"}}
@@ -6570,7 +6609,7 @@ class VerdictStoreTests(unittest.TestCase):
             "submitted_at": "2026-10-21T02:00:00Z"}})
         self.assertEqual([row["path"] for row in scan.review_queue([changed], verdicts)], [read["path"]])
 
-    def test_remote_and_local_rows_with_the_same_path_keep_separate_verdicts(self):
+    def test_remote_and_local_rows_with_the_same_path_keep_separate_verdicts(self) -> None:
         local = self.row("/same/path")
         remote = {**self.row("/same/path"), "environment": "macbook-pro-16"}
         queued = scan.review_queue([local, remote])
@@ -6593,7 +6632,7 @@ class VerdictStoreTests(unittest.TestCase):
         self.assertEqual({key: value["class"] for key, value in scan.classed_queue(session).items()},
                          {"/same/path": "blocked", "macbook-pro-16::/same/path": "in_progress"})
 
-    def test_a_new_pr_comment_returns_a_row_to_the_review_queue(self):
+    def test_a_new_pr_comment_returns_a_row_to_the_review_queue(self) -> None:
         old = self.row("/w/review-lane", pr={"state": "OPEN", "number": 42,
                                              "latest_human_activity": None})
         verdicts = {old["path"]: {"read": scan.read_key(old), "class": "blocked"}}
@@ -6604,19 +6643,19 @@ class VerdictStoreTests(unittest.TestCase):
         self.assertEqual(scan.review_queue([old], verdicts), [])
         self.assertEqual([row["path"] for row in scan.review_queue([updated], verdicts)], [old["path"]])
 
-    def test_the_newer_of_the_claude_and_codex_messages_is_what_was_read(self):
+    def test_the_newer_of_the_claude_and_codex_messages_is_what_was_read(self) -> None:
         self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T01:00:00Z",
                                                      codex_at="2026-10-07T02:00:00Z")), "2026-10-07T02:00:00Z")
         self.assertEqual(scan.row_final_at(self.row("/w", final_at="2026-10-07T03:00:00Z",
                                                      codex_at="2026-10-07T02:00:00Z")), "2026-10-07T03:00:00Z")
 
-    def write_session(self, name, queue_at, rows, result_at, verdicts):
+    def write_session(self, name: str, queue_at: str, rows: list[dict], result_at: str, verdicts: list[dict]) -> None:
         session = self.root / name
         session.mkdir()
         (session / "review-queue.json").write_text(json.dumps({"generated_at": queue_at, "rows": rows}))
         (session / "review-result.json").write_text(json.dumps({"queue_generated_at": result_at, "rows": verdicts}))
 
-    def test_every_session_s_classed_queue_feeds_the_store_and_bad_verdicts_do_not(self):
+    def test_every_session_s_classed_queue_feeds_the_store_and_bad_verdicts_do_not(self) -> None:
         self.write_session("s1", "g1", [{"path": "/w/a", "read": "ka"}, {"path": "/w/b", "read": "kb"}], "g1",
                            [{"path": "/w/a", "class": "blocked", "read": "forged"},
                             {"path": "/w/b", "class": "made-up"}])
@@ -6633,7 +6672,7 @@ class VerdictStoreTests(unittest.TestCase):
                                     "/w/c": {"class": "finished", "read": "kc", "queued_at": "g2"}})
         self.assertEqual(json.loads(self.store.read_text()), verdicts)
 
-    def test_an_older_session_s_read_does_not_replace_a_newer_one_in_the_store(self):
+    def test_an_older_session_s_read_does_not_replace_a_newer_one_in_the_store(self) -> None:
         self.write_session("old", "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "read": "k-old"}],
                            "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "class": "blocked"}])
         self.write_session("new", "2026-10-16T00:08:40+00:00", [{"path": "/w/a", "read": "k-new"}],
@@ -6649,7 +6688,7 @@ class VerdictStoreTests(unittest.TestCase):
 
         self.assertEqual(scan.absorb_verdicts(self.store)["/w/a"]["read"], "k-new")
 
-    def test_a_damaged_store_is_kept_aside_not_overwritten(self):
+    def test_a_damaged_store_is_kept_aside_not_overwritten(self) -> None:
         self.store.write_text("[1, 2")
         self.write_session("s1", "g1", [{"path": "/w/a", "read": "ka"}], "g1", [{"path": "/w/a", "class": "blocked"}])
 

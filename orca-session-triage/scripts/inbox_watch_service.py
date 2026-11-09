@@ -7,6 +7,8 @@ second reader of the existing triage offset.
 `activate-alerts` adds an independent reader for Mac notifications on new asks.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
@@ -25,7 +27,7 @@ LABEL = "com.eotel.orca-session-triage.inbox"
 ALERT_LABEL = "com.eotel.orca-session-triage.alert"
 
 
-def paths(home=None):
+def paths(home: str | Path | None = None) -> tuple[Path, Path, Path, Path]:
     home = Path(home or Path.home())
     cache = home / ".cache/orca-briefs"
     return (home / "Library/LaunchAgents" / f"{LABEL}.plist",
@@ -34,7 +36,7 @@ def paths(home=None):
             cache / "triage-watch.log")
 
 
-def plist_bytes(home=None, python=None, orca=None):
+def plist_bytes(home: str | Path | None = None, python: str | None = None, orca: str | None = None) -> bytes:
     _, watch, offset, log = paths(home)
     python = python or shutil.which("python3")
     orca = orca or shutil.which("orca")
@@ -54,7 +56,7 @@ def plist_bytes(home=None, python=None, orca=None):
     })
 
 
-def alert_paths(home=None):
+def alert_paths(home: str | Path | None = None) -> tuple[Path, Path, Path, Path]:
     home = Path(home or Path.home())
     return (home / "Library/LaunchAgents" / f"{ALERT_LABEL}.plist",
             home / ".cache/orca-briefs/triage-inbox.jsonl",
@@ -62,7 +64,7 @@ def alert_paths(home=None):
             home / ".cache/orca-briefs/triage-alert.log")
 
 
-def alert_plist_bytes(home: str | None = None, python: str | None = None,
+def alert_plist_bytes(home: str | Path | None = None, python: str | None = None,
                       tools: tuple[str, ...] | None = None) -> bytes:
     _, _, _, log = alert_paths(home)
     python = python or shutil.which("python3")
@@ -85,7 +87,7 @@ def alert_plist_bytes(home: str | None = None, python: str | None = None,
     })
 
 
-def launchd_pid(label=LABEL):
+def launchd_pid(label: str = LABEL) -> int | None:
     target = f"gui/{os.getuid()}/{label}"
     result = subprocess.run(["launchctl", "print", target], capture_output=True,
                             text=True, timeout=10)
@@ -95,7 +97,7 @@ def launchd_pid(label=LABEL):
     return int(match.group(1)) if match else None
 
 
-def uses_offset(command, offset):
+def uses_offset(command: str, offset: str | Path) -> bool:
     try:
         args = shlex.split(command)
     except ValueError:
@@ -106,7 +108,7 @@ def uses_offset(command, offset):
     return False
 
 
-def offset_readers(offset):
+def offset_readers(offset: str | Path) -> list[int]:
     result = subprocess.run(["ps", "-ww", "-axo", "pid=,command="], capture_output=True,
                             text=True, check=True, timeout=10)
     readers = []
@@ -117,7 +119,7 @@ def offset_readers(offset):
     return readers
 
 
-def status(home=None):
+def status(home: str | Path | None = None) -> tuple[bool, str]:
     _, _, offset, _ = paths(home)
     pid = launchd_pid()
     if pid is None:
@@ -128,12 +130,12 @@ def status(home=None):
     return True, f"watch-inbox running outside Orca tabs (PID {pid})"
 
 
-def alert_status():
+def alert_status() -> tuple[bool, str]:
     pid = launchd_pid(ALERT_LABEL)
     return (True, f"ask alerts running (PID {pid})") if pid else (False, "ask alert service is not running")
 
 
-def activate(home=None):
+def activate(home: str | Path | None = None) -> None:
     plist_path, watch, offset, log = paths(home)
     if not watch.is_file() or not os.access(watch, os.X_OK):
         raise RuntimeError(f"watch-inbox is missing or not executable: {watch}")
@@ -161,7 +163,7 @@ def activate(home=None):
     raise RuntimeError("launchd accepted the service but watch-inbox did not start; inspect the log")
 
 
-def activate_alerts(home=None):
+def activate_alerts(home: str | Path | None = None) -> None:
     plist_path, inbox, cursor, log = alert_paths(home)
     if alert_status()[0]:
         raise RuntimeError("ask alert service is already active")
@@ -189,7 +191,7 @@ def activate_alerts(home=None):
     raise RuntimeError("launchd accepted the alert service but it did not start; inspect the log")
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("render", "status", "activate", "render-alerts", "status-alerts", "activate-alerts"))
     args = parser.parse_args(argv)

@@ -1,25 +1,50 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Find Japanese word choices that need contextual review; never rewrite input."""
 
+from __future__ import annotations
+
 import argparse
 import bisect
 import json
 from pathlib import Path
 import re
 import sys
+from typing import TypedDict
+
+
+class Rule(TypedDict):
+    id: str
+    term: str
+    pattern: str
+    reason: str
+    alternatives: list[str]
+    keep_when: list[str]
+
+
+class Finding(TypedDict):
+    path: str
+    line: int
+    column: int
+    rule_id: str
+    term: str
+    match: str
+    context: str
+    reason: str
+    alternatives: list[str]
+    keep_when: list[str]
 
 
 RULES_PATH = Path(__file__).resolve().parents[1] / "references" / "word-choice.json"
 FENCE = re.compile(r" {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n)?$")
 
 
-def load_rules():
+def load_rules() -> list[tuple[Rule, re.Pattern[str]]]:
     data = json.loads(RULES_PATH.read_text(encoding="utf-8"))
     rules = data["rules"]
     if not isinstance(rules, list) or not rules:
         raise ValueError("rules は空でない配列にしてください")
     ids = set()
-    compiled = []
+    compiled: list[tuple[Rule, re.Pattern[str]]] = []
     for rule in rules:
         for key in ("id", "term", "pattern", "reason"):
             if not isinstance(rule[key], str) or not rule[key]:
@@ -35,15 +60,18 @@ def load_rules():
         pattern = re.compile(rule["pattern"])
         if pattern.search("") is not None:
             raise ValueError(f"空文字列に一致するルールです: {rule['id']}")
-        compiled.append((rule, pattern))
+        validated: Rule = {"id": rule["id"], "term": rule["term"],
+                           "pattern": rule["pattern"], "reason": rule["reason"],
+                           "alternatives": rule["alternatives"], "keep_when": rule["keep_when"]}
+        compiled.append((validated, pattern))
     return compiled
 
 
-def mask_markdown_code(source):
+def mask_markdown_code(source: str) -> str:
     """Mask common fenced/inline code while preserving offsets and newlines."""
     chars = list(source)
 
-    def mask(start, end):
+    def mask(start: int, end: int) -> None:
         for index in range(start, end):
             if chars[index] not in "\r\n":
                 chars[index] = " "
@@ -81,11 +109,11 @@ def mask_markdown_code(source):
     return "".join(chars)
 
 
-def scan(source, path, rules, *, markdown=True):
+def scan(source: str, path: str, rules: list[tuple[Rule, re.Pattern[str]]], *, markdown: bool = True) -> list[Finding]:
     searchable = mask_markdown_code(source) if markdown else source
     line_starts = [0] + [match.end() for match in re.finditer("\n", source)]
     lines = source.split("\n")
-    findings = []
+    findings: list[Finding] = []
     for rule, pattern in rules:
         for match in pattern.finditer(searchable):
             if match.start() == match.end():
@@ -106,7 +134,7 @@ def scan(source, path, rules, *, markdown=True):
     return sorted(findings, key=lambda item: (item["line"], item["column"], item["rule_id"]))
 
 
-def print_text(findings):
+def print_text(findings: list[Finding]) -> None:
     if not findings:
         print("見直し候補はありません（登録済みの表現だけを確認）。")
         return
@@ -119,7 +147,7 @@ def print_text(findings):
         print("  残す場面: " + " / ".join(item["keep_when"]))
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="人に向けた日本語から、文脈を見て見直す表現の候補を拾います。自動置換はしません。"
     )

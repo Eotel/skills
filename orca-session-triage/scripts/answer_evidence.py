@@ -191,7 +191,9 @@ def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:
                 result = entry.get("toolUseResult") if isinstance(entry, dict) else None
                 if (isinstance(entry, dict) and not result and scan_sessions.is_real_user_message(entry)
                         and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None):
-                    yield Answer(at, f"user {path.name}", scan_sessions.user_text(entry), free_text=True)
+                    text = scan_sessions.user_text(entry)
+                    assert text is not None
+                    yield Answer(at, f"user {path.name}", text, free_text=True)
                 if not (isinstance(result, dict) and isinstance(result.get("answers"), dict)
                         and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None):
                     continue

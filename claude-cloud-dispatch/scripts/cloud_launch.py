@@ -11,6 +11,11 @@ from an upload of the checkout where the Claude GitHub App is not installed on
 the repository. Run this from a clean checkout on a pushed branch.
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import NoReturn
+
 import argparse
 import json
 import os
@@ -38,22 +43,22 @@ STOP_WAIT = 3.0
 
 
 class LaunchError(Exception):
-    def __init__(self, reason, output=""):
+    def __init__(self, reason: str, output: str = "") -> None:
         super().__init__(reason)
         self.output = output
 
 
-def clean(raw):
+def clean(raw: bytes) -> str:
     """Terminal output as text, without escape sequences."""
     return ESCAPES.sub(b"", raw).decode("utf-8", "replace")
 
 
-def compact(text):
+def compact(text: str) -> str:
     """The TUI drops or moves spaces between redraws: compare without whitespace."""
     return re.sub(r"\s+", "", text)
 
 
-def new_session(text, quoted=()):
+def new_session(text: str, quoted: Sequence[str] = ()) -> re.Match[str] | None:
     """The first session URL in the output, other than those the brief itself quotes."""
     for match in SESSION_URL.finditer(text):
         if not any(known.startswith(match.group(1)) for known in quoted):
@@ -61,7 +66,7 @@ def new_session(text, quoted=()):
     return None
 
 
-def selected(text):
+def selected(text: str) -> str:
     """What follows the pointer in the last frame drawn."""
     _, pointer, rest = compact(text).rpartition(POINTER)
     return rest if pointer else ""
@@ -70,12 +75,12 @@ def selected(text):
 class Screen:
     """What claude has written to the pty so far."""
 
-    def __init__(self, fd):
+    def __init__(self, fd: int) -> None:
         self.fd = fd
         self.raw = b""
         self.closed = False
 
-    def read(self, wait):
+    def read(self, wait: float) -> None:
         """Take what arrives within `wait` seconds. A closed pty means claude has exited."""
         if self.closed:
             return
@@ -91,23 +96,23 @@ class Screen:
         else:
             self.closed = True
 
-    def read_for(self, seconds):
+    def read_for(self, seconds: float) -> None:
         end = time.monotonic() + seconds
         while not self.closed and time.monotonic() < end:
             self.read(max(0.0, end - time.monotonic()))
 
-    def send(self, keys):
+    def send(self, keys: bytes) -> None:
         try:
             os.write(self.fd, keys)
         except OSError as error:
             raise LaunchError(f"claude stopped reading before the trust prompt was answered ({error})",
                               self.text()) from error
 
-    def text(self, start=0):
+    def text(self, start: int = 0) -> str:
         return clean(self.raw[start:])
 
 
-def become_claude(checkout, claude, brief):
+def become_claude(checkout: str | Path, claude: str, brief: str) -> NoReturn:
     """The forked child: turn into claude, or leave. It must never return into the caller's code."""
     try:
         os.chdir(checkout)
@@ -119,7 +124,7 @@ def become_claude(checkout, claude, brief):
         os._exit(127)
 
 
-def answer_trust(screen):
+def answer_trust(screen: Screen) -> int:
     """Move the selector to Yes and confirm. Return where the output after Enter starts."""
     screen.read_for(KEY_WAIT)
     moved = len(screen.raw)
@@ -132,7 +137,7 @@ def answer_trust(screen):
     return entered
 
 
-def watch(screen, quoted, trust_folder, timeout):
+def watch(screen: Screen, quoted: Sequence[str], trust_folder: bool, timeout: float) -> dict[str, str]:
     deadline = time.monotonic() + timeout
     entered = None
     while not screen.closed and time.monotonic() < deadline:
@@ -158,7 +163,7 @@ def watch(screen, quoted, trust_folder, timeout):
                       "claude.ai/code before starting it again", screen.text())
 
 
-def stop(pid, screen):
+def stop(pid: int, screen: Screen) -> None:
     """End claude and reap it. It may ignore SIGTERM, or block writing to a pty nobody reads."""
     for sent in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -179,7 +184,7 @@ def stop(pid, screen):
                 return
 
 
-def launch(checkout, brief, *, claude="claude", trust_folder=False, timeout=150.0, log=None):
+def launch(checkout: str | Path, brief: str, *, claude: str = "claude", trust_folder: bool = False, timeout: float = 150.0, log: str | Path | None = None) -> dict[str, str]:
     """Start the session and return {"session_id", "url"}; raise LaunchError otherwise."""
     pid, fd = pty.fork()
     if pid == 0:
@@ -195,7 +200,7 @@ def launch(checkout, brief, *, claude="claude", trust_folder=False, timeout=150.
                 handle.write(screen.text())
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkout", required=True, help="checkout to start from; the session starts at its branch")
     parser.add_argument("--brief", required=True, help="file holding the task text")
