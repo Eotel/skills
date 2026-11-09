@@ -14,8 +14,9 @@ Each sent handoff is kept in --handoffs-dir, one file per send named by its UTC 
 the exact text, kind, keys, time, and NEXT_OFFSET; `last` prints the newest.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
-latest message, unanswered questions and ask times, the questions closed unanswered (`rejected`, with
-ask and close times) since the newest kept handoff, and undelivered queued input. Both commands
+latest message of its own (also while a turn runs or after an API error such as a usage limit ended it),
+unanswered questions and ask times, the questions answered (`answered`) and closed unanswered (`rejected`,
+with ask and close times) since the newest kept handoff, and undelivered queued input. Both commands
 default to the lead appointed in the shared hourly state when --lead-worktree is omitted.
 `send` ends the text with the run's signature, <session name>（HH:MM の定時）: the name ListAgents
 prints first and the local time the session started, from $CLAUDE_CONFIG_DIR/sessions/$CLAUDE_PID.json
@@ -154,6 +155,21 @@ def lead_state(projects: Path, worktree: str) -> str:
                       for item in queued))
 
 
+def last_said(entries: list[dict]) -> dict[str, str | None]:
+    """The newest text the lead itself wrote, also while a turn runs or after an API error (a usage limit) ended
+    it: Claude Code's error and placeholder messages (model <synthetic>) are not the lead's words."""
+    for entry in reversed(entries):
+        message = scan_sessions.message_of(entry)
+        if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
+            continue
+        content = message.get("content")
+        said = [block["text"] for block in content if isinstance(block, dict) and block.get("type") == "text"
+                and str(block.get("text") or "").strip()] if isinstance(content, list) else []
+        if said:
+            return {"at": entry.get("timestamp"), "text": said[-1]}
+    return {"at": None, "text": None}
+
+
 def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> dict[str, object]:
     """The lead's Orca state, newest transcript, unanswered questions, questions closed unanswered since the
     newest handoff kept in `handoffs`, and rendered tab tails."""
@@ -175,6 +191,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
     if claude:
         transcript = Path(claude["transcript"])
         entries = scan_sessions.load_jsonl(transcript)
+        final = last_said(entries)
         # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
         last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
         for entry in entries[last + 1:]:
@@ -182,27 +199,28 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
                     continue
-                if entry.get("type") == "assistant" and block.get("type") == "text" and block.get("text", "").strip():
-                    final = {"at": entry.get("timestamp"), "text": block["text"]}
-                elif (entry.get("type") == "assistant" and block.get("type") == "tool_use"
-                      and block.get("name") == "AskUserQuestion"):
+                if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                        and block.get("name") == "AskUserQuestion"):
                     questions[block.get("id")] = {"id": block.get("id"), "asked_at": entry.get("timestamp"),
                                                    "questions": (block.get("input") or {}).get("questions", [])}
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
         queued = scan_sessions.queued_input(transcript)
     # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
-    rejected = answer_evidence.rejected_questions(
-        dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
-                       *([Path(claude["transcript"])] if claude else [])]), last_sent_at(handoffs))
+    transcripts = list(dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
+                                      *([Path(claude["transcript"])] if claude else [])]))
+    since = last_sent_at(handoffs)
+    rejected = answer_evidence.rejected_questions(transcripts, since)
     agents = [{"type": agent.get("agentType"), "state": agent.get("state"),
                "state_started_at": scan_sessions.iso_time(agent.get("stateStartedAt")),
                "stopped_at": scan_sessions.iso_time(agent.get("stateStartedAt"))
                if agent.get("state") in ("done", "waiting") else None,
                "main_agent": agent.get("mainAgent")} for agent in row.get("agents") or []]
     return {"worktree": worktree, "agents": agents, "final": final,
-            "pending_questions": list(questions.values()), "rejected": rejected, "terminals": tabs,
-            "queued_input": queued}
+            "api_error": claude.get("api_error") if claude else None,
+            "pending_questions": list(questions.values()),
+            "answered": answer_evidence.answered_questions(transcripts, since), "rejected": rejected,
+            "terminals": tabs, "queued_input": queued}
 
 
 def decision_asks(values: list[str], keys: list[str]) -> dict[str, str]:
@@ -291,11 +309,15 @@ def main(argv: list[str] | None = None) -> int:
     state_command = commands.add_parser(
         "lead-state", parents=[kept, lead],
         description="JSON keys: worktree (path), agents (type, state, state_started_at, stopped_at, main_agent), "
-                    "final (at, text), pending_questions (id, asked_at, questions with choices), "
+                    "final (at, text: the lead's newest message of its own, past a running turn or an API error), "
+                    "api_error (the error text that ended the last turn, or null), "
+                    "pending_questions (id, asked_at, questions with choices), "
+                    "answered (questions answered since the newest kept handoff: id, asked_at, answered_at, "
+                    "answers by question, notes by question), "
                     "rejected (questions closed unanswered since the newest kept handoff, with ask/close times), "
                     "terminals (handle, screen_tail), queued_input (undelivered instructions and enqueue times).",
-        help="print the appointed lead's current state as JSON, with the questions closed unanswered (rejected) "
-             "since the newest kept handoff")
+        help="print the appointed lead's current state as JSON, with the questions answered (answered) and closed "
+             "unanswered (rejected) since the newest kept handoff")
     state_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                                help="Orca CLI executable (default: %(default)s)")
     send_command = commands.add_parser("send", parents=[kept, lead],

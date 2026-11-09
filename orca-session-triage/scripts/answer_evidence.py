@@ -238,6 +238,38 @@ def rejected_questions(transcripts: Iterable[Path], since: datetime | None) -> l
     return [item for _, item in sorted(closed, key=itemgetter(0))]
 
 
+def answered_questions(transcripts: Iterable[Path], since: datetime | None) -> list[dict]:
+    """AskUserQuestion calls answered at or after `since`, answered earliest first, each with its id, asked and
+    answered times, the choice per question, and the notes the user added to a question."""
+    found = []
+    for path in transcripts:
+        asked: dict[object, str | None] = {}
+        with path.open("rb") as stream:
+            for raw in (line for line in stream if b"AskUserQuestion" in line or b'"answers"' in line):
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                content = scan_sessions.message_of(entry).get("content") if isinstance(entry, dict) else None
+                result = entry.get("toolUseResult") if isinstance(entry, dict) else None
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                            and block.get("name") == "AskUserQuestion"):
+                        asked[block.get("id")] = entry.get("timestamp")
+                    elif (block.get("type") == "tool_result" and isinstance(result, dict)
+                          and isinstance(result.get("answers"), dict)
+                          and (at := scan_sessions.parse_time(entry.get("timestamp"))) is not None
+                          and (since is None or at >= since)):
+                        notes = result.get("annotations") if isinstance(result.get("annotations"), dict) else {}
+                        found.append((at, {"id": block.get("tool_use_id"), "asked_at": asked.get(block.get("tool_use_id")),
+                                           "answered_at": entry.get("timestamp"), "answers": result["answers"],
+                                           "notes": {question: note["notes"] for question, note in notes.items()
+                                                     if isinstance(note, dict) and note.get("notes")}}))
+    return [item for _, item in sorted(found, key=itemgetter(0))]
+
+
 def transcripts_of(projects: Path, worktrees: Iterable[Path]) -> Iterator[Path]:
     for worktree in dict.fromkeys(worktrees):
         yield from sorted(scan_sessions.find_claude_dir(projects, str(worktree)).glob("*.jsonl"))

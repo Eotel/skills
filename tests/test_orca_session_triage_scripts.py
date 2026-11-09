@@ -4295,6 +4295,45 @@ class HandoffProposalTests(unittest.TestCase):
         self.assertIsInstance(result["queued_input"][0]["minutes"], int)
         self.assertEqual(run.call_count, 3)
 
+    def test_lead_state_shows_the_last_ordinary_message_and_answers_since_the_last_handoff_past_a_limit(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        question = {"questions": [{"question": "Merge?", "options": [{"label": "Yes"}, {"label": "Wait"}]}]}
+
+        def asked(tool_id: str, at: str) -> dict:
+            return {**assistant({"type": "tool_use", "id": tool_id, "name": "AskUserQuestion", "input": question}),
+                    "timestamp": at}
+
+        def answered(tool_id: str, at: str, choice: str, **notes: str) -> dict:
+            return {"type": "user", "timestamp": at, "toolUseResult": {
+                        **question, "answers": {"Merge?": choice},
+                        "annotations": {"Merge?": {"notes": note} for note in notes.values()}},
+                    "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                                             "content": choice}]}}
+
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            asked("before", "2026-11-09T00:00:00Z"), answered("before", "2026-11-09T00:01:00Z", "Yes"),
+            {**assistant(text("まとめました")), "timestamp": "2026-11-09T01:10:00Z"},
+            asked("after", "2026-11-09T01:20:00Z"), answered("after", "2026-11-09T01:21:00Z", "Wait", note="CI の後で"),
+            {**user("続けて"), "timestamp": "2026-11-09T01:30:00Z"},
+            {**assistant(text("You've hit your weekly limit · resets 8pm")), "timestamp": "2026-11-09T01:31:00Z",
+             "isApiErrorMessage": True}])
+        handoff.SavedHandoff(text="前回", kind="info", decisions=[], sent_at="2026-11-09T01:00:00+00:00",
+                             next_offset=0).save(self.root / "handoffs", datetime(2026, 11, 9, 1, tzinfo=timezone.utc))
+        replies: dict[tuple[str, ...], dict] = {("worktree", "ps"): {"worktrees": [{**worktree("/w/lead"), "agents": []}]},
+                                                ("terminal", "list"): {"terminals": []}}
+
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            code, shown, err = self.call("lead-state", "--orca", "fake-orca")
+
+        self.assertEqual(code, 0, err)
+        result = json.loads(shown)
+        self.assertEqual(result["final"], {"at": "2026-11-09T01:10:00Z", "text": "まとめました"})
+        self.assertEqual(result["answered"], [{"id": "after", "asked_at": "2026-11-09T01:20:00Z",
+                                               "answered_at": "2026-11-09T01:21:00Z", "answers": {"Merge?": "Wait"},
+                                               "notes": {"Merge?": "CI の後で"}}])
+
     def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
                                           "lead": {"worktree": "/w/lead"}}))
@@ -4407,6 +4446,103 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result[0]["state"], "lost_schedule")
         self.assertIn("Release status", result[0]["question"])
+
+    def test_stale_asks_marks_an_ask_whose_related_issues_are_all_closed(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text(json.dumps([{"path": f"/w/{name}", "repo": "app", "class": "waiting", "claude": {
+            "final_at": "2026-11-09T01:00:00Z", "final_text": "どうしますか？"}} for name in ("closed", "open", "backlog")]))
+        issues = {"closed": ["acme/app#5", "https://github.com/acme/app/pull/6"], "open": ["acme/app#7"],
+                  "backlog": ["HOSYU_TEST-1"]}
+        write_jsonl(self.root / "inbox.jsonl", [
+            {"id": f"{name}-0000-ask", "kind": "ask", "worktree": name, "repo": "app", "ts": "2026-11-09T01:00:00Z",
+             "text": "どうしますか？", "questions": [{"question": f"{name} を進めますか？", "issue": issue} for issue in refs]}
+            for name, refs in issues.items()])
+        nodes = {"item_5": {"state": "CLOSED", "updatedAt": "2026-11-09T02:00:00Z"},
+                 "item_6": {"state": "MERGED", "updatedAt": "2026-11-09T03:00:00Z", "headRefOid": "h6"},
+                 "item_7": {"state": "OPEN", "updatedAt": "2026-11-09T02:00:00Z"}}
+        with patch.object(scan, "graphql_repository", return_value=nodes) as api:
+            code, result = self.call("stale-asks", "--from", str(saved))
+            with redirect_stdout(io.StringIO()) as out:
+                hourly_state.main(["--state-file", str(self.state), "stale-asks", "--from", str(saved), "--summary"])
+        self.assertEqual(code, 0)
+        self.assertEqual({item["name"]: item["related_issues_closed"] for item in result},
+                         {"closed": True, "open": False, "backlog": False})
+        closed = next(item for item in result if item["name"] == "closed")
+        self.assertEqual([(ref["ref"], ref["state"]) for ref in closed["related_issues"]],
+                         [("acme/app#5", "CLOSED"), ("https://github.com/acme/app/pull/6", "MERGED")])
+        self.assertEqual(len(api.call_args_list), 2)  # one read of acme/app per run
+        lines = {line.split(" | ")[0]: line for line in out.getvalue().splitlines()}
+        self.assertIn("関わる issue が閉じた", lines["closed"])
+        self.assertNotIn("関わる issue が閉じた", lines["open"] + lines["backlog"])
+
+    def test_answered_by_decision_records_the_one_unanswered_question_asked_under_it(self) -> None:
+        message = self.source("message.txt", "Merge?")
+        answer = self.source("answer.txt", "merge する")
+        asked = {row: self.call("asked", "--row", row, "--decision", decision, "--final-message-file", message,
+                                "--question-file", message)[1]["id"]
+                 for row, decision in (("/w/a", "merge:PR#10"), ("/w/b", "merge:PR#10"), ("/w/c", "deploy"))}
+
+        code, answered = self.call("answered", "--decision", "deploy", "--answer-file", answer)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            ambiguous = hourly_state.main(["--state-file", str(self.state), "answered", "--decision", "merge:PR#10",
+                                           "--answer-file", answer])
+
+        self.assertEqual((code, answered["id"], answered["answer"]), (0, asked["/w/c"], "merge する"))
+        self.assertEqual(ambiguous, 1)
+        self.assertIn(asked["/w/a"], err.getvalue())
+        self.assertIn(asked["/w/b"], err.getvalue())
+
+    def test_asked_many_takes_the_row_and_final_message_from_each_ask_and_checks_every_line_first(self) -> None:
+        scan_json = self.root / "scan.json"
+        # The same path on two Macs: the ask's tab names the row.
+        scan_json.write_text(json.dumps([
+            {"path": "/w/lane", "repo": "app", "class": "waiting", "terminals": [{"handle": "term_here"}]},
+            {"path": "/w/lane", "environment": "mbp16", "repo": "app", "class": "waiting",
+             "terminals": [{"handle": "term_there"}]}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000-ask", "kind": "ask", "worktree": "lane",
+                                                 "repo": "app", "handle": "term_there", "ts": "2026-11-09T01:00:00Z",
+                                                 "text": "A と B のどちらで出しますか？"}])
+        lines = self.root / "asked.jsonl"
+        from_ask = {"ask": "abcd1234", "decision": "release", "question": "A と B のどちらで出しますか？"}
+        by_row = {"row": "/w/other", "decision": "merge:PR#3", "question": "merge しますか？"}
+        lines.write_text(json.dumps(from_ask) + "\n" + json.dumps(by_row) + "\n")
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            refused = hourly_state.main(["--state-file", str(self.state), "asked-many", "--file", str(lines),
+                                         "--from", str(scan_json)])
+        self.assertEqual(refused, 1)
+        self.assertIn("line 2", err.getvalue())
+        self.assertEqual(self.call("show")[1]["questions"], {})
+
+        lines.write_text(json.dumps(from_ask) + "\n" + json.dumps({**by_row, "final_message": "merge しますか？"}) + "\n")
+        code, recorded = self.call("asked-many", "--file", str(lines), "--from", str(scan_json))
+
+        self.assertEqual(code, 0)
+        self.assertEqual([(item["row"], item["decision"], item["final_message"]) for item in recorded],
+                         [("mbp16::/w/lane", "release", "A と B のどちらで出しますか？"),
+                          ("/w/other", "merge:PR#3", "merge しますか？")])
+
+    def test_answered_many_records_by_id_or_decision_only_when_every_line_holds(self) -> None:
+        message = self.source("message.txt", "Merge?")
+        first, second = (self.call("asked", "--row", row, "--decision", decision, "--final-message-file", message,
+                                   "--question-file", message)[1]["id"]
+                         for row, decision in (("/w/a", "merge:PR#10"), ("/w/b", "merge:PR#11")))
+        lines = self.root / "answered.jsonl"
+        lines.write_text(json.dumps({"id": first, "answer": "merge する"}) + "\n"
+                         + json.dumps({"decision": "merge:PR#99", "answer": "待つ"}) + "\n")
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            refused = hourly_state.main(["--state-file", str(self.state), "answered-many", "--file", str(lines)])
+        self.assertEqual(refused, 1)
+        self.assertIn("line 2", err.getvalue())
+        self.assertEqual([item["answer"] for item in self.call("show")[1]["questions"].values()], [None, None])
+
+        lines.write_text(json.dumps({"id": first, "answer": "merge する"}) + "\n"
+                         + json.dumps({"decision": "merge:PR#11", "answer": "待つ"}) + "\n")
+        code, recorded = self.call("answered-many", "--file", str(lines))
+
+        self.assertEqual(code, 0)
+        self.assertEqual([(item["id"], item["answer"]) for item in recorded], [(first, "merge する"), (second, "待つ")])
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

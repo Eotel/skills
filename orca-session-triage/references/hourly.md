@@ -177,8 +177,12 @@ with their enqueue times and elapsed minutes, read again from its transcript.
 The lead defaults to the shared state's appointed worktree; `--lead-worktree`
 overrides it, and `--state-file` selects the shared state for both `send` and
 `lead-state`. `handoff.py lead-state` prints JSON with `worktree` (path),
-`agents` (states and stop times), `final` (latest message and time),
-`pending_questions` (unanswered questions, choices, and ask times), `rejected`
+`agents` (states and stop times), `final` (the lead's newest message of its
+own and its time, also while a turn runs or after an API error such as a usage
+limit ended it), `api_error` (that error's text, or null),
+`pending_questions` (unanswered questions, choices, and ask times), `answered`
+(questions answered since the newest kept handoff, with the choice and note per
+question and ask and answer times), `rejected`
 (questions closed without an answer since the newest kept handoff, with ask and
 close times), `queued_input` (undelivered instructions and enqueue times), and
 `terminals` (handles and screen tails);

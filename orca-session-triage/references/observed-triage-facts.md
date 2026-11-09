@@ -10,3 +10,4 @@
 - Backlog のコメントは bee issue view --comments --json の JSON に入らない。bee api issues/<KEY>/comments -f order=desc -f count=N で取る（パスに ?order=… を付けると出力が空になり JSONDecodeError） <!-- triage-retro:6e3a812c-515f-59ba-9d2a-43386696dffe -->
 - 帳票・画面の見た目を選ぶ問いは、文だけで伺わない。担当に、全体の中の位置を枠で示し案を同じ文字列で描いたページを作らせ、open を確かめてから AskUserQuestion で伺う。 <!-- triage-retro:278f9552-ece6-581b-9afe-e47aaf716582 -->
 - AskUserQuestion の答えで、選んだ選択肢（投稿・merge など外へ出す操作）とメモが食い違うときは、許可として担当へ渡す前に読みを 1 問で確かめる。先にメモ付きのまま渡したら、確かめた答えで上書きを送る <!-- triage-retro:a39ef175-0051-5f45-a8c5-12ae7f2a7eb5 -->
+- Actions の支払い上限の確認: org の billing API は 410 と admin:org 要求で読めない。最新 run の job を gh api repos/O/R/check-runs/JOB_ID/annotations で読むと課金で未起動かが分かる。 <!-- triage-retro:94336769-5eed-53ba-9af2-07f628ebed4c -->
