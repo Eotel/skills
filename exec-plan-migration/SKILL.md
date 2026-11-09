@@ -11,6 +11,10 @@ results recorded in the PR. This skill requires `plan-exec` and `agentic-docs`
 (`scripts/check_plans.py`). Delete this skill once the repositories that still
 use the legacy shape have migrated.
 
+For a cross-repository inventory or a retirement decision, read
+[references/lifecycle.md](references/lifecycle.md) for the target records,
+retirement gates, and coordinated distribution withdrawal conditions.
+
 ## Inventory
 
 Work in a dedicated worktree from the default branch. Run:
