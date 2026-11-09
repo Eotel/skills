@@ -2158,6 +2158,21 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("まで待つ", lines[2])
         self.assertIn("まで待つ", lines[3])
 
+    def test_time_only_reset_stays_on_the_date_implied_by_the_failure(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/limit", "class": "stalled", "claude": {
+            "final_at": "2026-11-08T14:00:00Z", "final_text": "usage limit"},
+            "stop": {"kind": "usage_limit", "action": "wait", "agent": "claude", "error": "usage limit",
+                     "resets": "2am (Asia/Tokyo)"}}]))
+        for moment, expired in (("2026-11-08T14:30:00+00:00", False),
+                                ("2026-11-08T18:00:00+00:00", True),
+                                ("2026-11-09T16:00:00+00:00", True)):
+            with self.subTest(moment=moment), patch.object(scan.time, "time", return_value=datetime.fromisoformat(moment).timestamp()), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+            self.assertEqual("解除済み・起こせる" in out.getvalue(), expired)
+
+
     def test_summary_names_each_missing_hook_file_with_its_host(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
@@ -2224,6 +2239,18 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main([*opts, "--summary"]), 0)
         self.assertIn("結果が出るまで残す", out.getvalue())
         self.assertIn("2026-11-09T01:00:00Z", out.getvalue())
+
+    def test_pending_delivery_preserves_a_waiting_verdict_and_its_question(self) -> None:
+        saved, state = self.dir / "scan.json", self.dir / "state.json"
+        saved.write_text(json.dumps([{"path": "/w/promise", "repo": "app", "class": "unsure", "reasons": [],
+            "claude": None, "codex": [], "terminals": [], "closable": ["t"],
+            "verdict": {"class": "waiting", "question": "公開しますか？"}}]))
+        state.write_text(json.dumps({"handoffs": {"h": {"to": "app/promise", "delivered_at": None}}}))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--state-file", str(state),
+                                         "--rows", "--class", "waiting"]), 0)
+        self.assertIn("公開しますか？", out.getvalue())
+        self.assertIn("waiting (scan: unsure)", out.getvalue())
 
     def test_rows_class_filter_uses_the_verdict_and_keeps_dirty_and_unpushed_values(self) -> None:
         saved, _ = self.saved_scan()
@@ -4311,6 +4338,7 @@ class HourlyStateTests(unittest.TestCase):
                     "final_at": "2026-11-02T01:00:00Z", "final_text": "公開しますか？"}}
                 for name in ("reasked", "progress", "prompt")]
         rows[1]["verdict"] = {"class": "in_progress"}
+        rows[1]["claude"]["pending_questions"] = [{"questions": [{"question": "公開しますか？"}]}]
         rows[2]["prompt_waiting"] = {"tab": "t", "question": "公開しますか？", "choices": ["1. はい"],
                                       "asked_at": "2026-11-09T02:00:00Z"}
         saved.write_text(json.dumps(rows))
@@ -4323,6 +4351,16 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(by_name["reasked"]["state"], "unanswered")
         self.assertEqual(by_name["progress"]["state"], "unanswered")
         self.assertEqual(by_name["prompt"]["since"], "2026-11-09T02:00:00Z")
+
+    def test_in_progress_without_a_question_is_not_an_unanswered_user_question(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        saved.write_text(json.dumps([{"path": "/w/continuing", "repo": "app", "class": "stalled",
+            "verdict": {"class": "in_progress", "next_step": "Continue implementation"},
+            "claude": {"final_at": "2026-11-09T01:00:00Z", "final_text": "I will continue implementation."}}]))
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual(code, 0)
+        self.assertEqual(result, [])
 
     def test_stale_asks_reports_pr_state_head_and_update_for_an_unasked_row(self) -> None:
         saved = self.root / "scan.json"

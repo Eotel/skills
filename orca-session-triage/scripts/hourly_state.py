@@ -371,12 +371,15 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                           and not (item.get("covers") and
                                    len(covering_answers(item, latest_decisions)) == len(item["covers"]))]
         in_progress = (row.get("verdict") or {}).get("class") == "in_progress"
-        if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
-                and not blocked_by_user(row) and not any(keys.values()) and not shared_pending and not in_progress):
-            continue
+        progress_question = in_progress and bool(row.get("prompt_waiting") or
+                                                  (row.get("claude") or {}).get("pending_questions"))
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
+                and not blocked_by_user(row) and not any(keys.values()) and not shared_pending
+                and not (in_progress and (progress_question or counted))):
+            continue
         comment = row.get("comment") or ""
         question = row_question(row, final)
         view = {"row": identity, "name": scan_sessions.row_name(row),
@@ -403,7 +406,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                             "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
             continue
-        if shared_pending or in_progress:
+        if shared_pending or progress_question:
             item = min(shared_pending, key=lambda item: item.get("asked_at") or "") if shared_pending else {}
             since_text = item.get("asked_at") or (row.get("prompt_waiting") or {}).get("asked_at") or final["at"]
             since = scan_sessions.parse_time(since_text) or now

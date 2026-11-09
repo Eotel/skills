@@ -76,7 +76,11 @@ asking). `open-asks`
 then marks the ask 伺い中 with who and since when, the lead's `watch` prints the
 claim once and stops reminding of it, `questions` leaves the claimed questions
 out of its batch (listing them under `claimed`), and `stale-asks` names the
-claim on the ask, so the other tab does not ask it again. Asks from before the record began stay open until the lead marks
+claim on the ask, so the other tab does not ask it again. `open-asks` and
+`stale-asks` read that owner's current lead-state: with no unanswered AskUserQuestion
+and a turn that ended over fifteen minutes ago, they show
+「伺っていない（claim のみ、N 分）」. Inspect that state before taking over.
+Asks from before the record began stay open until the lead marks
 them: check `open-asks`, then `answered --before <ISO time> --note <why>`.
 It marks only the asks an answer after them proves answered: a lead decision
 or an AskUserQuestion answer (in the transcripts of the current directory's

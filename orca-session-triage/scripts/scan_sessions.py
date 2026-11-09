@@ -13,7 +13,7 @@ import argparse
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from itertools import dropwhile, takewhile
 import hashlib
@@ -2125,7 +2125,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                               "; ".join(item.get("task") or item.get("condition") or "" for item in promises)]
             if row.get("class") == "finished":
                 row["class"] = "stalled"
-            row.pop("verdict", None)
+            if (row.get("verdict") or {}).get("class") == "finished":
+                row.pop("verdict", None)
         keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}",
                 f"remove:{row['path']}", f"remove:{row_identity(row)}"}
         if not row.get("environment"):
@@ -2923,7 +2924,7 @@ def main(argv: list[str] | None = None) -> int:
 WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する", "other": "その他: 人が読む"}
 
 
-def reset_time(value: str | None, now: datetime) -> datetime | None:
+def reset_time(value: str | None, now: datetime, failed_at: datetime | None) -> datetime | None:
     """Read an absolute reset timestamp or the dated/time-only notice shown by the CLI."""
     if value and (parsed := parse_time(value)):
         return parsed
@@ -2932,16 +2933,19 @@ def reset_time(value: str | None, now: datetime) -> datetime | None:
     if not match:
         return None
     month, day, hour, minute, period, zone = match.groups()
+    if not month and failed_at is None:
+        return None
     try:
-        local = now.astimezone(ZoneInfo(zone))
+        local = (failed_at or now).astimezone(ZoneInfo(zone))
         hour_number = int(hour)
         if not 1 <= hour_number <= 12:
             return None
         months: Sequence[str] = "jan feb mar apr may jun jul aug sep oct nov dec".split()
         month_number = next(number for number, label in enumerate(months, 1) if label == month.lower()) if month else local.month
-        return local.replace(month=month_number, day=int(day) if day else local.day,
-                             hour=hour_number % 12 + (12 if period.lower() == "pm" else 0),
-                             minute=int(minute or 0), second=0, microsecond=0)
+        reset = local.replace(month=month_number, day=int(day) if day else local.day,
+                              hour=hour_number % 12 + (12 if period.lower() == "pm" else 0),
+                              minute=int(minute or 0), second=0, microsecond=0)
+        return reset + timedelta(days=1) if not month and reset < local else reset
     except (ValueError, ZoneInfoNotFoundError):
         return None
 
@@ -2956,7 +2960,7 @@ def wake_line(row: dict, stop: StopReason) -> str:
               else WAKE_ACTIONS[stop["kind"]])
     if stop["kind"] == "usage_limit":
         now = datetime.fromtimestamp(time.time(), timezone.utc)
-        resets = reset_time(stop["resets"], now)
+        resets = reset_time(stop["resets"], now, parse_time(row_final_at(row)))
         if resets and resets <= now:
             action = "利用上限: 解除済み・起こせる" + ("（タブの開き直しが必要）" if not tabs else "")
     error = " ".join(stop["error"].split())
