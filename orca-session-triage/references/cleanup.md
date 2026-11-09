@@ -24,7 +24,9 @@ Its `--archive-scratch` passes that option to each `rm_check.py`, and
 `--remove-ok` runs steps 3 and 4 below for each worktree whose check is `ok`
 with no `containers`, putting the result in that worktree's line as `removal`
 (it exits 4 when one did not finish). Give it only rows these rules remove
-without asking.
+without asking. Its `--summary` prints one line per worktree instead of the
+JSON (`<name> | ok=… | removal=… | reasons=…`, reasons naming only `.yomiyasu/`
+left out): read those lines rather than parsing the JSON.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`

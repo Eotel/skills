@@ -11,6 +11,7 @@ reports and the answers answer_evidence.py finds, and names the questions left i
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -46,6 +47,9 @@ READ_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeEr
 # A lane's info that offers the user a choice; open-asks never lists one (2026-10-29: 14 hours unseen).
 CHOICE = re.compile(r"【要(?:判断|承認|確認)】|どちら|どれに|選択肢|選んで|(?:ます|です|でしょう)か[。？?]")
 EXCERPT = 160
+# A question's 「関わる issue」 on GitHub: owner/name#12, or the issue's or PR's URL. A Backlog key is not read.
+GITHUB_REF = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)(?:#|/(?:issues|pull)/)(\d+)")
+CLOSED_STATES = frozenset(("CLOSED", "MERGED"))
 
 
 @dataclass(frozen=True)
@@ -306,6 +310,31 @@ def row_prs(rows: list[dict]) -> dict[str, dict]:
             for identity, repo, number in wanted if (found := (states.get(repo) or {}).get(number))}
 
 
+def related_issues(ask: dict) -> list[str]:
+    """The 「関わる issue」 the ask's structured questions name, once each."""
+    return list(dict.fromkeys(issue for question in inbox_read.questions_of(ask) if isinstance(question, dict)
+                              if (issue := str(question.get("issue") or "").strip())))
+
+
+def with_issue_states(items: list[dict]) -> None:
+    """Replace each item's `related_issues` with their states, read in one GraphQL query per repository, and set
+    `related_issues_closed` when every one is closed or merged. A reference that is not on GitHub has no state."""
+    refs = {ref: GITHUB_REF.fullmatch(ref) for item in items for ref in item.get("related_issues") or []}
+    numbers: dict[str, set[int]] = {}
+    for found in filter(None, refs.values()):
+        numbers.setdefault(found.group(1), set()).add(int(found.group(2)))
+    states = {repo: lead_decisions.github_pr_states(repo, sorted(wanted), include_issues=True) or {}
+              for repo, wanted in numbers.items()}
+    for item in items:
+        shown = []
+        for ref in item.get("related_issues") or []:
+            found = (states[match.group(1)].get(int(match.group(2))) if (match := refs[ref]) else None)
+            shown.append({"ref": ref, "state": found.state if found else None,
+                          "updatedAt": found.updated_at if found else None})
+        item["related_issues"] = shown
+        item["related_issues_closed"] = bool(shown) and all(ref["state"] in CLOSED_STATES for ref in shown)
+
+
 def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision]) -> list[lead_decisions.Decision]:
     asked_at = scan_sessions.parse_time(question.get("asked_at"))
     return [decisions[key] for key in question.get("covers") or [] if key in decisions
@@ -401,7 +430,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     **view, "state": "unanswered", "since": ask.get("ts"),
                     "question": excerpt(asked) or view["question"],
                     "merge_question": scan_sessions.asks_merge(asked or question, comment),
-                    "decisions": keys.get(ask["id"], []),
+                    "decisions": keys.get(ask["id"], []), "related_issues": related_issues(ask),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids,
                             "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
@@ -422,6 +451,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
                                   "question": excerpt(asked) or view["question"],
                                   "merge_question": scan_sessions.asks_merge(asked or question, comment),
+                                  "related_issues": related_issues(ask),
                                   "ask": {**report_view(ask), "marked": ask["id"] not in open_ids},
                                   "answer": answer_view(answer)}))
             continue
@@ -547,11 +577,206 @@ def question_references(questions: dict[str, dict]) -> dict[str, list[dict]]:
             for key, (repo, numbers) in wanted.items()}
 
 
-def closed_references(row: str, question: str) -> list[dict]:
-    """The question's #numbers in its checkout's origin, only when every reference is CLOSED. A row on another
-    Mac (ENVIRONMENT::path) gives none: the same path here may hold another repository."""
-    refs = question_references({"q": {"row": row, "question": question}}).get("q", [])
-    return refs if all(item.get("state") == "CLOSED" for item in refs) else []
+@dataclass(frozen=True)
+class Asking:
+    """A question about to be put to the user, and the decision it settles."""
+    row: str
+    decision: str
+    final_message: str
+    question: str
+    asked_at: str
+    covers: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> str:
+        return identifier(self.row, self.decision)
+
+
+@dataclass(frozen=True)
+class Answering:
+    """The user's answer to a recorded question, named by its id or by the decision it was asked under."""
+    answer: str
+    id: str | None = None
+    decision: str | None = None
+    answered_at: str | None = None
+    replace_reason: str | None = None
+
+
+def closed_questions(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
+    """By key, the #numbers of each question not yet recorded, read in one batch per repository, when every one is
+    CLOSED in its checkout's origin. A row on another Mac (ENVIRONMENT::path) gives none: the same path here may
+    hold another repository."""
+    refs = question_references({asking.key: {"row": asking.row, "question": asking.question}
+                                for asking in askings if asking.key not in data["questions"]})
+    return {key: found for key, found in refs.items() if found and all(item.get("state") == "CLOSED" for item in found)}
+
+
+def record_question(data: dict, asking: Asking, closed: dict[str, list[dict]]) -> dict:
+    if asking.key not in data["questions"] and (refs := closed.get(asking.key)):
+        return {"state": "settled", "recorded": False, "row": asking.row, "question": asking.question,
+                "evidence": refs}
+    data["questions"].setdefault(asking.key, {"row": asking.row, "decision": asking.decision,
+                                              "final_message": asking.final_message,
+                                              "question": asking.question, "asked_at": asking.asked_at,
+                                              "owner_pane": os.environ.get("ORCA_PANE_KEY"),
+                                              "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
+                                              "answer": None})
+    return {"id": asking.key, **data["questions"][asking.key]}
+
+
+def asked_under(data: dict, decision: str) -> str:
+    """The id of the one open question asked under `decision`, else of the only question ever asked under it."""
+    named = {key: item for key, item in data["questions"].items() if item["decision"] == decision}
+    waiting = [key for key, item in named.items() if item["answer"] is None and not item.get("withdrawn_at")]
+    found = waiting or list(named)
+    if not found:
+        raise ValueError(f"no question was asked under decision {decision}")
+    if len(found) > 1:
+        raise ValueError(f"decision {decision} names {len(found)} {'open ' if waiting else ''}questions; "
+                         "give the id of one: "
+                         + ", ".join(f"{key} ({named[key]['row']})" for key in found))
+    return found[0]
+
+
+def record_answer(data: dict, answering: Answering) -> dict:
+    key = answering.id if answering.id is not None else asked_under(data, str(answering.decision))
+    if key not in data["questions"]:
+        raise ValueError(f"unknown question id: {key}")
+    question = data["questions"][key]
+    if question.get("withdrawn_at"):
+        raise ValueError(f"question was withdrawn at {question['withdrawn_at']}: {question['withdrawal_reason']}")
+    earlier = {name: question.get(name) for name in ("answer", "answered_at", "answered_in")}
+    if answering.replace_reason and question["answer"] is not None and question["answer"] != answering.answer:
+        # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
+        question.setdefault("replaced", []).append(
+            {**earlier, "reason": answering.replace_reason, "replaced_at": stamp()})
+        question["answer"] = None
+    if question["answer"] is not None and question["answer"] != answering.answer:
+        raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
+    if question["answer"] is None:
+        question.update(answer=answering.answer, answered_at=recorded_at(answering.answered_at),
+                        answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
+    return {"id": key, **question}
+
+
+ASKED_KEYS = frozenset(("ask", "row", "final_message", "decision", "question", "asked_at", "covers"))
+ANSWERED_KEYS = frozenset(("id", "decision", "answer", "answered_at", "replace_reason"))
+
+
+def line_text(item: dict, key: str) -> str:
+    value = item.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text")
+    return value.strip()
+
+
+def line_object(raw: str, keys: frozenset[str], either: tuple[str, str]) -> dict:
+    """A JSON Lines line as an object with only `keys` and exactly one of `either`."""
+    try:
+        item = json.loads(raw)
+    except ValueError as error:
+        raise ValueError(f"not JSON: {error}") from error
+    if not isinstance(item, dict):
+        raise ValueError("not a JSON object")
+    if unknown := sorted(set(item) - keys):
+        raise ValueError("unknown keys: " + ", ".join(unknown))
+    if (either[0] in item) == (either[1] in item):
+        raise ValueError(f"give either {either[0]} or {either[1]}")
+    return item
+
+
+class Inbox:
+    """The inbox asks and the saved scan's rows, read once, that an `asked-many` line names by ask id."""
+
+    def __init__(self, scan: str | None) -> None:
+        self.scan = scan
+
+    @cached_property
+    def asks(self) -> list[dict]:
+        return [item for item in inbox_read.inbox_entries(inbox_read.paths()[0])
+                if item.get("kind") == "ask" and item.get("id")]
+
+    @cached_property
+    def rows(self) -> list[dict]:
+        if self.scan is None:
+            raise ValueError("--from SCAN_JSON is needed to find the row of an ask")
+        return scan_sessions.saved_rows(self.scan)
+
+    def lane(self, ask_id: str) -> tuple[str, str]:
+        """The scan row of the worktree that sent the ask, found by its tab (which tells two Macs' same path apart),
+        else by its repository, and the ask's text, the lane's final message."""
+        found = [item for item in self.asks if inbox_read.names(str(item["id"]), ask_id)]
+        if len(found) != 1:
+            raise ValueError(f"ask {ask_id} names {len(found)} asks in the inbox")
+        ask = found[0]
+        named = [row for row in self.rows if Path(row["path"]).name == ask.get("worktree")]
+        lanes = [row for row in named if ask.get("handle") and any(
+            term.get("handle") == ask["handle"] for term in row.get("terminals") or [])] or [
+            row for row in named if (ask.get("repo") or "") in ("", row.get("repo") or "")]
+        if len(lanes) != 1:
+            raise ValueError(f"ask {ask_id} from {ask.get('worktree')} matches {len(lanes)} scan rows; give row: "
+                             + (", ".join(scan_sessions.row_identity(row) for row in lanes) or "(none)"))
+        return scan_sessions.row_identity(lanes[0]), line_text(ask, "text")
+
+
+def asking_line(raw: str, inbox: Inbox) -> Asking:
+    item = line_object(raw, ASKED_KEYS, ("ask", "row"))
+    if "ask" in item and "final_message" in item:
+        raise ValueError("an ask gives the final message; leave final_message out")
+    row, message = (inbox.lane(line_text(item, "ask")) if "ask" in item
+                    else (line_text(item, "row"), line_text(item, "final_message")))
+    covers = item.get("covers", [])
+    if not isinstance(covers, list) or not all(isinstance(key, str) and key.strip() for key in covers):
+        raise ValueError("covers must be a list of lead decision keys")
+    when = item.get("asked_at")
+    if when is not None and not isinstance(when, str):
+        raise ValueError("asked_at must be an ISO 8601 time with its timezone offset")
+    return Asking(row=row, decision=line_text(item, "decision"), final_message=message,
+                  question=line_text(item, "question"), asked_at=recorded_at(when),
+                  covers=tuple(key.strip() for key in covers))
+
+
+def answering_line(raw: str) -> Answering:
+    item = line_object(raw, ANSWERED_KEYS, ("id", "decision"))
+    when = item.get("answered_at")
+    if when is not None and not isinstance(when, str):
+        raise ValueError("answered_at must be an ISO 8601 time with its timezone offset")
+    if when is not None:
+        recorded_at(when)
+    key = "id" if "id" in item else "decision"
+    return Answering(answer=line_text(item, "answer"), answered_at=when,
+                     replace_reason=line_text(item, "replace_reason") if "replace_reason" in item else None,
+                     **{key: line_text(item, key)})
+
+
+def checked_lines[T](text: str, parse: Callable[[str], T]) -> list[tuple[int, T | str]]:
+    """Each non-blank line, numbered from 1, as what `parse` makes of it or the reason it cannot."""
+    checked: list[tuple[int, T | str]] = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            checked.append((number, parse(raw)))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            checked.append((number, str(error)))
+    return checked
+
+
+def record_lines[T](lines: list[tuple[int, T | str]], record: Callable[[T], dict]) -> list[dict]:
+    """Record every line, or raise naming each line that is wrong so the caller writes nothing."""
+    results, wrong = [], []
+    for number, line in lines:
+        if isinstance(line, str):
+            wrong.append((number, line))
+            continue
+        try:
+            results.append(record(line))
+        except ValueError as error:
+            wrong.append((number, str(error)))
+    if wrong or not results:
+        raise ValueError("nothing was recorded" + ("".join(f"\nline {number}: {reason}" for number, reason in wrong)
+                                                   or ": no lines were given"))
+    return results
 
 
 def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
@@ -625,38 +850,18 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         data["left"][args.row] = {"final_message": file_text(args.final_message_file), "left_at": stamp()}
         return data["left"][args.row]
     if args.action == "asked":
-        message = file_text(args.final_message_file)
-        question = file_text(args.question_file)
         decision = args.decision.strip()
         if not decision:
             raise ValueError("decision is empty")
-        key = identifier(args.row, decision)
-        if key not in data["questions"] and (refs := closed_references(args.row, question)):
-            return {"state": "settled", "recorded": False, "row": args.row, "question": question, "evidence": refs}
-        data["questions"].setdefault(key, {"row": args.row, "decision": decision,
-                                           "final_message": message,
-                                           "question": question, "asked_at": recorded_at(args.asked_at),
-                                           "owner_pane": os.environ.get("ORCA_PANE_KEY"),
-                                           "asked_in": str(worktree()), "covers": list(dict.fromkeys(args.covers)),
-                                           "answer": None})
-        return {"id": key, **data["questions"][key]}
+        asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
+                        question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
+                        covers=tuple(args.covers))
+        return record_question(data, asking, closed_questions(data, [asking]))
     if args.action == "answered":
-        question = data["questions"][args.id]
-        if question.get("withdrawn_at"):
-            raise ValueError(f"question was withdrawn at {question['withdrawn_at']}: {question['withdrawal_reason']}")
-        answer = file_text(args.answer_file)
-        earlier = {key: question.get(key) for key in ("answer", "answered_at", "answered_in")}
-        if args.replace_reason_file and question["answer"] is not None and question["answer"] != answer:
-            # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
-            question.setdefault("replaced", []).append(
-                {**earlier, "reason": file_text(args.replace_reason_file), "replaced_at": stamp()})
-            question["answer"] = None
-        if question["answer"] is not None and question["answer"] != answer:
-            raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
-        if question["answer"] is None:
-            question.update(answer=answer, answered_at=recorded_at(args.answered_at),
-                            answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
-        return {"id": args.id, **question}
+        return record_answer(data, Answering(
+            answer=file_text(args.answer_file), id=args.id, answered_at=args.answered_at,
+            decision=args.decision.strip() if args.decision is not None else None,
+            replace_reason=file_text(args.replace_reason_file) if args.replace_reason_file else None))
     if args.action == "withdraw":
         question = data["questions"][args.id]
         reason = file_text(args.reason_file)
@@ -713,6 +918,9 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                 line += f" | 伺っていない（claim のみ、{claimed['inactive_minutes']} 分）{claimed['by']}"
             else:
                 line += f" | 伺い中 {claimed['by']}（{claimed['at']}〜）。重ねて伺わない"
+        if item.get("related_issues_closed"):
+            line += " | 関わる issue が閉じた（" + ", ".join(
+                f"{ref['ref']} {ref['state']}" for ref in item["related_issues"]) + "）"
         if item.get("merge_question"):
             line += " | merge の問い"
         if review := item.get("review"):
@@ -768,7 +976,9 @@ def main(argv: list[str] | None = None) -> int:
                            "ask without an answer that proves it, marked or not), stopped_after_answer (answered "
                            "after its last message), or settled (a lead decision key ask:<name>::… has a record "
                            "after its last message, given as evidence), with the lane's ask, the answer, candidates "
-                           "that name only the lane or its PR numbers, and age_minutes; then each AskUserQuestion of "
+                           "that name only the lane or its PR numbers, age_minutes, and the ask's 関わる issue "
+                           "(related_issues with their states; related_issues_closed when every one is closed or "
+                           "merged, 関わる issue が閉じた in --summary); then each AskUserQuestion of "
                            "the --asked-in transcripts closed unanswered since the newest saved handoff, as rejected")
     stale.add_argument("--from", dest="from_file", metavar="SCAN_JSON", required=True,
                        help="the rows scan_sessions.py printed as JSON")
@@ -813,13 +1023,31 @@ def main(argv: list[str] | None = None) -> int:
     asked.add_argument("--asked-at", help="original ISO 8601 time when importing a question")
     asked.add_argument("--covers", action="append", default=[], metavar="KEY",
                        help="a lead decision key this question covers; repeat per key")
+    asked_many = commands.add_parser(
+        "asked-many", help='record several questions from JSON Lines of {"decision", "question", "asked_at"?, '
+                           '"covers"?: [KEY, ...]} with either "ask": an inbox ask id (or its first 8 or more '
+                           'characters), whose lane and text become the row and final message, or "row" and '
+                           '"final_message"; every line is checked first, and a wrong one writes nothing')
+    asked_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
+    asked_many.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
+                            help="the rows scan_sessions.py printed as JSON, where an ask's worktree (and its tab, "
+                                 "when the same path is on two Macs) finds its row; needed for an \"ask\" line")
     answered = commands.add_parser("answered", help="record the user's answer before acting on it")
-    answered.add_argument("--id", required=True)
+    which = answered.add_mutually_exclusive_group(required=True)
+    which.add_argument("--id")
+    which.add_argument("--decision", metavar="KEY",
+                       help="the asked --decision of the one open question asked under it (else of the only "
+                            "question asked under it); several open ones are refused with their ids")
     answered.add_argument("--answer-file", required=True)
     answered.add_argument("--answered-at", help="original ISO 8601 time when importing an answer")
     answered.add_argument("--replace-reason-file",
                           help="replace a different recorded answer with this checked one, keeping the earlier "
                                "answer, its time and tab under `replaced` with this file's reason")
+    answered_many = commands.add_parser(
+        "answered-many", help='record several answers from JSON Lines of {"answer", "answered_at"?, '
+                              '"replace_reason"?} with either "id" or "decision" (as answered --decision); every '
+                              'line is checked first, and a wrong one writes nothing')
+    answered_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
@@ -865,6 +1093,7 @@ def main(argv: list[str] | None = None) -> int:
             prs = row_prs([row for row in rows if scan_sessions.row_identity(row) in identities])
             for item in result:
                 item["pr"] = prs.get(item.get("row"), {"state": None, "head": None, "updatedAt": None})
+            with_issue_states(result)
         except READ_ERRORS as error:
             print(f"hourly state: {error}", file=sys.stderr)
             return 1
@@ -882,6 +1111,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.from_file else OrcaHost(args.orca))
             live = frozenset(owner_name(value) for value in args.live_owner) | host.live_owners()
             intake = issue_intake(path, host)
+        given = ((args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read())
+                 if args.action in ("asked-many", "answered-many") else "")
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
             read_only = ("show", "get", "pending", "left-now", "requests-needing-owner")
             writes = args.action not in read_only or intake is not None
@@ -907,6 +1138,14 @@ def main(argv: list[str] | None = None) -> int:
                                ("questions", "handoffs", "requests", "left") if args.id in data[kind]), None)
                 if result is None:
                     raise ValueError(f"unknown id: {args.id}")
+            elif args.action == "asked-many":
+                inbox = Inbox(args.from_file)
+                askings = checked_lines(given, lambda raw: asking_line(raw, inbox))
+                closed = closed_questions(data, [line for _, line in askings if isinstance(line, Asking)])
+                result = record_lines(askings, lambda asking: record_question(data, asking, closed))
+            elif args.action == "answered-many":
+                result = record_lines(checked_lines(given, answering_line),
+                                      lambda answering: record_answer(data, answering))
             else:
                 result = data if args.action == "show" else change(data, args)
             if writes:
@@ -914,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
-    if args.action == "pending" and args.summary:
+    if args.action == "pending" and args.summary and isinstance(result, dict):
         print("\n".join(line for kind, items in result.items()
                         if (line := summary(items, datetime.now(timezone.utc), kind))))
     else:
