@@ -20,14 +20,15 @@ distribute the exact verified snapshot to the configured Macs.
   have fixes/evidence replies and resolved conversations.
 - Native Windows 3.9 drive-relative run/verify/export and empty-home word-list
   selection pass at `d648f63`. Ruff/ty and distribution equality also pass.
-  The three full-suite jobs are running.
+  All six fork CI jobs pass. Full suites: Python 3.9 has 2437 passed/5 skipped;
+  Python 3.14 has 2434 passed/8 skipped; Windows 3.12 has 2416 passed/26 skipped.
 - Downstream branch: `codex/yomiyasu-drive-relative`, based on `1d7a23d`.
   Its 42 imported files match the new fix. The prior snapshot was checked before
   replacement. PR: https://github.com/Eotel/skills/pull/154 (assigned to Eotel).
-  CI, code review, and security review pass at `581a861`; its code incorporates
+  CI, code review, and security review pass at `0973902`; its code incorporates
   main `7bbc568`. All 585 local tests and 93 relevant upstream tests pass.
   The downstream CLI returns exit 2 without a traceback for missing and
-  directory-valued export sources. Only this plan changes after that verified code.
+  directory-valued export sources. Only this plan changes after verified code `581a861`.
 - Read-only deployment preflight found valid receipts and no broken client links
   on all three Macs. Managed content matches receipts, with only the documented
   CMD line-ending representation difference. Inspect fresh state before updating.
@@ -46,9 +47,10 @@ distribute the exact verified snapshot to the configured Macs.
 
 ## Remaining Work
 
-1. Finish fork CI and obtain original CI approval. Keep the PR evidence current.
-2. Check the final downstream head's CI and review, update both PR descriptions
-   with exact full-suite results, and request merge authorization for #154.
+1. Obtain original CI approval. Its `action_required` state is an external blocker;
+   equivalent-commit fork CI is green and the maintainer has been asked to approve.
+2. Keep both PR descriptions current and request merge authorization for #154
+   once its final head's CI and review finish.
 3. After explicit merge authorization, update the maintained APM pin to the
    merged revision and distribute through the current Mac procedure.
 4. Compare changed deployed files and executable bits through actual client
@@ -57,10 +59,10 @@ distribute the exact verified snapshot to the configured Macs.
 
 ## Now And Next
 
-Inspect the full fork CI jobs at `d648f63` and the final downstream head's checks.
-Do not treat the original repository's `action_required` state as successful CI.
-Fill both PR descriptions with the exact completed job results and distinguish
-the original repository's approval requirement. Then obtain #154 merge approval.
+Verify the final downstream head's checks, post both PR descriptions with the
+completed full-suite results, and obtain #154 merge approval. Do not treat the
+original repository's `action_required` state as successful CI. After approval,
+read fresh deployment state and perform the documented Mac rollout.
 
 ## Constraints and Human Tasks
 
