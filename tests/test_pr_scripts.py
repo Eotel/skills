@@ -54,8 +54,17 @@ class PrTemplateTests(unittest.TestCase):
         bin_dir.mkdir()
         (bin_dir / "gh").write_text(FAKE_GH, encoding="utf-8")
         (bin_dir / "gh").chmod(0o755)
+        git_environment = subprocess.check_output(
+            ["git", "rev-parse", "--local-env-vars"], text=True
+        ).splitlines()
         environment = patch.dict(
-            os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+            os.environ,
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key not in git_environment
+            } | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"},
+            clear=True,
         )
         environment.start()
         self.addCleanup(environment.stop)
@@ -68,6 +77,25 @@ class PrTemplateTests(unittest.TestCase):
         subprocess.run(
             ["git", "remote", "add", "origin", url], cwd=self.repo, check=True
         )
+
+    def commit_files(self, files: dict[str, str]) -> str:
+        for name, content in files.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "--", *files], cwd=self.repo, check=True)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                "commit", "-qm", "manifest fixture",
+            ],
+            cwd=self.repo,
+            check=True,
+        )
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
 
     def run_main(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -138,6 +166,149 @@ class PrTemplateTests(unittest.TestCase):
         status, _, err = self.run_main("pick")
         self.assertEqual(status, 2)
         self.assertIn("not a GitHub repository", err)
+
+    def test_check_requires_added_npm_packages_but_not_versions_or_removals(self) -> None:
+        base = self.commit_files({
+            "web/package.json": json.dumps({"dependencies": {"old": "1", "removed": "1"}}),
+        })
+        self.commit_files({
+            "web/package.json": json.dumps({
+                "dependencies": {"old": "2", "@scope/runtime": "1"},
+                "devDependencies": {"dev-tool": "1"},
+                "peerDependencies": {"peer-lib": "1"},
+                "optionalDependencies": {"optional-lib": "1"},
+            }),
+        })
+        self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
+        argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
+        status, out, _ = self.run_main(*argv)
+        self.assertEqual(status, 1)
+        expected = {"@scope/runtime", "dev-tool", "peer-lib", "optional-lib"}
+        self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
+        self.body.write_text(
+            REVIEW_FIRST_BODY + "\n\n" + " ".join(expected),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_main(*argv)[0], 0)
+
+    def test_check_reads_cargo_dependency_tables_and_declared_features(self) -> None:
+        base = self.commit_files({"crates/app/Cargo.toml": '''
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+[features]
+old_feature = []
+'''})
+        self.commit_files({"crates/app/Cargo.toml": '''
+[dependencies]
+serde = { version = "2", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+[dev-dependencies.test_alias]
+package = "test-crate"
+version = "1"
+[build-dependencies]
+build-crate = { version = "1", features = ["build_feature"] }
+[target.'cfg(unix)'.dependencies]
+unix-crate = "1"
+[target.'cfg(windows)'.dev-dependencies]
+windows-test = "1"
+[target.'cfg(unix)'.build-dependencies]
+unix-build = "1"
+[workspace.dependencies]
+workspace-crate = "1"
+[features]
+old_feature = ["serde?/rc"]
+new_feature = []
+'''})
+        self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
+        argv = ("check", str(self.body), "--kind", "review-first")
+        self.assertEqual(self.run_main(*argv)[0], 0)
+        status, out, _ = self.run_main(*argv, "--base", base)
+        self.assertEqual(status, 1)
+        expected = {
+            "test-crate", "build-crate", "unix-crate", "windows-test", "unix-build",
+            "workspace-crate", "new_feature", "preserve_order", "build_feature", "rc",
+        }
+        self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
+        self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")
+        self.assertEqual(self.run_main(*argv, "--base", base)[0], 0)
+
+    def test_check_matches_whole_names_ignoring_case(self) -> None:
+        base = self.commit_files({"Cargo.toml": ""})
+        self.commit_files({"Cargo.toml": '[dependencies]\nlog = "1"\nrand = "1"\n'})
+        argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
+        self.body.write_text(
+            REVIEW_FIRST_BODY + "\n\nlogin random clog brand log1 rand2 1log 2rand\n"
+            "log_name rand_name name_log name_rand\n"
+            "log-name rand-name name-log name-rand\n"
+            "log.name rand.name name.log name.rand",
+            encoding="utf-8",
+        )
+        status, out, _ = self.run_main(*argv)
+        self.assertEqual(status, 1)
+        self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, {"log", "rand"})
+        self.body.write_text(REVIEW_FIRST_BODY + "\n\n`LOG` と (RaNd)。", encoding="utf-8")
+        self.assertEqual(self.run_main(*argv)[0], 0)
+
+    def test_check_reads_python_dependencies_extras_and_normalized_names(self) -> None:
+        base = self.commit_files({"pyproject.toml": '''
+[project]
+dependencies = ["PyYAML>=6", "Foo._Bar>=1", "requests", "removed==1"]
+[tool.poetry.dependencies]
+existing = "1"
+'''})
+        self.commit_files({"pyproject.toml": '''
+[project]
+dependencies = ["pyyaml>=7", "foo-bar>=2", "requests[socks]>=2", "typing_extensions>=4", "new-package[fast]>=1; python_version >= '3.12'"]
+[project.optional-dependencies]
+gpu = ["requests", "test_package~=2"]
+[dependency-groups]
+dev = ["dev.package @ https://example.invalid/dev.whl", { include-group = "test" }]
+test = []
+[tool.poetry.dependencies]
+python = "^3.12"
+existing = { version = "2", extras = ["Poetry_Extra"] }
+httpx = "^0.28"
+[tool.poetry.group.dev.dependencies]
+pytest = { version = "^8" }
+[tool.poetry.extras]
+Network = ["httpx"]
+[build-system]
+requires = ["hatchling>=1"]
+'''})
+        self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
+        argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
+        status, out, _ = self.run_main(*argv)
+        self.assertEqual(status, 1)
+        expected = {
+            "new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest",
+            "fast", "poetry-extra", "network", "hatchling", "typing-extensions",
+        }
+        self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
+        # The manifest's own spelling also names a normalized Python name.
+        named = " ".join(expected - {"typing-extensions"}) + " typing_extensions"
+        self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + named, encoding="utf-8")
+        self.assertEqual(self.run_main(*argv)[0], 0)
+
+    def test_check_uses_the_merge_base_and_committed_head(self) -> None:
+        base = self.commit_files({"package.json": "{}"})
+        head = self.commit_files({"package.json": '{"dependencies": {"new-package": "1"}}'})
+        subprocess.run(["git", "checkout", "-q", "--detach", base], cwd=self.repo, check=True)
+        self.commit_files({
+            "package.json": '{"dependencies": {"new-package": "2"}}',
+            "base-only/package.json": '{"dependencies": {"base-only": "1"}}',
+        })
+        subprocess.run(["git", "branch", "base"], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=self.repo, check=True)
+        # Uncommitted changes must not replace HEAD's manifest in the comparison.
+        (self.repo / "package.json").write_text("{}", encoding="utf-8")
+        self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
+        status, out, _ = self.run_main(
+            "check", str(self.body), "--kind", "review-first", "--base", "base"
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("new-package", out)
+        self.assertNotIn("base-only", out)
 
 
 if __name__ == "__main__":
