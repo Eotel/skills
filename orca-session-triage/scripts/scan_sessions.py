@@ -5,6 +5,10 @@ GitHub calls per run, for the rows that get PR facts: one GraphQL query per
 repository (25 PRs a query), plus three REST reads (reviews, conversation
 comments, line comments) for each PR whose updatedAt changed since the copy
 kept in --pr-cache.
+
+A live scan whose every GitHub query, or every Jev call, failed to connect
+prints only a line starting with ネットワーク断 (also on stderr), writes no
+--review-out, and exits 3: scan again once the connection is back.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import sys
 import tempfile
 import time
 from typing import Any, NamedTuple, NotRequired, TypedDict
+import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -529,6 +534,25 @@ ASKS_FROM = 0.7
 SETTLED_BELOW = 0.3
 STATE_SURE_FROM = 0.6  # a status confidence below this is unsure
 NO_VERDICT = {"asks": None, "status": None, "confidence": None}
+NETWORK_DOWN_EXIT = 3
+
+
+class Reach:
+    """Each network read of a scan, by service: None when it reached the service, else why it could not connect.
+
+    A service whose every read failed to connect gave the scan nothing, and its rows would look settled
+    without their PR facts or Jev's verdicts; `down` names it, so main stops before writing them.
+    """
+
+    def __init__(self) -> None:
+        self.reads: dict[str, list[str | None]] = {"GitHub": [], "Jev": []}
+
+    def record(self, service: str, failure: str | None) -> None:
+        self.reads[service].append(" ".join(failure.split())[:200] if failure else None)
+
+    def down(self) -> list[str]:
+        return [f"{service} への {len(reads)} 回の読み取りがすべて接続できませんでした（{reads[-1]}）"
+                for service, reads in self.reads.items() if reads and all(reads)]
 
 
 def jev_key(env: Mapping[str, str], key_file: str | Path) -> str | None:
@@ -548,16 +572,19 @@ def probability(value: str | float) -> float:
     return number
 
 
-def jev_judge(api_key: str, opener: Callable[..., AbstractContextManager] | None = None) -> Callable[[str], dict | None]:
+def jev_judge(api_key: str, opener: Callable[..., AbstractContextManager] | None = None,
+              reach: Reach | None = None) -> Callable[[str], dict | None]:
     """A judge returning Jev's verdict on a message, or None on failure.
 
     The verdict holds `asks` (probability that it waits on the user), `status`
     (in_progress, blocked_on_others, or done), and that status's `confidence`.
+    Each call goes into `reach`: an OSError other than an HTTP answer never reached Jev.
     """
     def judge(message: str) -> dict | None:
         body = {"state": message[-JEV_MAX_CHARS:], "model": "jev-latest", "questions": JEV_QUESTIONS}
         request = urllib.request.Request(JEV_URL, data=json.dumps(body).encode(), headers={
             "Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
+        unreachable = None
         try:
             with (opener or urllib.request.urlopen)(request, timeout=JEV_TIMEOUT) as response:
                 answers = json.load(response)["answers"]
@@ -567,8 +594,13 @@ def jev_judge(api_key: str, opener: Callable[..., AbstractContextManager] | None
             return {"asks": probability(answers["asks_user"]["noul"]), "status": status,
                     "confidence": probability(answers["status"]["confidence"])}
         except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
+            if isinstance(error, OSError) and not isinstance(error, urllib.error.HTTPError):
+                unreachable = repr(error)
             print(f"Jev could not judge a final message: {error!r}", file=sys.stderr)
             return None
+        finally:
+            if reach is not None:
+                reach.record("Jev", unreachable)
     return judge
 
 
@@ -1581,6 +1613,10 @@ PrRef = int | str | Item  # a PR number, the head branch to find the PR by, or a
 PrLookup = Callable[[str, list[PrRef]], dict[PrRef, dict | None]]
 
 GH_TIMEOUT = 15
+# What gh prints when its request never reached GitHub: a failed DNS lookup ("error connecting to
+# api.github.com"), or a refused, reset, unreachable, or timed-out connection ("dial tcp …").
+GH_UNREACHABLE = re.compile(r"error connecting to|dial tcp|proxyconnect|i/o timeout|TLS handshake timeout"
+                            r"|connection (?:refused|reset)|network is unreachable|no such host")
 GRAPHQL_CHUNK = 25  # 25 PRs by number in one query cost 1 point, as one `gh pr view` did (measured 2026-10-28)
 # gh reads 30 PRs of a branch; the newest 5 keep it cheap (25 branches in one query cost 5 points).
 BRANCH_CANDIDATES = 5
@@ -1640,13 +1676,15 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
             + " ".join(fields) + " } }" + facts), aliases
 
 
-def graphql_repository(slug: str, query: str) -> dict | None:
+def graphql_repository(slug: str, query: str, reach: Reach | None = None) -> dict | None:
     """The `repository` object a query returned, or None when gh gave no data.
 
     A PR that does not exist comes back as a null alias with a NOT_FOUND error,
     and gh exits 1 while the other aliases still hold data, so stdout is read
-    whatever the exit code.
+    whatever the exit code. The query goes into `reach`, with gh's error when
+    its last try timed out or gh says it could not connect (GH_UNREACHABLE).
     """
+    timed_out = False
     for attempt in range(3):
         out = None
         try:
@@ -1655,16 +1693,21 @@ def graphql_repository(slug: str, query: str) -> dict | None:
             repository = (json.loads(out.stdout).get("data") or {}).get("repository")
             failure = out.stderr.strip() or out.stdout.strip()
             if isinstance(repository, dict):
+                if reach is not None:
+                    reach.record("GitHub", None)
                 return repository
             # A structured API rejection is not an empty or broken transport response.
             break
         except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as error:
+            timed_out = isinstance(error, subprocess.TimeoutExpired)
             failure = ((out.stderr.strip() or out.stdout.strip()) if out else "") or repr(error)
             if out and re.search(r"GraphQL:|HTTP 4\d\d|Bad credentials|gh auth login", failure):
                 break
         if attempt < 2:
             time.sleep(attempt + 1)
     print(f"GitHub query for {slug} failed, so its rows have no PR facts: {failure}", file=sys.stderr)
+    if reach is not None:
+        reach.record("GitHub", failure if timed_out or GH_UNREACHABLE.search(failure) else None)
     return None
 
 
@@ -1741,8 +1784,8 @@ def pr_activity(slug: str, node: dict, cache_dir: Path) -> list[list[dict]]:
     return [read[kind] or [] for kind, _ in ACTIVITY]
 
 
-def gh_prs(slug: str, refs: list[PrRef],
-           cache_dir: Path = Path(PR_ACTIVITY_DIR).expanduser()) -> dict[PrRef, dict | None]:
+def gh_prs(slug: str, refs: list[PrRef], cache_dir: Path = Path(PR_ACTIVITY_DIR).expanduser(),
+           reach: Reach | None = None) -> dict[PrRef, dict | None]:
     """Summaries of a repository's PRs by number or head branch; None where gh finds none or fails.
 
     One GraphQL query reads up to GRAPHQL_CHUNK PRs. Each PR's reviews and
@@ -1756,7 +1799,7 @@ def gh_prs(slug: str, refs: list[PrRef],
     wanted = [ref for ref in found if is_pr_ref(ref)]
     for start in range(0, len(wanted), GRAPHQL_CHUNK):
         query, aliases = pr_query(owner, name, wanted[start:start + GRAPHQL_CHUNK])
-        repository = graphql_repository(slug, query) or {}
+        repository = graphql_repository(slug, query, reach) or {}
         default_branch = (repository.get("defaultBranchRef") or {}).get("name")
         for alias, ref in aliases.items():
             answer = repository.get(alias) or {}
@@ -2981,7 +3024,8 @@ def main(argv: list[str] | None = None) -> int:
     if key is None:
         print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
               "idle final messages come back unsure, so read them", file=sys.stderr)
-    judge = jev_judge(key) if key else (lambda message: None)
+    reach = Reach()
+    judge = jev_judge(key, reach=reach) if key else (lambda message: None)
     # Orca state read from files has no live tabs to read.
     screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals))
     claude_root = str(Path(args.claude_projects).expanduser())
@@ -2998,8 +3042,13 @@ def main(argv: list[str] | None = None) -> int:
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
                                                processes=processes),
-                               pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser()),
+                               pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts)
+    if down := reach.down():
+        line = f"ネットワーク断: {'。'.join(down)}。接続が戻ってから走査し直してください（--review-out は書いていません）"
+        print(line)
+        print(line, file=sys.stderr)
+        return NETWORK_DOWN_EXIT
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
     rows = with_verdicts(rows, verdicts)
