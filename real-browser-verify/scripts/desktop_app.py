@@ -62,6 +62,7 @@ class Run:
 
     pid: int
     binary: str
+    started: str
     drive_log: Path
     app_log: Path
 
@@ -76,7 +77,7 @@ class Run:
             data = json.loads(path.read_text())
         except FileNotFoundError:
             raise DriveError(f"no app with pid {pid} was launched by this script (no {path})") from None
-        return cls(pid, data["binary"], Path(data["drive_log"]), Path(data["app_log"]))
+        return cls(pid, data["binary"], data.get("started", ""), Path(data["drive_log"]), Path(data["app_log"]))
 
     def save(self, tools: Path) -> None:
         path = self.record(tools, self.pid)
@@ -84,7 +85,14 @@ class Run:
         path.write_text(json.dumps(self.as_json()))
 
     def as_json(self) -> dict[str, object]:
-        return {"pid": self.pid, "binary": self.binary, "drive_log": str(self.drive_log), "app_log": str(self.app_log)}
+        return {
+            "pid": self.pid, "binary": self.binary, "started": self.started,
+            "drive_log": str(self.drive_log), "app_log": str(self.app_log),
+        }
+
+    def running(self) -> bool:
+        """Whether the pid still belongs to this app: a crashed app's pid can be reused by another process."""
+        return bool(self.started) and start_time(self.pid) == self.started
 
 
 def ensure_built(tools: Path) -> None:
@@ -100,14 +108,14 @@ def ensure_built(tools: Path) -> None:
             raise DriveError(f"could not build {output}:\n{result.stderr.strip()}")
 
 
-def alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def start_time(pid: int) -> str:
+    """When the process with this pid started, as ps prints it; empty when there is no such process."""
+    # The C locale keeps the text the same when launch and stop run under different languages.
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, check=False,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    return result.stdout.strip()
 
 
 def launch(tools: Path, binary: Path, args: list[str], env: list[tuple[str, str]], timeout: float) -> Run:
@@ -130,7 +138,7 @@ def launch(tools: Path, binary: Path, args: list[str], env: list[tuple[str, str]
             [str(binary), *args], env=environment, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    run = Run(process.pid, str(binary), drive_log, app_log)
+    run = Run(process.pid, str(binary), start_time(process.pid), drive_log, app_log)
     started = time.monotonic()
     while time.monotonic() < started + timeout:
         lines = drive_log.read_text().splitlines() if drive_log.exists() else []
@@ -168,7 +176,7 @@ def key_command(spec: str) -> list[str]:
 
 def send(tools: Path, pid: int, command: list[str], timeout: float) -> str:
     run = Run.load(tools, pid)
-    if not alive(pid):
+    if not run.running():
         raise DriveError(f"the app with pid {pid} is no longer running; its output:\n{tail(run.app_log)}")
     if any(SEPARATOR in part for part in command):
         raise DriveError("a command cannot contain the character U+001F")
@@ -187,13 +195,13 @@ def send(tools: Path, pid: int, command: list[str], timeout: float) -> str:
 
 
 def stop(tools: Path, pid: int) -> None:
-    Run.load(tools, pid)
-    if alive(pid):
+    run = Run.load(tools, pid)
+    if run.running():
         os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + 5
-        while alive(pid) and time.monotonic() < deadline:
+        while run.running() and time.monotonic() < deadline:
             time.sleep(0.05)
-        if alive(pid):
+        if run.running():
             os.kill(pid, signal.SIGKILL)
     Run.record(tools, pid).unlink()
 

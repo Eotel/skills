@@ -68,6 +68,23 @@ class DesktopAppTest(unittest.TestCase):
         self.assertFalse(alive(pid))
         self.assertNotEqual(self.script("stop", str(pid)).returncode, 0)
 
+    def test_stop_leaves_a_process_that_reused_a_recorded_pid(self) -> None:
+        # A launched app crashed without stop, and macOS gave its pid to another process.
+        other = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(other.kill)
+        record = self.tools / "runs" / f"{other.pid}.json"
+        record.parent.mkdir()
+        record.write_text(json.dumps({
+            "pid": other.pid, "binary": "/crashed/app", "started": "Thu Jan  1 09:00:00 1970",
+            "drive_log": str(self.root / "drive.log"), "app_log": str(self.root / "app.log"),
+        }))
+
+        stopped = self.script("stop", str(other.pid))
+
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertIsNone(other.poll())
+        self.assertFalse(record.exists())
+
     def test_launch_reports_an_app_that_exits_before_taking_commands(self) -> None:
         launched = self.script("launch", str(self.app("#!/bin/sh\necho 'no display'\nexit 3\n")), "--timeout", "10")
 
