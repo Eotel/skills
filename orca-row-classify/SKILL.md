@@ -21,8 +21,10 @@ judge each row from its own facts.
 
 - `path`, `repo`: the worktree. A remote row has `environment` and `identity`;
   copy its `identity` into the verdict so equal paths on different Macs stay distinct.
-- `claude.final_text` / `codex.last_assistant` / `orca_message.text`: the agent's newest final
-  message (its last part). `claude.last_user`: the prompt it answered.
+- `final`: the message to class, the newest final message of the worktree's tab (`source`,
+  `at`, `text`). `source` `card` is Orca's done card, recorded after the transcripts with other
+  text; `claude.final_text`, `codex.last_assistant`, and `orca_message.text` then hold an
+  older message. `claude.last_user`: the prompt the transcript's message answered.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
   Orca keeps no time for it.
 - `inbox`: the newest `done` and `ask` the worktree sent to the triage inbox

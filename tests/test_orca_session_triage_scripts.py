@@ -611,9 +611,11 @@ class ClassifyTests(unittest.TestCase):
         trees = [worktree("/w/report"), worktree("/w/notes")]
 
         with patch.object(scan.subprocess, "run", return_value=ps), \
-                patch.object(scan.rm_check, "process_handles", return_value={80: "term_report", 70: "term_notes"}):
+                patch.object(scan.rm_check, "process_handles", return_value={81: "term_report", 70: "term_notes"}):
+            # The resumed Claude's own environment hides its tab; only its shell shows it.
             live = scan.running_claude_transcripts(["/w/report", "/w/notes"], [sessions], self.projects,
-                                                   {80: (60, "claude"), 70: (60, "claude"), 60: (1, "-zsh")},
+                                                   {80: (81, "claude"), 81: (1, "-zsh"), 70: (60, "claude"),
+                                                    60: (1, "-zsh")},
                                                    lambda pids: {pid: "/ghq/other" for pid in pids},
                                                    tabs={"term_report": "/w/report", "term_notes": "/w/notes"})
         rows = scan.build_inventory(trees, [terminal("/w/report", "claude", "term_report"),
@@ -1965,7 +1967,7 @@ class NextStepFactTests(unittest.TestCase):
             "orca_message": None, "prompt_waiting": None,
             "claude": {"last_user": "u", "final_text": "f", "final_at": "t1", "transcript": "/x.jsonl"},
             "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
-            "final_at": "t1", "read": scan.read_key(rows[0])})
+            "final": {"source": "claude", "at": "t1", "text": "f"}, "final_at": "t1", "read": scan.read_key(rows[0])})
 
     def test_a_queued_row_carries_its_newest_inbox_reports_and_which_report_came_last(self) -> None:
         # The Orca comment has no time; a done report newer than the final message must reach the reader.
@@ -2143,16 +2145,18 @@ class ScanCommandTests(unittest.TestCase):
         report, prompt = "今日の報告です。" + "続き" * 200, "月報を出して。" + "詳しく" * 100
 
         def lane(name: str, said: str, said_at: str, card: str, card_at: str) -> dict:
-            return {"path": f"/w/app/{name}", "repo": "app", "environment": None, "class": "finished",
+            return {"path": f"/w/app/{name}", "repo": "app", "environment": None, "class": "unsure",
                     "reasons": [], "comment": "", "terminals": [], "codex": [],
                     "claude": {"final_text": said, "final_at": said_at, "last_user": "go"},
                     "done_cards": [{"agent": "claude", "handle": "term_" + name, "done_at": card_at,
                                     "interrupted": False, "prompt": prompt, "last_message": card}]}
         saved = self.dir / "scan.json"
-        saved.write_text(json.dumps([
-            lane("same", "同じ報告", "2026-11-09T01:00:00.400Z", "同じ報告", "2026-11-09T01:00:01Z"),
-            lane("report", "11/02 の別件", "2026-11-02T01:00:00Z", report, "2026-11-09T03:00:00Z"),
-            lane("older", "新しい発言", "2026-11-09T02:00:00Z", "古い card", "2026-11-09T00:00:00Z")]))
+        rows = [lane("same", "同じ報告", "2026-11-09T01:00:00.400Z", "同じ報告", "2026-11-09T01:00:01Z"),
+                lane("report", "11/02 の別件", "2026-11-02T01:00:00Z", report, "2026-11-09T03:00:00Z"),
+                lane("older", "新しい発言", "2026-11-09T02:00:00Z", "古い card", "2026-11-09T00:00:00Z")]
+        saved.write_text(json.dumps(rows))
+        # orca-row-classify reads only the queue, so the queue carries the message its read key stands for.
+        self.assertEqual([entry["final"]["text"] for entry in scan.review_queue(rows)], ["同じ報告", report, "新しい発言"])
 
         def final(name: str) -> dict:
             with redirect_stdout(io.StringIO()) as out:

@@ -289,12 +289,18 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
             if (isinstance(pid, int) and "claude" in processes.get(pid, (0, ""))[1] and isinstance(cwd, str)
                     and isinstance(session_id, str) and re.fullmatch(r"[\w-]+", session_id)):
                 live[pid] = (session_id, cwd, directory.parent / "projects")
-    tabs = tabs or {}
-    claude = [pid for pid, (_, command) in processes.items() if "claude" in command] if tabs else []
+    tab_paths: Mapping[str, str] = tabs or {}
+    claude = [pid for pid, (_, command) in processes.items() if "claude" in command] if tab_paths else []
     in_tab = tab_of(sorted({member for pid in claude for member in ancestry(pid, processes)})) if claude else {}
+
+    def tab_worktree(pid: int) -> str | None:
+        """The worktree of the first Orca tab the process or an ancestor names in ORCA_TERMINAL_HANDLE."""
+        return next((path for member in ancestry(pid, processes)
+                     if (path := tab_paths.get((in_tab.get(member) or TabProcess(None, None)).handle or ""))), None)
+
     # 2026-11-09: montly-report's tab resumed Claude in another checkout, and no sessions/<pid>.json was written.
     named = {pid: tab.session for pid in claude
-             if pid not in live and (tab := in_tab.get(pid)) and tab.handle in tabs and tab.session}
+             if pid not in live and (tab := in_tab.get(pid)) and tab.session and tab_worktree(pid)}
     chains = {pid: ancestry(pid, processes) for pid in [*live, *named]}
     known = {pid: cwd for pid, (_, cwd, _) in live.items()}
     where = {**cwds(sorted({member for chain in chains.values() for member in chain} - known.keys())), **known}
@@ -314,8 +320,7 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
 
     found: dict[str, set[Path]] = {}
     for pid, (session_id, cwd, own_projects) in live.items():
-        worktree = (next((path for member in chains[pid]
-                          if (path := tabs.get((in_tab.get(member) or TabProcess(None, None)).handle or ""))), None)
+        worktree = (tab_worktree(pid)
                     or next((path for member in chains[pid] if (path := worktree_of(where.get(member, "")))), None))
         transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects,
                                                           *(profiles if pid in named else [])])
@@ -2221,7 +2226,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
              **({"open_pr_cleanup": True} if row.get("open_pr_cleanup") else {}),
              **({"identity": row_identity(row)} if row.get("environment") else {}),
              "codex": row["codex"][-1] if row.get("codex") else None,
-             "final_at": row_final_at(row), "read": read_key(row)}
+             "final": final_message(row), "final_at": row_final_at(row), "read": read_key(row)}
             for row in rows if needs_reader(row)]
 
 
