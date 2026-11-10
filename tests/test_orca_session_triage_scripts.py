@@ -604,12 +604,12 @@ class ClassifyTests(unittest.TestCase):
                                           ("/ghq/other", "notes", "今日のメモ", "2026-11-09T01:00:00Z")):
             write_jsonl(scan.claude_project_dir(self.projects, cwd) / f"{session_id}.jsonl",
                         [user("go"), {**assistant(text(said)), "timestamp": at}])
-        ps = subprocess.CompletedProcess([], 0, (
-            f"   80 claude --dangerously-skip-permissions --resume {resumed} PATH=/bin ORCA_TERMINAL_HANDLE=term_report\n"
-            "   70 claude PATH=/bin ORCA_TERMINAL_HANDLE=term_notes HOME=/Users/x\n   60 -zsh\n"), "")
+        ps = subprocess.CompletedProcess([], 0, (f"   80 claude --dangerously-skip-permissions --resume {resumed}\n"
+                                                "   70 claude\n   60 -zsh\n"), "")
         trees = [worktree("/w/report"), worktree("/w/notes")]
 
-        with patch.object(scan.subprocess, "run", return_value=ps):
+        with patch.object(scan.subprocess, "run", return_value=ps), \
+                patch.object(scan.rm_check, "process_handles", return_value={80: "term_report", 70: "term_notes"}):
             live = scan.running_claude_transcripts(["/w/report", "/w/notes"], [sessions], self.projects,
                                                    {80: (60, "claude"), 70: (60, "claude"), 60: (1, "-zsh")},
                                                    lambda pids: {pid: "/ghq/other" for pid in pids},
