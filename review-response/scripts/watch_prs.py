@@ -4,7 +4,10 @@
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,
 and each Codex review's status, which Codex edits into one summary comment. When
 Codex has no code review for the current head --codex-wait minutes after the
-watcher first saw that head, CODEX NONE is printed once for that head. A CI
+watcher first saw that head, CODEX NONE is printed once for that head, only in a
+repository where Codex has commented before (one search API call per repository per
+run, made when the line would be printed; a failed search prints nothing and is
+retried on the next poll). A CI
 FAILURE line ends with 未起動 ["job", ...]: <reason> for the failed GitHub Actions
 jobs whose first annotation says GitHub never started them (an Actions budget or the
 spending limit), read once per failed result with one REST call per failed job.
@@ -38,6 +41,7 @@ import time
 MIN_INTERVAL = 60
 MIN_GRAPHQL_REMAINING = 1000
 CODEX_WAIT_MINUTES = 5.0
+CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 TERMINAL = ("MERGED", "CLOSED")
 SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
@@ -122,12 +126,14 @@ def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None
 
 def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
                 unstarted: Callable[[list[dict]], dict[str, str]] = lambda checks: {},
-                now: float | None = None, codex_wait: float = CODEX_WAIT_MINUTES * 60) -> tuple[list[str], dict]:
+                now: float | None = None, codex_wait: float = CODEX_WAIT_MINUTES * 60,
+                codex_used: Callable[[], bool] = lambda: True) -> tuple[list[str], dict]:
     """Diff: return (event lines, new state) without mutating either input.
 
     `unstarted(checks)` names the failed jobs GitHub never started, with the reason (see unstarted_jobs); it is
     called only for a new CI FAILURE. `now` (epoch seconds, default the current time) and `codex_wait`
-    (seconds) decide when an open head without a Codex code review is reported.
+    (seconds) decide when an open head without a Codex code review is reported; `codex_used()`, called only
+    then, says whether Codex reviews PRs in the repository at all.
 
     snapshot contains the gh PR view fields plus reviews, line_comments and
     comments arrays, which are absent when they were not read. Absent feeds report
@@ -204,10 +210,28 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
     reviewed = (codex.get("code_review") or [""])[0]
     if (current_state == "OPEN" and head and state.get("codex_none") != head
             and not (len(reviewed) >= 7 and head.startswith(reviewed))
-            and now - state["head_seen_at"] >= codex_wait):
+            and now - state["head_seen_at"] >= codex_wait and codex_used()):
         events.append(f"{spec} CODEX NONE on head {head[:7]} after {codex_wait / 60:g} min")
         state["codex_none"] = head
     return events, state
+
+
+def codex_commented(repo: str, cache: dict[str, bool]) -> bool:
+    """Whether Codex has commented on any issue or PR in `repo`, searched once per repository and kept in `cache`.
+
+    A failed search answers False without caching, so a later poll asks again.
+    """
+    if repo not in cache:
+        try:
+            found = gh_json(["api", "-X", "GET", "search/issues", "-f", f"q=repo:{repo} commenter:{CODEX_LOGIN}",
+                             "-f", "per_page=1"])
+            if not isinstance(found, dict):
+                raise ValueError("gh search response must contain a JSON object")
+            cache[repo] = int(found["total_count"]) > 0
+        except (ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+            print(f"watch_prs: Codex history check for {repo} failed: {exc}", file=sys.stderr, flush=True)
+            return False
+    return cache[repo]
 
 
 def gh_json(args: list[str]) -> dict | list:
@@ -299,12 +323,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--codex-wait", type=codex_wait_minutes, default=CODEX_WAIT_MINUTES, metavar="MINUTES",
         help="print CODEX NONE once for a head that has no Codex code review this many minutes after the "
-             f"watcher first saw it (default: {CODEX_WAIT_MINUTES:g})",
+             "watcher first saw it, in a repository where Codex has commented before "
+             f"(default: {CODEX_WAIT_MINUTES:g})",
     )
     parser.add_argument("--once", action="store_true", help="poll one cycle and exit; exits 1 instead of sleeping on RATE_LIMIT_LOW")
     args = parser.parse_args(argv)
     try:
         states = load_state(args.state_file)
+        codex_repos: dict[str, bool] = {}
         first_cycle = True
         while True:
             had_errors = False
@@ -330,9 +356,10 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 try:
                     snapshot = fetch_snapshot(spec, previous)
-                    events, updated = diff_events(spec, previous, snapshot, args.me,
-                                                  partial(unstarted_jobs, spec.split("#", 1)[0]),
-                                                  codex_wait=args.codex_wait * 60)
+                    repo = spec.split("#", 1)[0]
+                    events, updated = diff_events(spec, previous, snapshot, args.me, partial(unstarted_jobs, repo),
+                                                  codex_wait=args.codex_wait * 60,
+                                                  codex_used=partial(codex_commented, repo, codex_repos))
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:

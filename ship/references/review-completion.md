@@ -4,9 +4,11 @@
    and configured automated review status for the current head.
 2. Address valid findings. Respond with evidence when a finding does not apply.
 3. Wait for configured automated reviews on the current head to finish. When
-   `review-response`'s `scripts/watch_prs.py` prints `CODEX NONE` for the head,
-   post a PR comment `@codex review` whose last line is this session's name, and
-   keep waiting.
+   `review-response`'s `scripts/watch_prs.py` prints `CODEX NONE` for the head
+   of a PR in a repository where Codex reviews PRs, post a PR comment
+   `@codex review` whose last line is this session's name, and keep waiting.
+   Do not ask Codex in a repository it does not review, such as an outside
+   author's project.
 4. Re-read every review and comment feed, unresolved threads, and CI. Resolve
    newly arrived findings, then repeat the completion check.
 
