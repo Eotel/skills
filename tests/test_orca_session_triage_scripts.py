@@ -4387,7 +4387,8 @@ class LeadDecisionProposalTests(unittest.TestCase):
         def gh(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(args[:2], ["gh", "api"])
             return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"repository": {
-                f"pr_{number}": {"state": "OPEN", "updatedAt": stamp} for number in (12, 14)}}}), "")
+                f"item_{number}": {"__typename": "PullRequest", "state": "OPEN", "updatedAt": stamp}
+                for number in (12, 14)}}}), "")
 
         with patch("subprocess.run", side_effect=gh) as run:
             code, shown = self.call("unanswered", "--handed-off-file", str(self.handed), "--asana-status", str(status))
@@ -4400,6 +4401,25 @@ class LeadDecisionProposalTests(unittest.TestCase):
                                            "after": [reports[2]]})
         self.assertEqual([pr["asana"] for pr in row["prs"]], [{"completed": True}, {"completed": False}])
         self.assertTrue(all("asana" not in pr for pr in json.loads(without)["unanswered"][0]["prs"]))
+
+    def test_an_issue_key_reads_the_issue_and_names_the_worktrees_working_on_it(self) -> None:
+        # 2026-11-10: spawn:Eotel/skills#159 named an issue, was read as a PR, and printed nulls.
+        write_jsonl(self.handed, [{"decision": "spawn:acme/app#159", "handed_off_at": "2026-10-01T02:00:00Z"}])
+        nodes = {"item_159": {"__typename": "Issue", "state": "OPEN", "updatedAt": "2026-10-01T03:00:00Z",
+                              "closedByPullRequestsReferences": {"nodes": [{"number": 160}]}}}
+        worktrees = [{"path": f"/w/{name}", "repo": repo, "_environment": "mbp16", "linkedIssue": issue,
+                      "linkedItems": [{"type": "pr", "number": pr}] if pr else [], "linkedPR": None}
+                     for name, repo, issue, pr in [("app-159", "app", 159, None), ("app-pr160", "app", None, 160),
+                                                   ("other-159", "other", 159, None), ("app-1", "app", 1, None)]]
+
+        with patch.object(scan, "graphql_repository", return_value=nodes), \
+                patch.object(hourly_state, "orca_worktrees", return_value=worktrees):
+            code, shown = self.call("unanswered", "--handed-off-file", str(self.handed))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(shown)["unanswered"][0]["prs"], [{
+            "repo": "acme/app", "number": 159, "type": "issue", "state": "OPEN", "updatedAt": "2026-10-01T03:00:00Z",
+            "updated_after_handoff": True, "worktrees": ["mbp16::/w/app-159", "mbp16::/w/app-pr160"]}])
 
 
 class HandoffProposalTests(unittest.TestCase):

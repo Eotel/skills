@@ -22,7 +22,7 @@ prs = json.load(open(os.environ["FAKE_GH_PRS"])).get(slug)
 if prs is None:
     sys.exit("GraphQL: Could not resolve to a Repository with the name '" + slug + "'.")
 print(json.dumps({{"data": {{"repository": {{
-    "pr_" + number: prs.get(number) for number in re.findall(r"pr_(\\d+):", query)}}}}}}))
+    alias: prs.get(number) for alias, number in re.findall(r"((?:pr|item)_(\\d+)):", query)}}}}}}))
 """
 
 
@@ -158,8 +158,8 @@ class LeadDecisionsTests(unittest.TestCase):
             {"decision": "keep-uncommitted:/w/b", "handed_off_at": "2026-10-28T01:00:00+00:00"}]))
         self.record("remove:mac::/w/a", "消す")
         self.gh_prs.write_text(json.dumps({"Eotel/orca-board": {
-            "12": {"number": 12, "state": "MERGED", "updatedAt": "2026-10-28T02:00:00Z"},
-            "14": {"number": 14, "state": "OPEN", "updatedAt": "2026-10-27T23:00:00Z"}}}))
+            "12": {"__typename": "PullRequest", "state": "MERGED", "updatedAt": "2026-10-28T02:00:00Z"},
+            "14": {"__typename": "PullRequest", "state": "OPEN", "updatedAt": "2026-10-27T23:00:00Z"}}}))
 
         result = self.run_tool("unanswered", "--handed-off-file", str(self.handed_off))
 
@@ -170,13 +170,13 @@ class LeadDecisionsTests(unittest.TestCase):
             {"decision": "merge:Eotel/orca-board#12+#14", "handed_off_at": "2026-10-28T01:00:00+00:00",
              "first_handed_off_at": "2026-10-27T01:00:00+00:00", "handoff_count": 2,
              "reports": {"before": [], "after": []}, "prs": [
-                {"repo": "Eotel/orca-board", "number": 12, "state": "MERGED", "updatedAt": "2026-10-28T02:00:00Z",
+                {"repo": "Eotel/orca-board", "number": 12, "type": "pr", "state": "MERGED", "updatedAt": "2026-10-28T02:00:00Z",
                  "updated_after_handoff": True},
-                {"repo": "Eotel/orca-board", "number": 14, "state": "OPEN", "updatedAt": "2026-10-27T23:00:00Z",
+                {"repo": "Eotel/orca-board", "number": 14, "type": "pr", "state": "OPEN", "updatedAt": "2026-10-27T23:00:00Z",
                  "updated_after_handoff": False}]},
             {"decision": "spawn:acme/web#6303::review-fix", "handed_off_at": "2026-10-27T02:00:00+00:00",
              "first_handed_off_at": "2026-10-27T02:00:00+00:00", "handoff_count": 1,
-             "reports": {"before": [], "after": []}, "prs": [{"repo": "acme/web", "number": 6303, "state": None, "updatedAt": None,
+             "reports": {"before": [], "after": []}, "prs": [{"repo": "acme/web", "number": 6303, "type": None, "state": None, "updatedAt": None,
                       "updated_after_handoff": None}]},
             {"decision": "keep-uncommitted:/w/b", "handed_off_at": "2026-10-28T01:00:00+00:00",
              "first_handed_off_at": "2026-10-28T01:00:00+00:00", "handoff_count": 1, "prs": []}])
