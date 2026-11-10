@@ -64,6 +64,13 @@ def _path_matches(probe: Callable[[], bool]) -> bool:
         return False
 
 
+def absolute_path(path: str) -> str:
+    """Normalize lexical components and Windows drive-relative paths without following links."""
+    # Path.absolute() leaves other-drive paths relative before Python 3.12;
+    # Path.resolve() would change the symlink semantics.
+    return os.path.abspath(path)  # noqa: PTH100 -- native drive-relative resolution is required
+
+
 def unicode_whitespace(ch: str) -> bool:
     if not ch: return True
     if len(ch) > 1:
@@ -865,6 +872,10 @@ def _words_home(value: str) -> str:
     """--words の値の頭の ~ を、ホームフォルダに置き換える（check と hook の _home_path と同じ決まり）。"""
     if isinstance(value, str) and (value == "~" or value[:2] in ("~/", "~" + os.sep)):
         try:
+            configured = (os.environ.get("USERPROFILE", os.environ.get("HOMEDRIVE", "") + os.environ.get("HOMEPATH", ""))
+                          if os.name == "nt" else os.environ.get("HOME"))
+            if configured is not None and not os.path.splitdrive(configured)[1].strip().strip("/" + os.sep):
+                return value
             home = str(Path("~").expanduser())
             expanded = str(Path(value).expanduser())
         except Exception:  # pwd を読めない環境など
@@ -890,14 +901,14 @@ def find_words_folder(cwd: str | None, option: str | None = None) -> str | None:
             if cwd is None:
                 raise WordsError("Error opening folder {}: 作業ディレクトリを読めないため、相対パスを決められません".format(option))
             value = str(Path(cwd) / value)
-        folder = str(Path(os.path.normpath(value)).absolute())
+        folder = absolute_path(value)
         if not _path_matches(Path(folder).is_dir):
             reason = "フォルダではありません" if _path_matches(Path(folder).exists) else "フォルダがありません"
             raise WordsError("Error opening folder {}: --words の{}".format(option, reason))
         return folder
     if cwd is None:
         return None
-    origin = Path(os.path.normpath(cwd)).absolute()
+    origin = Path(absolute_path(cwd))
     current = origin
     while True:
         if _path_matches((current / ".git").exists):

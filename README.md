@@ -41,6 +41,8 @@ git config --worktree core.hooksPath "$hook_dir"
 
 Ruff ANN/PTH and ty check every Python file without file-specific exceptions.
 The documented PTH115 exception preserves raw symlink targets.
+The two PTH100 exceptions in `yomiyasu` preserve lexical drive-relative path
+resolution on older Windows Python versions without following symlinks.
 
 ## Skills
 
@@ -65,7 +67,7 @@ The documented PTH115 exception preserves raw symlink targets.
 - `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
   This is the MIT-licensed `nanaism/yomiyasu` v2.5.0 skill with the typing and
   pathlib changes proposed in [upstream PR #54](https://github.com/nanaism/yomiyasu/pull/54),
-  at commit `d6ba9e85c76d6ba570c4c465de63b29cccb671c2`. Its 42 files match
+  at commit `d648f6339f30842ff095fc0f6d1304a9ad37dd2b`. Its 42 files match
   that unmerged PR revision byte for byte. The `.codex-plugin/plugin.json`
   metadata is omitted because APM 0.35.0 treats it as a native Codex plugin and
   refuses the shared

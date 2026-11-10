@@ -52,8 +52,9 @@ _PRINT_CONFIG_ERROR = "--print-config には claude-code か codex を渡して�
 
 
 def _absolute_path(value: str) -> str:
-    # Normalize lexical components without following symlinks (the abspath contract).
-    return str(Path(os.path.normpath(value)).absolute())
+    # Keep Windows drive-relative resolution without following symlinks. The
+    # unregistered fast path must not import the check or visibility modules.
+    return os.path.abspath(value)  # noqa: PTH100 -- Path.absolute() is incomplete before Python 3.12
 
 
 def _options(argv: list[str]) -> dict | None:
@@ -110,7 +111,8 @@ def _home_path(value: str) -> str:
     """
     if isinstance(value, str) and (value == "~" or value[:2] in ("~/", "~" + os.sep)):
         try:
-            configured = os.environ.get("USERPROFILE" if os.name == "nt" else "HOME")
+            configured = (os.environ.get("USERPROFILE", os.environ.get("HOMEDRIVE", "") + os.environ.get("HOMEPATH", ""))
+                          if os.name == "nt" else os.environ.get("HOME"))
             if configured is not None and not os.path.splitdrive(configured)[1].strip().strip("/" + os.sep):
                 return value
             home = str(Path.home())
