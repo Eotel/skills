@@ -65,10 +65,12 @@ resolution on older Windows Python versions without following symlinks.
 - `natural-japanese`: review and revise human-facing Japanese word choices;
   flag expressions for contextual review with a Python scanner.
 - `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
-  This is the MIT-licensed `nanaism/yomiyasu` v2.5.0 skill with the typing and
-  pathlib changes proposed in [upstream PR #54](https://github.com/nanaism/yomiyasu/pull/54),
-  at commit `d648f6339f30842ff095fc0f6d1304a9ad37dd2b`. Its 42 files match
-  that unmerged PR revision byte for byte. The `.codex-plugin/plugin.json`
+  This copy is based on the MIT-licensed `nanaism/yomiyasu` v2.5.0 skill with the
+  typing and pathlib changes proposed in [upstream PR #54](https://github.com/nanaism/yomiyasu/pull/54),
+  at commit `d648f6339f30842ff095fc0f6d1304a9ad37dd2b`.
+  On top of that revision, this copy adds local changes for TAB-separated
+  replacements in `flag.txt` and word lists from the original checkout in linked
+  worktrees, proposed upstream in [issue #55](https://github.com/nanaism/yomiyasu/issues/55). The `.codex-plugin/plugin.json`
   metadata is omitted because APM 0.35.0 treats it as a native Codex plugin and
   refuses the shared
   `agent-skills` target. `yomiyasu_check.py` stores copies of the original and
