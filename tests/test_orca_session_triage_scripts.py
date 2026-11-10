@@ -4739,6 +4739,38 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([(item["id"], item["answer"]) for item in recorded], [(first, "merge する"), (second, "待つ")])
 
+    def test_answer_text_takes_its_recorded_time_and_a_time_ten_minutes_off_writes_nothing(self) -> None:
+        # 2026-11-10: an answer that arrived at 13:03 was recorded with a hand-written 「12:1x」.
+        message = self.source("message.txt", "Merge?")
+        first, second, third = (self.call("asked", "--row", row, "--decision", "merge", "--final-message-file",
+                                          message, "--question-file", message)[1]["id"] for row in ("/w/a", "/w/b", "/w/c"))
+        at = "2026-11-10T13:03:19+09:00"
+        stamped = {"id": first, "answered_at": at, "answer": "答え（11/10 {answered_at}、12:00 の定時のタブ）: merge する"}
+        lines = self.root / "answered.jsonl"
+        lines.write_text(json.dumps(stamped) + "\n"
+                         + json.dumps({"id": second, "answered_at": at, "answer": "答え（11/10 12:1x）: 待つ"}) + "\n")
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            refused = hourly_state.main(["--state-file", str(self.state), "answered-many", "--file", str(lines)])
+        self.assertEqual(refused, 1)
+        self.assertIn("line 2: 12:1x is 44 minutes from answered_at 13:03 JST", err.getvalue())
+        self.assertNotIn("line 1", err.getvalue())
+        self.assertEqual([item["answer"] for item in self.call("show")[1]["questions"].values()], [None] * 3)
+
+        lines.write_text(json.dumps(stamped) + "\n"
+                         + json.dumps({"id": second, "answered_at": at, "answer": "答え（11/10 13:0x）: 待つ"}) + "\n")
+        code, recorded = self.call("answered-many", "--file", str(lines))
+        answer = self.source("answer.txt", "答え（{answered_at}）: merge する")
+        _, now = self.call("answered", "--id", third, "--answer-file", answer)
+        again = self.call("answered", "--id", third, "--answer-file", answer, "--answered-at", "2026-11-10T00:00:00Z")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([item["answer"] for item in recorded],
+                         ["答え（11/10 13:03、12:00 の定時のタブ）: merge する", "答え（11/10 13:0x）: 待つ"])
+        recorded_at = datetime.fromisoformat(now["answered_at"]).astimezone(timezone(timedelta(hours=9)))
+        self.assertEqual(now["answer"], f"答え（{recorded_at:%H:%M}）: merge する")
+        self.assertEqual(again, (0, now))
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
