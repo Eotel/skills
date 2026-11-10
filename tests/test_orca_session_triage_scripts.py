@@ -6495,6 +6495,31 @@ class InboxReadTests(unittest.TestCase):
         # A failed dispatch whose tab is gone still leaves the cursor with the newest live run.
         self.assertEqual(hourly_runtime.latest_pane(runs, frozenset({"tab14:leaf"})), "tab14:leaf")
 
+    def test_a_refused_ack_names_the_scheduled_run_that_owns_the_default_cursor(self) -> None:
+        # 11/10 09:05: after the Mac woke, the 02:00 tab was refused and thought itself the latest run.
+        scheduled = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp() * 1000)
+        runs = [{"status": "dispatched", "terminalPaneKey": "tab07:leaf", "scheduledFor": scheduled,
+                 "startedAt": scheduled + 54_000, "usage": {"providerSessionId": "36647b53"}},
+                {"status": "completed", "terminalPaneKey": "tab02:leaf", "scheduledFor": scheduled - 5 * 3_600_000,
+                 "usage": {"providerSessionId": "1b7ed179"}}]
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = Path(root) / "inbox.jsonl", Path(root) / "default.offset"
+            write_jsonl(inbox, [{"kind": "ask", "text": "new question"}])
+            transcript = Path(root) / ".claude/projects/-w-triage/36647b53.jsonl"
+            write_jsonl(transcript, [user("/orca-session-triage hourly")])
+            env = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": "", "HOME": root,
+                   "ORCA_WORKTREE_ID": "repo::/w/triage", "ORCA_PANE_KEY": "tab02:leaf"}
+            with patch.dict(os.environ, env), patch.object(inbox_read, "paths", return_value=(inbox, cursor)), \
+                    patch.object(hourly_runtime, "scheduled_runs", return_value=runs), \
+                    redirect_stderr(io.StringIO()) as error:
+                self.assertEqual(inbox_read.main(["ack", str(inbox.stat().st_size)]), 1)
+        refusal = error.getvalue()
+        self.assertIn(datetime.fromtimestamp(scheduled / 1000).astimezone().isoformat(timespec="seconds"), refusal)
+        self.assertIn("dispatched", refusal)
+        self.assertIn("pane tab07:leaf", refusal)
+        self.assertIn(str(transcript), refusal)
+        self.assertIn("not this tab (pane tab02:leaf)", refusal)
+
     def test_closed_latest_run_does_not_return_cursor_ownership_to_older_tab(self) -> None:
         runs = [{"status": "completed", "terminalPaneKey": None},
                 {"status": "completed", "terminalPaneKey": "old-pane"}]

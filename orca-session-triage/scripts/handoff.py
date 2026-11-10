@@ -12,6 +12,10 @@ ack the NEXT_OFFSET it prints: every inbox entry before it is in the handoff, an
 this run's own handoff entry unless another report reached the inbox first.
 Each sent handoff is kept in --handoffs-dir, one file per send named by its UTC time, with
 the exact text, kind, keys, time, and NEXT_OFFSET; `last` prints the newest.
+`send` does not send, and prints why, while a report another tab of this workspace sent (another
+scheduled run: after the Mac sleeps, several run at once) or an answer to an ask the body names
+(by its first 8 characters or more) reached the inbox or the answer records after --since; read them
+and fix the body, or pass --force to send it as written.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
 latest message of its own (also while a turn runs or after an API error such as a usage limit ended it),
@@ -111,28 +115,53 @@ def workspace() -> Path:
     return Path(os.environ.get("ORCA_WORKTREE_ID", "").partition("::")[2] or Path.cwd())
 
 
-def late_reports(inbox: Path, since: int) -> tuple[list[str], int]:
-    """One entry per report after `since` (asks in full, others shortened) and the complete end offset."""
+def inbox_around(inbox: Path, since: int) -> tuple[list[dict], list[dict], int]:
+    """The reports before and after `since`, and the complete end offset."""
     data = inbox.read_bytes()
     end = data.rfind(b"\n") + 1
     if not 0 <= since <= end or (since and data[since - 1] != 10):
         raise ValueError("--since must be a NEXT_OFFSET that inbox_read.py printed for this inbox")
-    entries = []
-    for raw in data[since:end].splitlines():
-        try:
-            item = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(item, dict):
-            continue
-        worktree = str(item.get("worktree") or "-")
-        where = f"{item['repo']}/{worktree}" if item.get("repo") else worktree
-        head = f"- {item.get('ts') or '-'} {item.get('kind') or '-'} {where} id={item.get('id') or '-'}"
-        text = str(item.get("text") or "")
-        compact = " ".join(text.split())
-        entries.append(f"{head}\n{text}" if item.get("kind") == "ask" else
-                       f"{head}  {compact[:EXCERPT]}" + ("…" if len(compact) > EXCERPT else ""))
-    return entries, end
+    return [item for item in map(inbox_read.entry, data[:since].splitlines()) if item], \
+        [item for item in map(inbox_read.entry, data[since:end].splitlines()) if item], end
+
+
+def report_head(item: dict) -> str:
+    worktree = str(item.get("worktree") or "-")
+    where = f"{item['repo']}/{worktree}" if item.get("repo") else worktree
+    return f"- {item.get('ts') or '-'} {item.get('kind') or '-'} {where} id={item.get('id') or '-'}"
+
+
+def excerpt(text: object) -> str:
+    compact = " ".join(str(text or "").split())
+    return compact[:EXCERPT] + ("…" if len(compact) > EXCERPT else "")
+
+
+def late_reports(reports: list[dict]) -> list[str]:
+    """One entry per report after `since` (asks in full, others shortened)."""
+    return [f"{report_head(item)}\n{item.get('text') or ''}" if item.get("kind") == "ask" else
+            f"{report_head(item)}  {excerpt(item.get('text'))}" for item in reports]
+
+
+def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_read.Sender, handle: str,
+              answers: Path) -> list[str]:
+    """What reached the inbox or the answer records after `since` that the handoff may repeat or contradict:
+    each report another tab of this workspace sent (`handle` is this tab's), and each answer recorded since then
+    to an ask the body names by its first 8 characters or more."""
+    found = [f"{report_head(item)} (another tab of this workspace: {item.get('handle') or '-'})  "
+             f"{excerpt(item.get('text'))}" for item in after if sender.sent(item) and item.get("handle", "") != handle]
+    named = {item["id"] for item in [*before, *after] if item.get("kind") == "ask" and isinstance(item.get("id"), str)
+             and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
+    read_at = max(filter(None, (scan_sessions.parse_time(item.get("ts")) for item in before)), default=None)
+    try:
+        records = answers.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        records = []
+    for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
+        ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
+        if ask in named and (read_at is None or at is None or at > read_at):
+            found.append(f"- answered {record['id']} at {record.get('ts') or '-'} ({record.get('how') or '-'})  "
+                         f"{excerpt(record.get('note'))}")
+    return found
 
 
 def lead_claude(projects: Path, worktree: str) -> dict | None:
@@ -265,7 +294,15 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
     inbox = args.inbox.expanduser()
-    reports, end = late_reports(inbox, args.since)
+    before, after, end = inbox_around(inbox, args.since)
+    if not args.force and (found := overtaken(body, before, after, sender,
+                                              os.environ.get("ORCA_TERMINAL_HANDLE", ""), inbox_read.answers_path())):
+        print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
+              "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; --force sends it "
+              "as written:",
+              *found, sep="\n", file=sys.stderr)
+        return 1
+    reports = late_reports(after)
     facts = ["—— 送る直前に道具が足した事実 ——",
              f"走査の開始後に届いた報告: {len(reports)} 件" + ("" if reports else "（なし）"), *reports]
     if args.lead_worktree:
@@ -330,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
                               help="a handed-off question's key, as given to lead_decisions.py; repeat per question")
     send_command.add_argument("--decision-ask", action="append", default=[], metavar="KEY=ID",
                               help="bind a --decision key to an inbox ask id; repeat per key")
+    send_command.add_argument("--force", action="store_true",
+                              help="send even though another tab of this workspace reported, or an ask the body "
+                                   "names was answered, after --since")
     send_command.add_argument("--kind", choices=("ask", "info"), default="ask",
                               help="triage-notify kind (default: ask)")
     send_command.add_argument("--inbox", type=Path, default=Path(os.environ.get("TRIAGE_INBOX") or INBOX),

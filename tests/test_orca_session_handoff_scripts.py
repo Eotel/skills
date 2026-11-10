@@ -49,6 +49,8 @@ class HandoffTests(unittest.TestCase):
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True,
                               env={**os.environ, "ORCA_WORKTREE_ID": "repo1::/w/triage", "TRIAGE_HOST": "mac-a",
+                                   "ORCA_TERMINAL_HANDLE": "term_me",
+                                   "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl"),
                                    "CLAUDE_CONFIG_DIR": str(self.root), "CLAUDE_PID": "86520", **(env or {})})
 
     def last(self) -> subprocess.CompletedProcess[str]:
@@ -104,6 +106,55 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("消してよい", result.stderr)
         self.assertFalse(self.sent.exists())
         self.assertFalse(self.handed_off.exists())
+
+    def test_refuses_while_another_tab_of_this_workspace_reported_after_the_scan(self) -> None:
+        # 11/10 09:08: the 07:00 tab handed off 4 asks as open after the 02:00 tab of the same workspace
+        # handed off (09:05) and corrected them as answered (09:06).
+        seen = json.dumps({"id": "s1", "ts": "2026-11-10T09:00:00+09:00", "kind": "info", "worktree": "a",
+                           "text": "前"}) + "\n"
+        mine = {"id": "m1", "kind": "info", "host": "mac-a", "worktree": "triage", "handle": "term_me",
+                "text": "この回の経過"}
+        other = {"id": "o1", "ts": "2026-11-10T09:06:46+09:00", "kind": "info", "host": "mac-a",
+                 "worktree": "triage", "handle": "term_02", "text": "02:00 の定時のタブから、09:05 の引き継ぎの訂正です"}
+        self.inbox.write_text(seen + json.dumps(mine, ensure_ascii=False) + "\n")
+        self.assertEqual(self.run_tool("--since", str(len(seen.encode()))).returncode, 0)
+        self.sent.unlink()
+
+        with self.inbox.open("a") as stream:
+            stream.write(json.dumps(other, ensure_ascii=False) + "\n")
+        result = self.run_tool("--since", str(len(seen.encode())))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("id=o1", result.stderr)
+        self.assertIn("09:05 の引き継ぎの訂正", result.stderr)
+        self.assertFalse(self.sent.exists())
+        self.assertEqual(self.run_tool("--since", str(len(seen.encode())), "--force").returncode, 0)
+        self.assertTrue(self.sent.exists())
+
+    def test_refuses_while_an_ask_the_body_names_was_answered_after_the_scan(self) -> None:
+        ask = {"id": "f439c015-aaaa-bbbb-cccc-000000000001", "ts": "2026-11-09T18:00:00+09:00", "kind": "ask",
+               "worktree": "lane", "text": "投稿してよいですか"}
+        older = {"id": "87fc0252-aaaa-bbbb-cccc-000000000002", "ts": "2026-11-09T18:10:00+09:00", "kind": "ask",
+                 "worktree": "lane2", "text": "merge してよいですか"}
+        scanned = {"id": "s1", "ts": "2026-11-10T09:00:00+09:00", "kind": "info", "worktree": "a", "text": "走査の前"}
+        seen = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in (ask, older, scanned))
+        self.inbox.write_text(seen)
+        (self.root / "ask-answers.jsonl").write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in [
+            {"id": older["id"], "ts": "2026-11-09T18:20:00+09:00", "how": "send", "note": "merge する"}]))
+        self.body.write_text("未回答: ask f439c015（投稿）と ask 87fc0252（merge）\n")
+        self.assertEqual(self.run_tool("--since", str(len(seen.encode()))).returncode, 0)
+        self.sent.unlink()
+
+        with (self.root / "ask-answers.jsonl").open("a") as stream:
+            stream.write(json.dumps({"id": ask["id"], "ts": "2026-11-10T09:02:00+09:00", "how": "send",
+                                     "note": "三浦さんの答え: 投稿しない"}, ensure_ascii=False) + "\n")
+        result = self.run_tool("--since", str(len(seen.encode())))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(ask["id"], result.stderr)
+        self.assertIn("投稿しない", result.stderr)
+        self.assertNotIn(older["id"], result.stderr)
+        self.assertFalse(self.sent.exists())
 
     def test_send_signs_the_end_with_the_session_name_and_start_time_in_place_of_the_body_signature(self) -> None:
         self.inbox.write_text("")

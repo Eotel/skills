@@ -710,6 +710,16 @@ def watch(inbox: Path, cursor: Path, answers: Path, once: bool, interval: float,
         time.sleep(interval)
 
 
+def owner_line(run: dict) -> str:
+    """The run as `hourly_runs.py` lists it: scheduled time, status, start, pane, and transcript (its session)."""
+    import hourly_runs  # here: it imports scan_sessions, which imports this module
+
+    try:
+        return hourly_runs.run_of(run, Path.home()).line()
+    except (OSError, ValueError) as error:
+        return f"pane {run.get('terminalPaneKey') or '-'}, {run.get('status') or '-'}; transcript unread: {error}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -776,11 +786,16 @@ def main(argv: list[str] | None = None) -> int:
         # watch skips info as it advances: on the scheduled run's cursor it would hide them from that run.
         if args.action == "watch" and not os.environ.get("TRIAGE_READ_OFFSET"):
             raise ValueError("watch needs a cursor of its own: set TRIAGE_READ_OFFSET")
-        if (args.action == "ack" and not os.environ.get("TRIAGE_READ_OFFSET") and
-                not hourly_runtime.current_pane(os.environ.get("ORCA_CLI_COMMAND", "orca"))):
-            raise ValueError("the default inbox cursor belongs to the latest scheduled triage tab; read without "
-                             "it: ~/.cache/orca-briefs/bin/inbox --since HH:MM --wt NAME (HH:MM: when this run "
-                             "began; NAME: the worktree whose reports to read), or read --since HH:MM")
+        if args.action == "ack" and not os.environ.get("TRIAGE_READ_OFFSET"):
+            mine, owner = hourly_runtime.cursor_owner(os.environ.get("ORCA_CLI_COMMAND", "orca"))
+            if not mine:
+                # After the Mac sleeps, several scheduled tabs run at once: name the one that owns the cursor.
+                named = (f" ({owner_line(owner)}), not this tab (pane {os.environ.get('ORCA_PANE_KEY') or '-'})"
+                         if owner else "")
+                raise ValueError(f"the default inbox cursor belongs to the latest scheduled triage tab{named}; "
+                                 "read without it: ~/.cache/orca-briefs/bin/inbox --since HH:MM --wt NAME "
+                                 "(HH:MM: when this run began; NAME: the worktree whose reports to read), "
+                                 "or read --since HH:MM")
         if args.action == "read":
             source = SourceFilter.of(args.source, inbox_entries(inbox)) if args.source is not None else None
             options = ReadOptions(brief=args.brief, kinds=args.kind, source=source, summary=args.summary,
