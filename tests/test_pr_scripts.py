@@ -241,7 +241,7 @@ new_feature = []
             REVIEW_FIRST_BODY + "\n\nlogin random clog brand log1 rand2 1log 2rand\n"
             "log_name rand_name name_log name_rand\n"
             "log-name rand-name name-log name-rand\n"
-            "log.name rand.name name.log name.rand",
+            "log.name rand.name name.log name.rand\n<!-- log rand -->",
             encoding="utf-8",
         )
         status, out, _ = self.run_main(*argv)

@@ -36,6 +36,10 @@ _REMOTE_RE = re.compile(r"github\.com[:/](?P<repo>[^/]+/[^/]+)$")
 _REPO_RE = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
 _LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_NAME_SEPARATORS_RE = re.compile(r"[-_.]+")
+# A manifest entry is (where, name): where is "dependency", "feature" for a declared
+# feature or extra, or "feature of <dependency>" for a feature requested on a dependency.
+type ManifestEntry = tuple[str, str]
 # CommonMark fenced code: up to 3 spaces of indent, closed by the same character at least as
 # long; an unclosed fence runs to the end. A backtick fence line holds no other backtick.
 _FENCE_RE = re.compile(
@@ -56,12 +60,6 @@ class Undecided(Exception):
 class Section:
     title: str
     body: str
-
-
-@dataclass(frozen=True)
-class ManifestNames:
-    dependency_features: dict[str, set[str]]
-    declared_features: set[str]
 
 
 @dataclass(frozen=True)
@@ -209,19 +207,20 @@ def check(body: str, template: Template) -> list[str]:
     return problems
 
 
-def read_package_json(content: str) -> ManifestNames:
+def read_package_json(content: str) -> set[ManifestEntry]:
     document = json.loads(content)
-    dependencies: dict[str, set[str]] = {}
-    for group in (
-        "dependencies", "devDependencies", "peerDependencies", "optionalDependencies"
-    ):
-        dependencies.update((name, set()) for name in document.get(group, {}))
-    return ManifestNames(dependencies, set())
+    return {
+        ("dependency", name)
+        for group in (
+            "dependencies", "devDependencies", "peerDependencies", "optionalDependencies"
+        )
+        for name in document.get(group, {})
+    }
 
 
-def read_cargo_toml(content: str) -> ManifestNames:
+def read_cargo_toml(content: str) -> set[ManifestEntry]:
     document = tomllib.loads(content)
-    dependencies: dict[str, set[str]] = {}
+    entries: set[ManifestEntry] = set()
     packages: dict[str, str] = {}
     tables = [
         document,
@@ -231,29 +230,30 @@ def read_cargo_toml(content: str) -> ManifestNames:
     for table in tables:
         for group in ("dependencies", "dev-dependencies", "build-dependencies"):
             for alias, spec in table.get(group, {}).items():
-                name = spec.get("package", alias) if isinstance(spec, dict) else alias
-                packages[alias] = name
-                requested = spec.get("features", ()) if isinstance(spec, dict) else ()
-                dependencies.setdefault(name, set()).update(requested)
+                details = spec if isinstance(spec, dict) else {}
+                name = packages[alias] = details.get("package", alias)
+                entries.add(("dependency", name))
+                entries.update((f"feature of {name}", feature) for feature in details.get("features", ()))
     features = document.get("features", {})
+    entries.update(("feature", feature) for feature in features)
     # A feature can turn on a dependency's feature: json = ["serde_json/preserve_order"].
     for enabled in features.values():
         for item in enabled:
             alias, slash, feature = item.partition("/")
             if slash:
                 alias = alias.removesuffix("?")
-                dependencies.setdefault(packages.get(alias, alias), set()).add(feature)
-    return ManifestNames(dependencies, set(features))
+                entries.add((f"feature of {packages.get(alias, alias)}", feature))
+    return entries
 
 
 def normalize_python_name(name: str) -> str:
     """PEP 503 normalization for package and extra names."""
-    return re.sub(r"[-_.]+", "-", name).lower()
+    return _NAME_SEPARATORS_RE.sub("-", name).lower()
 
 
-def read_pyproject_toml(content: str) -> ManifestNames:
+def read_pyproject_toml(content: str) -> set[ManifestEntry]:
     document = tomllib.loads(content)
-    dependencies: dict[str, set[str]] = {}
+    entries: set[ManifestEntry] = set()
     project = document.get("project", {})
     optional = project.get("optional-dependencies", {})
     groups = [
@@ -274,8 +274,9 @@ def read_pyproject_toml(content: str) -> ManifestNames:
             if match is None:
                 raise ValueError(f"cannot read dependency: {requirement!r}")
             name = normalize_python_name(match["name"])
-            dependencies.setdefault(name, set()).update(
-                normalize_python_name(extra.strip())
+            entries.add(("dependency", name))
+            entries.update(
+                (f"feature of {name}", normalize_python_name(extra.strip()))
                 for extra in (match["extras"] or "").split(",")
                 if extra.strip()
             )
@@ -287,23 +288,25 @@ def read_pyproject_toml(content: str) -> ManifestNames:
                 continue
             # A Poetry spec is a version string, a table, or a list of tables.
             specs = spec if isinstance(spec, list) else [spec]
-            dependencies.setdefault(normalized, set()).update(
-                normalize_python_name(extra)
+            entries.add(("dependency", normalized))
+            entries.update(
+                (f"feature of {normalized}", normalize_python_name(extra))
                 for item in specs if isinstance(item, dict)
                 for extra in item.get("extras", ())
             )
     extras = (*optional, *poetry.get("extras", {}))
-    return ManifestNames(dependencies, {normalize_python_name(name) for name in extras})
+    entries.update(("feature", normalize_python_name(name)) for name in extras)
+    return entries
 
 
-MANIFEST_READERS: dict[str, Callable[[str], ManifestNames]] = {
+MANIFEST_READERS: dict[str, Callable[[str], set[ManifestEntry]]] = {
     "package.json": read_package_json,
     "Cargo.toml": read_cargo_toml,
     "pyproject.toml": read_pyproject_toml,
 }
 
 
-def manifest_names(path: str, content: str) -> ManifestNames:
+def manifest_names(path: str, content: str) -> set[ManifestEntry]:
     """Read a supported manifest, keeping its path in parse errors."""
     try:
         return MANIFEST_READERS[Path(path).name](content)
@@ -325,16 +328,13 @@ def added_manifest_names(repo_dir: Path, base: str) -> set[str]:
         path = next(changes) if status.startswith("R") else old_path
         if Path(path).name not in MANIFEST_READERS:
             continue
-        before = ManifestNames({}, set())
+        before: set[ManifestEntry] = set()
         if status != "A" and Path(old_path).name in MANIFEST_READERS:
             before = manifest_names(
                 old_path, _run(("git", "show", f"{ancestor}:{old_path}"), repo_dir)
             )
         after = manifest_names(path, _run(("git", "show", f"HEAD:{path}"), repo_dir))
-        added.update(after.dependency_features.keys() - before.dependency_features.keys())
-        added.update(after.declared_features - before.declared_features)
-        for name, features in after.dependency_features.items():
-            added.update(features - before.dependency_features.get(name, set()))
+        added.update(name for _, name in after - before)
     return added
 
 
@@ -343,7 +343,7 @@ def body_mentions_name(body: str, name: str) -> bool:
 
     Runs of -, _ and . match each other, so typing_extensions names the normalized typing-extensions.
     """
-    spelling = "[-_.]+".join(re.escape(part) for part in re.split(r"[-_.]+", name))
+    spelling = "[-_.]+".join(re.escape(part) for part in _NAME_SEPARATORS_RE.split(name))
     return re.search(
         rf"(?<![A-Za-z0-9_.-]){spelling}(?![A-Za-z0-9_.-])",
         body,
@@ -408,10 +408,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         problems = check(body, template)
         if args.base is not None:
+            visible = _COMMENT_RE.sub("", body)
             problems += [
                 f"missing added dependency/feature in body: {name}"
                 for name in sorted(added_manifest_names(args.repo_dir, args.base))
-                if not body_mentions_name(body, name)
+                if not body_mentions_name(visible, name)
             ]
     except Undecided as error:
         print(f"cannot check PR: {error}", file=sys.stderr)
