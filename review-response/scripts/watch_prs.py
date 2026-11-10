@@ -2,7 +2,9 @@
 """Poll a re-read list of owner/repo#N PRs and persist event history as JSON.
 
 Events: merged or closed, CI result per head, conflicts, new reviews and comments,
-and each Codex review's status, which Codex edits into one summary comment. A CI
+and each Codex review's status, which Codex edits into one summary comment. When
+Codex has no code review for the current head --codex-wait minutes after the
+watcher first saw that head, CODEX NONE is printed once for that head. A CI
 FAILURE line ends with 未起動 ["job", ...]: <reason> for the failed GitHub Actions
 jobs whose first annotation says GitHub never started them (an Actions budget or the
 spending limit), read once per failed result with one REST call per failed job.
@@ -35,6 +37,7 @@ import time
 
 MIN_INTERVAL = 60
 MIN_GRAPHQL_REMAINING = 1000
+CODEX_WAIT_MINUTES = 5.0
 TERMINAL = ("MERGED", "CLOSED")
 SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILURE = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
@@ -118,11 +121,13 @@ def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None
 
 
 def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
-                unstarted: Callable[[list[dict]], dict[str, str]] = lambda checks: {}) -> tuple[list[str], dict]:
+                unstarted: Callable[[list[dict]], dict[str, str]] = lambda checks: {},
+                now: float | None = None, codex_wait: float = CODEX_WAIT_MINUTES * 60) -> tuple[list[str], dict]:
     """Diff: return (event lines, new state) without mutating either input.
 
     `unstarted(checks)` names the failed jobs GitHub never started, with the reason (see unstarted_jobs); it is
-    called only for a new CI FAILURE.
+    called only for a new CI FAILURE. `now` (epoch seconds, default the current time) and `codex_wait`
+    (seconds) decide when an open head without a Codex code review is reported.
 
     snapshot contains the gh PR view fields plus reviews, line_comments and
     comments arrays, which are absent when they were not read. Absent feeds report
@@ -192,6 +197,16 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
             events.append(f"{spec} CODEX {kind} {status.upper()} (head {sha[:9]}{note})")
         codex[kind] = signature
     state["codex"] = codex
+    head = snapshot.get("headRefOid") or ""
+    now = time.time() if now is None else now
+    if head != state.get("head"):
+        state["head"], state["head_seen_at"] = head, now
+    reviewed = (codex.get("code_review") or [""])[0]
+    if (current_state == "OPEN" and head and state.get("codex_none") != head
+            and not (len(reviewed) >= 7 and head.startswith(reviewed))
+            and now - state["head_seen_at"] >= codex_wait):
+        events.append(f"{spec} CODEX NONE on head {head[:7]} after {codex_wait / 60:g} min")
+        state["codex_none"] = head
     return events, state
 
 
@@ -264,6 +279,13 @@ def poll_interval(value: str) -> float:
     return interval
 
 
+def codex_wait_minutes(value: str) -> float:
+    minutes = float(value)
+    if not 0 < minutes < float("inf"):
+        raise argparse.ArgumentTypeError("codex wait must be a positive, finite number of minutes")
+    return minutes
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("list_file", type=Path, help="one owner/repo#N per line; blank lines and # comments are ignored")
@@ -273,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--interval", type=poll_interval, default=MIN_INTERVAL,
         help=f"poll interval in seconds, at least {MIN_INTERVAL}; smaller values are rejected (default: {MIN_INTERVAL})",
+    )
+    parser.add_argument(
+        "--codex-wait", type=codex_wait_minutes, default=CODEX_WAIT_MINUTES, metavar="MINUTES",
+        help="print CODEX NONE once for a head that has no Codex code review this many minutes after the "
+             f"watcher first saw it (default: {CODEX_WAIT_MINUTES:g})",
     )
     parser.add_argument("--once", action="store_true", help="poll one cycle and exit; exits 1 instead of sleeping on RATE_LIMIT_LOW")
     args = parser.parse_args(argv)
@@ -304,7 +331,8 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     snapshot = fetch_snapshot(spec, previous)
                     events, updated = diff_events(spec, previous, snapshot, args.me,
-                                                  partial(unstarted_jobs, spec.split("#", 1)[0]))
+                                                  partial(unstarted_jobs, spec.split("#", 1)[0]),
+                                                  codex_wait=args.codex_wait * 60)
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:
