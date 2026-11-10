@@ -1659,8 +1659,9 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
     for index, ref in enumerate(refs):
         if isinstance(ref, Item):
             alias = f"item_{ref.number}"
-            fields.append(f"{alias}: issueOrPullRequest(number: {ref.number}) "
-                          "{ ... on Issue { state updatedAt } ... on PullRequest { state updatedAt headRefOid } }")
+            fields.append(f"{alias}: issueOrPullRequest(number: {ref.number}) {{ __typename "
+                          f"... on Issue {{ state updatedAt closedByPullRequestsReferences(first: {GRAPHQL_CHUNK}) "
+                          "{ nodes { number } } } ... on PullRequest { state updatedAt headRefOid } }")
         elif isinstance(ref, int):
             alias = f"pr_{ref}"
             fields.append(f"{alias}: pullRequest(number: {ref}) {{ ...PrFacts }}")

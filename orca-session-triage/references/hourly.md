@@ -225,11 +225,13 @@ unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]
 Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and
 `handoff_count`. Settled keys include the decision or bound ask's answer record;
 old handoffs without an ask binding still read. For a
-key naming PRs (`merge:owner/repo#136`, `merge:owner/repo#12+#14`,
-`spawn:owner/repo#6303::review-fix`) it adds each PR's `state`, `updatedAt`,
-and `updated_after_handoff`, read with one GitHub query per repository, plus inbox
-reports naming the key, PR reference, or URL, split before and after the last
-handoff. `--asana-status OUT_JSON` adds each PR's current `asana` object from the
+key naming PRs or issues (`merge:owner/repo#136`, `merge:owner/repo#12+#14`,
+`spawn:owner/repo#6303::review-fix`, `spawn:owner/repo#159`) it adds each one's
+`type` (`pr` or `issue`), `state`, `updatedAt`, and `updated_after_handoff`, read
+with one GitHub query per repository, plus inbox reports naming the key, PR
+reference, or URL, split before and after the last handoff. An issue also has
+`worktrees`: the Orca worktrees linked to it or to a PR that closes it (`[]` for
+none, null when Orca could not be read). `--asana-status OUT_JSON` adds each PR's current `asana` object from the
 run's saved status output; without it, no Asana values are attached. A
 repository gh cannot read leaves them null and is named on stderr. Carry each
 key still open into this handoff. When its PR changed since (merged, closed,

@@ -13,9 +13,10 @@ handoff.py appends each key it hands off to a second log; `handed_off` reads it,
 writes what a question decides (asana_pr.py) can hold the write while the key has no answer.
 `unanswered` prints open keys and settled keys with their answer records. Open keys carry their
 first and last hand-off times and count; a bound inbox ask's answer also settles a key.
-For a key naming PRs (`merge:owner/repo#12+#14`) it adds each PR's state, updatedAt, whether it
-was updated after that hand-off, named inbox reports, and values from --asana-status when given.
-GitHub is read with one query per repository. `show --match` and `--since-last-handoff` print
+For a key naming PRs or issues (`merge:owner/repo#12+#14`, `spawn:owner/repo#159`) it adds each one's
+type, state, updatedAt, whether it was updated after that hand-off, named inbox reports, and values
+from --asana-status when given; an issue also names the Orca worktrees working on it.
+GitHub is read with one query per repository, and Orca once, only when a key names an issue. `show --match` and `--since-last-handoff` print
 one line per matching answer, newest first in JST, marking remove keys whose paths still exist.
 """
 
@@ -27,6 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -96,12 +98,23 @@ class PrState:
     state: str | None
     updated_at: str | None
     head: str | None = None
+    type: str | None = None  # "issue" or "pr" when read with include_issues
+    closing_prs: frozenset[int] = frozenset()  # an issue's PRs that close it
+
+
+ITEM_TYPES = {"Issue": "issue", "PullRequest": "pr"}
 
 
 class PrStates(Protocol):
     """The state and last update of some PRs of one repository, by number; None when it cannot be read."""
 
     def __call__(self, repo: str, numbers: list[int], /) -> Mapping[int, PrState] | None: ...
+
+
+class IssueWorkers(Protocol):
+    """The worktrees working on an issue: linked to it, or to a PR that closes it; None when they cannot be read."""
+
+    def __call__(self, repo: str, number: int, closing_prs: frozenset[int], /) -> list[str] | None: ...
 
 
 @dataclass(frozen=True)
@@ -231,7 +244,8 @@ def github_pr_states(repo: str, numbers: list[int], *, include_issues: bool = Fa
     """PrStates read from GitHub with scan_sessions' query, one GraphQL query per GRAPHQL_CHUNK PRs.
 
     A repository gh cannot read gives None, and scan_sessions names it on stderr; a number GitHub has no
-    PR for (an issue, or a typo in the key) is left out and named on stderr.
+    PR for (an issue, or a typo in the key) is left out and named on stderr. With include_issues, issues are
+    read too, with their type and the PRs that close them.
     """
     # Imported here: tools that import this module only to read its logs (asana_pr.py) do not load the scan.
     import scan_sessions
@@ -244,13 +258,44 @@ def github_pr_states(repo: str, numbers: list[int], *, include_issues: bool = Fa
     if any(repository is None for repository, _ in read):
         return None
     found = {(ref.number if isinstance(ref, scan_sessions.Item) else int(ref)):
-             PrState(node.get("state"), node.get("updatedAt"), node.get("headRefOid"))
+             PrState(node.get("state"), node.get("updatedAt"), node.get("headRefOid"),
+                     ITEM_TYPES.get(node.get("__typename") or ""), frozenset(
+                         closing["number"] for closing in (node.get("closedByPullRequestsReferences") or {}).get(
+                             "nodes") or [] if isinstance(closing, dict) and isinstance(closing.get("number"), int)))
              for repository, aliases in read for alias, ref in aliases.items()
              if isinstance(ref, (int, scan_sessions.Item)) and isinstance(node := (repository or {}).get(alias), dict)}
     missing = [f"#{number}" for number in numbers if number not in found]
     if missing:
-        print(f"GitHub has no PR {' '.join(missing)} in {repo}, so its fields are null", file=sys.stderr)
+        print(f"GitHub has no {'issue or ' if include_issues else ''}PR {' '.join(missing)} in {repo}, "
+              "so its fields are null", file=sys.stderr)
     return found
+
+
+def github_item_states(repo: str, numbers: list[int]) -> Mapping[int, PrState] | None:
+    """PrStates of issues and PRs alike: a decision key's #number may name either."""
+    return github_pr_states(repo, numbers, include_issues=True)
+
+
+def orca_issue_workers(orca: str) -> IssueWorkers:
+    """IssueWorkers from Orca's worktrees, read on the first call, as hourly_state links a checkout to an issue."""
+    # Imported here: hourly_state imports this module, and only a key naming an issue needs Orca.
+    import hourly_state
+
+    read: list[list[hourly_state.Checkout] | None] = []
+
+    def workers(repo: str, number: int, closing_prs: frozenset[int]) -> list[str] | None:
+        if not read:
+            try:
+                read.append(hourly_state.OrcaHost(orca).checkouts())
+            except hourly_state.READ_ERRORS as error:
+                print(f"Orca worktrees unreadable, so issue worktrees are null: {error}", file=sys.stderr)
+                read.append(None)
+        if (checkouts := read[0]) is None:
+            return None
+        issue = hourly_state.Issue(repo=repo, number=number, title="", url="", closing_prs=closing_prs, assignees=())
+        return [checkout.identity for checkout in checkouts if checkout.works_on(issue)]
+
+    return workers
 
 
 def moment(value: str | None) -> datetime | None:
@@ -262,12 +307,17 @@ def moment(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def pr_view(pr: PullRequest, states: Mapping[int, PrState] | None, handed_off_at: str) -> dict[str, object]:
+def pr_view(pr: PullRequest, states: Mapping[int, PrState] | None, handed_off_at: str,
+            workers: IssueWorkers) -> dict[str, object]:
     found = (states or {}).get(pr.number)
     state, updated_at = (found.state, found.updated_at) if found else (None, None)
     updated, handed = moment(updated_at), moment(handed_off_at)
-    return {"repo": pr.repo, "number": pr.number, "state": state, "updatedAt": updated_at,
-            "updated_after_handoff": updated > handed if updated and handed else None}
+    view: dict[str, object] = {"repo": pr.repo, "number": pr.number, "type": found.type if found else None,
+                               "state": state, "updatedAt": updated_at,
+                               "updated_after_handoff": updated > handed if updated and handed else None}
+    if found and found.type == "issue":
+        view["worktrees"] = workers(pr.repo, pr.number, found.closing_prs)
+    return view
 
 
 def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None,
@@ -316,7 +366,7 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
-                  decisions: list[str] | None = None) -> dict[str, list[dict]]:
+                  workers: IssueWorkers, decisions: list[str] | None = None) -> dict[str, list[dict]]:
     """Open keys with their hand-off history and PR facts, and settled keys with the answering record."""
     history: dict[str, list[HandOff]] = {}
     for item in handed:
@@ -341,7 +391,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     unanswered = []
     for key, item in last.items():
         at = item.handed_off_at if item else None
-        views = [pr_view(pr, states[pr.repo], at or "") for pr in named[key]]
+        views = [pr_view(pr, states[pr.repo], at or "", workers) for pr in named[key]]
         for pr, view in zip(named[key], views):
             url = f"https://github.com/{pr.repo}/pull/{pr.number}"
             if url in asana:
@@ -377,7 +427,7 @@ def show_answers(items: Iterable[Decision], words: list[str], since: datetime | 
     return shown
 
 
-def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -> int:
+def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--decisions-file", type=Path, default=DEFAULT_LOG, help="append-only JSONL log")
     commands = parser.add_subparsers(dest="action", required=True)
@@ -408,6 +458,9 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")
     unanswered.add_argument("--asana-status", type=Path, help="OUT_JSON already written by asana99_status.py")
+    unanswered.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                            help="Orca CLI that lists the worktrees working on an issue a key names "
+                                 "(default: $ORCA_CLI_COMMAND or orca)")
     unanswered.add_argument("--summary", action="store_true",
                             help="one line per unanswered key, followed by the settled count")
     args = parser.parse_args(argv)
@@ -452,7 +505,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_pr_states) -
             asana = ({item["url"]: item["asana"] for item in
                       json.loads(args.asana_status.expanduser().read_text(encoding="utf-8"))} if args.asana_status else {})
             result = open_handoffs(handed_off(args.handed_off_file.expanduser()), latest(records(log)), read_prs,
-                                   ask_answers(inbox_read.answers_path().expanduser()), entries, asana, args.decision)
+                                   ask_answers(inbox_read.answers_path().expanduser()), entries, asana,
+                                   orca_issue_workers(args.orca), args.decision)
             if args.summary:
                 for item in result["unanswered"]:
                     print(item["decision"])
