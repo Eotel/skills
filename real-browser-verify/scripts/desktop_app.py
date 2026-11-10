@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -163,14 +164,20 @@ def launch(tools: Path, binary: Path, args: list[str], env: list[tuple[str, str]
     )
 
 
+def terminate(pid: int, running: Callable[[], bool]) -> None:
+    """Send SIGTERM, then SIGKILL if the app is still running after 5 seconds."""
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while running() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if running():
+        os.kill(pid, signal.SIGKILL)
+
+
 def end(process: subprocess.Popen[bytes]) -> None:
-    """Stop an app that launch gave up on, with SIGKILL if SIGTERM does not end it within 5 seconds."""
-    process.terminate()
-    try:
-        process.wait(5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    """Stop and reap an app that launch gave up on."""
+    terminate(process.pid, lambda: process.poll() is None)
+    process.wait()
 
 
 def tail(path: Path, lines: int = 20) -> str:
@@ -212,12 +219,7 @@ def send(tools: Path, pid: int, command: list[str], timeout: float) -> str:
 def stop(tools: Path, pid: int) -> None:
     run = Run.load(tools, pid)
     if run.running():
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 5
-        while run.running() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if run.running():
-            os.kill(pid, signal.SIGKILL)
+        terminate(pid, run.running)
     Run.record(tools, pid).unlink()
 
 
