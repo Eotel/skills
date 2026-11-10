@@ -39,14 +39,16 @@ the images to the repository.
 
 ## Check
 
-Run `scripts/pr_template.py check <body-file> --repo-dir <checkout>` (`-` reads stdin).
-It fails on a missing, misordered, or empty heading at the template's top heading level. It checks shape only: whether the first
-section says what happened to users or data is still the writer's job. A repository's own CI
-check on PR bodies, where one exists, has the final say.
+Run `scripts/pr_template.py check <body-file> --repo-dir <checkout> --base <PR base branch>`
+(`-` reads stdin; `check --help` describes the diff rules).
+It fails on missing, misordered, or empty template headings, or added dependency, feature,
+or extra names absent from the body.
 
 ## Done
 
 - `check` passes on the body that is posted.
+- A PR that adds a dependency, feature, setting, or mechanism explains why it is needed,
+  which alternative fixes were not chosen, and when it can be removed.
 - A PR that changes a screen shows its before/after PNGs in the posted body, with no local path
   left.
 - Verified results and unverified points are listed apart; nothing unverified reads as fact.
