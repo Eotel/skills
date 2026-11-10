@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 from functools import cached_property
 import hashlib
@@ -50,6 +50,12 @@ EXCERPT = 160
 # A question's 「関わる issue」 on GitHub: owner/name#12, or the issue's or PR's URL. A Backlog key is not read.
 GITHUB_REF = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)(?:#|/(?:issues|pull)/)(\d+)")
 CLOSED_STATES = frozenset(("CLOSED", "MERGED"))
+JST = timezone(timedelta(hours=9))
+# An answer text names its recorded time (JST HH:MM) with this; without it, each time of day the text gives
+# (13:03, or 12:1x for 12:10-12:19) must be within ANSWER_CLOCK_SLACK minutes of that time.
+ANSWERED_AT = "{answered_at}"
+CLOCK = re.compile(r"(?<![\d:+])([01]?\d|2[0-3]):([0-5])([\dx])(?!\d)")
+ANSWER_CLOCK_SLACK = 10
 
 
 @dataclass(frozen=True)
@@ -638,6 +644,26 @@ def asked_under(data: dict, decision: str) -> str:
     return found[0]
 
 
+def stamped_answer(answer: str, answered_at: str) -> str:
+    """The answer with {answered_at} as its recorded time in JST. A text without it may not give a time of day
+    ANSWER_CLOCK_SLACK minutes or more from that time: on 2026-11-10 an answer of 13:03 was recorded as 「12:1x」.
+    Beside {answered_at}, other times (the hourly tab's, a time the user names) are left as written."""
+    at = datetime.fromisoformat(answered_at).astimezone(JST)
+    if ANSWERED_AT in answer:
+        return answer.replace(ANSWERED_AT, f"{at:%H:%M}")
+    minute = at.hour * 60 + at.minute
+    off = []
+    for found in CLOCK.finditer(answer):
+        start = int(found[1]) * 60 + int(found[2]) * 10
+        minutes = range(start, start + 10) if found[3] == "x" else (start + int(found[3]),)
+        gap = min(min(abs(given - minute), 1440 - abs(given - minute)) for given in minutes)
+        if gap >= ANSWER_CLOCK_SLACK:
+            off.append(f"{found[0]} is {gap} minutes from answered_at {at:%H:%M} JST")
+    if off:
+        raise ValueError("; ".join(off) + f"; write {ANSWERED_AT} where the answer's time goes")
+    return answer
+
+
 def record_answer(data: dict, answering: Answering) -> dict:
     key = answering.id if answering.id is not None else asked_under(data, str(answering.decision))
     if key not in data["questions"]:
@@ -645,16 +671,20 @@ def record_answer(data: dict, answering: Answering) -> dict:
     question = data["questions"][key]
     if question.get("withdrawn_at"):
         raise ValueError(f"question was withdrawn at {question['withdrawn_at']}: {question['withdrawal_reason']}")
+    # A recorded answer keeps its time, so recording the same text again changes nothing.
+    when = (question["answered_at"] if question["answer"] is not None and not answering.replace_reason
+            else recorded_at(answering.answered_at))
+    answer = stamped_answer(answering.answer, when)
     earlier = {name: question.get(name) for name in ("answer", "answered_at", "answered_in")}
-    if answering.replace_reason and question["answer"] is not None and question["answer"] != answering.answer:
+    if answering.replace_reason and question["answer"] is not None and question["answer"] != answer:
         # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
         question.setdefault("replaced", []).append(
             {**earlier, "reason": answering.replace_reason, "replaced_at": stamp()})
         question["answer"] = None
-    if question["answer"] is not None and question["answer"] != answering.answer:
+    if question["answer"] is not None and question["answer"] != answer:
         raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
     if question["answer"] is None:
-        question.update(answer=answering.answer, answered_at=recorded_at(answering.answered_at),
+        question.update(answer=answer, answered_at=when,
                         answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
     return {"id": key, **question}
 
@@ -1038,15 +1068,18 @@ def main(argv: list[str] | None = None) -> int:
     which.add_argument("--decision", metavar="KEY",
                        help="the asked --decision of the one open question asked under it (else of the only "
                             "question asked under it); several open ones are refused with their ids")
-    answered.add_argument("--answer-file", required=True)
+    answered.add_argument("--answer-file", required=True,
+                          help=f"the exact answer; {ANSWERED_AT} in it becomes the recorded time (JST HH:MM), and "
+                               f"without it a time of day {ANSWER_CLOCK_SLACK}+ minutes off that time is refused")
     answered.add_argument("--answered-at", help="original ISO 8601 time when importing an answer")
     answered.add_argument("--replace-reason-file",
                           help="replace a different recorded answer with this checked one, keeping the earlier "
                                "answer, its time and tab under `replaced` with this file's reason")
     answered_many = commands.add_parser(
         "answered-many", help='record several answers from JSON Lines of {"answer", "answered_at"?, '
-                              '"replace_reason"?} with either "id" or "decision" (as answered --decision); every '
-                              'line is checked first, and a wrong one writes nothing')
+                              '"replace_reason"?} with either "id" or "decision" (as answered --decision), the answer '
+                              'checked as answered --answer-file is; every line is checked first, and a wrong one '
+                              'writes nothing')
     answered_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
