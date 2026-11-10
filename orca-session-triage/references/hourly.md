@@ -31,7 +31,8 @@ After handling the entries, pass `NEXT_OFFSET` to
 scheduled triage tab may acknowledge that cursor; a run Orca marked
 `dispatch_failed` on a restart still counts while its tab is connected. An older tab must
 leave new inbox entries unacknowledged for the current run; it can finish without handling
-them. The separately
+them. After the Mac sleeps, several scheduled tabs run at once: a refused `ack` names
+the run that owns the cursor (scheduled and start times, status, pane, and session). The separately
 appointed lead in a separate worktree (currently `triage-lead` on the local
 Mac) reads with
 `TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-inbox-read.offset"`
@@ -216,7 +217,10 @@ later runs through `scripts/lead_decisions.py`. Give each question in the
 handoff a stable key in the form `hourly_state.py asked --decision` uses, such
 as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 `--decision` key already has an answer and prints those answers, and records
-each key it sends. Before writing the handoff, run `lead_decisions.py
+each key it sends. It also refuses, and prints what it found, while a report
+from another tab of this workspace (a parallel scheduled run) or an answer to an
+ask the body names reached the inbox or the answer records after `--since`:
+fix the body from them, or pass `--force` to send it as written. Before writing the handoff, run `lead_decisions.py
 unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]}`.
 Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and
 `handoff_count`. Settled keys include the decision or bound ask's answer record;
