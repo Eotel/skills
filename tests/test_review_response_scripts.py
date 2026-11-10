@@ -483,6 +483,51 @@ class WatchPrsTests(unittest.TestCase):
             "acme/api#12 CODEX security_review COMPLETED (head aaaaaaaaa, no findings)",
         ])
 
+    def test_codex_none_once_per_head_after_the_wait(self) -> None:
+        # 2026-11-10: two PRs got no Codex review on their head until "@codex review" was posted,
+        # and the watcher printed nothing meanwhile.
+        none_a = "acme/api#12 CODEX NONE on head aaaaaaa after 5 min"
+        events, state = prs.diff_events(self.spec, {}, self.snapshot(), self.me, now=1000.0)
+        self.assertEqual(events, [])
+        events, state = prs.diff_events(self.spec, state, self.snapshot(), self.me, now=1299.0)
+        self.assertEqual(events, [])
+        events, state = prs.diff_events(self.spec, state, self.snapshot(), self.me, now=1300.0)
+        self.assertEqual(events, [none_a])
+        events, state = prs.diff_events(self.spec, state, self.snapshot(), self.me, now=1900.0)
+        self.assertEqual(events, [])
+        pushed = self.snapshot(headRefOid="b" * 40)
+        events, state = prs.diff_events(self.spec, state, pushed, self.me, now=2000.0)
+        self.assertEqual(events, [])
+        events, _ = prs.diff_events(self.spec, state, pushed, self.me, now=2060.0, codex_wait=60.0)
+        self.assertEqual(events, ["acme/api#12 CODEX NONE on head bbbbbbb after 1 min"])
+
+    def test_codex_state_for_the_head_suppresses_none(self) -> None:
+        started = self.snapshot(comments=self.codex_summary("running"))
+        _, state = prs.diff_events(self.spec, {}, started, self.me, now=1000.0)
+        events, state = prs.diff_events(self.spec, state, started, self.me, now=2000.0)
+        self.assertEqual(events, [])
+        # A review of the previous head does not count for a new one.
+        pushed = self.snapshot(headRefOid="b" * 40, comments=self.codex_summary("completed", findings=False))
+        _, state = prs.diff_events(self.spec, state, pushed, self.me, now=3000.0)
+        events, _ = prs.diff_events(self.spec, state, pushed, self.me, now=3300.0)
+        self.assertEqual(events, ["acme/api#12 CODEX NONE on head bbbbbbb after 5 min"])
+
+    def test_codex_wait_option(self) -> None:
+        view = {"state": "OPEN", "headRefOid": "a" * 40, "mergeable": "MERGEABLE", "statusCheckRollup": [],
+                "updatedAt": "2026-11-10T11:05:00Z"}
+        _, run = self.fake_gh({"12": view}, {})
+        with tempfile.TemporaryDirectory() as temporary:
+            listing = Path(temporary) / "prs.txt"
+            listing.write_text(self.spec + "\n", encoding="utf-8")
+            argv = [str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me,
+                    "--once", "--codex-wait", "2"]
+            output = io.StringIO()
+            with patch.object(prs.subprocess, "run", side_effect=run), redirect_stdout(output):
+                for now in (1000.0, 1119.0, 1120.0):
+                    with patch.object(prs.time, "time", return_value=now):
+                        self.assertEqual(prs.main(argv), 0)
+        self.assertEqual(output.getvalue().splitlines(), ["acme/api#12 CODEX NONE on head aaaaaaa after 2 min"])
+
     def test_codex_summary_table_reports_reviews_without_the_state_marker(self) -> None:
         def summary(word: str) -> list[dict]:
             marker = json.dumps({"headSha": "a" * 40, "status": word.lower()})

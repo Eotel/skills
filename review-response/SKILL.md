@@ -27,6 +27,10 @@ description: Handle code reviews that came back on many PRs at once (items retur
   table renderer. Each script documents its options with `--help`; tracker IDs
   and repository aliases come from the caller's configuration, not from this
   skill.
+- While waiting for automated reviews, a `CODEX NONE` line from
+  `scripts/watch_prs.py` means Codex has not started on that head: post a PR
+  comment `@codex review` whose last line is this session's name, and keep
+  waiting.
 - Implementation goes through `codex-orchestration-core`, and through
   `codex-tdd-orchestration` when parallel workers are wanted.
 - The team's tracker conventions (task naming, reviewer mapping, when a review
