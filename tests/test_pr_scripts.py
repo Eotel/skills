@@ -217,6 +217,7 @@ unix-build = "1"
 [workspace.dependencies]
 workspace-crate = "1"
 [features]
+old_feature = ["serde?/rc"]
 new_feature = []
 '''})
         self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
@@ -226,7 +227,7 @@ new_feature = []
         self.assertEqual(status, 1)
         expected = {
             "test-crate", "build-crate", "unix-crate", "windows-test", "unix-build",
-            "workspace-crate", "new_feature", "preserve_order", "build_feature",
+            "workspace-crate", "new_feature", "preserve_order", "build_feature", "rc",
         }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
         self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")
@@ -270,6 +271,8 @@ existing = { version = "2", extras = ["Poetry_Extra"] }
 httpx = "^0.28"
 [tool.poetry.group.dev.dependencies]
 pytest = { version = "^8" }
+[tool.poetry.extras]
+Network = ["httpx"]
 '''})
         self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
         argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
@@ -277,7 +280,7 @@ pytest = { version = "^8" }
         self.assertEqual(status, 1)
         expected = {
             "new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest",
-            "fast", "poetry-extra",
+            "fast", "poetry-extra", "network",
         }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
         self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")

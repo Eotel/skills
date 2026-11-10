@@ -222,6 +222,7 @@ def read_package_json(content: str) -> ManifestNames:
 def read_cargo_toml(content: str) -> ManifestNames:
     document = tomllib.loads(content)
     dependencies: dict[str, set[str]] = {}
+    packages: dict[str, str] = {}
     tables = [
         document,
         document.get("workspace", {}),
@@ -231,9 +232,18 @@ def read_cargo_toml(content: str) -> ManifestNames:
         for group in ("dependencies", "dev-dependencies", "build-dependencies"):
             for alias, spec in table.get(group, {}).items():
                 name = spec.get("package", alias) if isinstance(spec, dict) else alias
+                packages[alias] = name
                 requested = spec.get("features", ()) if isinstance(spec, dict) else ()
                 dependencies.setdefault(name, set()).update(requested)
-    return ManifestNames(dependencies, set(document.get("features", {})))
+    features = document.get("features", {})
+    # A feature can turn on a dependency's feature: json = ["serde_json/preserve_order"].
+    for enabled in features.values():
+        for item in enabled:
+            alias, slash, feature = item.partition("/")
+            if slash:
+                alias = alias.removesuffix("?")
+                dependencies.setdefault(packages.get(alias, alias), set()).add(feature)
+    return ManifestNames(dependencies, set(features))
 
 
 def normalize_python_name(name: str) -> str:
@@ -281,7 +291,8 @@ def read_pyproject_toml(content: str) -> ManifestNames:
                 for item in specs if isinstance(item, dict)
                 for extra in item.get("extras", ())
             )
-    return ManifestNames(dependencies, {normalize_python_name(name) for name in optional})
+    extras = (*optional, *poetry.get("extras", {}))
+    return ManifestNames(dependencies, {normalize_python_name(name) for name in extras})
 
 
 MANIFEST_READERS: dict[str, Callable[[str], ManifestNames]] = {
