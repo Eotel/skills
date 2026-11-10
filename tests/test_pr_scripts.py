@@ -273,6 +273,8 @@ httpx = "^0.28"
 pytest = { version = "^8" }
 [tool.poetry.extras]
 Network = ["httpx"]
+[build-system]
+requires = ["hatchling>=1"]
 '''})
         self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
         argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
@@ -280,7 +282,7 @@ Network = ["httpx"]
         self.assertEqual(status, 1)
         expected = {
             "new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest",
-            "fast", "poetry-extra", "network",
+            "fast", "poetry-extra", "network", "hatchling",
         }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
         self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")

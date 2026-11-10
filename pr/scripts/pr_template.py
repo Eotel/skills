@@ -260,6 +260,7 @@ def read_pyproject_toml(content: str) -> ManifestNames:
         project.get("dependencies", []),
         *optional.values(),
         *document.get("dependency-groups", {}).values(),
+        document.get("build-system", {}).get("requires", []),
     ]
     for group in groups:
         for requirement in group:
