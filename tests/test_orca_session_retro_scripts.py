@@ -891,6 +891,25 @@ class RetroTests(unittest.TestCase):
             self.assertEqual(retro.skill_target("example/app/shared", self.root), source)
             self.assertEqual(retro.skill_target("team/skills/shared", self.root), source)
 
+    def test_skill_from_a_lock_entry_in_another_case_is_writable_in_its_checkout(self) -> None:
+        checkout = self.home / "ghq/github.com/Owner/tool"
+        source = checkout / "skills/tool-usage/SKILL.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# Tool usage\n")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "add", "skills/tool-usage/SKILL.md"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "-c", "core.hooksPath=/dev/null",
+                        "commit", "-qm", "test fixture"], check=True)
+        (self.home / ".apm").mkdir()
+        (self.home / ".apm/apm.lock.yaml").write_text(
+            "dependencies:\n- repo_url: owner/tool\n  host: github.com\n  virtual_path: skills/tool-usage\n"
+            "deployments:\n")
+        with mock.patch.object(retro.Path, "home", return_value=self.home):
+            target = retro.skill_target("Owner/tool/tool-usage", self.root)
+        self.assertEqual(target, source)
+        self.assertIsNone(retro.source_checkout_ready(source, {"target_versions": {}}))
+
     def test_adoption_the_worker_cannot_write_notifies_once(self) -> None:
         log = self.home / "notify.log"
         notifier = self.home / "triage-notify"
