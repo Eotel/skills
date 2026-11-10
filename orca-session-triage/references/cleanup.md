@@ -26,7 +26,9 @@ with no `containers`, putting the result in that worktree's line as `removal`
 (it exits 4 when one did not finish). Give it only rows these rules remove
 without asking. Its `--summary` prints one line per worktree instead of the
 JSON (`<name> | ok=… | removal=… | reasons=…`, reasons naming only `.yomiyasu/`
-left out): read those lines rather than parsing the JSON.
+left out): read those lines rather than parsing the JSON. After the worktrees,
+either form lists every held file in one block (`確認が要るファイル`, one line
+each with the worktree, reason, and decision): ask the user about them together.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -51,9 +53,10 @@ Run these per worktree, in order.
    is the base and `notes` say so; such a row gets no `--pr-head` advice.
    Pass `--base` when the output's `base` is not where the work merges.
    - `reasons` lists everything that keeps the worktree in one place: each
-     blocker, with the uncommitted paths after their count, then each path to
-     review. Read it when `ok` is false: `blockers` alone can be empty while a
-     path to review keeps the worktree.
+     blocker, with the uncommitted paths after their count, then each work
+     record, then each held file with its reason and the decision it needs.
+     Read it when `ok` is false: `blockers` alone can be empty while a path to
+     review keeps the worktree.
    - `blockers` (uncommitted changes, HEAD outside the base) stop the removal;
      `uncommitted` lists the paths of the changes. Report them and leave the
      worktree. Untracked Python bytecode (`__pycache__/` of `.pyc` files) is
@@ -69,19 +72,28 @@ Run these per worktree, in order.
      `notes` say so and nothing blocks on that alone.
    - `review` lists ignored paths that are neither caches nor copies in the
      main checkout: a directory is copied when each of its files is there with
-     the same content, whatever else the main checkout holds there. Open each
-     one: generated sources and test output
-     (screenshots, uploaded fixtures) are regenerable; anything else (exports,
-     reports, hand-written notes) goes back to the user before removal. A `.env`
-     entry names the keys whose values its `.env.example` lacks, never the
-     values: they may be the only copy of an API key. In a worktree the user
-     chose to remove, a scratch record folder (`.yomiyasu/`, `.investigate/`)
-     moves next to the lane's brief and report, and the removal goes on without
-     another question: run `rm_check.py` again with `--archive-scratch`. When
-     those folders alone keep the worktree, it moves them to
-     `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/` (listed in
-     `archived`) and checks again; it moves nothing while anything else blocks
-     or needs review. Without the option nothing moves. When the lead's answer
+     the same content, whatever else the main checkout holds there. Each one is
+     also in `records` or `held`. A path is never removed for its name or for
+     being untracked alone.
+     - `records` are work records, by `kind`: `notes` (`.yomiyasu/`,
+       `.investigate/`), `reviews` (`.claude/reviews/`, `.impeccable/`), and
+       `images` (a folder of only screenshots). In a worktree the user chose to
+       remove, they move aside and the removal goes on without another
+       question: run `rm_check.py` again with `--archive-scratch`.
+     - `held` are settings (`setting`: `.env`, `*.local.*`), data (`data`:
+       SQLite, CSV, dumps), and anything else (`unknown`), each with `reason`
+       and the `decision` the user makes. Collect them and ask once. A `.env`
+       names the keys whose values its `.env.example` lacks, never the values:
+       they may be the only copy of an API key.
+
+     When work records alone keep the worktree (nothing blocks and `held` is
+     empty), `--archive-scratch` copies each to
+     `~/.cache/orca-briefs/archive/<worktree>-<name>-<YYYYMMDD>/`, compares
+     every file, appends the original path and the result to `archived.jsonl`
+     there, deletes the original, and checks again (listed in `archived`, each
+     with `verified`). A copy that differs is deleted and the original stays.
+     It moves nothing while anything else blocks or is held. Without the option
+     nothing moves. When the lead's answer
      to `remove:<path>` names another path to archive first (`.tmp/`,
      `.tmp/pr-descriptions`), pass it as `--archive-path <path>` (repeatable,
      relative to the worktree): it moves to the same place under the same
@@ -92,7 +104,7 @@ Run these per worktree, in order.
      ignores and does not have yet to the same place in main, confirmed with cmp
      (`copied_to_main`). Other ignored files, such as `.env` or
      `.claude/settings.local.json`, are settings main would run with and stay
-     for review. With `--detach-nested` as well, nested copies and these
+     held. With `--detach-nested` as well, nested copies and these
      folders go together.
    - `regenerable` lists what a tool writes again from tracked files or
      installed packages with no one's input: untracked Python bytecode, and,
@@ -104,14 +116,19 @@ Run these per worktree, in order.
      taihei-cbm's test uploads (`apps/api/media/files/datafile/storage/`), an
      ignored directory of only `*.log` files (its size and last write in
      `notes`), an ignored `.claude/scheduled_tasks.lock` whose holder (its
-     `pid`, started at its `procStart`) no longer runs, and an ignored
-     directory holding only these and empty files (`web/var/`). They do
+     `pid`, started at its `procStart`) no longer runs, an ignored output
+     whose generator `GENERATED_BY` in `rm_check.py` names (only while that
+     generator is tracked in the worktree and names the output's file name,
+     such as `.claude/.venv-missing` from `.claude/hooks/worktree_create.sh`),
+     and an ignored directory holding only these and empty files (`web/var/`).
+     Add a generator there after reading the tracked file that writes the
+     output. They do
      not hold up the removal. Neither
      does a `.env` that differs from its `.env.example` only in ports, which the
      example and fresh ports rebuild, nor the `.apm-local/` that APM 0.35 writes
      at the worktree root: its random installation identity binds only that
      checkout, and the next install writes a new one. Ignored caches and test
-     reports (`.cache/`, `.coverage`, `playwright-report*/`, and the like) are
+     reports (`.cache/`, `.coverage`, `playwright-report*/`, `blob-report/`, and the like) are
      skipped without a listing. An untracked path is never judged by its name,
      since a `build/` the repository does not ignore may be new source, and a
      `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its

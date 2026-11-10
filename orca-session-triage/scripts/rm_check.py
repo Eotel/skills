@@ -37,8 +37,9 @@ CACHE_PARTS = {
     ".mypy_cache", ".svelte-kit", "apm_modules", ".import_linter_cache", ".moon", "dist", "build",
     "coverage", ".coverage", "test-results", ".cache",
 }
-# Playwright's HTML reporter writes to playwright-report/ or the outputFolder a config names after it.
-CACHE_PREFIXES = ("playwright-report",)
+# Playwright's HTML reporter writes to playwright-report/ or the outputFolder a config names after it, and its
+# blob reporter to blob-report/.
+CACHE_PREFIXES = ("playwright-report", "blob-report")
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
@@ -52,6 +53,16 @@ REGENERABLE_PARTS = {"__generated__"}
 REGENERABLE_PART_PAIRS = {("graphql", "generated"), ("var", "test-storage")}
 REGENERABLE_PREFIXES = ("src/paraglide/", "e2e/screenshots/", "e2e/.state/", "e2e/.auth/", ".apm-local/",
                         ".husky/_/", ".vite-hooks/_/", "apps/api/media/files/datafile/storage/")
+# Ignored outputs a tracked file of the repository writes, by that file. Each counts as regenerable only while
+# its generator is tracked in the worktree and names the output's file name: a repository without that
+# generator gets no such pass. A worktree setup hook's marker for a failed `uv sync`, a SessionStart hook's
+# log, a GraphQL schema document, and the git info a prebuild script writes for the UI.
+GENERATED_BY = {
+    ".claude/.venv-missing": ".claude/hooks/worktree_create.sh",
+    ".worktree-setup.log": ".claude/settings.json",
+    "docs/generated/graphql-schema.md": "backend/cxc_tools/regen_graphql_doc.py",
+    "public/git-info.json": "scripts/gen-git-info.js",
+}
 # An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
@@ -59,8 +70,17 @@ NESTED_READY = "worktrees of other repositories remain inside: "
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
 SCRATCH_DIRS = (".yomiyasu", ".investigate")
 # Records --archive-scratch copies to main. Other ignored files, such as .claude/settings.local.json or .env,
-# are settings tools in main would run with, so they stay for review.
+# are settings tools in main would run with, so they stay for a decision.
 RECORD_DIRS = (".claude/reviews/",)
+# Work records among the ignored paths, by kind: investigation notes, review records (agents' and impeccable's
+# design critiques), and verification images. Nothing in main runs with them, so --archive-scratch moves them
+# out of the worktree with a manifest instead of asking. Anything else ignored that holds work is held.
+RECORD_KINDS = {".yomiyasu": "notes", ".investigate": "notes", ".claude/reviews": "reviews",
+                ".impeccable": "reviews"}
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+DATA_SUFFIXES = (".sqlite3", ".sqlite", ".db", ".csv", ".tsv", ".xlsx", ".sql", ".dump", ".parquet")
+# Where --archive-scratch and --archive-path record each move: when, from where, to where, and the comparison.
+ARCHIVE_MANIFEST = "archived.jsonl"
 ARCHIVE_DIR = Path.home() / ".cache/orca-briefs/archive"
 # Closes a busy tab only while its worktree has not moved since the scan that listed it.
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
@@ -259,6 +279,73 @@ def lock_holder(lock: Path) -> LockHolder | None:
     return LockHolder(pid, running(pid, started if isinstance(started, str) else None))
 
 
+def generated(worktree: Path, rel: str) -> bool:
+    """Whether GENERATED_BY names a generator of `rel` that the worktree tracks and that names the file."""
+    generator = GENERATED_BY.get(rel.rstrip("/"))
+    if generator is None or git(worktree, "ls-files", "--error-unmatch", "--", generator).returncode != 0:
+        return False
+    try:
+        return PurePosixPath(rel.rstrip("/")).name in (worktree / generator).read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def files_in(path: Path) -> list[Path]:
+    """The path itself, or every file and symlink inside a directory."""
+    if path.is_symlink() or not path.is_dir():
+        return [path]
+    return [child for child in path.rglob("*") if child.is_symlink() or not child.is_dir()]
+
+
+class Record(TypedDict):
+    path: str
+    kind: str
+
+
+class Held(TypedDict):
+    path: str
+    kind: str
+    reason: str
+    decision: str
+
+
+def record_kind(worktree: Path, rel: str) -> str | None:
+    """notes, reviews, or images (or mixed) for an ignored path whose files are all work records and none
+    tracked; None for anything else."""
+    files = files_in(worktree / rel)
+    kinds = set()
+    for file in files:
+        inside = file.relative_to(worktree).as_posix()
+        kind = next((kind for top, kind in RECORD_KINDS.items() if within(inside, top)), None)
+        if kind is None and not file.is_symlink() and file.suffix.lower() in IMAGE_SUFFIXES:
+            kind = "images"
+        if kind is None:
+            return None
+        kinds.add(kind)
+    if not kinds or git(worktree, "ls-files", "--", rel).stdout.strip():
+        return None
+    return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
+def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> Held:
+    """A setting, data, or unknown path that keeps the worktree, with why and what the lead decides; a .env
+    names the keys its .env.example lacks, never their values."""
+    files = files_in(source)
+    where = "main と内容が違います" if in_main else "main にありません"
+    if any(file.name.startswith(".env") or ".local." in file.name for file in files):
+        if keys:
+            return {"path": rel, "kind": "setting",
+                    "reason": "作業場だけの設定です（%s）。.env.example にない値があります: %s" % (where, ", ".join(keys)),
+                    "decision": "値を main の .env か秘密の置き場へ移すか、捨ててよいかを決めてください"}
+        return {"path": rel, "kind": "setting", "reason": "作業場だけの設定です（%s）" % where,
+                "decision": "main へ写すか、捨ててよいかを決めてください"}
+    if all(file.suffix.lower() in DATA_SUFFIXES for file in files):
+        return {"path": rel, "kind": "data", "reason": "作業場で作ったデータです（%s）" % where,
+                "decision": "残す場所を決めて移すか、捨ててよいかを決めてください"}
+    return {"path": rel, "kind": "unknown", "reason": "再生成する元も用途も分かりません（%s）" % where,
+            "decision": "中身を開き、何のファイルかを確かめて、残すか捨てるかを決めてください"}
+
+
 class IgnoredPaths(NamedTuple):
     review: list[str]
     regenerable: list[str]
@@ -267,18 +354,24 @@ class IgnoredPaths(NamedTuple):
     logs: list[str]
     # The live PIDs that hold the worktree's scheduled tasks lock.
     lock_holders: list[int]
+    # The paths of `review` split by what they hold: work records --archive-scratch moves aside, and the rest.
+    records: list[Record]
+    held: list[Held]
 
 
 def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
-    """(review, regenerable, nested, logs, lock_holders): ignored paths that hold something and are neither caches
-    nor copies of the main checkout, split into those to open and those a setup or test run writes again,
-    the worktrees of other repositories found at them (such as `local-deps/<repo>`), and the live holder of a
-    scheduled tasks lock, which is not a path to open.
+    """(review, regenerable, nested, logs, lock_holders, records, held): ignored paths that hold something and are
+    neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
+    test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
+    live holder of a scheduled tasks lock, which is not a path to open, and the paths that keep the worktree
+    again, split into work records and files held for a decision.
 
     `--ignored=matching` names each path an ignore pattern matched, so a generated
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
     review, regenerable, nested, logs, holders = [], [], [], [], []
+    records: list[Record] = []
+    held: list[Held] = []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
     for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
@@ -297,7 +390,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
         if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
             nested.extend(found)
             continue
-        if holds_only_regenerable(source, Path(worktree)):
+        if holds_only_regenerable(source, Path(worktree)) or generated(Path(worktree), rel):
             regenerable.append(rel)
             continue
         if (files := log_files(source)) is not None:
@@ -305,6 +398,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             logs.append(log_note(rel, files))
             continue
         where = "not in main checkout" if not copy.exists() else "differs from main checkout"
+        keys = None
         if source.name == ".env" and source.is_file():
             keys = env_keys_beyond_example(source)
             if keys == []:
@@ -313,7 +407,11 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             if keys:
                 where += "; values .env.example does not have: " + ", ".join(keys)
         review.append("%s (%s)" % (rel, where))
-    return IgnoredPaths(review, regenerable, nested, logs, holders)
+        if kind := record_kind(Path(worktree), rel):
+            records.append({"path": rel, "kind": kind})
+        else:
+            held.append(held_file(source, rel, copy.exists(), keys))
+    return IgnoredPaths(review, regenerable, nested, logs, holders, records, held)
 
 
 def on_remote(worktree: Path, head: str) -> bool:
@@ -714,7 +812,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested, logs, lock_holders = ignored_paths(worktree, main)
+    review, regenerable, nested, logs, lock_holders, records, held_files = ignored_paths(worktree, main)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
@@ -747,6 +845,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     if since is not None:
         blockers.extend(moved_since(Path(worktree), since))
     return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
+            "records": records, "held": held_files,
             "regenerable": bytecode + regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
             "containers": compose_in(worktree, compose_projects), "processes": processes or [], "notes": logs}
 
@@ -973,12 +1072,16 @@ def holds_only_records(result: dict, movable: tuple[str, ...]) -> bool:
 
 def reasons(result: dict) -> list[str]:
     """Every reason the worktree stays, in one list: the blockers, with the uncommitted paths after their count,
-    then each ignored path to open. Empty when nothing keeps it."""
+    then each work record --archive-scratch moves, then each file held for a decision with why and what to
+    decide. Empty when nothing keeps it."""
     uncommitted = result.get("uncommitted") or []
     listed = ", ".join(uncommitted[:REASON_PATHS]) + (", …" if len(uncommitted) > REASON_PATHS else "")
     return [*("%s: %s" % (blocker, listed) if uncommitted and re.fullmatch(r"\d+ uncommitted changes", blocker)
               else blocker for blocker in result["blockers"]),
-            *("ignored path to open: " + entry for entry in result.get("review") or [])]
+            *("work record to move with --archive-scratch: %s (%s)" % (item["path"], item["kind"])
+              for item in result.get("records") or []),
+            *("判断が要るファイル: %s（%s）— %s。%s" % (item["path"], item["kind"], item["reason"], item["decision"])
+              for item in result.get("held") or [])]
 
 
 def copy_to_main(worktree: Path, main: Path, review: list[str]) -> list[dict[str, str]]:
@@ -1018,6 +1121,37 @@ def archive_target(archive: Path, worktree: Path, scratch: Path, day: str) -> Pa
     name = "%s-%s-%s" % (worktree.name, scratch.name.lstrip("."), day)
     return next(target for target in (archive / name, *(archive / ("%s-%d" % (name, n)) for n in range(2, 1000)))
                 if not target.exists())
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def archive(source: Path, target: Path, worktree: Path) -> dict:
+    """Copy `source` to `target`, compare every file, record the move in the archive's manifest, then delete
+    `source`. A copy that fails or differs is deleted and `source` stays, so nothing is lost on the way."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    moved = {"from": str(source), "to": str(target), "verified": False}
+    try:
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, target, symlinks=True)
+        else:
+            shutil.copy2(source, target, follow_symlinks=False)
+        moved["verified"] = same_tree(source, target)
+    except OSError as error:
+        moved["error"] = str(error)
+    if not moved["verified"]:
+        remove_path(target)
+        return moved
+    entry = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "worktree": str(worktree), **moved,
+             "files": len(files_in(source))}
+    with (target.parent / ARCHIVE_MANIFEST).open("a", encoding="utf-8") as manifest:
+        manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    remove_path(source)
+    return moved
 
 
 # OrbStack has stopped answering `docker compose ls` for 20 minutes; a removal check must not wait on it.
@@ -1105,10 +1239,14 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
                              "records under .claude/reviews/) to the same place in main, confirmed with cmp; then "
-                             "when %s alone keep the worktree (nothing else blocks or needs review), move them to "
-                             "<archive-dir>/<worktree>-<name>-<YYYYMMDD>/, then check again; off by default, so "
-                             "move them only where the lead's rules say to. With --detach-nested, nested worktrees "
-                             "and these records together do not hold each other back" % " and ".join(SCRATCH_DIRS))
+                             "when %s and the work records listed in `records` (notes, review records such as "
+                             ".impeccable/, and folders of only images) alone keep the worktree (nothing else "
+                             "blocks and `held` is empty), move them to <archive-dir>/<worktree>-<name>-<YYYYMMDD>/: "
+                             "copy, compare every file, append {at, worktree, from, to, verified, files} to "
+                             "<archive-dir>/%s, delete the original, then check again; off by default, so move them "
+                             "only where the lead's rules say to. With --detach-nested, nested worktrees and these "
+                             "records together do not hold each other back" % (" and ".join(SCRATCH_DIRS),
+                                                                                ARCHIVE_MANIFEST))
     parser.add_argument("--archive-path", action="append", default=[], metavar="PATH",
                         help="a path inside the worktree, relative to it, such as .tmp/ when the lead's answer to "
                              "remove:<path> names it; repeat for more. Moved like --archive-scratch's folders, to "
@@ -1228,6 +1366,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
                       decided=tuple(decided), since=since)
     result = recheck()
+
+    def movable_now(result: dict) -> tuple[str, ...]:
+        """The scratch folders and named paths, and with --archive-scratch the work records this check found."""
+        found = (item["path"].rstrip("/") for item in result["records"]) if args.archive_scratch else ()
+        return (*movable, *found)
+
     copied = []
     # Nothing is written to main while anything else keeps the worktree.
     if args.archive_scratch and holds_only_records(result, movable):
@@ -1240,7 +1384,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         # Records --archive-scratch and --archive-path move next do not keep it.
         others = [blocker for blocker in result["blockers"]
                   if not blocker.startswith("worktrees of other repositories")]
-        scratch_next = bool(archive_movers(Path(worktree), result, movable, besides_nested=True))
+        scratch_next = bool(archive_movers(Path(worktree), result, movable_now(result), besides_nested=True))
         removable = (nested and (scratch_next or (not others and not result["review"]))
                      and not any(item["blockers"] for item in nested))
         detached = [item["path"] for item in nested if removable
@@ -1255,13 +1399,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["detached"] = detached
     if movable:
         day = datetime.now().strftime("%Y%m%d")
-        archived = []
-        for source in archive_movers(Path(worktree), result, movable):
-            target = archive_target(args.archive_dir, Path(worktree), source, day)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(source, target)
-            archived.append({"from": str(source), "to": str(target)})
-        if archived:
+        archived = [archive(source, archive_target(args.archive_dir, Path(worktree), source, day), Path(worktree))
+                    for source in archive_movers(Path(worktree), result, movable_now(result))]
+        if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}
         elif any((Path(worktree) / name).exists() for name in movable):
