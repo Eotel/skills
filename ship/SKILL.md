@@ -17,7 +17,9 @@ turn.
    test that only mirrors a low-impact mechanical edit.
 2. **Verify.** Run focused checks capable of detecting the requested failure.
    Broaden for integration, shared-boundary refactors, or repository release
-   policy. Use `real-browser-verify` for changed UI behavior.
+   policy. Use `real-browser-verify` for changed UI behavior. When the diff
+   touches code that runs only inside a desktop app shell, also operate that app
+   behind the user's windows with its desktop script.
 3. **Review the diff.** Run `code-review`, then `simplify`, on the same
    [pre-commit review inputs](references/pre-commit-review.md). Address valid
    `code-review` findings before running `simplify`. Where `simplify` is not
