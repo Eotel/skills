@@ -48,6 +48,8 @@ SPECIAL = {
     "return": "\r", "tab": "\t", "space": " ", "delete": "\x7f", "escape": "\x1b",
     "left": "\uf702", "right": "\uf703", "down": "\uf701", "up": "\uf700",
 }
+# What shift types on the digit keys of the ANSI layout; shift types a letter key's capital.
+SHIFTED_DIGITS = dict(zip("1234567890", "!@#$%^&*()"))
 # Separates the fields of a command; tabs and newlines stay usable in page script and text.
 SEPARATOR = "\x1f"
 
@@ -181,7 +183,10 @@ def key_command(spec: str) -> list[str]:
         raise DriveError(
             f"unknown key {spec!r}: use [cmd+][shift+][option+][control+]<key>, key one of {', '.join(KEY_CODES)}"
         )
-    return ["key", str(KEY_CODES[name]), SPECIAL.get(name, name), ",".join(mods) or "-"]
+    typed = SPECIAL.get(name, name)
+    if "shift" in mods and name not in SPECIAL:
+        typed = SHIFTED_DIGITS.get(name, name.upper())
+    return ["key", str(KEY_CODES[name]), typed, ",".join(mods) or "-"]
 
 
 def send(tools: Path, pid: int, command: list[str], timeout: float) -> str:
