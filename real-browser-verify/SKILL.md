@@ -1,6 +1,6 @@
 ---
 name: real-browser-verify
-description: Verify changed UI behavior in a real authenticated browser and capture evidence. Use before claiming that a frontend change, UI bug fix, or deployment works.
+description: Verify changed UI behavior in a real authenticated browser or desktop app and capture evidence. Use before claiming that a frontend change, UI bug fix, desktop app change, or deployment works.
 ---
 
 # Real-Browser Verify
@@ -8,6 +8,14 @@ description: Verify changed UI behavior in a real authenticated browser and capt
 The bar for "verified" on changed UI behavior is to reach the actual target
 screen in a real browser, authenticate as the affected role, and exercise the
 functional path. A passing suite or loaded page proves a different claim.
+
+## Desktop apps
+
+When the change runs in a desktop app built around a web view (Tauri and similar), read
+[references/desktop-app.md](references/desktop-app.md) and drive the app with
+`scripts/desktop_app.py`; it stays behind the user's windows. The same bar applies: reach the
+screen, exercise the path, capture evidence. Do the check yourself rather than asking the user to
+operate the app.
 
 ## Procedure
 

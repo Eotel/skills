@@ -87,7 +87,8 @@ resolution on older Windows Python versions without following symlinks.
 - `pr`: write a PR body in the template the repository calls for (its own, the
   review-first template for repositories of the account and its organizations, or the
   upstream template elsewhere) and check its headings.
-- `real-browser-verify`: verify changed UI behavior in an authenticated browser.
+- `real-browser-verify`: verify changed UI behavior in an authenticated browser,
+  or in a macOS desktop app built around a web view, driven behind the user's windows.
 - `repo-local-git-hooks`: repair repository hooks bypassed by global Git config.
 - `review-response`: handle reviews that came back on many PRs and drive each PR
   to its end state. Uses `codex-orchestration-core` for implementation work.
