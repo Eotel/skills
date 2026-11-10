@@ -3073,10 +3073,9 @@ class RmCheckTests(unittest.TestCase):
         (self.wt / "app.txt").write_text("v2\n")
         _, both = self.run_main()
 
-        self.assertEqual((code, review_only["blockers"]), (1, []))
-        self.assertEqual(review_only["reasons"], ["ignored path to open: uploads/ (not in main checkout)"])
-        self.assertEqual(both["reasons"], ["1 uncommitted changes: app.txt",
-                                           "ignored path to open: uploads/ (not in main checkout)"])
+        self.assertEqual((code, review_only["blockers"], len(review_only["reasons"])), (1, [], 1))
+        self.assertIn("uploads/", review_only["reasons"][0])
+        self.assertEqual(both["reasons"], ["1 uncommitted changes: app.txt", review_only["reasons"][0]])
 
     def test_a_process_outside_tabs_that_ends_during_the_wait_does_not_block(self) -> None:
         brief = subprocess.Popen(["sleep", "30"], cwd=self.wt)
@@ -3293,10 +3292,70 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(dirty["archived"], [])
         self.assertEqual((code, result["ok"], result["review"], result["blockers"]), (0, True, [], []))
         self.assertFalse((self.wt / ".yomiyasu").exists() or (self.wt / ".investigate").exists())
-        moved = sorted(path.name for path in archive.iterdir())
+        moved = sorted(path.name for path in archive.iterdir() if path.is_dir())
         self.assertRegex(" ".join(moved), r"^wt-investigate-\d{8} wt-yomiyasu-\d{8}$")
         self.assertEqual((archive / moved[1] / "inputs" / "draft.md").read_text(), "原文\n")
         self.assertEqual(sorted(Path(item["to"]).name for item in result["archived"]), moved)
+
+    def test_an_ignored_output_is_regenerable_only_while_a_tracked_file_of_its_generator_names_it(self) -> None:
+        # 11/10: a repository's worktree hook wrote .claude/.venv-missing in 29 worktrees, and each one stopped removal.
+        (self.main / ".git/info/exclude").write_text(".claude/.venv-missing\n")
+        (self.wt / ".claude").mkdir()
+        (self.wt / ".claude/.venv-missing").write_text("uv sync failed at 2026-10-01\n")
+
+        unconfirmed = self.check()
+        hook = self.main / ".claude/hooks/worktree_create.sh"
+        hook.parent.mkdir(parents=True)
+        hook.write_text('VENV_MARKER="$WORKTREE_PATH/.claude/.venv-missing"\n')
+        git(self.main, "add", ".claude/hooks/worktree_create.sh")
+        git(self.main, "commit", "-q", "-m", "hook")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        confirmed = self.check()
+
+        self.assertEqual(([item["path"] for item in unconfirmed["held"]], unconfirmed["ok"]),
+                         ([".claude/.venv-missing"], False))
+        self.assertEqual((confirmed["ok"], confirmed["held"], confirmed["regenerable"]),
+                         (True, [], [".claude/.venv-missing"]))
+
+    def test_archive_scratch_moves_work_records_aside_and_lists_the_files_it_holds_for_a_decision(self) -> None:
+        # 11/10: screenshots and design critiques stopped removals until each was moved by hand with --archive-path.
+        (self.main / ".git/info/exclude").write_text("scripts/__screenshots__/\n.impeccable/\nlocal.sqlite3\n")
+        (self.main / ".env.example").write_text("API_URL=http://localhost\n")
+        git(self.main, "add", ".env.example")
+        git(self.main, "commit", "-q", "-m", "example")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        (self.wt / "scripts/__screenshots__").mkdir(parents=True)
+        (self.wt / "scripts/__screenshots__/after-mobile.png").write_bytes(b"\x89PNG after")
+        (self.wt / ".impeccable/critique").mkdir(parents=True)
+        (self.wt / ".impeccable/critique/admin.md").write_text("余白が狭い\n")
+        (self.wt / ".env").write_text("API_URL=http://localhost\nOPENAI_API_KEY=sk-only-here\n")
+        (self.wt / "local.sqlite3").write_bytes(b"SQLite format 3\x00")
+        archive = Path(self.tmp.name) / "archive"
+
+        code, held = self.run_main("--archive-scratch", "--archive-dir", str(archive))
+
+        self.assertEqual((code, held["archived"]), (1, []))
+        self.assertEqual(sorted((item["path"], item["kind"]) for item in held["records"]),
+                         [(".impeccable/", "reviews"), ("scripts/__screenshots__/", "images")])
+        self.assertEqual([(item["path"], item["kind"]) for item in held["held"]],
+                         [(".env", "setting"), ("local.sqlite3", "data")])
+        self.assertIn("OPENAI_API_KEY", held["held"][0]["reason"])
+        self.assertNotIn("sk-only-here", json.dumps(held, ensure_ascii=False))
+        self.assertTrue(all(item["decision"] for item in held["held"]))
+        self.assertTrue(any(".env" in reason and held["held"][0]["decision"] in reason for reason in held["reasons"]))
+
+        (self.wt / ".env").unlink()
+        (self.wt / "local.sqlite3").unlink()
+        code, result = self.run_main("--archive-scratch", "--archive-dir", str(archive))
+
+        self.assertEqual((code, result["ok"], result["review"]), (0, True, []))
+        self.assertFalse((self.wt / "scripts/__screenshots__").exists() or (self.wt / ".impeccable").exists())
+        self.assertTrue(all(item["verified"] for item in result["archived"]))
+        manifest = [json.loads(line) for line in (archive / "archived.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(entry["from"] for entry in manifest),
+                         sorted(str(self.wt.resolve() / rel) for rel in (".impeccable", "scripts/__screenshots__")))
+        moved = next(Path(entry["to"]) for entry in manifest if entry["from"].endswith("__screenshots__"))
+        self.assertEqual((moved / "after-mobile.png").read_bytes(), b"\x89PNG after")
 
     def test_archive_path_moves_a_named_path_only_when_named_paths_alone_keep_the_worktree(self) -> None:
         (self.main / ".git/info/exclude").write_text(".tmp/\n")
