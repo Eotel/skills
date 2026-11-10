@@ -7,7 +7,7 @@ Codex has no code review for the current head --codex-wait minutes after the
 watcher first saw that head, CODEX NONE is printed once for that head, only in a
 repository where Codex has commented before (one search API call per repository per
 run, made when the line would be printed; a failed search prints nothing and is
-retried on the next poll). A CI
+retried on the next poll, not for the other PRs of that repository in the same poll). A CI
 FAILURE line ends with 未起動 ["job", ...]: <reason> for the failed GitHub Actions
 jobs whose first annotation says GitHub never started them (an Actions budget or the
 spending limit), read once per failed result with one REST call per failed job.
@@ -216,11 +216,14 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
     return events, state
 
 
-def codex_commented(repo: str, cache: dict[str, bool]) -> bool:
+def codex_commented(repo: str, cache: dict[str, bool], failed: set[str]) -> bool:
     """Whether Codex has commented on any issue or PR in `repo`, searched once per repository and kept in `cache`.
 
-    A failed search answers False without caching, so a later poll asks again.
+    A failed search answers False and goes into `failed`, which the caller empties every poll: the other PRs of
+    that repository skip the search in the same poll, and the next poll asks again.
     """
+    if repo in failed:
+        return False
     if repo not in cache:
         try:
             found = gh_json(["api", "-X", "GET", "search/issues", "-f", f"q=repo:{repo} commenter:{CODEX_LOGIN}",
@@ -230,6 +233,7 @@ def codex_commented(repo: str, cache: dict[str, bool]) -> bool:
             cache[repo] = int(found["total_count"]) > 0
         except (ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
             print(f"watch_prs: Codex history check for {repo} failed: {exc}", file=sys.stderr, flush=True)
+            failed.add(repo)
             return False
     return cache[repo]
 
@@ -334,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         first_cycle = True
         while True:
             had_errors = False
+            codex_search_failed: set[str] = set()
             try:
                 remaining, reset = graphql_budget()
             except FileNotFoundError:
@@ -359,7 +364,8 @@ def main(argv: list[str] | None = None) -> int:
                     repo = spec.split("#", 1)[0]
                     events, updated = diff_events(spec, previous, snapshot, args.me, partial(unstarted_jobs, repo),
                                                   codex_wait=args.codex_wait * 60,
-                                                  codex_used=partial(codex_commented, repo, codex_repos))
+                                                  codex_used=partial(codex_commented, repo, codex_repos,
+                                                                     codex_search_failed))
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:

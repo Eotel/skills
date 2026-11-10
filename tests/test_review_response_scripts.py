@@ -449,11 +449,11 @@ class WatchPrsTests(unittest.TestCase):
 
     def fake_gh(
         self, views: dict[str, dict], feeds: dict[str, list[dict]], remaining: int = 5000, reset: int = 1793160542,
-        codex_comments: int = 1,
+        codex_comments: int | None = 1,
     ) -> tuple[list[list[str]], Callable[..., subprocess.CompletedProcess[str]]]:
         """Answer gh at the subprocess boundary and record each command's arguments.
 
-        A search for issues Codex commented on finds `codex_comments` of them.
+        A search for issues Codex commented on finds `codex_comments` of them, or fails when it is None.
         """
         calls: list[list[str]] = []
 
@@ -465,6 +465,8 @@ class WatchPrsTests(unittest.TestCase):
             elif args[:2] == ["pr", "view"]:
                 body = views[args[2]]
             elif "search/issues" in args:
+                if codex_comments is None:
+                    return subprocess.CompletedProcess(command, 1, "", "HTTP 403: secondary rate limit")
                 body = {"total_count": codex_comments, "items": []}
             elif args[-1].split("?")[0].endswith("/annotations"):
                 body = feeds.get(args[-1].split("?")[0], [])
@@ -558,6 +560,32 @@ class WatchPrsTests(unittest.TestCase):
                 searches = [args for args in calls if "search/issues" in args]
                 self.assertEqual(len(searches), 1)
                 self.assertIn("q=repo:acme/api commenter:chatgpt-codex-connector[bot]", searches[0])
+
+    def test_failed_codex_history_search_runs_once_per_poll(self) -> None:
+        view = {"state": "OPEN", "headRefOid": "a" * 40, "mergeable": "MERGEABLE", "statusCheckRollup": [],
+                "updatedAt": "2026-11-10T11:05:00Z"}
+        calls, run = self.fake_gh({"12": view, "13": view, "14": view}, {}, codex_comments=None)
+        searches_per_poll: list[int] = []
+
+        def next_poll(_: float) -> None:
+            searches_per_poll.append(sum("search/issues" in args for args in calls))
+            calls.clear()
+            if len(searches_per_poll) == 2:
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary:
+            listing = Path(temporary) / "prs.txt"
+            listing.write_text("acme/api#12\nacme/api#13\nacme/api#14\n", encoding="utf-8")
+            state_file = Path(temporary) / "state.json"
+            seen = {"head": "a" * 40, "head_seen_at": 0.0}
+            state_file.write_text(json.dumps({f"acme/api#{n}": seen for n in (12, 13, 14)}), encoding="utf-8")
+            output = io.StringIO()
+            with patch.object(prs.subprocess, "run", side_effect=run), redirect_stdout(output), \
+                    redirect_stderr(io.StringIO()), patch.object(prs.time, "time", return_value=1000.0), \
+                    patch.object(prs.time, "sleep", side_effect=next_poll):
+                self.assertEqual(prs.main([str(listing), "--state-file", str(state_file), "--me", self.me]), 130)
+        self.assertEqual(searches_per_poll, [1, 1])
+        self.assertEqual(output.getvalue(), "")
 
     def test_codex_summary_table_reports_reviews_without_the_state_marker(self) -> None:
         def summary(word: str) -> list[dict]:
