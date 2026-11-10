@@ -270,10 +270,17 @@ def read_pyproject_toml(content: str) -> ManifestNames:
             )
     poetry = document.get("tool", {}).get("poetry", {})
     for table in (poetry, *poetry.get("group", {}).values()):
-        for name in table.get("dependencies", {}):
+        for name, spec in table.get("dependencies", {}).items():
             normalized = normalize_python_name(name)
-            if normalized != "python":
-                dependencies.setdefault(normalized, set())
+            if normalized == "python":
+                continue
+            # A Poetry spec is a version string, a table, or a list of tables.
+            specs = spec if isinstance(spec, list) else [spec]
+            dependencies.setdefault(normalized, set()).update(
+                normalize_python_name(extra)
+                for item in specs if isinstance(item, dict)
+                for extra in item.get("extras", ())
+            )
     return ManifestNames(dependencies, {normalize_python_name(name) for name in optional})
 
 
@@ -314,8 +321,8 @@ def added_manifest_names(repo_dir: Path, base: str) -> set[str]:
         after = manifest_names(path, _run(("git", "show", f"HEAD:{path}"), repo_dir))
         added.update(after.dependency_features.keys() - before.dependency_features.keys())
         added.update(after.declared_features - before.declared_features)
-        for name in after.dependency_features.keys() & before.dependency_features.keys():
-            added.update(after.dependency_features[name] - before.dependency_features[name])
+        for name, features in after.dependency_features.items():
+            added.update(features - before.dependency_features.get(name, set()))
     return added
 
 

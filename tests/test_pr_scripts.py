@@ -207,7 +207,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 package = "test-crate"
 version = "1"
 [build-dependencies]
-build-crate = "1"
+build-crate = { version = "1", features = ["build_feature"] }
 [target.'cfg(unix)'.dependencies]
 unix-crate = "1"
 [target.'cfg(windows)'.dev-dependencies]
@@ -226,7 +226,7 @@ new_feature = []
         self.assertEqual(status, 1)
         expected = {
             "test-crate", "build-crate", "unix-crate", "windows-test", "unix-build",
-            "workspace-crate", "new_feature", "preserve_order",
+            "workspace-crate", "new_feature", "preserve_order", "build_feature",
         }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
         self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")
@@ -258,7 +258,7 @@ existing = "1"
 '''})
         self.commit_files({"pyproject.toml": '''
 [project]
-dependencies = ["pyyaml>=7", "foo-bar>=2", "requests[socks]>=2", "new-package>=1; python_version >= '3.12'"]
+dependencies = ["pyyaml>=7", "foo-bar>=2", "requests[socks]>=2", "new-package[fast]>=1; python_version >= '3.12'"]
 [project.optional-dependencies]
 gpu = ["requests", "test_package~=2"]
 [dependency-groups]
@@ -266,7 +266,7 @@ dev = ["dev.package @ https://example.invalid/dev.whl", { include-group = "test"
 test = []
 [tool.poetry.dependencies]
 python = "^3.12"
-existing = "2"
+existing = { version = "2", extras = ["Poetry_Extra"] }
 httpx = "^0.28"
 [tool.poetry.group.dev.dependencies]
 pytest = { version = "^8" }
@@ -275,7 +275,10 @@ pytest = { version = "^8" }
         argv = ("check", str(self.body), "--kind", "review-first", "--base", base)
         status, out, _ = self.run_main(*argv)
         self.assertEqual(status, 1)
-        expected = {"new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest"}
+        expected = {
+            "new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest",
+            "fast", "poetry-extra",
+        }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
         self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")
         self.assertEqual(self.run_main(*argv)[0], 0)
