@@ -598,11 +598,13 @@ class ClassifyTests(unittest.TestCase):
         sessions = Path(self.tmp.name) / "profile/sessions"
         sessions.mkdir(parents=True)
         (sessions / "70.json").write_text(json.dumps({"pid": 70, "sessionId": "notes", "cwd": "/ghq/other"}))
-        for cwd, session_id, said, at in (("/w/report", "old", "11/02 の別件", "2026-11-02T01:00:00Z"),
-                                          ("/ghq/work-reports", resumed, "今日の報告", "2026-11-09T01:00:00Z"),
-                                          ("/w/notes", "old", "前のメモ", "2026-11-02T01:00:00Z"),
-                                          ("/ghq/other", "notes", "今日のメモ", "2026-11-09T01:00:00Z")):
-            write_jsonl(scan.claude_project_dir(self.projects, cwd) / f"{session_id}.jsonl",
+        # The resumed session is written under its Orca profile's own projects, which need not be ~/.claude's.
+        for root, cwd, session_id, said, at in (
+                (self.projects, "/w/report", "old", "11/02 の別件", "2026-11-02T01:00:00Z"),
+                (sessions.parent / "projects", "/ghq/work-reports", resumed, "今日の報告", "2026-11-09T01:00:00Z"),
+                (self.projects, "/w/notes", "old", "前のメモ", "2026-11-02T01:00:00Z"),
+                (self.projects, "/ghq/other", "notes", "今日のメモ", "2026-11-09T01:00:00Z")):
+            write_jsonl(scan.claude_project_dir(root, cwd) / f"{session_id}.jsonl",
                         [user("go"), {**assistant(text(said)), "timestamp": at}])
         ps = subprocess.CompletedProcess([], 0, (f"   80 claude --dangerously-skip-permissions --resume {resumed}\n"
                                                 "   70 claude\n   60 -zsh\n"), "")

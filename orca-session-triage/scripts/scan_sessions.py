@@ -299,6 +299,8 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
     known = {pid: cwd for pid, (_, cwd, _) in live.items()}
     where = {**cwds(sorted({member for chain in chains.values() for member in chain} - known.keys())), **known}
     live.update({pid: (session, where.get(pid, ""), Path(projects_root)) for pid, session in named.items()})
+    # Without its session file, the profile that wrote the transcript is unknown: search each one's projects.
+    profiles = [directory.parent / "projects" for directory in session_dirs]
 
     def worktree_of(cwd: str) -> str | None:
         path = max((path for path in worktree_paths if cwd == path or cwd.startswith(path.rstrip("/") + "/")),
@@ -315,7 +317,8 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
         worktree = (next((path for member in chains[pid]
                           if (path := tabs.get((in_tab.get(member) or TabProcess(None, None)).handle or ""))), None)
                     or next((path for member in chains[pid] if (path := worktree_of(where.get(member, "")))), None))
-        transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects])
+        transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects,
+                                                          *(profiles if pid in named else [])])
         if worktree and transcript:
             found.setdefault(worktree, set()).add(transcript)
     return {worktree: sorted(paths) for worktree, paths in found.items()}
