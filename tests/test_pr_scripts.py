@@ -259,7 +259,7 @@ existing = "1"
 '''})
         self.commit_files({"pyproject.toml": '''
 [project]
-dependencies = ["pyyaml>=7", "foo-bar>=2", "requests[socks]>=2", "new-package[fast]>=1; python_version >= '3.12'"]
+dependencies = ["pyyaml>=7", "foo-bar>=2", "requests[socks]>=2", "typing_extensions>=4", "new-package[fast]>=1; python_version >= '3.12'"]
 [project.optional-dependencies]
 gpu = ["requests", "test_package~=2"]
 [dependency-groups]
@@ -282,10 +282,12 @@ requires = ["hatchling>=1"]
         self.assertEqual(status, 1)
         expected = {
             "new-package", "test-package", "dev-package", "socks", "gpu", "httpx", "pytest",
-            "fast", "poetry-extra", "network", "hatchling",
+            "fast", "poetry-extra", "network", "hatchling", "typing-extensions",
         }
         self.assertEqual({line.rsplit(": ", 1)[1] for line in out.splitlines()}, expected)
-        self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + " ".join(expected), encoding="utf-8")
+        # The manifest's own spelling also names a normalized Python name.
+        named = " ".join(expected - {"typing-extensions"}) + " typing_extensions"
+        self.body.write_text(REVIEW_FIRST_BODY + "\n\n" + named, encoding="utf-8")
         self.assertEqual(self.run_main(*argv)[0], 0)
 
     def test_check_uses_the_merge_base_and_committed_head(self) -> None:

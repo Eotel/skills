@@ -339,9 +339,13 @@ def added_manifest_names(repo_dir: Path, base: str) -> set[str]:
 
 
 def body_mentions_name(body: str, name: str) -> bool:
-    """Match a complete name, including next to Japanese text or Markdown punctuation."""
+    """Match a complete name, including next to Japanese text or Markdown punctuation.
+
+    Runs of -, _ and . match each other, so typing_extensions names the normalized typing-extensions.
+    """
+    spelling = "[-_.]+".join(re.escape(part) for part in re.split(r"[-_.]+", name))
     return re.search(
-        rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
+        rf"(?<![A-Za-z0-9_.-]){spelling}(?![A-Za-z0-9_.-])",
         body,
         re.IGNORECASE | re.ASCII,
     ) is not None
@@ -362,8 +366,8 @@ def main(argv: list[str] | None = None) -> int:
             f"Read changed manifests ({', '.join(MANIFEST_READERS)}) at the merge-base\n"
             "of REF and HEAD and at committed HEAD. Version-only changes and removals do not count.\n"
             "Python package and extra names are normalized (lowercase; runs of -, _, . become -).\n"
-            "Names in the body are case-insensitive and must be delimited by characters\n"
-            "other than ASCII letters, digits, _, -, or . An unresolved base or unreadable\n"
+            "Names in the body are case-insensitive, treat runs of -, _, . as the same, and must be\n"
+            "delimited by characters other than ASCII letters, digits, _, -, or . An unresolved base or unreadable\n"
             "manifest exits with status 2."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
