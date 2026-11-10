@@ -18,7 +18,9 @@ turn.
 2. **Verify.** Run focused checks capable of detecting the requested failure.
    Broaden for integration, shared-boundary refactors, or repository release
    policy. Use `real-browser-verify` for changed UI behavior.
-3. **Review the diff.** Remove accidental complexity, scope drift, dead code, and
+3. **Review the diff.** Run `code-review` using the
+   [pre-commit review inputs](references/pre-commit-review.md). Address valid
+   findings, then remove accidental complexity, scope drift, dead code, and
    duplicated rules without cutting requested behavior.
 4. **Prepare the change.** Delete the completed exec plan after promoting
    durable decisions, put its verification results in the PR description, stage
