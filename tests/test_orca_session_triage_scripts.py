@@ -2665,6 +2665,76 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(written["rows"][0]["claude"]["final_text"], "PR を出しました。")
         self.assertTrue(written["generated_at"])
 
+    def scan_offline(self, worktrees: list[dict], *extra: str) -> tuple[int, str, Path]:
+        """Scan these Orca worktrees with --review-out; the exit code, stdout, and the queue's path."""
+        ps, terms = self.dir / "ps.json", self.dir / "terms.json"
+        ps.write_text(json.dumps({"result": {"worktrees": worktrees}}))
+        terms.write_text(json.dumps({"result": {"terminals": []}}))
+        queue = self.dir / "triage" / "review-queue.json"
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            code = scan.main(["--ps-json", str(ps), "--terminals-json", str(terms),
+                              "--claude-projects", str(self.dir / "claude"), "--codex-sessions", str(self.dir / "none"),
+                              "--review-out", str(queue), *extra])
+        return code, out.getvalue(), queue
+
+    def test_a_scan_that_reached_no_repository_on_github_stops_without_a_review_queue(self) -> None:
+        # 11/10 08:58: DNS failed after the Mac woke, every repository's PRs were missing, and the scan exited 0.
+        def remote(name: str, repo: str) -> dict:
+            return {**worktree(f"/remote/{name}", "done", pr={"number": 5, "url": f"https://github.com/{repo}/pull/5"}),
+                    "_environment": "mbp16",
+                    "agents": [{"agentType": "claude", "state": "done", "lastAssistantMessage": "PR を出しました。"}]}
+
+        rows = [remote("a", "acme/app"), remote("b", "acme/lib")]
+        offline = subprocess.CompletedProcess([], 1, "", 'Post "https://api.github.com/graphql": proxyconnect tcp: '
+                                                      "dial tcp 127.0.0.1:9: connect: connection refused")
+        github = FakeGitHub({"acme/app": [pr_node(5)]})
+
+        def one_repo_reached(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return offline if 'name: "lib"' in " ".join(argv) else github(argv, **kwargs)
+
+        with patch.object(scan.subprocess, "run", return_value=offline), patch.object(scan.time, "sleep"):
+            code, out, queue = self.scan_offline(rows)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(out.startswith("ネットワーク断"), out)
+        self.assertFalse(queue.exists())
+
+        with patch.object(scan.subprocess, "run", side_effect=one_repo_reached), patch.object(scan.time, "sleep"):
+            code, _, queue = self.scan_offline(rows)
+        self.assertEqual(code, 0)
+        self.assertTrue(queue.exists())
+
+    def test_a_github_answer_after_a_timed_out_try_counts_as_reached(self) -> None:
+        reach = scan.Reach()
+        answered = subprocess.CompletedProcess([], 1, '{"data": {"repository": null}}',
+                                               "GraphQL: Could not resolve to a Repository with the name 'acme/gone'.")
+        with patch.object(scan.subprocess, "run", side_effect=[subprocess.TimeoutExpired("gh", 30), answered]), \
+                patch.object(scan.time, "sleep"):
+            scan.graphql_repository("acme/gone", "query", reach)
+        self.assertEqual(reach.down(), [])
+
+    def test_a_scan_whose_every_jev_call_failed_to_connect_stops_without_a_review_queue(self) -> None:
+        key = self.dir / "api_key"
+        key.write_text("key-1\n")
+        write_jsonl(scan.claude_project_dir(self.dir / "claude", "/w/idle") / "s.jsonl",
+                    [user("go"), assistant(text("PR を出しました。"))])
+
+        def offline(request: urllib.request.Request, timeout: float) -> io.BytesIO:
+            raise urllib.error.URLError(OSError(8, "nodename nor servname provided, or not known"))
+
+        with patch.object(scan.urllib.request, "urlopen", offline):
+            code, out, queue = self.scan_offline([worktree("/w/idle", "done")], "--jev-key-file", str(key))
+        self.assertNotEqual(code, 0)
+        self.assertTrue(out.startswith("ネットワーク断"), out)
+        self.assertFalse(queue.exists())
+
+        def refused(request: urllib.request.Request, timeout: float) -> io.BytesIO:
+            raise urllib.error.HTTPError("u", 401, "Unauthorized", Message(), None)
+
+        with patch.object(scan.urllib.request, "urlopen", refused):
+            code, _, queue = self.scan_offline([worktree("/w/idle", "done")], "--jev-key-file", str(key))
+        self.assertEqual(code, 0)
+        self.assertTrue(queue.exists())
+
     def test_only_scans_one_worktree_and_queues_it_even_when_working(self) -> None:
         selected, other = "/w/selected", "/w/other"
         ps, terms = self.dir / "ps.json", self.dir / "terms.json"

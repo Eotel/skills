@@ -158,7 +158,9 @@ board's done cards; close what the user approves.
   such row with its agent's tab and what it needs.
 - **Review queue**: run the scan with
   `--review-out ~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}/review-queue.json`.
-  It queues every row Jev judged from a final message (`unsure`, `stalled`,
+  When every GitHub query or every Jev call failed to connect, the scan prints
+  only a line starting with 「ネットワーク断」, writes no queue, and exits 3:
+  scan again once the connection is back. It queues every row Jev judged from a final message (`unsure`, `stalled`,
   `waiting`) and every `stalled` row whose own PR merged, unless a careful read
   already classed that same final message. Then invoke the `orca-row-classify`
   skill with `~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}`: it reads the
