@@ -318,7 +318,21 @@ def apm_deployments(base: Path) -> list[Deployment]:
     return [Deployment(repo, repo / fields.get("virtual_path", ""), copies)
             for fields, copies in blocks
             if "repo_url" in fields and fields.get("host", "github.com") == "github.com"
-            for repo in [Path.home() / "ghq/github.com" / fields["repo_url"]]]
+            for repo in [ghq_checkout(fields["repo_url"])]]
+
+
+def ghq_checkout(repo_url: str) -> Path:
+    """The ghq checkout of ``repo_url``, spelled as on disk.
+
+    The lock may spell the owner in another case. A case-insensitive file system still finds the
+    files, but git names the checkout's toplevel as the disk spells it, so a path in the lock's
+    spelling would fall outside its own repository.
+    """
+    path = Path.home() / "ghq/github.com"
+    for part in repo_url.split("/"):
+        names = [entry.name for entry in path.iterdir()] if path.is_dir() else []
+        path /= part if part in names else next((name for name in names if name.casefold() == part.casefold()), part)
+    return path
 
 
 def apm_source(path: Path, deployments: Sequence[Deployment]) -> Path:
