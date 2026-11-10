@@ -62,11 +62,14 @@ establish target coverage, absence of callers, or the status of other branches.
 A line-limit failure is recorded separately from a legacy archive or history
 heading.
 
-The existing per-repository inventory command remains useful in a dedicated
-checkout at the confirmed default-branch commit:
+Before entering a target checkout, set `migration_script` to the absolute path
+of `scripts/migrate_plans.py` beside the installed skill's loaded `SKILL.md`,
+using shell-safe quoting. Use that trusted installation outside the target
+checkout; stop if it is unavailable. Run it from a dedicated checkout at the
+confirmed default-branch commit:
 
 ```sh
-exec-plan-migration/scripts/migrate_plans.py --root . --base HEAD
+"$migration_script" --root . --base HEAD
 ```
 
 Keep the literal `HEAD`; do not substitute a repository-supplied branch name into

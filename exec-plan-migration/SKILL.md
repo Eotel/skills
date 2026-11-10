@@ -17,12 +17,17 @@ retirement gates, and coordinated distribution withdrawal conditions.
 
 ## Inventory
 
+Before entering the target checkout, set `migration_script` to the absolute path
+of `scripts/migrate_plans.py` beside the installed skill's loaded `SKILL.md`,
+using shell-safe quoting. Use that trusted installation outside the target
+checkout; stop if it is unavailable.
+
 Work in a dedicated worktree at the confirmed default-branch commit. Keep the
 literal `HEAD` as the comparison base; do not insert branch names into the shell
 command. Run:
 
 ```bash
-<skill>/scripts/migrate_plans.py --root . --base HEAD
+"$migration_script" --root . --base HEAD
 ```
 
 The report lists the completed plans, every tracked line that references them
