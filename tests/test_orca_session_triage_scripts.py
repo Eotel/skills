@@ -2703,6 +2703,15 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(queue.exists())
 
+    def test_a_github_answer_after_a_timed_out_try_counts_as_reached(self) -> None:
+        reach = scan.Reach()
+        answered = subprocess.CompletedProcess([], 1, '{"data": {"repository": null}}',
+                                               "GraphQL: Could not resolve to a Repository with the name 'acme/gone'.")
+        with patch.object(scan.subprocess, "run", side_effect=[subprocess.TimeoutExpired("gh", 30), answered]), \
+                patch.object(scan.time, "sleep"):
+            scan.graphql_repository("acme/gone", "query", reach)
+        self.assertEqual(reach.down(), [])
+
     def test_a_scan_whose_every_jev_call_failed_to_connect_stops_without_a_review_queue(self) -> None:
         key = self.dir / "api_key"
         key.write_text("key-1\n")

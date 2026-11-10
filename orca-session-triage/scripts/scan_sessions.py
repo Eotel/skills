@@ -1684,9 +1684,9 @@ def graphql_repository(slug: str, query: str, reach: Reach | None = None) -> dic
     whatever the exit code. The query goes into `reach`, with gh's error when
     its last try timed out or gh says it could not connect (GH_UNREACHABLE).
     """
-    timed_out = False
     for attempt in range(3):
-        out = None
+        # Only the last try says whether GitHub was reached: an answer after a timeout reached it.
+        out, timed_out = None, False
         try:
             out = subprocess.run(["gh", "api", "graphql", "-f", "query=" + query],
                                  capture_output=True, text=True, timeout=GH_TIMEOUT)
