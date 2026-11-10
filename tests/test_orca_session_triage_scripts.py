@@ -591,6 +591,39 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual({path: [p.name for p in found] for path, found in live.items()},
                          {"/w/report": ["moved.jsonl"]})
 
+    def test_a_session_run_from_outside_the_worktree_belongs_to_the_worktree_of_its_orca_tab(self) -> None:
+        # 2026-11-09: montly-report's tab resumed Claude in a checkout outside the worktree, with no sessions/<pid>.json,
+        # so the row showed an 11/02 message on another matter from the worktree's own transcript, not that day's report.
+        resumed = "92c0a1e6-6483-42b4-865d-2439ed459003"
+        sessions = Path(self.tmp.name) / "profile/sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "70.json").write_text(json.dumps({"pid": 70, "sessionId": "notes", "cwd": "/ghq/other"}))
+        # The resumed session is written under its Orca profile's own projects, which need not be ~/.claude's.
+        for root, cwd, session_id, said, at in (
+                (self.projects, "/w/report", "old", "11/02 の別件", "2026-11-02T01:00:00Z"),
+                (sessions.parent / "projects", "/ghq/work-reports", resumed, "今日の報告", "2026-11-09T01:00:00Z"),
+                (self.projects, "/w/notes", "old", "前のメモ", "2026-11-02T01:00:00Z"),
+                (self.projects, "/ghq/other", "notes", "今日のメモ", "2026-11-09T01:00:00Z")):
+            write_jsonl(scan.claude_project_dir(root, cwd) / f"{session_id}.jsonl",
+                        [user("go"), {**assistant(text(said)), "timestamp": at}])
+        ps = subprocess.CompletedProcess([], 0, (f"   80 claude --dangerously-skip-permissions --resume {resumed}\n"
+                                                "   70 claude\n   60 -zsh\n"), "")
+        trees = [worktree("/w/report"), worktree("/w/notes")]
+
+        with patch.object(scan.subprocess, "run", return_value=ps), \
+                patch.object(scan.rm_check, "process_handles", return_value={81: "term_report", 70: "term_notes"}):
+            # The resumed Claude's own environment hides its tab; only its shell shows it.
+            live = scan.running_claude_transcripts(["/w/report", "/w/notes"], [sessions], self.projects,
+                                                   {80: (81, "claude"), 81: (1, "-zsh"), 70: (60, "claude"),
+                                                    60: (1, "-zsh")},
+                                                   lambda pids: {pid: "/ghq/other" for pid in pids},
+                                                   tabs={"term_report": "/w/report", "term_notes": "/w/notes"})
+        rows = scan.build_inventory(trees, [terminal("/w/report", "claude", "term_report"),
+                                            terminal("/w/notes", "claude", "term_notes")],
+                                    self.projects, {}, "要判断", now=NOW, judge=judging({}), live_transcripts=live)
+
+        self.assertEqual([row["claude"]["final_text"] for row in rows], ["今日の報告", "今日のメモ"])
+
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
         tree: dict = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
@@ -1934,7 +1967,7 @@ class NextStepFactTests(unittest.TestCase):
             "orca_message": None, "prompt_waiting": None,
             "claude": {"last_user": "u", "final_text": "f", "final_at": "t1", "transcript": "/x.jsonl"},
             "codex": {"last_assistant": "new", "last_assistant_at": "t1", "rollout": "/r.jsonl"},
-            "final_at": "t1", "read": scan.read_key(rows[0])})
+            "final": {"source": "claude", "at": "t1", "text": "f"}, "final_at": "t1", "read": scan.read_key(rows[0])})
 
     def test_a_queued_row_carries_its_newest_inbox_reports_and_which_report_came_last(self) -> None:
         # The Orca comment has no time; a done report newer than the final message must reach the reader.
@@ -2105,6 +2138,39 @@ class ScanCommandTests(unittest.TestCase):
         path = self.dir / "scan.json"
         path.write_text(json.dumps(rows, ensure_ascii=False))
         return path, checkout
+
+    def test_a_done_card_newer_than_the_transcript_is_the_final_message_and_row_lists_cards_in_full(self) -> None:
+        # 2026-11-09: montly-report's row showed an 11/02 message on another matter while its card held that day's
+        # report, and --row had no done_cards, so reading the card took hand-written Python.
+        report, prompt = "今日の報告です。" + "続き" * 200, "月報を出して。" + "詳しく" * 100
+
+        def lane(name: str, said: str, said_at: str, card: str, card_at: str) -> dict:
+            return {"path": f"/w/app/{name}", "repo": "app", "environment": None, "class": "unsure",
+                    "reasons": [], "comment": "", "terminals": [], "codex": [],
+                    "claude": {"final_text": said, "final_at": said_at, "last_user": "go"},
+                    "done_cards": [{"agent": "claude", "handle": "term_" + name, "done_at": card_at,
+                                    "interrupted": False, "prompt": prompt, "last_message": card}]}
+        saved = self.dir / "scan.json"
+        rows = [lane("same", "同じ報告", "2026-11-09T01:00:00.400Z", "同じ報告", "2026-11-09T01:00:01Z"),
+                lane("report", "11/02 の別件", "2026-11-02T01:00:00Z", report, "2026-11-09T03:00:00Z"),
+                lane("older", "新しい発言", "2026-11-09T02:00:00Z", "古い card", "2026-11-09T00:00:00Z")]
+        saved.write_text(json.dumps(rows))
+        # orca-row-classify reads only the queue, so the queue carries the message its read key stands for.
+        self.assertEqual([entry["final"]["text"] for entry in scan.review_queue(rows)], ["同じ報告", report, "新しい発言"])
+
+        def final(name: str) -> dict:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--row", name]), 0)
+            return json.loads(out.getvalue())
+
+        shown = final("report")
+        self.assertEqual(shown["final"], {"source": "card", "at": "2026-11-09T03:00:00Z", "text": report})
+        self.assertEqual([(card["prompt"], card["last_message"]) for card in shown["done_cards"]],
+                         [(prompt, report)])
+        self.assertEqual([final(name)["final"]["source"] for name in ("same", "older")], ["claude", "claude"])
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rows", "--sort", "final"]), 0)
+        self.assertEqual([line.split(" | ")[0] for line in out.getvalue().splitlines()], ["report", "older", "same"])
 
     def test_wake_names_each_lane_the_api_stopped_with_its_tab_and_what_it_needs(self) -> None:
         def stopped(path: str, environment: str | None, handle: str, kind: str, action: str, error: str, resets: str | None = None) -> dict:

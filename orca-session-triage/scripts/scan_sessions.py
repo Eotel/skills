@@ -215,6 +215,34 @@ def process_cwds(pids: list[int]) -> dict[int, str]:
     return cwds
 
 
+NAMED_SESSION = re.compile(r"\s(?:--resume|-r|--session-id)[ =]"
+                           r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\s|$)")
+
+
+class TabProcess(NamedTuple):
+    handle: str | None  # ORCA_TERMINAL_HANDLE: the Orca tab it runs in
+    session: str | None  # the Claude session its --resume or --session-id names
+
+
+def tab_processes(pids: list[int]) -> dict[int, TabProcess]:
+    """Each process's Orca tab (rm_check.process_handles) and the Claude session its arguments name; one with
+    neither is left out."""
+    if not pids:
+        return {}
+    handles = rm_check.process_handles(pids)
+    try:
+        out = subprocess.run(["ps", "-ww", "-o", "pid=,args=", "-p", ",".join(map(str, pids))],
+                             capture_output=True, text=True, timeout=ORCA_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    sessions = {}
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid.isdigit() and (named := NAMED_SESSION.search(" " + args)):
+            sessions[int(pid)] = named[1]
+    return {pid: TabProcess(handles.get(pid), sessions.get(pid)) for pid in {*handles, *sessions}}
+
+
 def ancestry(pid: int, processes: dict[int, tuple[int, str]]) -> list[int]:
     """The process and its ancestors, nearest first."""
     chain = []
@@ -235,13 +263,18 @@ def session_transcript(session_id: str, cwd: str, roots: Sequence[Path]) -> Path
 
 def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequence[Path], projects_root: str | Path,
                                processes: dict[int, tuple[int, str]],
-                               cwds: Callable[[list[int]], dict[int, str]]) -> dict[str, list[Path]]:
+                               cwds: Callable[[list[int]], dict[int, str]], tabs: Mapping[str, str] | None = None,
+                               tab_of: Callable[[list[int]], dict[int, TabProcess]] = tab_processes
+                               ) -> dict[str, list[Path]]:
     """The transcripts of running Claude sessions by the worktree each runs under.
 
     A session can move its cwd out of the worktree (into a worktree under .claude/worktrees, or as a
-    background session its tab's Claude started), and its transcript then lands in another project
-    directory. Its worktree is the first of the process and its ancestors whose cwd, from its session file or
-    else from lsof, is inside one.
+    background session its tab's Claude started), or start outside it, and its transcript then lands in another
+    project directory. `tabs` maps an Orca tab's handle to its worktree: a session whose process or ancestor
+    carries one of them in ORCA_TERMINAL_HANDLE (read by `tab_of`) belongs to that tab's worktree, and a Claude in
+    such a tab with no session file is known by the session its --resume or --session-id names. Otherwise its
+    worktree is the first of the process and its ancestors whose cwd, from its session file or else from lsof,
+    is inside one.
     """
     live = {}
     for directory in session_dirs:
@@ -256,9 +289,24 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
             if (isinstance(pid, int) and "claude" in processes.get(pid, (0, ""))[1] and isinstance(cwd, str)
                     and isinstance(session_id, str) and re.fullmatch(r"[\w-]+", session_id)):
                 live[pid] = (session_id, cwd, directory.parent / "projects")
-    chains = {pid: ancestry(pid, processes) for pid in live}
+    tab_paths: Mapping[str, str] = tabs or {}
+    claude = [pid for pid, (_, command) in processes.items() if "claude" in command] if tab_paths else []
+    in_tab = tab_of(sorted({member for pid in claude for member in ancestry(pid, processes)})) if claude else {}
+
+    def tab_worktree(pid: int) -> str | None:
+        """The worktree of the first Orca tab the process or an ancestor names in ORCA_TERMINAL_HANDLE."""
+        return next((path for member in ancestry(pid, processes)
+                     if (path := tab_paths.get((in_tab.get(member) or TabProcess(None, None)).handle or ""))), None)
+
+    # 2026-11-09: montly-report's tab resumed Claude in another checkout, and no sessions/<pid>.json was written.
+    named = {pid: tab.session for pid in claude
+             if pid not in live and (tab := in_tab.get(pid)) and tab.session and tab_worktree(pid)}
+    chains = {pid: ancestry(pid, processes) for pid in [*live, *named]}
     known = {pid: cwd for pid, (_, cwd, _) in live.items()}
     where = {**cwds(sorted({member for chain in chains.values() for member in chain} - known.keys())), **known}
+    live.update({pid: (session, where.get(pid, ""), Path(projects_root)) for pid, session in named.items()})
+    # Without its session file, the profile that wrote the transcript is unknown: search each one's projects.
+    profiles = [directory.parent / "projects" for directory in session_dirs]
 
     def worktree_of(cwd: str) -> str | None:
         path = max((path for path in worktree_paths if cwd == path or cwd.startswith(path.rstrip("/") + "/")),
@@ -272,8 +320,10 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
 
     found: dict[str, set[Path]] = {}
     for pid, (session_id, cwd, own_projects) in live.items():
-        worktree = next((path for member in chains[pid] if (path := worktree_of(where.get(member, "")))), None)
-        transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects])
+        worktree = (tab_worktree(pid)
+                    or next((path for member in chains[pid] if (path := worktree_of(where.get(member, "")))), None))
+        transcript = session_transcript(session_id, cwd, [Path(projects_root), own_projects,
+                                                          *(profiles if pid in named else [])])
         if worktree and transcript:
             found.setdefault(worktree, set()).add(transcript)
     return {worktree: sorted(paths) for worktree, paths in found.items()}
@@ -1992,11 +2042,13 @@ InboxReports = dict[tuple[str, str], dict[str, InboxReport]]
 
 
 def row_final_at(row: dict) -> str | None:
-    """When the newest final message a reader would class was written (Claude or Codex), or None."""
+    """When the newest final message a reader would class was written (Claude, Codex, Orca, or a newer done card
+    that `final_message` takes), or None."""
     codex = row.get("codex") or []
     said = [at for at in ((row.get("claude") or {}).get("final_at"),
                           codex[-1].get("last_assistant_at") if codex else None,
-                          (row.get("orca_message") or {}).get("at")) if at]
+                          (row.get("orca_message") or {}).get("at"),
+                          (newer_card(row, transcript_final(row)) or {}).get("at")) if at]
     return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
 
 
@@ -2174,7 +2226,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
              **({"open_pr_cleanup": True} if row.get("open_pr_cleanup") else {}),
              **({"identity": row_identity(row)} if row.get("environment") else {}),
              "codex": row["codex"][-1] if row.get("codex") else None,
-             "final_at": row_final_at(row), "read": read_key(row)}
+             "final": final_message(row), "final_at": row_final_at(row), "read": read_key(row)}
             for row in rows if needs_reader(row)]
 
 
@@ -2632,8 +2684,9 @@ def select_row(rows: Sequence[dict], key: str, option: str = "--row") -> dict:
                      + "; candidates: " + (", ".join(choices) or "(none)"))
 
 
-def final_message(row: dict) -> dict:
-    """{source, at, text} of the newest final message the row's agents or Orca hold; empty strings without one."""
+def transcript_final(row: dict) -> dict:
+    """{source, at, text} of the newest final message the row's transcripts or Orca hold; empty strings without
+    one."""
     latest = latest_message({"claude": row.get("claude"), "codex": row.get("codex") or [],
                              "orca_message": row.get("orca_message")})
     if latest is None:
@@ -2643,6 +2696,32 @@ def final_message(row: dict) -> dict:
           "codex": ((row.get("codex") or [{}])[-1]).get("last_assistant_at"),
           "orca": (row.get("orca_message") or {}).get("at")}[source]
     return {"source": source, "at": at or "", "text": text or ""}
+
+
+def newer_card(row: dict, said: dict) -> dict | None:
+    """The newest done card's last message as {source: "card", at, text}, when Orca recorded it after `said` and it
+    says something else; else None.
+
+    A session the scan could not tie to the worktree (no process, or a cwd outside it) leaves the worktree's
+    transcript behind its tab, while Orca's card holds the tab's last word. The same message, recorded a second
+    after the transcript's entry, keeps the transcript's.
+    """
+    cards = [(at, card) for card in row.get("done_cards") or []
+             if card.get("last_message") and (at := parse_time(card.get("done_at")))]
+    if not cards:
+        return None
+    at, card = max(cards, key=lambda item: item[0])
+    said_at = parse_time(said["at"])
+    if " ".join(card["last_message"].split()) == " ".join(said["text"].split()) or (said_at and at <= said_at):
+        return None
+    return {"source": "card", "at": card["done_at"], "text": card["last_message"]}
+
+
+def final_message(row: dict) -> dict:
+    """{source, at, text} of the tab's newest final message: the transcripts' or Orca's, or a newer done card's
+    (source "card"); empty strings without one."""
+    said = transcript_final(row)
+    return newer_card(row, said) or said
 
 
 def github_of(row: dict) -> str:
@@ -2665,7 +2744,7 @@ MERGE = re.compile(r"(?<![A-Za-z])merge(?![A-Za-z])|マージ", re.IGNORECASE)
 ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class", "scan_class", "reasons",
             "question", "merge_question", "review", "stop", "waits_on", "next_step", "verdict", "final",
             "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "processes",
-            "tabs", "closable", "meaningful_tabs", "open_pr_cleanup")
+            "tabs", "done_cards", "closable", "meaningful_tabs", "open_pr_cleanup")
 
 
 class ReviewResult(TypedDict):
@@ -2754,6 +2833,13 @@ def row_view(row: dict) -> dict:
         "processes": row.get("processes") or [],
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
+        # Whole, unlike --cards: the prompt and last message are what a reader came for.
+        "done_cards": [{"agent": card.get("agent") or "", "handle": card.get("handle") or "",
+                        "done_at": card.get("done_at") or "", "interrupted": bool(card.get("interrupted")),
+                        "prompt": card.get("prompt") or "", "last_message": card.get("last_message") or "",
+                        "screen_tail": card.get("screen_tail") or [], "draft": card.get("draft"),
+                        "draft_text": card.get("draft_text") or "", "composer_empty": card.get("composer_empty")}
+                       for card in row.get("done_cards") or []],
         "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
         "open_pr_cleanup": bool(row.get("open_pr_cleanup")),
     }
@@ -2901,9 +2987,11 @@ def main(argv: list[str] | None = None) -> int:
     claude_root = str(Path(args.claude_projects).expanduser())
     processes = {} if args.ps_json else worktree_processes(
         [w["path"] for w in worktrees if not w.get("_environment")], Path(PROCESS_CPU).expanduser(), time.time())
+    local = {w.get("worktreeId"): w["path"] for w in worktrees if not w.get("_environment")}
     live = {} if args.ps_json else running_claude_transcripts(
-        [w["path"] for w in worktrees if not w.get("_environment")], claude_session_dirs(), claude_root,
-        process_table(), process_cwds)
+        list(local.values()), claude_session_dirs(), claude_root, process_table(), process_cwds,
+        tabs={t["handle"]: local[t.get("worktreeId")] for t in terminals
+              if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local})
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
