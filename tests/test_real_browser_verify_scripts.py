@@ -85,6 +85,18 @@ class DesktopAppTest(unittest.TestCase):
         self.assertIsNone(other.poll())
         self.assertFalse(record.exists())
 
+    def test_launch_kills_an_app_that_ignores_sigterm_after_a_timeout(self) -> None:
+        # Its helpers load, but its page never reports ready, and it ignores SIGTERM.
+        hung = "#!/bin/sh\ntrap '' TERM\necho \"loaded $$\" >> \"$DRIVE_LOG\"\nexec sleep 30\n"
+
+        launched = self.script("launch", str(self.app(hung)), "--timeout", "1")
+
+        self.assertEqual(launched.returncode, 1)
+        (drive_log,) = (self.tools / "logs").glob("*-drive.log")
+        pid = int(drive_log.read_text().split()[1])
+        self.addCleanup(lambda: alive(pid) and os.kill(pid, 9))
+        self.assertFalse(alive(pid))
+
     def test_launch_reports_an_app_that_exits_before_taking_commands(self) -> None:
         launched = self.script("launch", str(self.app("#!/bin/sh\necho 'no display'\nexit 3\n")), "--timeout", "10")
 

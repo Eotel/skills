@@ -148,17 +148,27 @@ def launch(tools: Path, binary: Path, args: list[str], env: list[tuple[str, str]
         if process.poll() is not None:
             raise DriveError(f"{binary} exited with {process.returncode}; its output:\n{tail(app_log)}")
         if f"loaded {process.pid}" not in lines and time.monotonic() > started + LOAD_GRACE:
-            process.terminate()
+            end(process)
             raise DriveError(
                 f"{binary} did not load the helpers and was stopped. A binary signed with the hardened runtime (a "
                 f"release build) ignores DYLD_INSERT_LIBRARIES; use a debug build. Its output:\n{tail(app_log)}"
             )
         time.sleep(0.05)
-    process.terminate()
+    end(process)
     raise DriveError(
         f"{binary} loaded the helpers, but its page did not finish loading within {timeout:g}s; it was stopped. "
         f"Its output:\n{tail(app_log)}"
     )
+
+
+def end(process: subprocess.Popen[bytes]) -> None:
+    """Stop an app that launch gave up on, with SIGKILL if SIGTERM does not end it within 5 seconds."""
+    process.terminate()
+    try:
+        process.wait(5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def tail(path: Path, lines: int = 20) -> str:
