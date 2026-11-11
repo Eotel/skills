@@ -17,14 +17,19 @@ For a large inbox, `read --summary` shows each entry on one line with its
 only those entries in full, wherever the cursor stands (an acknowledged one is
 marked 既読). An id may be its first 8 or more characters, as handoffs and
 `~/.cache/orca-briefs/bin/inbox` print it; one naming several entries lists them
-and prints nothing. Read a long inbox this way rather than cutting the output,
+and prints nothing. `read --text WORD` searches every entry's whole text and
+structured questions, ignoring case and wherever the cursor stands, and prints
+each match's header (time, kind, host, source, `id=`; 既読 when acknowledged)
+with the lines holding WORD: search with it rather than in the 160-character
+summary, which cuts words. Read a long inbox this way rather than cutting the output,
 and read past entries by time or worktree with `inbox --since`. `--kind ask,done` filters by type, and
 `--source skills/triage-request-ledger` filters by the displayed
 `repo/worktree` (older entries without a repo use their worktree). A worktree
 name alone, as backlog-watch prints it, also reads its `repo/worktree` when one
 repo has it; a source no entry has names the near ones on stderr. A read with
 `--kind`, `--source`, `--id`, or `--since` prints no `NEXT_OFFSET`, so an entry the filter
-hid is never acknowledged: acknowledge from an unfiltered read.
+hid is never acknowledged: acknowledge from an unfiltered read. `--text`
+prints none either.
 After handling the entries, pass `NEXT_OFFSET` to
 `scripts/inbox_read.py ack <NEXT_OFFSET>`. The scheduled run owns the default
 `~/.cache/orca-session-triage/inbox-read.offset` cursor. Only the latest
@@ -250,7 +255,10 @@ until the key has an answer, `asana99_status.py` marks that difference
 the lead's direction for its row, and name what you did in the handoff. When a
 row's situation changes so the answer may no longer fit, ask under a new key.
 `show --match WORD` (repeat per word) matches any word in the key or answer,
-ignoring case, and prints one line per answer. `--since-last-handoff` selects
+ignoring case, and prints one line per answer. A line cuts its answer at 160
+characters and then says 「…（続きは --json）」: before acting on a cut answer,
+read it whole with `--json`, which prints the matching records with their full
+answer, key, time, and the line's marks. `--since-last-handoff` selects
 answers since the newest saved handoff; `--handoffs-dir` selects that directory.
 These views show newest answers first in JST and mark a `remove:` key 未実行
 while its path still exists. `--history` adds the answers a later record of
@@ -416,6 +424,14 @@ orca automations create --name "session triage" --trigger hourly \
   through it rather than from the automation's JSON or a shell loop over
   transcript paths, which contain spaces. A manual `orca automations run`
   does not run the precheck.
+- To change the scheduled prompt, print it with `hourly_runs.py --workspace
+  <triage workspace path> --prompt > FILE`, edit FILE, and replace it with
+  `hourly_runs.py --workspace <triage workspace path> --set-prompt FILE`. It
+  replaces the prompt with the file's whole text (less its final newline),
+  reads it back, and exits 1 printing the difference when Orca keeps another.
+  The text must start with `/orca-session-triage hourly`, by which the tools
+  find the automation. Outside the triage workspace, a missing automation names
+  the workspaces that have one.
 - Orca runs the precheck through `/bin/sh` with the login `PATH`, but in the
   repo's main checkout rather than the workspace, so the command names the
   workspace.

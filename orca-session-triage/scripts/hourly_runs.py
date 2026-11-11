@@ -5,11 +5,17 @@ Each line gives when the run was scheduled and started (local time), Orca's stat
 what the precheck printed when it skipped the run, the run's tab pane, and its Claude
 transcript, so neither Orca's automation records nor transcript paths that contain
 spaces have to be read by hand. `--json` prints the same fields as a list.
+
+`--prompt` prints the prompt of the workspace's scheduled triage automation, and
+`--set-prompt FILE` replaces it with the file's whole text (less its final newline)
+through `orca automations edit`, then reads it back: when Orca keeps another text,
+it prints the difference and exits 1.
 """
 
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from difflib import unified_diff
 import json
 import os
 from pathlib import Path
@@ -110,6 +116,41 @@ def run_of(record: dict[str, Any], home: Path) -> Run:
                pane=record.get("terminalPaneKey") or "", transcript=str(transcript) if transcript else "")
 
 
+def triage_automation(orca: str, workspace: str) -> dict[str, Any]:
+    """The workspace's one scheduled triage automation; ValueError names the workspaces that have one instead."""
+    found = hourly_runtime.hourly_automations(orca)
+    here = os.path.realpath(workspace)
+    mine = [automation for automation in found if hourly_runtime.workspace_path(automation.get("workspaceId")) == here]
+    if len(mine) == 1:
+        return mine[0]
+    if mine:
+        raise ValueError(f"{len(mine)} scheduled triage automations run in {here}: "
+                         + ", ".join(str(automation.get("id")) for automation in mine))
+    elsewhere = sorted({hourly_runtime.workspace_path(automation.get("workspaceId")) or "-" for automation in found})
+    raise ValueError(f"no scheduled triage automation runs in {here}"
+                     + (f"; pass --workspace with one of: {', '.join(elsewhere)}" if elsewhere else ""))
+
+
+def set_prompt(orca: str, workspace: str, path: Path) -> int:
+    """Replace the triage automation's prompt with the file's text, then compare what Orca reads back."""
+    prompt = path.read_text(encoding="utf-8").removesuffix("\n")
+    if not prompt.startswith(hourly_runtime.HOURLY_PROMPT):
+        raise ValueError(f"{path} does not start with {hourly_runtime.HOURLY_PROMPT!r}: the scheduled-run tools "
+                         "find the automation by it")
+    automation_id = str(triage_automation(orca, workspace)["id"])
+    hourly_runtime.orca_result(orca, "automations", "edit", automation_id, "--prompt", prompt)
+    saved = next((str(automation.get("prompt") or "")
+                  for automation in hourly_runtime.orca_result(orca, "automations", "list")["automations"]
+                  if automation.get("id") == automation_id), "")
+    if saved != prompt:
+        print(f"hourly runs: Orca reads back another prompt for {automation_id}:", file=sys.stderr)
+        sys.stderr.writelines(unified_diff(prompt.splitlines(keepends=True), saved.splitlines(keepends=True),
+                                           str(path), f"orca automation {automation_id}"))
+        return 1
+    print(f"prompt set: {automation_id} ({len(prompt)} characters, read back the same)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workspace", default=hourly_runtime.workspace_path(
@@ -123,9 +164,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="include each run's last utterance and whether AskUserQuestion has no tool_result")
     parser.add_argument("--questions", action="store_true",
                         help="include each AskUserQuestion, its answer, and when each was recorded")
+    prompt = parser.add_mutually_exclusive_group()
+    prompt.add_argument("--prompt", action="store_true",
+                        help="print the prompt of the workspace's scheduled triage automation instead of its runs")
+    prompt.add_argument("--set-prompt", type=Path, metavar="FILE",
+                        help="replace that prompt with FILE's whole text (less its final newline; it must start "
+                             f"with {hourly_runtime.HOURLY_PROMPT}), read it back, and exit 1 printing the "
+                             "difference when Orca keeps another")
     args = parser.parse_args(argv)
     if not args.workspace:
         parser.error("--workspace or ORCA_WORKTREE_ID is required")
+    if args.prompt or args.set_prompt:
+        try:
+            if args.set_prompt:
+                return set_prompt(args.orca, args.workspace, args.set_prompt)
+            print(triage_automation(args.orca, args.workspace)["prompt"])
+            return 0
+        except subprocess.CalledProcessError as error:
+            print(f"hourly runs: orca {' '.join(error.cmd[1:3])} failed: "
+                  f"{(error.stderr or error.stdout or '').strip()}", file=sys.stderr)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            print(f"hourly runs: {error}", file=sys.stderr)
+        return 1
     try:
         records = hourly_runtime.scheduled_runs(args.orca, args.workspace)[:args.limit]
     except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:

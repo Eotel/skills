@@ -5,6 +5,9 @@ import os
 import subprocess
 from typing import Any
 
+# The scheduled triage automation's prompt starts the hourly run; the tools find the automation by it.
+HOURLY_PROMPT = "/orca-session-triage hourly"
+
 
 def orca_result(orca: str, *args: str) -> dict[str, Any]:
     out = subprocess.run([orca, *args, "--json"], capture_output=True, text=True,
@@ -17,14 +20,18 @@ def workspace_path(workspace_id: str | None) -> str | None:
     return os.path.realpath(workspace_id.split("::", 1)[-1]) if workspace_id else None
 
 
+def hourly_automations(orca: str) -> list[dict[str, Any]]:
+    """Every automation of this Orca whose prompt starts the hourly triage run, in any workspace."""
+    return [automation for automation in orca_result(orca, "automations", "list")["automations"]
+            if (automation.get("prompt") or "").startswith(HOURLY_PROMPT)]
+
+
 def scheduled_runs(orca: str, workspace: str) -> list[dict[str, Any]]:
     """Newest first; skip unrelated automations and manually triggered runs."""
     here = os.path.realpath(workspace)
-    automations = orca_result(orca, "automations", "list")["automations"]
     runs = []
-    for automation in automations:
-        if (workspace_path(automation.get("workspaceId")) != here or
-                not (automation.get("prompt") or "").startswith("/orca-session-triage hourly")):
+    for automation in hourly_automations(orca):
+        if workspace_path(automation.get("workspaceId")) != here:
             continue
         for run in orca_result(orca, "automations", "runs", "--id", automation["id"])["runs"]:
             if (run.get("trigger") == "scheduled" and

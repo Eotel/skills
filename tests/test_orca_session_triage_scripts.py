@@ -4297,6 +4297,19 @@ class LeadDecisionProposalTests(unittest.TestCase):
         self.assertEqual(shown.splitlines(), ["2026-10-01T11:00:00+09:00 remove:/w/a  READY to remove",
                                               "2026-10-01T10:00:00+09:00 merge:Acme/app#1  Hold for review"])
 
+    def test_show_json_gives_the_whole_answer_a_line_cuts_and_the_line_names_the_cut(self) -> None:
+        # A conditional answer cut at 160 characters reads as unconditional.
+        answer = "merge する。" + "経過" * 90 + "ただし CI が green のときだけ"
+        self.lead.append(self.log, self.lead.Decision("1", "merge:Acme/app#1", answer, "2026-10-01T01:00:00Z"))
+
+        line = self.call("show", "--match", "acme")[1]
+        code, shown = self.call("show", "--match", "acme", "--json")
+
+        self.assertTrue(line.endswith("…（続きは --json）\n"), line)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(shown), [{"id": "1", "decision": "merge:Acme/app#1", "answer": answer,
+                                              "decided_at": "2026-10-01T01:00:00Z", "value": None, "marks": []}])
+
     def test_show_since_newest_handoff_sorts_in_jst_and_marks_existing_remove_paths(self) -> None:
         kept = self.root / "kept"
         kept.mkdir()
@@ -5933,6 +5946,42 @@ class HourlyRunsTests(unittest.TestCase):
             " | skip: a scheduled turn is working | pane - | -",
         ])
 
+    def test_set_prompt_replaces_the_triage_automations_prompt_and_fails_when_orca_reads_back_another(self) -> None:
+        saved = {"triage": "/orca-session-triage hourly 旧", "other": "/orca-session-triage hourly 別"}
+        edits: list[list[str]] = []
+        keep = {"value": lambda prompt: prompt}
+
+        def orca(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[1:3] == ["automations", "edit"]:
+                edits.append(args)
+                saved[args[3]] = keep["value"](args[args.index("--prompt") + 1])
+            result = {"automations": [{"id": key, "workspaceId": f"repo::/w/{key}", "prompt": prompt}
+                                      for key, prompt in saved.items()]}
+            return subprocess.CompletedProcess(args, 0, json.dumps({"id": "1", "ok": True, "result": result}))
+
+        def run(*argv: str) -> tuple[int, str, str]:
+            with patch.object(hourly_runtime.subprocess, "run", side_effect=orca), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = hourly_runs.main(["--workspace", "/w/triage", "--orca", "test-orca", *argv])
+            return code, out.getvalue(), err.getvalue()
+
+        with tempfile.TemporaryDirectory() as root:
+            prompt = Path(root) / "prompt.md"
+            self.assertEqual(run("--prompt")[:2], (0, "/orca-session-triage hourly 旧\n"))
+            prompt.write_text("/orca-session-triage hourly 新\n二行目\n", encoding="utf-8")
+            self.assertEqual(run("--set-prompt", str(prompt))[0], 0)
+            self.assertEqual(edits[-1], ["test-orca", "automations", "edit", "triage", "--prompt",
+                                         "/orca-session-triage hourly 新\n二行目", "--json"])
+            self.assertEqual(saved["other"], "/orca-session-triage hourly 別")
+            keep["value"] = lambda prompt: prompt.splitlines()[0]
+            code, _, error = run("--set-prompt", str(prompt))
+            self.assertEqual(code, 1)
+            self.assertIn("-二行目", error)
+            # Another prompt would hide the automation from every tool that finds the scheduled runs by it.
+            prompt.write_text("hourly 新\n", encoding="utf-8")
+            self.assertEqual(run("--set-prompt", str(prompt))[0], 1)
+            self.assertEqual(len(edits), 2)
+
 
 class InboxWatchServiceTests(unittest.TestCase):
     def test_plist_runs_the_existing_watch_with_the_existing_offset(self) -> None:
@@ -6129,6 +6178,26 @@ class InboxReadTests(unittest.TestCase):
             output, error = run("same")
             self.assertEqual(output, "")
             self.assertIn("repo-a/same, repo-b/same", error)
+
+    def test_text_finds_a_word_past_the_summary_cut_wherever_the_cursor_stands(self) -> None:
+        # The summary's 160 characters cut the word the lead searched for.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))
+            write_jsonl(inbox, [{"id": "old", "ts": "t1", "kind": "done", "host": "h", "repo": "r", "worktree": "a",
+                                 "text": "経過 " + "x" * 200 + "\nPR #12 を Merge した\n別の行"}])
+            acknowledged = str(inbox.stat().st_size)
+            cursor.write_text(acknowledged)
+            with inbox.open("a", encoding="utf-8") as stream:
+                for row in ({"id": "new", "ts": "t2", "kind": "ask", "host": "h", "worktree": "b", "text": "質問",
+                             "questions": [{"header": "公開", "question": "merge しますか？", "recommended": "A"}]},
+                            {"id": "miss", "ts": "t3", "kind": "info", "host": "h", "worktree": "c", "text": "無関係"}):
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                self.assertEqual(inbox_read.main(["read", "--text", "MERGE"]), 0)
+            self.assertEqual(out.getvalue(), "t1 done h r/a id=old 既読\nPR #12 を Merge した\n\n"
+                                             "t2 ask h b id=new\nQ1 id=new:1 [公開] merge しますか？（推奨: A）\n\n")
+            self.assertEqual(cursor.read_text(), acknowledged)
 
     def test_since_reads_acknowledged_entries_by_time_without_an_offset_to_acknowledge(self) -> None:
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)

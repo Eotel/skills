@@ -2,9 +2,11 @@
 """Read new triage inbox lines by append position, then acknowledge handled lines.
 
 `read` does not advance the cursor. After handling its output, pass the printed
-byte position to `ack`; only a read without --kind, --source, --id, or --since prints it,
-so an entry a filter hid is never acknowledged. `initialize` starts a new cursor
-at the current end only after the lead has handled all existing inbox entries.
+byte position to `ack`; only a read without --kind, --source, --id, --since, or --text
+prints it, so an entry a filter hid is never acknowledged. `read --text WORD` searches every
+entry's whole text, before or after the cursor, and prints each match's header with the lines
+holding WORD. `initialize` starts a new cursor at the current end only after the lead has
+handled all existing inbox entries.
 `watch` is the lead's Monitor: it prints every new ask and done, advances its own
 cursor, and names each ask left unanswered for 15 minutes.
 
@@ -44,7 +46,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 
 import answer_evidence
 import hourly_runtime
@@ -113,6 +115,13 @@ class Sender:
         return item.get("worktree") == self.worktree and item.get("host") in (None, "", self.host)
 
 
+class Placed(NamedTuple):
+    """An inbox entry with the offset after it and whether the cursor has passed it."""
+    end: int
+    acknowledged: bool
+    item: dict
+
+
 @dataclass(frozen=True)
 class SourceFilter:
     """`read --source`: the value given, and the sources it names."""
@@ -134,11 +143,12 @@ class ReadOptions:
     summary: bool = False
     ids: frozenset[str] | None = None
     since: datetime | None = None
+    text: str | None = None
 
     @property
     def filtered(self) -> bool:
         return (self.kinds is not None or self.source is not None or self.ids is not None
-                or self.since is not None)
+                or self.since is not None or self.text is not None)
 
 
 def report_kinds(value: str) -> frozenset[ReportKind]:
@@ -327,8 +337,8 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
             print(f"inbox-read: no entry has source {options.source.given}; near sources: "
                   f"{', '.join(near_sources(entries, options.source.given)) or 'none'}", file=sys.stderr)
     if options.filtered:
-        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, --id, or --since "
-              "to acknowledge", file=sys.stderr)
+        print("inbox-read: a filtered read prints no NEXT_OFFSET; read without --kind, --source, --id, --since, "
+              "or --text to acknowledge", file=sys.stderr)
     else:
         print(f"NEXT_OFFSET={end}")
 
@@ -338,38 +348,52 @@ def names(entry_id: str, wanted: str) -> bool:
     return entry_id == wanted or len(wanted) >= ID_PREFIX_MIN and entry_id.startswith(wanted)
 
 
+def placed_entries(inbox: Path, cursor: Path, options: ReadOptions) -> list[Placed]:
+    """Every complete entry the filters show, wherever the cursor stands, in inbox order."""
+    acknowledged = int(cursor.read_text().strip()) if cursor.exists() else 0
+    data = inbox.read_bytes()
+    if acknowledged > len(data):
+        raise ValueError("inbox is shorter than the saved read position")
+    placed, end = [], 0
+    for raw in data[:complete_end(data)].splitlines(keepends=True):
+        end += len(raw)
+        if (item := entry(raw)) is not None and shown_by_filters(item, options):
+            placed.append(Placed(end, end <= acknowledged, item))
+    return placed
+
+
+def read_text(inbox: Path, cursor: Path, options: ReadOptions) -> None:
+    """Print each entry whose whole text (`full_text`) holds options.text, ignoring case, wherever the cursor
+    stands: its header, acknowledged ones marked 既読, then every line holding it."""
+    wanted, found = (options.text or "").casefold(), False
+    for _, acknowledged, item in placed_entries(inbox, cursor, options):
+        hits = [line for line in full_text(item).splitlines() if wanted in line.casefold()]
+        if hits:
+            found = True
+            print(f"{entry_header(item)}{' 既読' if acknowledged else ''}\n" + "\n".join(hits) + "\n")
+    if not found:
+        print(f"inbox-read: no entry holds {options.text}", file=sys.stderr)
+
+
 def read_ids(inbox: Path, cursor: Path, options: ReadOptions) -> None:
     """Print in full, in inbox order, the entries the ids name, those already acknowledged marked 既読.
 
     Nothing is printed when an id names no entry or several: the candidates are named instead.
     """
-    acknowledged = int(cursor.read_text().strip()) if cursor.exists() else 0
-    data = inbox.read_bytes()
-    if acknowledged > len(data):
-        raise ValueError("inbox is shorter than the saved read position")
-    entries, end = [], 0
-    for raw in data[:complete_end(data)].splitlines(keepends=True):
-        end += len(raw)
-        try:
-            item = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(item, dict) and item.get("id") and shown_by_filters(item, options):
-            entries.append((end, item))
+    entries = [placed for placed in placed_entries(inbox, cursor, options) if placed.item.get("id")]
     wanted = sorted(options.ids or ())
-    hits = {value: [(end, item) for end, item in entries if names(str(item["id"]), value)] for value in wanted}
-    several = {value: found for value, found in hits.items() if len({str(item["id"]) for _, item in found}) > 1}
+    hits = {value: [placed for placed in entries if names(str(placed.item["id"]), value)] for value in wanted}
+    several = {value: found for value, found in hits.items() if len({str(item["id"]) for *_, item in found}) > 1}
     if several:
         raise ValueError("\n".join(
             f"id {value} names {len(found)} entries; pass more of one:"
             + "".join(f"\n  {item.get('ts') or '-'} {item.get('kind') or '-'} {source_of(item)} id={item['id']}"
-                      for _, item in found) for value, found in several.items()))
+                      for *_, item in found) for value, found in several.items()))
     missing = [value for value, found in hits.items() if not found]
     if missing:
         raise ValueError("no entry has id " + ",".join(missing))
-    for end, item in sorted({id(item): (end, item) for found in hits.values() for end, item in found}.values(),
-                            key=lambda hit: hit[0]):
-        print(f"{entry_header(item)}{' 既読' if end <= acknowledged else ''}\n{full_text(item)}\n")
+    for _, acknowledged, item in sorted({placed.end: placed for found in hits.values() for placed in found}.values()):
+        print(f"{entry_header(item)}{' 既読' if acknowledged else ''}\n{full_text(item)}\n")
 
 
 def inbox_entries(inbox: Path) -> list[dict]:
@@ -724,7 +748,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest="action", required=True)
     read_command = actions.add_parser("read", help="show complete new lines without changing the cursor; "
-                                                   "NEXT_OFFSET only without --kind, --source, --id, and --since")
+                                                   "NEXT_OFFSET only without --kind, --source, --id, --since, "
+                                                   "and --text")
     read_command.add_argument("--brief", action="store_true", help="show only the first 160 characters of info")
     read_command.add_argument("--kind", type=report_kinds, help="filter by comma-separated ask,done,info")
     read_command.add_argument("--source", help="filter by exact repo/worktree (or worktree for older entries); a "
@@ -735,10 +760,15 @@ def main(argv: list[str] | None = None) -> int:
                                    "HH:MM means its most recent local occurrence; prints no NEXT_OFFSET")
     read_command.add_argument("--summary", action="store_true",
                               help="show one line per entry with its id and a 160-character excerpt")
-    read_command.add_argument("--id", type=entry_ids, dest="ids",
-                              help="show only these comma-separated entry ids, in full, wherever the cursor stands "
-                                   "(acknowledged ones marked 既読); an id may be its first 8 or more characters, "
-                                   "and one naming several entries lists them and prints nothing")
+    picked = read_command.add_mutually_exclusive_group()
+    picked.add_argument("--id", type=entry_ids, dest="ids",
+                        help="show only these comma-separated entry ids, in full, wherever the cursor stands "
+                             "(acknowledged ones marked 既読); an id may be its first 8 or more characters, "
+                             "and one naming several entries lists them and prints nothing")
+    picked.add_argument("--text", metavar="WORD",
+                        help="search every entry's whole text and structured questions, ignoring case, wherever "
+                             "the cursor stands: print each match's header (id, time, source; acknowledged ones "
+                             "marked 既読) and the lines holding WORD")
     watch_command = actions.add_parser(
         "watch", help="the lead's Monitor: print every new ask and done as a summary line, advance the cursor, "
                       "and print `unanswered <n> min: <line>` once per ask left unanswered --remind-after minutes")
@@ -781,6 +811,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.action == "answered" and (args.ids is None) == (args.before is None):
         parser.error("answered takes ids or --before, not both")
+    if args.action == "read" and args.text is not None and not args.text.strip():
+        parser.error("--text needs a word to search for")
     inbox, cursor = paths()
     try:
         # watch skips info as it advances: on the scheduled run's cursor it would hide them from that run.
@@ -799,8 +831,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "read":
             source = SourceFilter.of(args.source, inbox_entries(inbox)) if args.source is not None else None
             options = ReadOptions(brief=args.brief, kinds=args.kind, source=source, summary=args.summary,
-                                  ids=args.ids, since=args.since)
-            (read_ids if args.ids else read)(inbox, cursor, options)
+                                  ids=args.ids, since=args.since, text=args.text)
+            (read_ids if args.ids else read_text if args.text is not None else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":
             watch(inbox, cursor, answers_path(), args.once, args.interval, args.remind_after)
