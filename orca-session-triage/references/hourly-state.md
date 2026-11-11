@@ -21,8 +21,9 @@ For `asked --decision`, use the same subject and action across runs, such as
 | Decision | Before moving on |
 | --- | --- |
 | User says to leave a row | `leave --row ROW --final-message-file MESSAGE_FILE`. On later runs, `left-now --row ROW --final-message-file MESSAGE_FILE` exits 0 while the stored final message exactly matches; exit 1 makes it eligible again. |
-| Ask a question | Check `show` for the same decision, including a differently worded version. If already recorded, do not ask it again; check whether its answer still applies. Otherwise record with `asked --row ROW --decision SUBJECT_AND_ACTION --final-message-file MESSAGE_FILE --question-file QUESTION_FILE` **immediately before** AskUserQuestion and keep its returned `id`. Add `--covers KEY` per lead decision key the question settles. The script records the Orca pane that asked, so another run can leave that tab open while closing unrelated idle tabs. When every `#number` in the question is CLOSED in the row's origin, it records nothing and prints the evidence. If presenting it fails, resolve that failed delivery before another run treats it as asked. For several questions, `asked-many --file JSONL --from SCAN_JSON` takes one object per line: `decision`, `question`, optional `asked_at` and `covers`, and either `ask` (an inbox ask id; the scan row of the worktree that sent it, told apart by its tab when two Macs share the path, and the ask's text become the row and final message) or `row` and `final_message`. Every line is checked first; a wrong one records nothing and is named with its line number. |
-| User answers | Record the exact answer with `answered --id ID --answer-file ANSWER_FILE` before relaying it or acting on it; `--decision KEY` in place of `--id` finds the one open question asked under that key and refuses several, naming their ids. `answered-many --file JSONL` records several from one object per line (`answer`, `id` or `decision`, optional `answered_at` and `replace_reason`), checking every line first as `asked-many` does. Write `{answered_at}` in the answer where its time goes: it becomes the recorded time in JST (`13:03`). An answer without it that gives a time of day (`13:03`, or `12:1x` for 12:10–12:19) 10 minutes or more from the recorded time is refused, naming the gap; with it, other times in the text stay as written. It records the tab (or worktree) that recorded it; a different answer already recorded is refused with that answer, its time, and the tab. When the user's checked reading replaces a recorded answer (a note on an outward choice), pass `--replace-reason-file`: the earlier answer, its time and tab stay under `replaced` with the reason. A pending question has `answer: null`; the old tab stays open, but the next hourly run continues with other rows and does not repeat that question. If the answer arrived in another tab, relay it to the waiting tab and mark it answered before closing that tab. |
+| Ask a question | Check `show` for the same decision, including a differently worded version. If already recorded, do not ask it again; check whether its answer still applies. Otherwise record with `asked --row ROW --decision SUBJECT_AND_ACTION --final-message-file MESSAGE_FILE --question-file QUESTION_FILE` **immediately before** AskUserQuestion and keep its returned `id`. Add `--covers KEY` per lead decision key the question settles. The script records the Orca pane that asked, so another run can leave that tab open while closing unrelated idle tabs. When every issue or PR the question names is CLOSED, it records nothing and prints the evidence; how it reads them, and the merged PRs it names, are under 「Issues and PRs a question names」. If presenting it fails, resolve that failed delivery before another run treats it as asked. For several questions, `asked-many --file JSONL --from SCAN_JSON` takes one object per line: `decision`, `question`, optional `asked_at` and `covers`, and either `ask` (an inbox ask id; the scan row of the worktree that sent it, told apart by its tab when two Macs share the path, and the ask's text become the row and final message) or `row` and `final_message`. Every line is checked first; a wrong one records nothing and is named with its line number. A line whose question is settled by CLOSED references is not recorded either: after the JSON, stderr names each such line and its references, and the command exits 2. Pass the AskUserQuestion's own time as `asked_at` when recording after the call, so `pending` pairs the record with that call. |
+| User answers | Record the exact answer with `answered --id ID --answer-file ANSWER_FILE` before relaying it or acting on it; `--decision KEY` in place of `--id` finds the one open question asked under that key and refuses several, naming their ids. `answered-many --file JSONL` records several from one object per line (`answer`, `id` or `decision`, optional `answered_at` and `replace_reason`), checking every line first as `asked-many` does. Write `{answered_at}` in the answer where its time goes: it becomes the recorded time in JST (`13:03`). An answer without it that gives a time of day (`13:03`, or `12:1x` for 12:10–12:19) 10 minutes or more from the recorded time is refused, naming the gap; with it, other times in the text stay as written. It records the tab (or worktree) that recorded it; a different answer already recorded is refused with that answer, its time, and the tab. When the user's checked reading replaces a recorded answer (a note on an outward choice), pass `--replace-reason-file`: the earlier answer, its time and tab stay under `replaced` with the reason. A pending question has `answer: null`; the old tab stays open, but the next hourly run continues with other rows and does not repeat that question. If the answer arrived in another tab, relay it to the waiting tab and mark it answered before closing that tab. When a later ask of the same lane withdrew the question's inbox ask (`triage-notify --withdraws`) or names its id, `answered` still records, adds `reissued_by` (each such ask's `id`, `ts`, `withdrew`), and names it on stderr: read that ask's text and choices before relaying the answer. |
+| The user must act outside the chat (sign a CLA, register a secret) | `user-wait --text-file FILE [--row ROW] --pr-check OWNER/NAME#N CHECK --secret NAME OWNER/NAME...` records what the user is to do with at least one way to check it: a check run on a PR (repeat per check), or a secret that each listed repository must hold (repeat per secret). `stale-asks` reads every check now with gh (`checks`; `checks_done` when every one passes), and an unreadable one says why instead of a state. Once its result is seen, `user-wait-close --id ID --evidence-file FILE` closes it. |
 | Nothing will answer it | `withdraw --id ID --reason-file FILE` closes a question no answer will settle, keeping the reason and time; it is not the user's answer. |
 | User promises “when A settles, give B the task” | Record `promise --from-row A --to-row B --condition CONDITION --task TASK`. Every run checks undelivered promises against the latest A result. When the condition holds, send B the task as the Boundary permits. Record `delivered --id ID --delivery queued` or `--delivery turn_started` once that delivery is confirmed. |
 
@@ -93,7 +94,7 @@ each `in_progress` row with a recorded question, each row with a shared unanswer
 question, and each row named by an unanswered handed-off ask key against its lane's inbox
 reports and the answers `scripts/answer_evidence.py` finds (the lead's latest
 decision per key, AskUserQuestion answers and ordinary user messages in those
-worktrees' transcripts, and `send --decision`), and prints them longest waiting first with `since` and
+worktrees' transcripts, and the answers `send` delivered with `--ask`, with or without `--decision`), and prints them longest waiting first with `since` and
 `age_minutes`. An answer proves only the ask named by its decision key, or,
 without such a key, one whose id it names, whose structured questions it quotes
 in full, or to which it was delivered; one naming only the
@@ -137,6 +138,15 @@ parent's last message when reporting its waiting time.
   handoff (`--handoffs-dir`). `name` is the worktree that asked it, `questions`
   the questions with their choices, `since` and `closed_at` when it was asked
   and closed. Ask it again, or record why it no longer stands.
+- `user_wait`: an open `user-wait`, with its `checks` read in this run.
+  `--summary` adds 確かめ: and each check's state, and 確かめ方の条件がそろった
+  once every check holds: look at the result, then close it with
+  `user-wait-close`.
+
+An `unanswered` or `stopped_after_answer` item, and a row's shared unanswered
+question, carries `reissued` when a later ask of the same lane withdrew its ask
+or one of its questions (each such ask's `id`, `ts`, `withdrew`); `--summary`
+adds 出し直しあり. Put the newer ask in front of the user, not the old one.
 
 An unfulfilled one-shot CronCreate whose session no longer runs appears as
 `lost_schedule`, with its schedule and prompt opening. A plain `in_progress`
@@ -145,13 +155,22 @@ verdict without a question is work to resume, not a user question.
 `show` retains full final messages, asked times, answers, handoff terms, and
 requests with their owners and closure evidence. `pending` lists what is
 still open (unanswered questions, undelivered handoffs, open requests, and left
-rows), plus settled questions with evidence and unrecorded transcript answers,
-each as a list entry carrying its `id` (`row` for a left row); read the
+rows), plus settled questions with evidence, unrecorded transcript answers,
+open user waits (`user_waits`), and `unrecorded_questions`, each as a list entry carrying its `id` (`row` for a left row); read the
 open items with it rather than walking `show`'s dictionaries by hand, and
 `get --id ID` for one entry. A question is settled when it was withdrawn, every
-`--covers` key has a lead answer after it was asked, or every `#number` in it is
-CLOSED; each unanswered question's `prs` lists the same `#numbers` with their
-current state, head, and update time, read in one batch per repository. An
+`--covers` key has a lead answer after it was asked, or every issue and PR it
+names is CLOSED; each unanswered question's `prs` lists them with their
+`type`, current state, head, and update time, read in one batch per repository.
+An unanswered question whose inbox ask a later ask withdrew carries `reissued`,
+as in `stale-asks`. `unrecorded_questions` lists the questions of an
+AskUserQuestion still waiting for its answer in the transcripts of the
+workspaces questions were recorded in, beyond the records that account for
+it: the records of that workspace asked in the 30 minutes up to the call (of
+the call's own session when they name one) pair with its questions, and each
+question left over is listed with its `workspace`, `session`, `tool_use_id`,
+and `since`. Record it with `asked --asked-at` set to that `since`, and
+`withdraw` that record when no answer will come (its session ended). An
 unanswered one lists the answers to the same question found in the
 recorded worktrees' transcripts as `unrecorded_answers`. `pending --summary` and
 `stale-asks --summary` print one line per item: name, state, since,
@@ -159,3 +178,21 @@ age_minutes, the ask id (or the entry's id), and the question's start. It
 does not infer a user's answer from a tab closing or from a later verdict.
 Consult the actual answer and update the state. A waiting tab is not an
 invitation to ask the same question in the new session.
+
+## Issues and PRs a question names
+
+`asked`, `asked-many`, `pending`, and `stale-asks` read the issues and PRs a
+question names by the rule `scan_sessions.py` reads a verdict's `waits_on`
+with: `owner/name#N` and GitHub URLs as written, `name#N` as the repository of
+the row's organization with that name (or the only one whose name ends in
+`-name`), and a bare `#N` in the repository named before it in the question,
+else the row's origin. A name no repository of the organization has, and a
+bare `#N` of a row on another Mac, stay unresolved: `repo` is null, no state is
+read, and `--summary` prints （リポジトリ不明）#N. Name the repository in the
+question (`owner/name#N`) when it matters.
+
+A newly recorded question that names an issue also gets `merged_after_basis`:
+for each such issue, its newest merged PRs that close it or name it, merged
+after the ask the question came from (`asked-many --ask`), or every one when
+that time is not known. stderr names them too. The question may rest on what
+such a PR changed: read the PR before putting the question to the user.

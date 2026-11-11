@@ -14,7 +14,8 @@
   shows the context before the question) with each one's `id`, `source`,
   and `handle` in `items` for relaying the answer. Relay each answer with
   `send --decision <answer> --ask <id>`: the question drops out of the next
-  batch once the send lands. `--after <next_after>` pages on without recording
+  batch once the send lands. A question a later ask of the same lane withdrew
+  is refused with that ask's id; answer the newer one. `--after <next_after>` pages on without recording
   anything. The questions come from the asks not answered yet (`open-asks`),
   wherever the inbox cursor stands. A question another tab claimed with
   `inbox_read.py claim` (it is asking the user now) is left out and listed

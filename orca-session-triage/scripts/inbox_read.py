@@ -39,6 +39,7 @@ from difflib import SequenceMatcher
 import fcntl
 from itertools import takewhile
 import json
+from operator import itemgetter
 import os
 from pathlib import Path
 import re
@@ -511,6 +512,45 @@ def checked_answer_ids(value: str, entries: list[dict]) -> list[str]:
             raise ValueError(f"no ask in the inbox has id {answer}")
         ids.append(found[0] + (f":{number}" if colon else ""))
     return ids
+
+
+@dataclass(frozen=True)
+class Reissue:
+    """A later ask of the same lane that withdrew an ask (or some of its questions) or names its id: the lane may
+    have asked the question again, so an answer to the old ask may no longer fit."""
+    id: str
+    ts: str
+    withdrawn: tuple[str, ...]  # what it withdrew of the ask with triage-notify --withdraws: "<id>" or "<id>:<n>"
+
+    def covers(self, number: int | None) -> bool:
+        """Whether it withdrew the whole ask, or its question `number`."""
+        return any(":" not in value or number is not None and value.endswith(f":{number}") for value in self.withdrawn)
+
+    def view(self) -> dict:
+        return {"id": self.id, "ts": self.ts, "withdrew": list(self.withdrawn)}
+
+
+def reissues(ask_id: str, entries: list[dict]) -> list[Reissue]:
+    """Asks of the same worktree and repository sent after the ask with this full id that withdraw it or one of its
+    questions (`triage-notify --withdraws`), or name its id in their text or questions, oldest first. A handoff,
+    which names every ask it carries, is not one."""
+    asked = next((item for item in entries if item.get("kind") == "ask" and item.get("id") == ask_id), None)
+    since = asked_at(asked) if asked else None
+    if asked is None or since is None:
+        return []
+    found: list[tuple[datetime, Reissue]] = []
+    for item in entries:
+        at = asked_at(item) if item.get("kind") == "ask" and item.get("id") not in (None, ask_id) else None
+        if (at is None or at <= since or is_handoff(item) or item.get("worktree") != asked.get("worktree")
+                or (item.get("repo") or "") != (asked.get("repo") or "")):
+            continue
+        withdrawn = tuple(value for value in item.get("withdraws") or [] if isinstance(value, str)
+                          and names(ask_id, value.partition(":")[0]))
+        named = answer_evidence.names_id(json.dumps([item.get("text"), item.get("questions")], ensure_ascii=False),
+                                         ask_id)
+        if withdrawn or named:
+            found.append((at, Reissue(str(item["id"]), str(item.get("ts") or ""), withdrawn)))
+    return [reissue for _, reissue in sorted(found, key=itemgetter(0))]
 
 
 def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None:
