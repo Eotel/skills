@@ -693,13 +693,26 @@ def repository_names(owner: str) -> frozenset[str]:
     return frozenset()
 
 
+# A word of letters written before ` #N` (or ` PR #N`): a repository, or prose such as "merge #10".
+SPACED_WORD = re.compile(r"(?<![\w.-])([A-Za-z]+)(?: PR)? #\d")
+
+
+def prose_words(text: str, names: frozenset[str]) -> frozenset[str]:
+    """The words written before ` #N` that no repository of `names` (the organization's, as gh listed them) has as
+    a hyphen-separated part of its name: prose, so the `#N` is bare. With no names listed, none: `cvm #12` is read
+    as no repository, never as the row's own."""
+    return frozenset(word for word in map(str.lower, SPACED_WORD.findall(text)) if names and not any(
+        f"-{word}-" in f"-{name.lower()}-" for name in names))
+
+
 def question_references(questions: dict[str, dict]) -> dict[str, list[dict]]:
     """Each question's issues and PRs, read once per repository, by the rule scan_sessions.waited_items reads a
     verdict's waits_on with: `owner/name#N` and GitHub URLs as written, `name#N` as the repository of the row's
     organization so named (or the only one whose name ends in `-name`), and a bare `#N` in the repository named before
-    it, else the row's checkout's origin. A repository it cannot tell leaves `repo` None and no state: a name no
-    repository of the organization has (infra-aws#526 was read as the row's own #526 until 2026-11-11), or a bare `#N`
-    of a row on another Mac, whose path here may hold another repository. The organization's names are listed once,
+    it, else the row's checkout's origin; so does a `#N` after an ordinary word (prose_words). A repository it
+    cannot tell leaves `repo` None and no state: a name no repository of the organization has (infra-aws#526 was
+    read as the row's own #526 until 2026-11-11), or a bare `#N` of a row on another Mac, whose path here may hold
+    another repository. The organization's names are listed once,
     only for a question naming a repository other than the row's own."""
     wanted: dict[str, list[tuple[str | None, int]]] = {}
     origins: dict[str, str | None] = {}
@@ -716,7 +729,9 @@ def question_references(questions: dict[str, dict]) -> dict[str, list[dict]]:
         if owner and not named <= {own} and owner not in listed:
             listed[owner] = repository_names(owner)
         names = {own, *listed.get(owner, ())} if owner else set()
-        refs = [(repo or None, number) for repo, number in scan_sessions.waited_items(text, origins[row] or "", names)]
+        prose = prose_words(text, listed.get(owner, frozenset()))
+        refs = [(repo or None, number)
+                for repo, number in scan_sessions.waited_items(text, origins[row] or "", names, prose)]
         if refs:
             wanted[key] = refs
     repos: dict[str, set[int]] = {}
@@ -1012,8 +1027,10 @@ def record_lines[T](lines: list[tuple[int, T | str]], record: Callable[[T], dict
     return results
 
 
-def unpaired(questions: list[hourly_runs.Question], records: list[dict]) -> list[hourly_runs.Question]:
-    """The questions left once each record is paired, most shared words first, with a question not yet paired."""
+def unpaired(questions: list[hourly_runs.Question],
+             records: list[dict]) -> tuple[list[hourly_runs.Question], set[int]]:
+    """The questions left once each record is paired, most shared words first, with a question not yet paired, and
+    the indexes of the records paired."""
     words = [set(answer_evidence.QUESTION_WORD.findall(question.question)) for question in questions]
     pairs = sorted(((len(words[asked] & set(answer_evidence.QUESTION_WORD.findall(record["question"]))), asked, kept)
                     for asked in range(len(questions)) for kept, record in enumerate(records)), reverse=True)
@@ -1023,7 +1040,7 @@ def unpaired(questions: list[hourly_runs.Question], records: list[dict]) -> list
         if asked not in paired and kept not in used:
             paired.add(asked)
             used.add(kept)
-    return [question for index, question in enumerate(questions) if index not in paired]
+    return [question for index, question in enumerate(questions) if index not in paired], used
 
 
 def unrecorded_questions(data: dict, projects: Path) -> list[dict]:
@@ -1031,7 +1048,8 @@ def unrecorded_questions(data: dict, projects: Path) -> list[dict]:
     workspaces questions were recorded in (each record's `asked_in`: the triage workspace), read as
     `hourly_runs.py --questions` reads them, that no record accounts for. The records of that workspace asked in the
     RECORDED_BEFORE up to the call (only those of the call's own session when a record names one) are paired with its
-    questions (unpaired), and each question left over is unrecorded. A record rarely repeats AskUserQuestion's
+    questions (unpaired), and each question left over is unrecorded. The calls are taken in order, and a record
+    paired with an earlier call, answered or not, is not paired again. A record rarely repeats AskUserQuestion's
     wording, so their count decides and the words only pick which is left: on 2026-11-10 a run put three questions
     and recorded two, and no tool showed the third."""
     records = [item for item in data["questions"].values() if item.get("asked_in")]
@@ -1041,17 +1059,21 @@ def unrecorded_questions(data: dict, projects: Path) -> list[dict]:
         for path in answer_evidence.transcripts_of(projects, [Path(workspace)]):
             calls: dict[str, list[hourly_runs.Question]] = {}
             for question in hourly_runs.conversation(path).questions:
-                if not question.result_received:
-                    calls.setdefault(question.tool_use_id, []).append(question)
+                calls.setdefault(question.tool_use_id, []).append(question)
+            unused = [item for item in here if item.get("session") in (None, path.stem)]
             for asked in calls.values():
                 at = scan_sessions.parse_time(asked[0].asked_at)
-                kept = [item for item in here if at is not None and item.get("session") in (None, path.stem)
+                kept = [item for item in unused if at is not None
                         and (when := scan_sessions.parse_time(item["asked_at"])) is not None
                         and at - RECORDED_BEFORE <= when <= at]
-                found.extend({"name": Path(workspace).name, "workspace": workspace, "session": path.stem,
-                              "tool_use_id": question.tool_use_id, "state": "unrecorded",
-                              "since": question.asked_at, "question": question.question}
-                             for question in unpaired(asked, kept))
+                left, used = unpaired(asked, kept)
+                taken = {id(kept[index]) for index in used}
+                unused = [item for item in unused if id(item) not in taken]
+                if not asked[0].result_received:
+                    found.extend({"name": Path(workspace).name, "workspace": workspace, "session": path.stem,
+                                  "tool_use_id": question.tool_use_id, "state": "unrecorded",
+                                  "since": question.asked_at, "question": question.question}
+                                 for question in left)
     return found
 
 

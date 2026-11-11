@@ -1941,11 +1941,12 @@ WAITED_ITEM = re.compile(r"github\.com/(?P<url>[\w.-]+/[\w.-]+)/(?:pull|issues)/
 NOT_REPOS = ("pr", "prs", "issue", "and", "or", "then", "review")  # words before `#N` that name no repository
 
 
-def waited_items(waits_on: str, slug: str, names: set[str]) -> list[tuple[str | None, int]]:
+def waited_items(waits_on: str, slug: str, names: set[str],
+                 prose: frozenset[str] = frozenset()) -> list[tuple[str | None, int]]:
     """The issues and PRs a verdict's waits_on names. `repo#N` is a repository of the row's organization:
     among `names`, the repositories known there, the one named so or the only one whose name ends in `-repo`
     (masters → taihei-coresys-masters), else None. A bare `#N` (or `PR #N`) belongs to the repository named
-    before it, else the row's own."""
+    before it, else the row's own; so does `word #N` for a lowercase word in `prose` (merge #10)."""
     org = slug.partition("/")[0]
     items: list[tuple[str | None, int]] = []
     last: str | None = slug
@@ -1953,7 +1954,7 @@ def waited_items(waits_on: str, slug: str, names: set[str]) -> list[tuple[str | 
         repo = found["url"] or found["repo"]
         if repo and "/" in repo:
             last = repo
-        elif repo and repo.lower() not in NOT_REPOS:
+        elif repo and repo.lower() not in NOT_REPOS and repo.lower() not in prose:
             ends = [name for name in names if name.lower().endswith("-" + repo.lower())]
             last = (f"{org}/{repo}" if repo in names else f"{org}/{ends[0]}" if len(ends) == 1 else None)
         items.append((last, int(found["url_number"] or found["number"] or 0)))

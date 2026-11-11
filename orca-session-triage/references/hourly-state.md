@@ -167,7 +167,8 @@ as in `stale-asks`. `unrecorded_questions` lists the questions of an
 AskUserQuestion still waiting for its answer in the transcripts of the
 workspaces questions were recorded in, beyond the records that account for
 it: the records of that workspace asked in the 30 minutes up to the call (of
-the call's own session when they name one) pair with its questions, and each
+the call's own session when they name one, and not paired with an earlier
+call) pair with its questions, and each
 question left over is listed with its `workspace`, `session`, `tool_use_id`,
 and `since`. Record it with `asked --asked-at` set to that `since`, and
 `withdraw` that record when no answer will come (its session ended). An
@@ -186,7 +187,9 @@ question names by the rule `scan_sessions.py` reads a verdict's `waits_on`
 with: `owner/name#N` and GitHub URLs as written, `name#N` as the repository of
 the row's organization with that name (or the only one whose name ends in
 `-name`), and a bare `#N` in the repository named before it in the question,
-else the row's origin. A name no repository of the organization has, and a
+else the row's origin. A word of letters written before ` #N` that no
+repository of the organization has as a hyphen-separated part of its name
+(`merge #10`) is prose, and that `#N` is bare. A name no repository of the organization has, and a
 bare `#N` of a row on another Mac, stay unresolved: `repo` is null, no state is
 read, and `--summary` prints （リポジトリ不明）#N. Name the repository in the
 question (`owner/name#N`) when it matters.

@@ -5745,6 +5745,44 @@ class HourlyStateTests(unittest.TestCase):
         self.call("asked-many", "--file", str(lines))
         self.assertEqual(self.call("pending")[1]["unrecorded_questions"], [])
 
+    def test_a_record_that_accounts_for_an_earlier_call_does_not_hide_a_later_unrecorded_one(self) -> None:
+        # PR #176 review: a question recorded and answered at 01:01 paired with an unrecorded one put at 01:05.
+        transcript = self.root / "claude/projects/-w-triage/triage-run.jsonl"
+        write_jsonl(transcript, [
+            {**assistant({"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_1",
+                          "input": {"questions": [{"question": "REPORT-42 を devel に登録しますか？"}]}}),
+             "timestamp": "2026-11-10T01:01:00.000Z"},
+            {**user([{"type": "tool_result", "tool_use_id": "toolu_1", "content": "登録する"}]),
+             "timestamp": "2026-11-10T01:02:00.000Z"},
+            {**assistant({"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_2",
+                          "input": {"questions": [{"question": "API の鍵を作り直しますか？"}]}}),
+             "timestamp": "2026-11-10T01:05:00.000Z"}])
+        lines = self.root / "asked.jsonl"
+        lines.write_text(json.dumps({"row": "/w/lane", "decision": "d1", "final_message": "伺います",
+                                     "question": "REPORT-42: devel に登録するか",
+                                     "asked_at": "2026-11-10T01:00:50+00:00"}) + "\n")
+        self.call("asked-many", "--file", str(lines))
+
+        self.assertEqual([item["question"] for item in self.call("pending")[1]["unrecorded_questions"]],
+                         ["API の鍵を作り直しますか？"])
+
+    def test_an_ordinary_word_before_a_number_leaves_it_in_the_rows_repository(self) -> None:
+        # PR #176 review: in "merge #10", merge was read as a repository, so #10 went unread.
+        lane = self.lane()
+        question = self.source("question.txt", "merge #10 と cvm #12 を進めますか？")
+
+        def graphql(slug: str, query: str) -> dict:
+            return {"item_10": {"__typename": "PullRequest", "state": "OPEN", "headRefOid": slug}}
+
+        with self.gh(lambda args: (0, [{"name": "app"}, {"name": "web-cvm-server"}], "")), \
+                patch.object(scan, "graphql_repository", side_effect=graphql):
+            self.call("asked", "--row", str(lane), "--decision", "merge:#10", "--final-message-file", question,
+                      "--question-file", question)
+            _, pending = self.call("pending")
+        # cvm names a part of web-cvm-server, so its #12 stays unread rather than read as the row's own.
+        self.assertEqual([(pr["repo"], pr["number"], pr["state"]) for pr in pending["questions"][0]["prs"]],
+                         [("acme/app", 10, "OPEN"), (None, 12, None)])
+
     def test_a_repository_named_before_a_number_is_read_in_the_rows_organization(self) -> None:
         # 2026-11-11: infra-aws#526 was read as the row's own #526, merged in May.
         lane = self.lane()
@@ -5764,7 +5802,7 @@ class HourlyStateTests(unittest.TestCase):
                          [("acme/infra-aws", 526, "OPEN")])
 
     def test_asked_names_prs_merged_after_the_ask_for_an_issue_its_question_names(self) -> None:
-        # 2026-11-11: cxc #1170 was asked from an issue comment that #1216, merged the same day, had made untrue.
+        # 2026-11-11: a question rested on an issue comment that a PR merged the same day had made untrue.
         scan_json = self.root / "scan.json"
         scan_json.write_text(json.dumps([{"path": "/w/lane", "repo": "app", "class": "waiting"}]))
         write_jsonl(self.root / "inbox.jsonl", [{"id": "c1170000-0000-ask", "kind": "ask", "worktree": "lane",
@@ -5793,11 +5831,11 @@ class HourlyStateTests(unittest.TestCase):
 
     def test_user_wait_is_read_now_by_how_it_is_checked_and_an_unreadable_repository_says_why(self) -> None:
         # 2026-11-10: a guessed repository name and 2>/dev/null printed 0 secrets for a repository that held one.
-        text = self.source("wait.txt", "LiveKit の CLA に署名し、CORELIB_PAT を登録する")
+        text = self.source("wait.txt", "LiveKit の CLA に署名し、SHARED_PAT を登録する")
         self.assertEqual(self.run_main("user-wait", "--text-file", text)[0], 1)
         code, wait = self.call("user-wait", "--text-file", text, "--started-at", "2026-11-10T11:06:00+00:00",
                                "--pr-check", "livekit/agents#3911", "license/cla",
-                               "--secret", "CORELIB_PAT", "acme/users", "acme/ffs", "acme/gone")
+                               "--secret", "SHARED_PAT", "acme/users", "acme/ffs", "acme/gone")
         self.assertEqual(code, 0)
         (self.root / "inbox.jsonl").write_text("")
         scan_json = self.root / "scan.json"
@@ -5809,14 +5847,14 @@ class HourlyStateTests(unittest.TestCase):
             repo = args[args.index("-R") + 1]
             if repo == "acme/gone":
                 return 1, None, "failed to get secrets: HTTP 404: Not Found"
-            return 0, [{"name": "CORELIB_PAT"}] if repo == "acme/users" else [], ""
+            return 0, [{"name": "SHARED_PAT"}] if repo == "acme/users" else [], ""
 
         with self.gh(gh):
             _, stale = self.call("stale-asks", "--from", str(scan_json))
             _, summary_line, _ = self.run_main("stale-asks", "--from", str(scan_json), "--summary")
         self.assertEqual([(item["state"], item["id"], item["checks_done"]) for item in stale],
                          [("user_wait", wait["id"], False)])
-        self.assertIn("livekit/agents#3911 license/cla pending; CORELIB_PAT: acme/users 有り, acme/ffs 無し, "
+        self.assertIn("livekit/agents#3911 license/cla pending; SHARED_PAT: acme/users 有り, acme/ffs 無し, "
                       "acme/gone 読めない（failed to get secrets: HTTP 404: Not Found）", summary_line)
         self.assertEqual([item["id"] for item in self.call("pending")[1]["user_waits"]], [wait["id"]])
         evidence = self.source("evidence.txt", "license/cla が pass、3 つとも登録を確かめた")
