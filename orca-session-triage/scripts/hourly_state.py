@@ -814,9 +814,11 @@ def new_references(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
 
 def record_question(data: dict, asking: Asking, references: dict[str, list[dict]]) -> dict:
     """Record the question, or, when every issue and PR it names is CLOSED, record nothing and give that evidence.
-    A recorded question names the tab's session (CLAUDE_CODE_SESSION_ID), its transcript's name."""
+    A question another session already put (`asking.session`) is recorded all the same: it only accounts for that
+    call. A recorded question names its session (CLAUDE_CODE_SESSION_ID by default), its transcript's name."""
     refs = references.get(asking.key) or []
-    if asking.key not in data["questions"] and refs and all(ref.get("state") == "CLOSED" for ref in refs):
+    if (asking.key not in data["questions"] and asking.session is None and refs
+            and all(ref.get("state") == "CLOSED" for ref in refs)):
         return {"state": "settled", "recorded": False, "row": asking.row, "question": asking.question,
                 "evidence": refs}
     new = asking.key not in data["questions"]

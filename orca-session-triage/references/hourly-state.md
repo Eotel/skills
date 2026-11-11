@@ -173,7 +173,8 @@ call) pair with its questions, and each
 question left over is listed with its `workspace`, `session`, `tool_use_id`,
 and `since`. Record it with `asked --asked-at` set to that `since` and
 `--session` set to its `session` (`asked_at` and `session` in an `asked-many`
-line), and `withdraw` that record when no answer will come (its session ended). An
+line); it is recorded even when every issue or PR it names is CLOSED. `withdraw`
+that record when no answer will come (its session ended). An
 unanswered one lists the answers to the same question found in the
 recorded worktrees' transcripts as `unrecorded_answers`. `pending --summary` and
 `stale-asks --summary` print one line per item: name, state, since,

@@ -5773,7 +5773,7 @@ class HourlyStateTests(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, here)
         projects = self.root / "claude/projects"
-        for workspace, asked in (("/w/triage", "今夜の実行を止めますか？"), (str(Path.cwd() / "lead"), "PR を閉じますか？")):
+        for workspace, asked in (("/w/triage", "#5 の今夜の実行を止めますか？"), (str(Path.cwd() / "lead"), "PR を閉じますか？")):
             write_jsonl(scan.claude_project_dir(projects, workspace) / "run.jsonl", [{
                 **assistant({"type": "tool_use", "name": "AskUserQuestion", "id": f"toolu_{len(asked)}",
                              "input": {"questions": [{"question": asked}]}}),
@@ -5781,12 +5781,17 @@ class HourlyStateTests(unittest.TestCase):
 
         _, pending = self.call("pending", "--asked-in", "lead")
         self.assertEqual(sorted(item["question"] for item in pending["unrecorded_questions"]),
-                         ["PR を閉じますか？", "今夜の実行を止めますか？"])
-        # PR #176 review: a later run records it with that call's session and time, and it is accounted for.
+                         ["#5 の今夜の実行を止めますか？", "PR を閉じますか？"])
+        # PR #176 review: a later run records it with that call's session and time, and it is accounted for, even
+        # once the PR it names has closed.
         (unrecorded,) = [item for item in pending["unrecorded_questions"] if item["workspace"] == "/w/triage"]
         question = self.source("question.txt", unrecorded["question"])
-        self.call("asked", "--row", "/w/lane", "--decision", "stop:tonight", "--final-message-file", question,
-                  "--question-file", question, "--asked-at", unrecorded["since"], "--session", unrecorded["session"])
+        closed = {"item_5": {"__typename": "PullRequest", "state": "CLOSED", "headRefOid": "c5"}}
+        with patch.object(scan, "graphql_repository", return_value=closed):
+            _, recorded = self.call("asked", "--row", str(self.lane()), "--decision", "stop:tonight",
+                                    "--final-message-file", question, "--question-file", question,
+                                    "--asked-at", unrecorded["since"], "--session", unrecorded["session"])
+        self.assertEqual(recorded["session"], unrecorded["session"])
         self.assertEqual([item["question"] for item in self.call("pending", "--asked-in", "lead")[1]
                           ["unrecorded_questions"]], ["PR を閉じますか？"])
 
