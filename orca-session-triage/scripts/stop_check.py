@@ -19,7 +19,9 @@ Before AskUserQuestion in the hourly workspace, the PreToolUse hook checks for
 kana or kanji in the questions, options and descriptions, and a handoff sent during this run.
 After AskUserQuestion, the PostToolUse hook tells Claude to check, in one question, how to read
 each answer whose chosen option sends something out (a post, merge, send, push, or production
-change) while the same question carries a note. It does not judge whether they disagree.
+change) while the same question carries a note. It does not judge whether they disagree. It also
+names each answered question whose inbox ask a later ask of the same lane withdrew or names
+(inbox_read.reissues): the lane may have asked it again with other choices.
 """
 
 from __future__ import annotations
@@ -34,12 +36,15 @@ import sys
 from typing import Any
 import unicodedata
 
+import answer_evidence
 import handoff
+import hourly_state
 import inbox_read
 import hourly_runtime
 import retro
 
 STATE_DIR = "~/.cache/orca-session-triage"
+HOURLY_STATE = hourly_state.DEFAULT_STATE
 TRIAGE_PROMPT = "/orca-session-triage"
 # Kept in the session's state directory: how far the transcript was read and which artifacts are still watched.
 WATCH_STATE = "artifact-watches.json"
@@ -142,15 +147,47 @@ def noted_outward_answers(hook_input: dict[str, Any]) -> list[str]:
     return found
 
 
-def answer_decision(hook_input: dict[str, Any]) -> dict[str, Any] | None:
-    """A PostToolUse decision that puts the check in front of Claude, or None."""
-    noted = noted_outward_answers(hook_input)
-    if not noted:
-        return None
-    return {"decision": "block", "reason": (
-        "外へ出す操作の選択肢に、メモが付いた答えがあります。" + " / ".join(noted) +
-        "。担当へ許可として渡す前に、選択肢とメモの読みを 1 問で確かめてください。"
-        "確かめた答えは hourly_state.py answered --replace-reason-file で記録を置き換えます。")}
+def reissued_answers(hook_input: dict[str, Any], state: Path, entries: list[dict]) -> list[str]:
+    """Each answered question's ask that later asks of the same lane withdrew or name, as `ask X（question）→ Y`.
+    Its ask is the inbox ask that shows the question (as `inbox_read.py questions` prints it), or the ask of a
+    question hourly_state.py recorded unanswered with the same wording or for this very call (call_records: a
+    record of this session made just before it, which no earlier call took)."""
+    response = hook_input.get("tool_response")
+    if hook_input.get("tool_name") != "AskUserQuestion" or not isinstance(response, dict) or not isinstance(
+            response.get("answers"), dict):
+        return []
+    answered = set(response["answers"])
+    asks = {str(entry["id"]): shown for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+            for shown in answer_evidence.questions_of(entry) if shown in answered}
+    transcript, call = hook_input.get("transcript_path"), hook_input.get("tool_use_id")
+    try:
+        recorded = list(hourly_state.read(state)["questions"].values())
+        mine = [item for item in recorded if item.get("session") == hook_input.get("session_id")]
+        this_call = (hourly_state.call_records(mine, Path(transcript), call)
+                     if mine and transcript and call and Path(transcript).is_file() else [])
+    except (OSError, ValueError):
+        recorded, this_call = [], []
+    for item in [*this_call, *(item for item in recorded if item.get("question") in answered)]:
+        if (item.get("answer") is None and not item.get("withdrawn_at")
+                and (ask := hourly_state.question_ask(item, entries))):
+            asks.setdefault(ask[0], item["question"])
+    return [f"ask {ask_id[:8]}（{hourly_state.excerpt(question)}）→ ask {reissue.id[:8]}（{reissue.ts}、"
+            + ("取り下げて出し直した" if reissue.withdrawn else "名指しした") + "）"
+            for ask_id, question in asks.items() for reissue in inbox_read.reissues(ask_id, entries)]
+
+
+def answer_decision(hook_input: dict[str, Any], state: Path | None = None,
+                    entries: list[dict] | None = None) -> dict[str, Any] | None:
+    """A PostToolUse decision that puts the checks in front of Claude, or None."""
+    reasons = []
+    if noted := noted_outward_answers(hook_input):
+        reasons.append("外へ出す操作の選択肢に、メモが付いた答えがあります。" + " / ".join(noted) +
+                       "。担当へ許可として渡す前に、選択肢とメモの読みを 1 問で確かめてください。"
+                       "確かめた答えは hourly_state.py answered --replace-reason-file で記録を置き換えます。")
+    if state is not None and (reissued := reissued_answers(hook_input, state, entries or [])):
+        reasons.append("答えた問いの ask を、後から同じ担当の ask が取り下げたか名指ししています。" + " / ".join(reissued) +
+                       "。新しい ask の本文と選択肢を読み、答えが今の問いに合うかを確かめてから記録し、担当へ送ってください。")
+    return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
 
 
 def deny(reasons: list[str]) -> dict[str, Any] | None:
@@ -322,7 +359,12 @@ def main(handoffs_dir: Path | None = None) -> int:
         return 0
     orca = os.environ.get("ORCA_CLI_COMMAND", "orca")
     if hook_input.get("hook_event_name") == "PostToolUse":
-        decision = answer_decision(hook_input)
+        try:
+            entries = (hourly_state.inbox_entries() if hook_input.get("tool_name") == "AskUserQuestion"
+                       and (hook_input.get("tool_response") or {}).get("answers") else [])
+        except (OSError, AttributeError):
+            entries = []
+        decision = answer_decision(hook_input, Path(HOURLY_STATE).expanduser(), entries)
         if decision:
             json.dump(decision, sys.stdout, ensure_ascii=False)
         return 0

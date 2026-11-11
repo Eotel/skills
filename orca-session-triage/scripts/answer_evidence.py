@@ -4,7 +4,8 @@ An answer is one of:
 - a decision the lead recorded with lead_decisions.py, the latest one per key (a later record replaces the earlier);
 - an AskUserQuestion answer in the Claude transcripts of the worktrees that ask the user (the lead's, and the
   hourly runs' triage workspace);
-- an answer `send --decision --ask <id>[:<n>]` delivered (`send --decision` in ask-answers.jsonl).
+- an answer `send --ask <id>[:<n>]` delivered, with or without --decision (`send --decision` or `send` in
+  ask-answers.jsonl).
 
 Only an answer that came after the ask and names it is proof: one delivered to it, or for an ask without
 structured questions one naming its id (in full or its first 8 or more characters), and for an ask with them one
@@ -32,7 +33,8 @@ import re
 import lead_decisions
 import scan_sessions
 
-DELIVERED = "send --decision"
+# How ask-answers.jsonl records an answer send delivered to the ask, with and without --decision.
+DELIVERED = ("send --decision", "send")
 # A worktree name this short ("main", "web") appears in unrelated answers.
 NAME_MIN = 4
 # `#1234` or `owner/repo#1234`; shorter numbers are too common to name a PR.
@@ -172,9 +174,9 @@ def delivered(log: Path) -> Iterator[Answer]:
             record = json.loads(raw)
         except ValueError:
             continue
-        if (isinstance(record, dict) and record.get("how") == DELIVERED and isinstance(record.get("id"), str)
+        if (isinstance(record, dict) and record.get("how") in DELIVERED and isinstance(record.get("id"), str)
                 and (at := scan_sessions.parse_time(record.get("ts"))) is not None):
-            yield Answer(at, DELIVERED, str(record.get("note") or ""), record["id"])
+            yield Answer(at, record["how"], str(record.get("note") or ""), record["id"])
 
 
 def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:

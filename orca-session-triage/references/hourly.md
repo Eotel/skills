@@ -63,7 +63,9 @@ It prints every new `ask` and `done`, whatever its source, as a summary line,
 and `unanswered <n> min: <line>` once per ask left unanswered for 15 minutes.
 Being read is not being answered. `send --decision <answer> --ask <id>[:<n>]`
 records the ask (or one of its questions) answered once the send lands (the
-id's first 8 or more characters will do, as for `read --id`);
+id's first 8 or more characters will do, as for `read --id`). When a later ask
+of the same lane withdrew every question given (`triage-notify --withdraws`),
+it sends nothing and names that ask: answer the newer ask instead;
 `scripts/inbox_read.py answered <id> --note <why>` records one answered another
 way (on another Mac, by the user in the lane, or no longer asked), and
 `open-asks` lists the rest apart from handoffs, oldest first (`--json` for other tools; the board
@@ -117,7 +119,11 @@ whose chosen option sends something out (a post, merge, send, push, or
 production change) while the same question carries a note. Check how to read
 the choice and the note with the user in one question before handing it to a
 lane as permission; the hook does not judge whether they disagree. Record the
-checked answer with `hourly_state.py answered --replace-reason-file`.
+checked answer with `hourly_state.py answered --replace-reason-file`. The
+same hook names each answered question whose inbox ask (the one showing it, or
+the ask of an unanswered record with the same wording or made in this session
+just before this call) a later ask of the same lane withdrew or names. Read that ask's text
+and choices and check the answer still fits before recording and relaying it.
 While the Mac's 1-minute load is above 300, a PreToolUse hook
 (`scripts/bash_timeout.py`) raises each Bash call's timeout to 600000 when it
 has none or a shorter one, so a tool that runs past the default 120 seconds
