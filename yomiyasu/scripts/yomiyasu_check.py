@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 yomiyasu_check.py - 最終稿に lint、原文と最終稿に diff（新規作成では資料との照合）をまとめて実行し、記録を残す。
 
@@ -14,7 +15,7 @@ mail（メール・チャット）と paper（論文・研究レポート）も�
 """
 
 from __future__ import annotations
-__version__ = "2.5.0"
+__version__ = "3.0.0"
 
 import sys
 
@@ -55,15 +56,18 @@ class _TextWriter(Protocol):
 
 
 _VISIBILITY_NAMES = ("decode_source", "DOC_TYPES", "READER_LEVELS", "normalize_doc_type", "normalize_reader",
-                     "WordsError", "resolve_words", "words_context", "words_label", "absolute_path")
+                     "WordsError", "resolve_words", "words_context", "words_label", "input_path_problem",
+                     "absolute_path")
 try:
     try:
         if __package__:
             from .markdown_visibility import decode_source, DOC_TYPES, READER_LEVELS, normalize_doc_type, normalize_reader
             from .markdown_visibility import WordsError, resolve_words, words_context, words_label, absolute_path
+            from .markdown_visibility import input_path_problem
         else:
             from markdown_visibility import decode_source, DOC_TYPES, READER_LEVELS, normalize_doc_type, normalize_reader
             from markdown_visibility import WordsError, resolve_words, words_context, words_label, absolute_path
+            from markdown_visibility import input_path_problem
     except SyntaxError as error:
         # 隣の markdown_visibility.py が壊れている。ほかの読めないときと同じく ImportError にする（スクリプトでは終了コード3）。
         raise ImportError(
@@ -104,6 +108,7 @@ try:
         normalize_reader = _visibility_module.normalize_reader
         WordsError = _visibility_module.WordsError
         resolve_words = _visibility_module.resolve_words
+        input_path_problem = _visibility_module.input_path_problem
         words_context = _visibility_module.words_context
         words_label = _visibility_module.words_label
         absolute_path = _visibility_module.absolute_path
@@ -1105,7 +1110,7 @@ def _read_named(role: str, index: int, given: str, stdin_data: bytes | None) -> 
         assert stdin_data is not None
         return _make_input(role, index, None, stdin_data)
     try:
-        with Path(given).open('rb') as handle:
+        with open(given, 'rb') as handle:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
             if role == "final" and not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 return None, ("Error opening file {}: 通常のファイルではありません（パイプなど。検査のあとで読み直せません）。"
                               "標準入力から渡すときは --final - を使ってください".format(given))
@@ -1220,6 +1225,30 @@ def _split_stdin(data: bytes, with_labels: bool = False) -> tuple[list | None, s
     if with_labels:
         return [(role, data[start:end], label) for role, start, end, label in parts], None
     return [(role, data[start:end]) for role, start, end, _ in parts], None
+
+
+_PATH_HINTS = {
+    "run": "このファイルを検査するときは、--stdin の区切りの行（<<<yomiyasu:original>>>、<<<yomiyasu:final>>> など）で"
+           "標準入力から渡すか、ファイルの名前の代わりに - を渡してください（- は1か所だけ）",
+    "verify": "このファイルを照らすときは、ファイルの名前の代わりに - を渡して、標準入力から渡してください（--final と --source で1か所だけ）",
+    "start": "start は標準入力を使えません。作業フォルダの中の、名前が点で始まらないファイルを渡してください",
+    "export": "export は標準入力を使えません。作業フォルダの中の、名前が点で始まらないファイルを渡すか、verify --final - で照らしてください",
+}
+
+
+def _path_problem(command: str, paths: Sequence[str | None]) -> str | None:
+    """コマンドラインで渡されたファイルのうち、読まないものがあれば誤りの文、なければ None（3.0.0。
+    markdown_visibility.input_path_problem）。どのファイルも読む前、状態フォルダに何かを書く前に呼ぶ。
+    作業ディレクトリが消えているときは、ほかの所と同じ _NoWorkingDirectory（終了コード2）にする。"""
+    if any(path is not None and path != "-" for path in paths):
+        _getcwd()
+    for path in paths:
+        if path is None:
+            continue
+        reason = input_path_problem(path)
+        if reason is not None:
+            return "Error opening file {}: {}。{}".format(path, reason, _PATH_HINTS[command])
+    return None
 
 
 def _read_inputs(args: argparse.Namespace) -> tuple[tuple[_Input | None, list[_Input], _Input] | None, str | None]:
@@ -1440,11 +1469,15 @@ class _Children(object):
     """lint と diff の子プロセスを、同じ締め切り（開始から --timeout 秒）で並べて動かす。
 
     check が外から止められたとき（SIGTERM、SIGHUP、Ctrl+C）は、呼ぶ側が stop() で動いている子を止める。止めないと、
-    子は親を失ったまま最後まで動き続ける（反証で見つけた例）。"""
+    子は親を失ったまま最後まで動き続ける（反証で見つけた例）。
 
-    def __init__(self, timeout: float, environment: dict[str, str]) -> None:
+    cwd は子の作業フォルダ（3.0.0）。lint と diff は作業フォルダの外のファイルと点で始まる部分を含むパスを読まないので、
+    写しのフォルダ（.yomiyasu/inputs/ か一時フォルダ）を子の作業フォルダにして、写しはファイルの名前だけで渡す。"""
+
+    def __init__(self, timeout: float, environment: dict[str, str], cwd: str | None = None) -> None:
         self.deadline = time.monotonic() + timeout
         self.environment = environment
+        self.cwd = cwd
         self.lock = threading.Lock()
         self.processes: list[subprocess.Popen[bytes]] = []
         self.stopped = False
@@ -1486,7 +1519,7 @@ class _Children(object):
                     self.results[name] = ("error", None, None, "", 0, "子プロセスを動かす前に止められました")
                     return
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, env=self.environment)
+                                           stderr=subprocess.PIPE, env=self.environment, cwd=self.cwd)
                 self.processes.append(process)
         except Exception as error:  # 起動できない。結果を必ず残し、状態を partial にする
             self.results[name] = cannot(error)
@@ -1686,8 +1719,9 @@ class _Context(object):
         self.state_dir_option = None     # --state-dir で決めた状態フォルダ（{仕上げ} に書く）
         self.doc_type = None             # 文書の種類と読者（正規化した値。lint と diff に渡し、記録と状態の行に残す）
         self.reader = None
-        self.words: dict | None = None                # 語の一覧の context.words の5つのキー（使わないときは None。子に --words で渡す）
-        self.flag_replacements: dict[str, str] = {}    # 残した指摘の語に添える使う語（記録の words には入れない）
+        self.words: dict | None = None                # 語の一覧の context.words の5つか7つのキー（使わないときは None。子に --words で渡す）
+        self.flag_replacements: dict[str, str] = {}    # flag.txt の使う語（記録の words には入れない）
+        self.kept_replacements: dict[str, str] = {}    # そのうち、最終稿の lint の指摘に添えた使う語（残した指摘の語に添える）
 
     @property
     def final(self) -> _Input:
@@ -1750,11 +1784,17 @@ def _words_arguments(words: dict | None) -> list[str]:
 
 
 def _report_words(context: dict) -> dict | None:
-    """子の JSON の context.words から、check が比べる5つのキー（lint の allow_removed を除く）。ないときは None。"""
+    """子の JSON の context.words から、check が比べる5つのキー（lint の allow_removed を除く）。ないときは None。
+    3.0.0: flag-patterns.txt のキー（flag_patterns_lines、flag_patterns_sha256）があれば、その2つも足して7つにする。"""
     words = context.get("words")
     if not isinstance(words, dict):
         return None
-    return OrderedDict((key, words.get(key)) for key in ("path", "allow_lines", "flag_lines", "allow_sha256", "flag_sha256"))
+    keys = _WORDS_KEYS + (_WORDS_PATTERN_KEYS if any(key in words for key in _WORDS_PATTERN_KEYS) else ())
+    return OrderedDict((key, words.get(key)) for key in keys)
+
+
+_WORDS_KEYS = ("path", "allow_lines", "flag_lines", "allow_sha256", "flag_sha256")
+_WORDS_PATTERN_KEYS = ("flag_patterns_lines", "flag_patterns_sha256")
 
 
 def _context_problem(parsed: dict, doc_type: str | None, reader: str | None, words: dict | None = None) -> str | None:
@@ -1778,6 +1818,9 @@ def _run_checks(ctx: _Context, snapshots: dict[int, str], stance: str | None, ti
     """lint と diff を子プロセスで（並べて）動かし、資料があればプロセスの中で照らす。"""
     lint_module, diff_module = _lint_module(), _diff_module()
     environment = dict(os.environ, PYTHONIOENCODING="utf-8")
+    # 写しはすべて同じフォルダにある。子はそのフォルダで動かし、写しをファイルの名前で渡す（_Children の cwd）
+    folder = str(Path(absolute_path(snapshots[id(ctx.final)])).parent)
+    snapshots = {key: Path(path).name for key, path in snapshots.items()}
     final_snapshot = snapshots[id(ctx.final)]
     context = _context_arguments(ctx.doc_type, ctx.reader) + _words_arguments(ctx.words)
     commands = OrderedDict()
@@ -1807,7 +1850,7 @@ def _run_checks(ctx: _Context, snapshots: dict[int, str], stance: str | None, ti
     for name in ctx.required:
         ctx.entries[name] = _check_entry(name, targets[name])
 
-    children = _Children(timeout, environment)
+    children = _Children(timeout, environment, cwd=folder)
     try:
         for name, command in commands.items():
             children.start(name, command)
@@ -1882,6 +1925,7 @@ def _run_checks(ctx: _Context, snapshots: dict[int, str], stance: str | None, ti
             ctx.lint_result = parsed
             ctx.lint_findings = findings
             ctx.kept_marks = _kept_marks(parsed["findings"])
+            ctx.kept_replacements = _kept_mark_replacements(parsed["findings"], ctx.flag_replacements)
             entry["summary"] = OrderedDict((("candidate_count", parsed["candidate_count"]), ("counts", parsed["counts"]),
                                             ("kept_marks", ctx.kept_marks)))
         else:
@@ -2163,21 +2207,33 @@ _HEAD_NOTE = "候補の中身は下の節にあります。出力を切らずに
 # 候補です」と「語の一覧（flag.txt）の語（語、語）の候補です」。語に「）」があっても読めるよう、末尾の「）の候補です」まで取る。
 # 語に「、」がある語の一覧の語は分かれる）。run の「残した指摘の語」の節と冒頭の行、verify の行、記録の lint の要約に使う
 _KEPT_MARK_RULES = {"calque": ("直訳語", re.compile(r"当たった言い方: (.*)）の候補です")),
-                    "project_term": ("語の一覧", re.compile(r"語の一覧（flag\.txt）の語（(.*)）の候補です"))}
+                    "project_term": ("語の一覧", re.compile(
+                        r"語の一覧（flag(?:\.txt|-patterns\.txt|\.txt、flag-patterns\.txt)）の語（(.*)）の候補です"))}
+# 3.0.0: lint は project_term の message の末尾に「使う語: 語 → 使う語、…。」を足すことがある。語はこれより前から取る
+# （使う語は一覧を書いた人の文字列なので、「）の候補です」を含んでいても語の切り出しがずれないようにする）
+_PROJECT_TERM_SUGGESTIONS = "。使う語: "
+# lint が使う語を添えないときの project_term の message の結び（「）」と lint の _V220_MESSAGE_TAIL）。この結びで終わる
+# message は分けずに読む（語やパターンの名前に「。使う語: 」があっても、使う語のない一覧の読み方を 3.0.0 の前と変えない）
+_PROJECT_TERM_PLAIN_TAIL = "）の候補です。文脈を見て、誰が何をどうするかを書き直すか確かめてください。"
 _KEPT_MARK_SHOWN_LINES = 5
 _KEPT_MARK_SHOWN_WORDS = 10
 _KEPT_MARK_HEAD = "残した指摘の語: {}。下の「■ 残した指摘の語」のとおり、書き直すか、尋ねるか、残す理由を書いてください。"
 _KEPT_MARK_SECTION = (
-    "■ 残した指摘の語（最終稿の直訳語と語の一覧の指摘。{}語）\n"
-    "flag.txt の使う語は、替える名前の出典にできます（references/calques.md 4章）。\n"
-    "最終稿に残した次の語は、その文を SKILL.md Step 2 の問いで読み直し、書き直すか、残すなら次のどちらかにしてください。\n"
-    "- 書き直しに使う名前が flag.txt の使う語、原文、依頼、提供資料、文脈のどれにもないか、動作やその動作をする人が"
-    "原文、依頼、提供資料、文脈のどれにも書いていないか、前後の文と呼び名がそろわず"
+    "■ 残した指摘の語（最終稿の直訳語と語の一覧の指摘。{count}語）\n"
+    "{note}最終稿に残した次の語は、その文を SKILL.md Step 2 の問いで読み直し、書き直すか、残すなら次のどちらかにしてください。\n"
+    "- {unsourced}前後の文と呼び名がそろわず"
     "同じものを指すか分からない: 本文を残し、「書き手に確かめたい点」で尋ねる（残す理由を書くだけにしない）。問いは3点までの決まりと"
     "選び方に従い、入らない分は「ほかに N か所」に数える。\n"
     "- 直訳語の指摘で、その分野で定着した言い方か、文字どおりの意味（音、実物の場所など）: 残す理由を「残したAIっぽいところ」に書く。"
     "語の一覧（flag.txt）の語は、定着した言い方でも残さない。\n"
     "- 本文だけを返す指定では、確かめたい点も説明も付けないので、書き直せない語は本文のまま残す。")
+_KEPT_MARK_UNSOURCED = "書き直しに使う名前や動作、その動作をする人が、原文、依頼、提供資料、文脈のどれにも書いていないか、"
+# 3.0.0: lint の指摘に flag.txt の使う語を添えた run だけ、使う語を替える名前の出典に数える
+_KEPT_MARK_REPLACEMENT_NOTE = "flag.txt の使う語は、替える名前の出典にできます（references/calques.md 4章）。\n"
+_KEPT_MARK_UNSOURCED_WITH_REPLACEMENTS = ("書き直しに使う名前が flag.txt の使う語、原文、依頼、提供資料、文脈のどれにもないか、"
+                                          "動作やその動作をする人が、原文、依頼、提供資料、文脈のどれにも書いていないか、")
+# 3.0.0: 語の一覧に flag-patterns.txt があった run だけ、2つ目の項目の「語の一覧（flag.txt）の語」のあとに足す
+_KEPT_MARK_PATTERNS_NOTE = "（flag-patterns.txt の語も同じ）"
 _KEPT_MARK_VERIFY = ("残した指摘の語: {}。完了報告を付けるときは、「書き手に確かめたい点」で尋ねたか（3点を超える分は「ほかに N か所」"
                      "に数える）、残す理由を「残したAIっぽいところ」に書いたかを確かめてから提出してください。")
 
@@ -2194,7 +2250,10 @@ def _kept_marks(findings: list[dict]) -> list[dict]:
         rule = finding.get("rule")
         if rule not in _KEPT_MARK_RULES:
             continue
-        found = _KEPT_MARK_RULES[rule][1].search(finding.get("message") or "")
+        message = finding.get("message") or ""
+        if rule == "project_term" and not message.endswith(_PROJECT_TERM_PLAIN_TAIL):
+            message = message.partition(_PROJECT_TERM_SUGGESTIONS)[0]
+        found = _KEPT_MARK_RULES[rule][1].search(message)
         words = [word for word in found.group(1).split("、") if word] if found else []
         line = finding.get("line") if type(finding.get("line")) is int else None
         for word in words or [None]:
@@ -2212,9 +2271,33 @@ def _kept_marks(findings: list[dict]) -> list[dict]:
     return rows
 
 
-def _kept_marks_text(marks: list[dict], flag_replacements: dict[str, str] | None = None) -> str:
+def _kept_mark_replacements(findings: list[dict], replacements: dict[str, str]) -> dict[str, str]:
+    """lint の指摘の末尾に「使う語: 語 → 使う語、…。」と添えた語の使う語だけを返す。パターンだけに当たった名前は、
+    flag.txt の語と同じ字でも、ほかの語の使う語の一部に見えても添えない（「、」と「。」で区切った1組ずつと照らす）。"""
+    kept = {}
+    if not replacements:
+        return kept
+    for finding in findings or ():
+        if not isinstance(finding, dict) or finding.get("rule") != "project_term":
+            continue
+        message = finding.get("message") or ""
+        if message.endswith(_PROJECT_TERM_PLAIN_TAIL):
+            continue
+        head, _, tail = message.partition(_PROJECT_TERM_SUGGESTIONS)
+        found = _KEPT_MARK_RULES["project_term"][1].search(head)
+        if found is None or not tail:
+            continue
+        suggestions = "、" + tail.removesuffix("。") + "、"
+        for word in found.group(1).split("、"):
+            replacement = replacements.get(word)
+            if replacement and "、{} → {}、".format(word, replacement) in suggestions:
+                kept[word] = replacement
+    return kept
+
+
+def _kept_marks_text(marks: list[dict], replacements: dict[str, str] | None = None) -> str:
     """「語（語の一覧か直訳語。行番号。使う語）」を「、」でつなぐ。使う語がなければ省き、行と語が多ければ初めだけを出す。"""
-    replacements = flag_replacements or {}
+    replacements = replacements or {}
     shown = []
     for mark in marks[:_KEPT_MARK_SHOWN_WORDS]:
         lines = mark["lines"]
@@ -2400,7 +2483,7 @@ def _head_lines(ctx: _Context, diff_module: ModuleType) -> list[str]:
     if not parts:
         return []
     kept = ctx.kept_marks if lint is not None else []
-    return ["。".join(parts)] + ([_KEPT_MARK_HEAD.format(_kept_marks_text(kept, ctx.flag_replacements))] if kept else []) + [_HEAD_NOTE]
+    return ["。".join(parts)] + ([_KEPT_MARK_HEAD.format(_kept_marks_text(kept, ctx.kept_replacements))] if kept else []) + [_HEAD_NOTE]
 
 
 def _detector_value(ctx: _Context, diff_module: ModuleType, key: str) -> int | None:
@@ -2617,8 +2700,14 @@ def _sections(ctx: _Context, lint_module: ModuleType, diff_module: ModuleType) -
         sections.append(diff_module.report_parts(dict(base, meaning_risks=ctx.risks))["risks"])
     kept = ctx.kept_marks if ctx.lint_result is not None and not ctx.final_changed else []
     if kept:
-        sections.append(_KEPT_MARK_SECTION.format(len(kept)) + "\n"
-                        + "\n".join("- " + _kept_marks_text([mark], ctx.flag_replacements) for mark in kept))
+        replaced = bool(ctx.kept_replacements)
+        section = _KEPT_MARK_SECTION.format(
+            count=len(kept), note=_KEPT_MARK_REPLACEMENT_NOTE if replaced else "",
+            unsourced=_KEPT_MARK_UNSOURCED_WITH_REPLACEMENTS if replaced else _KEPT_MARK_UNSOURCED)
+        if ctx.words is not None and ctx.words.get("flag_patterns_sha256") is not None:
+            section = section.replace("語の一覧（flag.txt）の語は、", "語の一覧（flag.txt）の語" + _KEPT_MARK_PATTERNS_NOTE + "は、", 1)
+        sections.append(section + "\n"
+                        + "\n".join("- " + _kept_marks_text([mark], ctx.kept_replacements) for mark in kept))
     parts = ctx.diff_parts
     rules = None
     if parts is not None and parts["rules"]:
@@ -2963,6 +3052,12 @@ def _run_impl(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         if stance is None:
             shown = args.stance if args.stance.strip() else "（空）"
             _error("--stance に使えない値です: {}。使えるのは {} です。".format(shown, "、".join(diff_module.STANCES)))
+            return 2
+    if not args.stdin:
+        # 3.0.0: 作業フォルダの外のファイルと、点で始まる部分を含むパスは、どれも読む前に断る（何も書かない）
+        problem = _path_problem("run", args.final + list(args.source or []) + list(args.materials or []))
+        if problem:
+            _error(problem)
             return 2
     original_snapshot = None
     snapshot_id = None
@@ -3336,7 +3431,7 @@ def _read_target(given: str, stdin_data: bytes | None) -> tuple[_Target | None, 
             return None, "Error reading stdin: UTF-8 として読めません"
         return target, None
     try:
-        with Path(given).open('rb') as handle:
+        with open(given, 'rb') as handle:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
             data = handle.read()
     except (OSError, ValueError) as error:
         reason = getattr(error, "strerror", None) or error
@@ -3800,10 +3895,18 @@ def _record_shape(record: dict) -> list[str]:
 
 
 def _words_shape(words: object) -> bool:
-    """記録の options.words が、run の書く形（context.words の5つのキー）か。"""
+    """記録の options.words が、run の書く形（context.words の5つのキーか、flag-patterns.txt の2つを足した7つのキー）か。"""
     def digest(value: object) -> bool:
         return value is None or (isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value))
-    return (isinstance(words, dict) and list(words) == ["path", "allow_lines", "flag_lines", "allow_sha256", "flag_sha256"]
+    if isinstance(words, dict) and list(words) == list(_WORDS_KEYS + _WORDS_PATTERN_KEYS):
+        if not (type(words["flag_patterns_lines"]) is int and words["flag_patterns_lines"] >= 0
+                and isinstance(words["flag_patterns_sha256"], str) and digest(words["flag_patterns_sha256"])):
+            return False
+        words = OrderedDict((key, words[key]) for key in _WORDS_KEYS)
+        return (isinstance(words["path"], str) and Path(words["path"]).is_absolute()
+                and all(type(words[key]) is int and words[key] >= 0 for key in ("allow_lines", "flag_lines"))
+                and digest(words["allow_sha256"]) and digest(words["flag_sha256"]))
+    return (isinstance(words, dict) and list(words) == list(_WORDS_KEYS)
             and isinstance(words["path"], str) and Path(words['path']).is_absolute()
             and all(type(words[key]) is int and words[key] >= 0 for key in ("allow_lines", "flag_lines"))
             and digest(words["allow_sha256"]) and digest(words["flag_sha256"])
@@ -4039,8 +4142,14 @@ def _replay(state: str, record: dict, timeout: float) -> tuple[list[tuple[str, s
     inputs = record["inputs"]
     entries = OrderedDict((entry["name"], entry) for entry in record["checks"] if entry["status"] == "ran")
 
+    folder = absolute_path(str(Path(state, "inputs")))
+
     def snapshot(item: dict) -> str:
-        return str(Path(state, 'inputs', item['sha256'] + '.bin'))
+        return str(Path(folder, item["sha256"] + ".bin"))
+
+    def snapshot_name(item: dict) -> str:
+        # 子には写しのフォルダを作業フォルダにして、ファイルの名前で渡す（run の _run_checks と同じ。3.0.0）
+        return item["sha256"] + ".bin"
 
     # 記録と同じ種類と読者と語の一覧を付ける（付けないと lint のレポートが合わない）。語の一覧は記録の場所を渡し、
     # 一覧を使わなかった記録は --no-words（verify の作業ディレクトリから探し直さない）
@@ -4048,20 +4157,20 @@ def _replay(state: str, record: dict, timeout: float) -> tuple[list[tuple[str, s
     commands = OrderedDict()
     if "lint" in entries:
         commands["lint"] = ([sys.executable, "-B", str(Path(_HERE, 'yomiyasu_lint.py')), "--json"] + context
-                            + [snapshot(inputs["final"])])
+                            + [snapshot_name(inputs["final"])])
     if "diff" in entries:
         command = [sys.executable, "-B", str(Path(_HERE, 'yomiyasu_diff.py')), "--json"]
         if record["options"].get("stance") is not None:
             command += ["--stance", record["options"]["stance"]]
         # run と同じく資料の写しも渡す（2.4.0）
         for item in inputs.get("materials") or []:
-            command += ["--material", snapshot(item)]
+            command += ["--material", snapshot_name(item)]
         # 新規作成で資料を原文とみなした記録は、その資料の写しと比べる
         source_item = _diff_source_item(record)
         assert source_item is not None
-        commands["diff"] = command + context + [snapshot(source_item), snapshot(inputs["final"])]
+        commands["diff"] = command + context + [snapshot_name(source_item), snapshot_name(inputs["final"])]
     environment = dict(os.environ, PYTHONIOENCODING="utf-8")
-    children = _Children(timeout, environment)
+    children = _Children(timeout, environment, cwd=folder)
     problems = []
     rebuilt = {}
     try:
@@ -4378,6 +4487,12 @@ def _verify(args: argparse.Namespace, parser: argparse.ArgumentParser, _final: _
     if problem:
         _error(problem)
         return 2
+    if _final is None:
+        # 3.0.0: 作業フォルダの外のファイルと、点で始まる部分を含むパスは、読む前に断る（export は _management で確かめる）
+        problem = _path_problem("verify", (args.final, args.source))
+        if problem:
+            _error(problem)
+            return 2
     stdin_data = None
     if _final is None and "-" in (args.final, args.source):
         stdin_data, problem = _read_stdin_bytes()
@@ -4729,9 +4844,9 @@ def armed_update(state: str, run_id: str, change: Callable[[dict], object], budg
 
 
 def _managed_input(path: str) -> _Input:
-    if path == "-" or not _path_matches(Path(path).is_file):
+    if path == "-" or not os.path.isfile(path):  # noqa: PTH113 -- probe the given string as is, so 'x.md/' is not a file as in 3.0.0
         raise ValueError("通常の原文ファイルを渡してください（標準入力は使えません）。")
-    with Path(path).open('rb') as stream:
+    with open(path, 'rb') as stream:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
         data = stream.read(_MANAGED_BYTES + 1)
     if len(data) > _MANAGED_BYTES:
         raise ValueError("原文は2 MiBまでです。")
@@ -4978,7 +5093,7 @@ def verify_quick(state: str, final_path: str | None = None, final_bytes: bytes |
     if final_bytes is None:
         if final_path is None:
             raise ValueError("final_path or final_bytes is required")
-        with Path(final_path).open('rb') as stream:
+        with open(final_path, 'rb') as stream:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
             final_bytes = stream.read()
     target = _Target(_abspath(final_path) if final_path is not None else None, final_bytes)
     result = _verification(state, target, run_id, since)
@@ -4998,6 +5113,12 @@ def _management(command: str, args: argparse.Namespace, parser: argparse.Argumen
             parser.error(problem)
     if args.source == "-" or getattr(args, "final", None) == "-":
         parser.error("標準入力（-）は使えません")
+    if command in ("start", "export"):
+        # 3.0.0: 作業フォルダの外のファイルと、点で始まる部分を含むパスは、読む前と書く前に断る。start の --final は
+        # まだ読まないが、あとで run と export に渡すファイルなので同じに確かめる。end の --source は登録と比べるだけで読まない
+        problem = _path_problem(command, (args.source, args.final))
+        if problem:
+            parser.error(problem)
     if command == "start":
         # 語の一覧（run と同じ探し方）。読めなければ、状態フォルダを決める前に2で断る
         words, problem = _resolve_words(args, parser, _getcwd())
@@ -5108,7 +5229,7 @@ _RECORD_NOTE = ("記録はこのコマンドだけが作ります。同じ権限
 _EXIT_CODES = """終了コード:
   0  run: 検査を最後まで実行し、--fail-on の条件に当たらなかった（状態 executed か unrecorded。候補の有無によらない）。verify: 記録と照合が合った（executed）。-h と --version も0。start: 登録した（started）。export: 写しを書いた（exported）。end: 登録を終えた（ended）
   1  run: --fail-on の条件に当たった（記録は残す）。verify: 記録がない、または記録と合わない（理由は2行目の状態の行と --json の problems）。run: 登録の上限で実行しなかった（unverified）。export: 照合が合わない。end: 登録がない
-  2  使い方か入力の誤り（ファイルを開けない、UTF-8 として読めない、区切りの誤り、使えない値、原文と最終稿が同じファイル、資料と最終稿が同じ中身、空の最終稿、別の原文の実行ID、語の一覧を読めない、--words と --no-words を一緒に指定した）。何も書かない（状態 not_run）
+  2  使い方か入力の誤り（ファイルを開けない、読まないファイル（作業フォルダの外、名前が点で始まる部分を含むパス）を渡した、UTF-8 として読めない、区切りの誤り、使えない値、原文と最終稿が同じファイル、資料と最終稿が同じ中身、空の最終稿、別の原文の実行ID、語の一覧を読めない（--words のフォルダがない、UTF-8 でない、1万行を超える、flag.txt か flag-patterns.txt に使えない行がある。ファイルの中身の誤りは、ファイルの名前と行番号を出す）、--words と --no-words を一緒に指定した）。何も書かない（状態 not_run）
   3  検査の一部を実行できなかった（lint か diff が内部の誤りか時間切れで終わらなかった、途中で最終稿が変わった。状態 partial）か、check の予期しない内部の誤り、出力先が閉じられて結果を最後まで書けなかった"""
 _USAGE = ("yomiyasu_check.py run --final 最終稿 (--source 原文 | --material 資料) [オプション]\n"
           "       yomiyasu_check.py run --stdin [オプション]\n"
@@ -5171,8 +5292,10 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
         return super().add_usage(usage, actions, groups, prefix)
 
 
-_WORDS_HELP = ("語の一覧（allow.txt と flag.txt）のフォルダ。省くと、作業ディレクトリから上へたどった git の最上位"
+_WORDS_HELP = ("語の一覧（allow.txt と flag.txt。名前と正規表現を書く flag-patterns.txt も置けます）のフォルダ。"
+               "省くと、作業ディレクトリから上へたどった git の最上位"
                "（.git のあるフォルダ。git の外では作業ディレクトリ）の .yomiyasu-words/ を探します（lint、diff と同じ）。"
+               "linked worktree にこのフォルダがなければ、元の checkout の一覧を探します。"
                "check が探して読み、lint と diff にこの場所を渡して、記録に場所と語の数と SHA-256 を残します。"
                "読めない一覧は終了コード2で、何も書きません。")
 _NO_WORDS_HELP = "語の一覧を探さず、読みません（--words と一緒には使えません）。"
