@@ -77,6 +77,7 @@ INTERPOLATION = re.compile(r"\$\{[^}]*\}")
 # HCL's comments, and the top-level block headers terraform fmt starts at the line's start (data "archive_file" "x" {).
 HCL_COMMENT = re.compile(r"/\*.*?\*/|(?:#|//)[^\n]*", re.DOTALL)
 HCL_BLOCK = re.compile(r"^[a-z_]+\b[^\n{]*\{", re.MULTILINE)
+ARCHIVE_BLOCK = re.compile(r'(?:data|resource)\s+"archive_file"\s')
 # An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
@@ -358,7 +359,7 @@ def archive_outputs(writes: re.Pattern[str], text: str) -> list[str]:
     text = HCL_COMMENT.sub("", text)
     starts = [found.start() for found in HCL_BLOCK.finditer(text)] + [len(text)]
     blocks = [text[start:end] for start, end in zip(starts, starts[1:])]
-    return [name for block in blocks if '"archive_file"' in block.split("{", 1)[0] for name in writes.findall(block)]
+    return [name for block in blocks if ARCHIVE_BLOCK.match(block) for name in writes.findall(block)]
 
 
 def ignore_source(worktree: Path, rel: str) -> str:

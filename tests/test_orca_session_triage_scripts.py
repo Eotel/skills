@@ -1322,7 +1322,8 @@ class ClassifyTests(unittest.TestCase):
         limit = "You've hit your weekly limit · resets 2am (Asia/Tokyo)"
         # Claude Code tags a limit worded in a way the rule does not know yet; its tab shows the turn before it.
         reworded = "Claude is paused for this plan until 2am (Asia/Tokyo)"
-        for path, said in (("/w/resumed", limit), ("/w/limited", limit), ("/w/reworded", reworded)):
+        for path, said in (("/w/resumed", limit), ("/w/limited", limit), ("/w/reworded", reworded),
+                           ("/w/wrapped", limit)):
             self.claude_says(path, user("go"), {**assistant(text(said)), "isApiErrorMessage": True,
                                                 "error": "rate_limit"})
         resumed = {"source": "screen", "tail": [
@@ -1335,21 +1336,26 @@ class ClassifyTests(unittest.TestCase):
         stopped = {"source": "screen", "tail": [
             "⏺ テストを足しました。", "✻ Cooked for 2m 3s · done 8:40", "❯ 続けて", "  ⎿  " + reworded,
             "✻ Baked for 1s · done 9:02", "─" * 40, "❯", "─" * 40]}
+        # A narrow pane wraps the notice: neither line shows it alone.
+        wrapped = {"source": "screen", "tail": [
+            "⏺ テストを足しました。", "✻ Cooked for 2m 3s · done 8:40", "❯ 続けて", "  ⎿  You've hit your weekly",
+            "     limit · resets 2am (Asia/Tokyo)", "✻ Baked for 1s · done 9:02", "❯"]}
         judged = []
         rows = {r["path"]: r for r in scan.build_inventory(
             [worktree("/w/resumed", "done", pr={"number": 3691, "state": "merged"}), worktree("/w/limited", "done"),
-             worktree("/w/reworded", "done")],
+             worktree("/w/reworded", "done"), worktree("/w/wrapped", "done")],
             [terminal("/w/resumed", "claude", "term_r"), terminal("/w/limited", "claude", "term_l"),
-             terminal("/w/reworded", "claude", "term_w")], self.projects,
+             terminal("/w/reworded", "claude", "term_w"), terminal("/w/wrapped", "claude", "term_n")], self.projects,
             {}, "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(),
-            screens={(None, "term_r"): resumed, (None, "term_l"): limited, (None, "term_w"): stopped})}
+            screens={(None, "term_r"): resumed, (None, "term_l"): limited, (None, "term_w"): stopped,
+                     (None, "term_n"): wrapped})}
 
         self.assertIsNone(rows["/w/resumed"]["stop"])
         self.assertEqual(rows["/w/resumed"]["class"], "finished")
         self.assertIn("the transcript's usage limit is past: the tab's screen shows a later turn "
                       "(✻ Cooked for 4m 14s · done 14:04)", rows["/w/resumed"]["reasons"])
         self.assertEqual(judged, ["PR #3691 を merge し、devel の ETL ホストで fetch しました。\n確かめていないのは次の 2 つです。"])
-        for path in ("/w/limited", "/w/reworded"):
+        for path in ("/w/limited", "/w/reworded", "/w/wrapped"):
             self.assertEqual((rows[path]["class"], rows[path]["stop"]["kind"]), ("stalled", "usage_limit"))
 
     def test_a_local_codex_tab_without_a_recent_rollout_is_judged_from_its_screen(self) -> None:
@@ -3714,7 +3720,8 @@ class RmCheckTests(unittest.TestCase):
                    "terraform/modules/backup/main.tf": 'data "archive_file" "build" {\n'
                                                        '  output_path = "${path.module}/zip/build.zip"\n'
                                                        '  # output_path = "${path.module}/zip/unique-backup.zip"\n}\n',
-                   "terraform/modules/other/main.tf": "# no archive here\n"}
+                   "terraform/modules/other/main.tf": 'module "archive_file" {\n  source = "./empty"\n'
+                                                       '  output_path = "${path.module}/zip/kept.zip"\n}\n'}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
             (self.main / name).write_text(content)

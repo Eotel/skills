@@ -1145,14 +1145,21 @@ def claude_progress(screen: dict) -> str | None:
     return lines[found]
 
 
-# The start of a transcript's limit error looked for on the screen, short enough to survive the screen's wrapping.
+# The start of a transcript's limit error looked for on the screen.
 LIMIT_HEAD = 40
 
 
-def limit_notice(line: str, error: str) -> bool:
-    """Whether a screen line shows a usage-limit notice, worded as the rule knows or as the transcript's error."""
+def limit_notices(lines: list[str], error: str) -> list[int]:
+    """The indexes of the stripped screen lines a usage-limit notice ends on, worded as the rule knows or as the
+    transcript's error, also where a narrow terminal wrapped it onto the next line (mid-word or at a space)."""
     head = error.strip().splitlines()[0][:LIMIT_HEAD] if error.strip() else ""
-    return bool(USAGE_LIMIT.search(line) or head and head in line)
+
+    def shows(text: str) -> bool:
+        return bool(USAGE_LIMIT.search(text) or head and head in text)
+
+    return [index for index, line in enumerate(lines)
+            if shows(line) or index and not shows(lines[index - 1])
+            and any(shows(lines[index - 1] + glue + line) for glue in ("", " "))]
 
 
 def turn_after_limit(screen: dict, error: str = "") -> str | None:
@@ -1161,7 +1168,7 @@ def turn_after_limit(screen: dict, error: str = "") -> str | None:
     ends with a turn-end line too ("✻ Baked for 1s · done 9:02"), but with no ⏺ between. `error` is the
     transcript's limit error, found on the screen even when its wording is new."""
     lines = [line.strip() for line in screen_lines(screen)]
-    notice = max((index for index, line in enumerate(lines) if limit_notice(line, error)), default=-1)
+    notice = max(limit_notices(lines, error), default=-1)
     replied = next((index for index in range(notice + 1, len(lines)) if lines[index].startswith("⏺ ")), None)
     if replied is None:
         return None
@@ -1187,7 +1194,7 @@ def resumed_after_limit(row: dict, claude_screens: list[dict]) -> tuple[str, str
     if not (stop and stop["kind"] == "usage_limit" and stop["agent"] == "claude"):
         return None
     later = [(line, screen) for screen in claude_screens if (line := turn_after_limit(screen, stop["error"]))]
-    stopped = any(any(limit_notice(line, stop["error"]) for line in screen_lines(screen))
+    stopped = any(limit_notices([line.strip() for line in screen_lines(screen)], stop["error"])
                   and not turn_after_limit(screen, stop["error"]) for screen in claude_screens)
     if not later or stopped:
         return None
