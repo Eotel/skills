@@ -1373,6 +1373,8 @@ class ClassifyTests(unittest.TestCase):
             "• Done. PR #9 is merged.", "", f"  Worked for 3m 2s • {datetime.fromtimestamp(NOW - 3600):%H:%M}",
             "› Ask Codex to do anything"]}
         # A tab idle for three days shows an old turn: its clock is read on the day of its last output.
+        # A tab that runs a later turn under an old completion is not judged from that completion.
+        busy = {"source": "screen", "tail": [*older["tail"][:3], "› 続けて", "• Working (12s • esc to interrupt)"]}
         blocker = "PR #10 のレビュー待ちです。"
         self.claude_says("/w/idle", user("go"), {**assistant(text(blocker)), "timestamp": "2027-01-15T06:00:00Z"})
         judged = []
@@ -1380,16 +1382,19 @@ class ClassifyTests(unittest.TestCase):
             [worktree("/w/uv", "done", agent="codex"),
              worktree("/w/took", "done", agent="codex", pr={"number": 9, "state": "merged"}),
              worktree("/w/two", "done", agent="codex", pr={"number": 9, "state": "merged"}),
-             worktree("/w/idle", "done", agent="codex")],
+             worktree("/w/idle", "done", agent="codex"), worktree("/w/busy", "working", agent="codex")],
             [terminal("/w/uv", "codex", "term_u"), terminal("/w/took", "codex", "term_t"),
              terminal("/w/two", "codex", "term_new"), terminal("/w/two", "codex", "term_old"),
-             terminal("/w/idle", "codex", "term_i", quiet_minutes=3 * 24 * 60)], self.projects, {},
+             terminal("/w/idle", "codex", "term_i", quiet_minutes=3 * 24 * 60), terminal("/w/busy", "codex", "term_b")],
+            self.projects, {},
             "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(0.1, "blocked_on_others"),
             screens={(None, "term_u"): screen, (None, "term_t"): screen, (None, "term_new"): screen,
-                     (None, "term_old"): older, (None, "term_i"): older})}
+                     (None, "term_old"): older, (None, "term_i"): older, (None, "term_b"): busy})}
         row = rows["/w/uv"]
 
-        self.assertEqual(row["orca_message"], {"text": reply, "at": "2027-01-15T07:50:00Z", "from": "screen"})
+        # The line gives the minute only: its last second keeps a reply after a merge in that minute.
+        self.assertEqual(row["orca_message"], {"text": reply, "at": "2027-01-15T07:50:59Z", "from": "screen"})
+        self.assertNotIn("orca_message", rows["/w/busy"])
         self.assertEqual([rows[path]["class"] for path in ("/w/uv", "/w/took", "/w/two", "/w/idle")], ["stalled"] * 4)
         self.assertEqual(judged, [reply] * 3 + [blocker])
         self.assertEqual([entry["path"] for entry in scan.review_queue(list(rows.values()))],

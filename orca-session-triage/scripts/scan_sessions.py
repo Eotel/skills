@@ -910,6 +910,7 @@ CODEX_TURN_END = re.compile(r"[─━ ]*Worked for \d[^•·─━]*(?:[•·] *
 # The local clock time a turn-end line ends with ("Worked for 14m 48s • 15:06").
 TURN_CLOCK = re.compile(r"[•·] *(\d{1,2}):(\d{2})")
 CODEX_ACTION = re.compile(r"• (?:(?:Edited|Added|Deleted) .+\(\+\d+ -\d+\)|Working \(.+\))\s*")
+CODEX_WORKING = re.compile(r"• Working \(")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
@@ -1203,7 +1204,8 @@ def resumed_after_limit(row: dict, claude_screens: list[dict]) -> tuple[str, str
 
 
 def turn_clock(line: str, now: float) -> str | None:
-    """The UTC time of a turn-end line's local "• HH:MM", on the last day it is not later than `now`."""
+    """The UTC time of a turn-end line's local "• HH:MM", on the last day it is not later than `now`, at the minute's
+    last second: a Codex that merged its PR replies within the same minute, and its reply has to stay after it."""
     found = TURN_CLOCK.search(line)
     if not found:
         return None
@@ -1214,7 +1216,7 @@ def turn_clock(line: str, now: float) -> str | None:
         return None
     if at > local:
         at -= timedelta(days=1)
-    return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (at + timedelta(seconds=59)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def codex_tab_message(terms: list[dict], screens: Screens) -> tuple[str, str | None]:
@@ -1226,11 +1228,13 @@ def codex_tab_message(terms: list[dict], screens: Screens) -> tuple[str, str | N
         screen = rendered(screens.get((None, term.get("handle"))))
         if not screen or screen_agent(screen) != "codex" or term.get("agentIdentity") not in (None, "codex"):
             continue
-        lines = screen_lines(screen)
-        ends = [line.strip() for line in lines if CODEX_TURN_END.fullmatch(line.strip())]
+        lines = [line.strip() for line in screen_lines(screen)]
+        ends = [index for index, line in enumerate(lines) if CODEX_TURN_END.fullmatch(line)]
+        if not ends or any(CODEX_WORKING.match(line) for line in lines[ends[-1] + 1:]):
+            continue  # no turn ended, or a later one runs
         last_output = term.get("lastOutputAt")
-        if ends and (reply := codex_screen_message(lines)):
-            shown.append((reply, turn_clock(ends[-1], last_output / 1000) if last_output is not None else None))
+        if reply := codex_screen_message(screen_lines(screen)):
+            shown.append((reply, turn_clock(lines[ends[-1]], last_output / 1000) if last_output is not None else None))
     return max(shown, key=lambda found: found[1] or "", default=("", None))
 
 
