@@ -63,6 +63,15 @@ GENERATED_BY = {
     "docs/generated/graphql-schema.md": "backend/cxc_tools/regen_graphql_doc.py",
     "public/git-info.json": "scripts/gen-git-info.js",
 }
+# Ignored outputs a named tool builds again from a tracked file beside them: Cargo's target/ beside Cargo.toml,
+# and Tauri's gen/schemas/ under the directory of its config.
+CARGO_MANIFEST = "Cargo.toml"
+TAURI_CONFIGS = ("tauri.conf.json", "tauri.conf.json5", "Tauri.toml")
+# `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
+# with any backend but local, the state itself is kept by the backend.
+TERRAFORM_DIR = ".terraform"
+# A tracked Terraform file's archive_file writing into a directory beside it: output_path = "${path.module}/zip/…".
+ARCHIVE_OUTPUT = 'output_path\\s*=\\s*"\\$\\{path\\.module\\}/%s/'
 # An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
@@ -290,6 +299,54 @@ def generated(worktree: Path, rel: str) -> bool:
         return False
 
 
+def tracked(worktree: Path, rel: PurePosixPath) -> bool:
+    return git(worktree, "ls-files", "--error-unmatch", "--", str(rel)).returncode == 0
+
+
+def tool_output(worktree: Path, rel: str) -> str | None:
+    """What a named tool writes again at this ignored path, from a tracked file the worktree holds, or None:
+    Cargo's target/ beside Cargo.toml, Tauri's gen/schemas/ beside its config, a .terraform/ whose backend is not
+    local, and a directory of zip files that a Terraform archive_file beside it writes."""
+    path = PurePosixPath(rel.rstrip("/"))
+    source = worktree / path
+    if source.is_symlink() or not source.is_dir():
+        return None
+    if path.name == "target" and tracked(worktree, path.parent / CARGO_MANIFEST):
+        return "Cargo's build output (%s)" % (path.parent / CARGO_MANIFEST)
+    if path.parts[-2:] == ("gen", "schemas"):
+        config = next((path.parent.parent / name for name in TAURI_CONFIGS
+                       if tracked(worktree, path.parent.parent / name)), None)
+        return "Tauri's generated schemas (%s)" % config if config else None
+    if path.name == TERRAFORM_DIR:
+        try:
+            backend = json.loads((source / "terraform.tfstate").read_text(encoding="utf-8")).get("backend") or {}
+        except (OSError, ValueError, AttributeError):
+            return None
+        kind = backend.get("type") if isinstance(backend, dict) else None
+        return ("terraform init's providers and modules; the %s backend keeps the state" % kind
+                if isinstance(kind, str) and kind and kind != "local" else None)
+    files = files_in(source)
+    if not files or any(file.is_symlink() or file.suffix != ".zip" for file in files):
+        return None
+    writes = re.compile(ARCHIVE_OUTPUT % re.escape(path.name))
+    beside = git(worktree, "ls-files", "-z", "--", str(path.parent)).stdout.split("\0")
+    for name in beside:
+        module = PurePosixPath(name)
+        if module.suffix == ".tf" and module.parent == path.parent:
+            try:
+                if writes.search((worktree / module).read_text(errors="replace")):
+                    return "archives Terraform's archive_file writes (%s)" % module
+            except OSError:
+                continue
+    return None
+
+
+def ignore_source(worktree: Path, rel: str) -> str:
+    """The ignore file, line, and pattern that exclude `rel`, as `git check-ignore -v` prints them."""
+    found = git(worktree, "check-ignore", "-v", "--", rel).stdout.strip()
+    return found.split("\t", 1)[0] or "an ignore rule git did not name"
+
+
 def files_in(path: Path) -> list[Path]:
     """The path itself, or every file and symlink inside a directory."""
     if path.is_symlink() or not path.is_dir():
@@ -350,8 +407,9 @@ class IgnoredPaths(NamedTuple):
     review: list[str]
     regenerable: list[str]
     nested: list[Path]
-    # The size and last write of each directory of logs counted as regenerable.
-    logs: list[str]
+    # Why paths counted as regenerable for what they hold: a directory of logs (its size and last write), and a
+    # tool's output (the tool and the ignore line that excludes it).
+    notes: list[str]
     # The live PIDs that hold the worktree's scheduled tasks lock.
     lock_holders: list[int]
     # The paths of `review` split by what they hold: work records --archive-scratch moves aside, and the rest.
@@ -360,7 +418,7 @@ class IgnoredPaths(NamedTuple):
 
 
 def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
-    """(review, regenerable, nested, logs, lock_holders, records, held): ignored paths that hold something and are
+    """(review, regenerable, nested, notes, lock_holders, records, held): ignored paths that hold something and are
     neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
     test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
     live holder of a scheduled tasks lock, which is not a path to open, and the paths that keep the worktree
@@ -369,7 +427,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
     `--ignored=matching` names each path an ignore pattern matched, so a generated
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
-    review, regenerable, nested, logs, holders = [], [], [], [], []
+    review, regenerable, nested, notes, holders = [], [], [], [], []
     records: list[Record] = []
     held: list[Held] = []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
@@ -395,7 +453,11 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             continue
         if (files := log_files(source)) is not None:
             regenerable.append(rel)
-            logs.append(log_note(rel, files))
+            notes.append(log_note(rel, files))
+            continue
+        if tool := tool_output(Path(worktree), rel):
+            regenerable.append(rel)
+            notes.append("%s is %s, ignored by %s" % (rel, tool, ignore_source(Path(worktree), rel)))
             continue
         where = "not in main checkout" if not copy.exists() else "differs from main checkout"
         keys = None
@@ -411,7 +473,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             records.append({"path": rel, "kind": kind})
         else:
             held.append(held_file(source, rel, copy.exists(), keys))
-    return IgnoredPaths(review, regenerable, nested, logs, holders, records, held)
+    return IgnoredPaths(review, regenerable, nested, notes, holders, records, held)
 
 
 def on_remote(worktree: Path, head: str) -> bool:
@@ -806,13 +868,13 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                 assert merged_head is not None
                 blockers.append("HEAD %s cannot be compared with merged PR head %s" % (head[:8], merged_head[:8]))
             elif base is None:
-                blockers.append("no base ref found (%s); pass --base" % ", ".join(BASE_CANDIDATES))
+                blockers.append("no base ref found (%s); pass --base" % ", ".join((*BASE_CANDIDATES, *LOCAL_BASES)))
             elif not pr:
                 blockers.append("HEAD %s is not in %s" % (head[:8], base))
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested, logs, lock_holders, records, held_files = ignored_paths(worktree, main)
+    review, regenerable, nested, notes, lock_holders, records, held_files = ignored_paths(worktree, main)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
@@ -847,7 +909,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
             "records": records, "held": held_files,
             "regenerable": bytecode + regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
-            "containers": compose_in(worktree, compose_projects), "processes": processes or [], "notes": logs}
+            "containers": compose_in(worktree, compose_projects), "processes": processes or [], "notes": notes}
 
 
 def main_checkout(worktree: str | Path) -> str | None:
@@ -858,6 +920,8 @@ def main_checkout(worktree: str | Path) -> str | None:
 
 
 BASE_CANDIDATES = ("origin/HEAD", "origin/main", "origin/master")
+# With none of those (a repository with no remote), work merges into the branch the main checkout keeps.
+LOCAL_BASES = ("main", "master")
 
 
 def ref_exists(worktree: str | Path, ref: str) -> bool:
@@ -870,6 +934,11 @@ def default_base(worktree: str | Path) -> str | None:
         if ref_exists(worktree, ref):
             return ref
     return None
+
+
+def local_base(worktree: str | Path) -> str | None:
+    """The first local main or master branch, for a repository with no remote default branch."""
+    return next((name for name in LOCAL_BASES if ref_exists(worktree, "refs/heads/" + name)), None)
 
 
 def remote_identity(url: str) -> tuple[str, str]:
@@ -1330,11 +1399,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                             % (comment, key))
         else:
             notes.append("Lead answered %s: %r" % (key, answer.answer))
-    fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or default_base(worktree))
+    remote_default = default_base(worktree)
+    local_default = None if remote_default else local_base(worktree)
+    fallback = remote_default or local_default
+    fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
     if fetch_note:
         notes.append(fetch_note)
-    if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree)
-                                                         or default_base(worktree)):
+    if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree) or fallback):
         pr, lookup_error = merged_pr_at_head(worktree)
         branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
         if pr:
@@ -1343,7 +1414,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         elif lookup_error:
             notes.append("looking up a merged PR of branch %s failed: %s; pass --pr" % (branch, lookup_error))
     by_pr = pr_base(worktree, pr)
-    base = args.base or by_pr or start_base(worktree) or default_base(worktree)
+    base = args.base or by_pr or start_base(worktree) or fallback
     if not (args.base or args.pr or args.pr_head or pr or head_in(worktree, base)):
         # A branch can track a local branch (branch.<name>.remote=.), which proves nothing was pushed.
         upstream = git(worktree, "rev-parse", "--symbolic-full-name", "@{upstream}").stdout.strip()
@@ -1351,6 +1422,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             base = upstream.removeprefix("refs/remotes/")
             notes.append("Using %s as base: HEAD is pushed to the branch it tracks, and no PR was given or found"
                          % base)
+    if local_default and base == local_default and not args.base:
+        notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
+                     "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
     try:
         projects = [] if args.no_docker else compose_projects()

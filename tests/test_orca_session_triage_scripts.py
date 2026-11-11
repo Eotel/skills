@@ -1290,6 +1290,89 @@ class ClassifyTests(unittest.TestCase):
         [back] = self.inventory([worktree("/w/back", "working")], [terminal("/w/back", "claude", "term_b")], failed)
         self.assertEqual((back["class"], back["stop"]["agent"], back["stop"]["kind"]), ("stalled", "claude", "connection"))
 
+    def test_a_claude_tab_whose_screen_shows_its_turn_running_is_working_and_not_judged(self) -> None:
+        # 2026-11-11: tohoku-review-color-flow-docs was read as finished while its tab showed Composing… for 17 min.
+        self.claude_says("/w/busy", user("go"), assistant(text("スクリーンショットを撮りました。")))
+        self.claude_says("/w/ghost", user("go"), assistant(text("Merged.")))
+        running = {"source": "screen", "tail": [
+            "⏺ スクリーンショットを撮りました。",
+            "· Composing… (17m 47s · ↓ 11.9k tokens · thinking more with xhigh effort)",
+            "Update available! Run: brew upgrade claude-code@latest", "─" * 40, "❯", "─" * 40]}
+        # A resized terminal can leave an old status line above the turn's end.
+        ghost = {"source": "screen", "tail": ["✢ Honking… (1m 24s · ↓ 3.3k tokens)", "⏺ Merged.",
+                                              "✻ Cooked for 2m 3s · done 10:00", "❯"]}
+        judged = []
+        rows = {r["path"]: r for r in scan.build_inventory(
+            [worktree("/w/busy", "done"), worktree("/w/ghost", "done", pr={"number": 1, "state": "merged"})],
+            [terminal("/w/busy", "claude", "term_b"), terminal("/w/ghost", "claude", "term_g")], self.projects, {},
+            "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(),
+            screens={(None, "term_b"): running, (None, "term_g"): ghost})}
+
+        self.assertEqual((rows["/w/busy"]["class"], rows["/w/busy"]["reasons"]), ("working", [
+            "the tab's screen shows Claude working: "
+            "· Composing… (17m 47s · ↓ 11.9k tokens · thinking more with xhigh effort)"]))
+        self.assertEqual(rows["/w/busy"]["closable"], [])
+        self.assertEqual(rows["/w/ghost"]["class"], "finished")
+        self.assertEqual(judged, ["Merged."])
+        self.assertEqual([entry["path"] for entry in scan.review_queue(list(rows.values()))], [])
+
+    def test_a_usage_limit_is_past_once_the_tab_shows_a_later_turn(self) -> None:
+        # 2026-11-11: cvm-etl-devel-role resumed in another account and merged #3691 at 14:04, yet its transcript
+        # here still ended at the weekly limit, so the scan called it stalled until the limit reset.
+        limit = "You've hit your weekly limit · resets 2am (Asia/Tokyo)"
+        # Claude Code tags a limit worded in a way the rule does not know yet; its tab shows the turn before it.
+        reworded = "Claude is paused for this plan until 2am (Asia/Tokyo)"
+        for path, said in (("/w/resumed", limit), ("/w/limited", limit), ("/w/reworded", reworded)):
+            self.claude_says(path, user("go"), {**assistant(text(said)), "isApiErrorMessage": True,
+                                                "error": "rate_limit"})
+        resumed = {"source": "screen", "tail": [
+            "⏺ PR #3691 を merge し、devel の ETL ホストで fetch しました。", "  確かめていないのは次の 2 つです。",
+            "✻ Cooked for 4m 14s · done 14:04", "─" * 40, "❯", "─" * 40, "  ⏵⏵ bypass permissions on"]}
+        # The limit's own turn ends with a turn-end line too, with no reply between.
+        limited = {"source": "screen", "tail": [
+            "❯ 続けて", "  ⎿  " + limit, "     /usage-credits to finish what you’re working on.",
+            "✻ Baked for 1s · done 9:02 · 1 monitor still running", "─" * 40, "❯", "─" * 40]}
+        stopped = {"source": "screen", "tail": [
+            "⏺ テストを足しました。", "✻ Cooked for 2m 3s · done 8:40", "❯ 続けて", "  ⎿  " + reworded,
+            "✻ Baked for 1s · done 9:02", "─" * 40, "❯", "─" * 40]}
+        judged = []
+        rows = {r["path"]: r for r in scan.build_inventory(
+            [worktree("/w/resumed", "done", pr={"number": 3691, "state": "merged"}), worktree("/w/limited", "done"),
+             worktree("/w/reworded", "done")],
+            [terminal("/w/resumed", "claude", "term_r"), terminal("/w/limited", "claude", "term_l"),
+             terminal("/w/reworded", "claude", "term_w")], self.projects,
+            {}, "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(),
+            screens={(None, "term_r"): resumed, (None, "term_l"): limited, (None, "term_w"): stopped})}
+
+        self.assertIsNone(rows["/w/resumed"]["stop"])
+        self.assertEqual(rows["/w/resumed"]["class"], "finished")
+        self.assertIn("the transcript's usage limit is past: the tab's screen shows a later turn "
+                      "(✻ Cooked for 4m 14s · done 14:04)", rows["/w/resumed"]["reasons"])
+        self.assertEqual(judged, ["PR #3691 を merge し、devel の ETL ホストで fetch しました。\n確かめていないのは次の 2 つです。"])
+        for path in ("/w/limited", "/w/reworded"):
+            self.assertEqual((rows[path]["class"], rows[path]["stop"]["kind"]), ("stalled", "usage_limit"))
+
+    def test_a_local_codex_tab_without_a_recent_rollout_is_judged_from_its_screen(self) -> None:
+        # 2026-11-11: four uv-migration Codex lanes were "unstarted" while their tabs showed them waiting on a secret.
+        reply = "CI は Ruff 成功、残る3 job は引き続き CORELIB_PAT 設定待ちです。"
+        screen = {"source": "screen", "tail": [
+            "• Ran gh pr checks 764", "  └ lint pass", "• " + reply, "", "  Worked for 14m 48s • 15:06",
+            "› Ask Codex to do anything", "  GPT-6.1-Sol xhigh · ~/orca/workspaces/app/uv"]}
+        judged = []
+        [row] = scan.build_inventory(
+            [worktree("/w/uv", "done", agent="codex")], [terminal("/w/uv", "codex", "term_u")], self.projects, {},
+            "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(0.1, "blocked_on_others"),
+            screens={(None, "term_u"): screen})
+
+        self.assertEqual(row["orca_message"], {"text": reply, "at": None, "from": "screen"})
+        self.assertEqual((row["class"], judged), ("stalled", [reply]))
+        self.assertEqual([entry["path"] for entry in scan.review_queue([row])], ["/w/uv"])
+        # Its tab is read even while Orca shows the Codex working.
+        busy = [worktree("/w/uv", "working", agent="codex")]
+        self.assertEqual([t["handle"] for t in scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], set())],
+                         ["term_u"])
+        self.assertEqual(scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], {"/w/uv"}), [])
+
     def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self) -> None:
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.
         def stop(line: str) -> tuple[str, str, str | None] | None:
@@ -2338,11 +2421,13 @@ class ScanCommandTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--cards"]), 0)
 
+        # 2026-11-11: the hourly tab passed a card's handle to `orca terminal read` as a positional argument and got
+        # "Unknown command"; the card and meaningful lines now carry the command.
         self.assertEqual(out.getvalue().splitlines(), [
-            "fix-login | waiting (scan: stalled) | card term_1 claude | draft - | composer unknown"
-            " | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
+            "fix-login | waiting (scan: stalled) | card term_1 claude | read: orca terminal read --terminal term_1"
+            " | draft - | composer unknown | PR #10 を出しました。 merge してよいですか | screen: ✻ Baked for 3m ⏎ ❯",
             "fix-login | waiting (scan: stalled) | closable term_2",
-            "fix-login | waiting (scan: stalled) | meaningful term_1",
+            "fix-login | waiting (scan: stalled) | meaningful term_1 | read: orca terminal read --terminal term_1",
             f"fix-login | waiting (scan: stalled) | close: {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
             "mbp16::app | waiting | card - codex interrupted | draft unknown | composer unknown | - | screen: -",
         ])
@@ -2523,6 +2608,37 @@ class ScanCommandTests(unittest.TestCase):
                         expected = [str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
                                     *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
                     self.assertIn(shlex.join(expected), out.getvalue())
+
+    def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
+        # 2026-11-11: --rm-specs gave 2 of the 8 rows to check; the hourly tab built the other 6 specs by hand, and
+        # a zsh loop handed each to rm_check.py without its PR ("--pr: expected one argument").
+        def row(name: str, klass: str, **fields: object) -> dict:
+            return {"path": f"/w/app/{name}", "repo": "app", "environment": None, "class": klass, "reasons": [],
+                    "terminals": [], "claude": None, "codex": [], "meaningful_tabs": [f"term_{name}"], **fields}
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([row("tabs", "finished", pr={"number": 7}), row("busy", "stalled"),
+                                     row("far", "finished", environment="mbp16")]))
+
+        def specs(*names: str) -> tuple[int, str, str]:
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(saved), "--rm-specs", *(f"--row={name}" for name in names)])
+            return code, out.getvalue(), err.getvalue()
+
+        self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", ""))
+        code, out, err = specs("tabs", "busy", "mbp16::far")
+        self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
+        self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
+        self.assertIn(f"mbp16::far: left out: on another Mac: {scan.RM_CHECK_BATCH} --host mbp16 '/w/app/far -'", err)
+        self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
+
+    def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
+        # 2026-11-11: --summary said unsure=22, and --rows --class unsure printed nothing: saved verdicts had
+        # classed those rows.
+        saved, _ = self.saved_scan()
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        self.assertEqual(out.getvalue().splitlines()[0],
+                         "classes: stalled=0 (scan: 1), unsure=1, waiting=2 (scan: 1), working=1")
 
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self) -> None:
         local = {"worktrees": [worktree("/local/w", "done")],
@@ -3560,6 +3676,43 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(sorted(result["regenerable"]), ["apps/api/media/", "logs/"])
         self.assertRegex(" ".join(result["notes"]), r"logs/ holds only logs: 12 bytes, last written \d{4}-")
 
+    def test_ignored_cargo_tauri_and_terraform_outputs_are_regenerable_beside_their_sources(self) -> None:
+        # 2026-11-10/11: keito's src-tauri/target/ and gen/schemas/, and taihei-aws's .terraform/ (s3 backend) and
+        # module zip/ held removals as unknown until the hourly tab read their .gitignore lines by hand.
+        sources = {"src-tauri/.gitignore": "/target/\n/gen/schemas\n", "src-tauri/Cargo.toml": "[package]\n",
+                   "src-tauri/tauri.conf.json": "{}\n", "terraform/devel/main.tf": 'terraform { backend "s3" {} }\n',
+                   "terraform/modules/dms/monitor.tf": 'data "archive_file" "restart" {\n'
+                                                       '  output_path = "${path.module}/zip/restart.zip"\n}\n',
+                   "terraform/modules/other/main.tf": "# no archive here\n"}
+        for name, content in sources.items():
+            (self.main / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.main / name).write_text(content)
+        with (self.main / ".gitignore").open("a") as ignore:
+            ignore.write(".terraform\nzip\n")
+        git(self.main, "add", ".gitignore", *sources)
+        git(self.main, "commit", "-q", "-m", "tauri and terraform")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        outputs = {"src-tauri/target/debug/app": "binary", "src-tauri/gen/schemas/desktop-schema.json": "{}",
+                   "terraform/devel/.terraform/terraform.tfstate": json.dumps({"backend": {"type": "s3"}}),
+                   "terraform/devel/.terraform/providers/aws": "provider",
+                   "terraform/local/.terraform/terraform.tfstate": json.dumps({"backend": {"type": "local"}}),
+                   "terraform/modules/dms/zip/restart.zip": "zip", "terraform/modules/other/zip/kept.zip": "zip"}
+        for name, content in outputs.items():
+            (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.wt / name).write_text(content)
+
+        code, result = self.run_main()
+
+        # Being ignored is no sign on its own: a local backend, and zips nothing tracked writes, are held.
+        self.assertEqual((code, [item["path"] for item in result["held"]]),
+                         (1, ["terraform/local/.terraform/", "terraform/modules/other/zip/"]))
+        self.assertEqual(sorted(result["regenerable"]), ["src-tauri/gen/schemas/", "src-tauri/target/",
+                                                         "terraform/devel/.terraform/", "terraform/modules/dms/zip/"])
+        self.assertIn("src-tauri/target/ is Cargo's build output (src-tauri/Cargo.toml), ignored by "
+                      "src-tauri/.gitignore:1:/target/", result["notes"])
+        self.assertIn("terraform/modules/dms/zip/ is archives Terraform's archive_file writes "
+                      "(terraform/modules/dms/monitor.tf), ignored by .gitignore:5:zip", result["notes"])
+
     def test_open_pr_at_clean_checkout_head_is_removable(self) -> None:
         (self.wt / "app.txt").write_text("pushed change\n")
         git(self.wt, "commit", "-q", "-am", "change")
@@ -4152,6 +4305,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((dirty_code, dirty["blockers"]), (1, ["1 uncommitted changes"]))
 
     def test_command_without_a_base_ref_says_so(self) -> None:
+        git(self.main, "branch", "-m", "main", "trunk")
         (self.wt / "app.txt").write_text("v2\n")
         out = io.StringIO()
         with redirect_stdout(out):
@@ -4160,7 +4314,21 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue())["blockers"],
                          ["1 uncommitted changes",
-                          "no base ref found (origin/HEAD, origin/main, origin/master); pass --base"])
+                          "no base ref found (origin/HEAD, origin/main, origin/master, main, master); pass --base"])
+
+    def test_a_repository_with_no_remote_is_checked_against_its_local_main(self) -> None:
+        # 2026-11-10: an orca worktree whose repository has only an Initial commit and no remote stopped at
+        # "no base ref found" until the hourly tab passed --base main.
+        code, result = self.run_main_without_base()
+        self.assertEqual((code, result["base"], result["blockers"]), (0, "main", []))
+        self.assertIn("Using main as base: the repository has no origin/HEAD, origin/main, origin/master, so the "
+                      "local branch the main checkout keeps stands in", result["notes"])
+
+        (self.wt / "app.txt").write_text("v2\n")
+        git(self.wt, "commit", "-q", "-am", "unmerged")
+        code, result = self.run_main_without_base()
+        self.assertEqual(code, 1)
+        self.assertRegex(" ".join(result["blockers"]), r"HEAD \w{8} is not in main")
 
     def test_stale_remote_refs_are_fetched_before_judging(self) -> None:
         bare = Path(self.tmp.name) / "remote.git"

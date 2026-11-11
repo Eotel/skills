@@ -51,7 +51,20 @@ board's done cards; close what the user approves.
   `orca_message` (`from: screen`). Codex's reply bullet (•, not a command it
   ran) or turn-end line (`Worked for … • HH:MM`) names Codex the same way; its
   last reply, or the `↳ Recap:` under that turn's end when the reply scrolled
-  off, is the message.
+  off, is the message. A local Codex tab with no recent rollout is read the
+  same way (its tab is read even while Orca shows it working): a reply under
+  its turn-end line is the row's `orca_message` (`from: screen`), so Jev and
+  the review queue read it instead of calling the row `unstarted`.
+  A Claude tab whose screen ends on the status line of a running turn
+  (`· Composing… (17m 47s · …`, with no turn-end line or ⏺ below it) makes the
+  row `working` (`screen_progress`, reason 「the tab's screen shows Claude
+  working: …」) before Jev or a saved verdict. A usage limit that ended the
+  transcript is past when a Claude tab shows a ⏺ after the limit's notice
+  (worded as `USAGE_LIMIT` knows or as the start of the transcript's limit
+  error), or after one that scrolled off, and then a turn-end or running status
+  line, and no Claude tab shows the notice as its last word: the screen's
+  reply becomes the final message and the row gets no `stop` (a lane resumed
+  in another account writes its transcript elsewhere).
   It also reads the tabs of worktrees with a done or waiting agent, the agent
   tabs of worktrees Orca keeps no agent for, and another Mac's shell tabs Orca
   lists without output: a permission selector or an AskUserQuestion selector
@@ -87,7 +100,8 @@ board's done cards; close what the user approves.
   missing file (`hook error … No such file or directory`) puts it in the row's
   `hook_errors` (`host`, `path`, `tab`) and reasons, on any Mac. The screen
   keeps an old error until the tab runs again.
-  `--summary` prints class counts, review rows, finished worktree/tab counts,
+  `--summary` prints class counts (the class `--rows --class` keeps, the
+  scan's count beside it as `(scan: N)` where they differ), review rows, finished worktree/tab counts,
   open PR cleanup rows with each one's `rm_check.py` command, and each hook error with its host. `--rows` prints one line per row (name, the
   verdict's class over the scan's, GitHub repo and PR, tab count, newest final
   message time, its question, `waits_on`, `next_step`, or message start,
@@ -107,7 +121,10 @@ board's done cards; close what the user approves.
   instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
   `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
-  commands). `--only NAME` scans one worktree and queues it in `--review-out` even
+  commands). `--rm-specs --row NAME` (repeatable) prints only the named rows,
+  a finished one also while its tabs remain; a row it leaves out is named on
+  stderr with why (another Mac's with its `rm-check-batch --host` command), and
+  the exit status is 1. `--only NAME` scans one worktree and queues it in `--review-out` even
   when it would not need a careful read. Read rows through these rather than parsing the
   scan's JSON by hand. Jev
   (TypeSafe; key from `TYPESAFE_API_KEY` or `~/.config/typesafe/api_key`)
@@ -139,7 +156,9 @@ board's done cards; close what the user approves.
   whether the screen's input line is empty (`composer_empty`); null when the
   screen was not read. `--cards` prints each done card (its draft's first 60
   characters), `closable` tab, and `meaningful_tabs` entry on its own line,
-  led by the worktree's name: read cards through it. With
+  led by the worktree's name, a card or meaningful tab with a handle followed
+  by its `read: orca terminal read --terminal HANDLE` command: read cards
+  through it. With
   `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
   that closes them, and a finished or open PR cleanup row with its
   `rm_check.py` command. Each row records the scan's start (`scanned_at`).
