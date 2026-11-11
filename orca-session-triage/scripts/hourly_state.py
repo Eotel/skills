@@ -789,6 +789,7 @@ class Asking:
     covers: tuple[str, ...] = ()
     ask: str | None = None  # the full id of the inbox ask it was taken from
     based_at: str | None = None  # when what the question rests on was said: that ask's time
+    session: str | None = None  # the session that put it; None for this one (CLAUDE_CODE_SESSION_ID)
 
     @property
     def key(self) -> str:
@@ -823,7 +824,8 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "final_message": asking.final_message,
                                               "question": asking.question, "asked_at": asking.asked_at,
                                               "owner_pane": os.environ.get("ORCA_PANE_KEY"),
-                                              "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "ask_id": asking.ask,
+                                              "session": asking.session or os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                                              "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
     return {"id": asking.key, **data["questions"][asking.key],
@@ -907,7 +909,7 @@ def record_answer(data: dict, answering: Answering) -> dict:
     return {"id": key, **question}
 
 
-ASKED_KEYS = frozenset(("ask", "row", "final_message", "decision", "question", "asked_at", "covers"))
+ASKED_KEYS = frozenset(("ask", "row", "final_message", "decision", "question", "asked_at", "covers", "session"))
 ANSWERED_KEYS = frozenset(("id", "decision", "answer", "answered_at", "replace_reason"))
 
 
@@ -981,7 +983,8 @@ def asking_line(raw: str, inbox: Inbox) -> Asking:
         raise ValueError("asked_at must be an ISO 8601 time with its timezone offset")
     return Asking(row=row, decision=line_text(item, "decision"), final_message=message,
                   question=line_text(item, "question"), asked_at=recorded_at(when),
-                  covers=tuple(key.strip() for key in covers), ask=ask.get("id"), based_at=ask.get("ts"))
+                  covers=tuple(key.strip() for key in covers), ask=ask.get("id"), based_at=ask.get("ts"),
+                  session=line_text(item, "session") if "session" in item else None)
 
 
 def answering_line(raw: str) -> Answering:
@@ -1189,7 +1192,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
             raise ValueError("decision is empty")
         asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
                         question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
-                        covers=tuple(args.covers))
+                        covers=tuple(args.covers), session=args.session)
         return record_question(data, asking, new_references(data, [asking]))
     if args.action == "answered":
         return record_answer(data, Answering(
@@ -1408,11 +1411,13 @@ def main(argv: list[str] | None = None) -> int:
     asked.add_argument("--final-message-file", required=True)
     asked.add_argument("--question-file", required=True)
     asked.add_argument("--asked-at", help="original ISO 8601 time when importing a question")
+    asked.add_argument("--session", help="the session that put it, when importing a question another session put "
+                                         "(an unrecorded question's session in pending); default: this one")
     asked.add_argument("--covers", action="append", default=[], metavar="KEY",
                        help="a lead decision key this question covers; repeat per key")
     asked_many = commands.add_parser(
         "asked-many", help='record several questions from JSON Lines of {"decision", "question", "asked_at"?, '
-                           '"covers"?: [KEY, ...]} with either "ask": an inbox ask id (or its first 8 or more '
+                           '"covers"?: [KEY, ...], "session"?} with either "ask": an inbox ask id (or its first 8 or more '
                            'characters), whose lane and text become the row and final message, or "row" and '
                            '"final_message"; every line is checked first, and a wrong one writes nothing. A line '
                            'whose #numbers are all CLOSED is not recorded: each is named after the output '

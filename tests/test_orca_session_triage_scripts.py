@@ -5777,6 +5777,13 @@ class HourlyStateTests(unittest.TestCase):
         _, pending = self.call("pending", "--asked-in", "/w/lead")
         self.assertEqual(sorted(item["question"] for item in pending["unrecorded_questions"]),
                          ["PR を閉じますか？", "今夜の実行を止めますか？"])
+        # PR #176 review: a later run records it with that call's session and time, and it is accounted for.
+        (unrecorded,) = [item for item in pending["unrecorded_questions"] if item["workspace"] == "/w/triage"]
+        question = self.source("question.txt", unrecorded["question"])
+        self.call("asked", "--row", "/w/lane", "--decision", "stop:tonight", "--final-message-file", question,
+                  "--question-file", question, "--asked-at", unrecorded["since"], "--session", unrecorded["session"])
+        self.assertEqual([item["question"] for item in self.call("pending", "--asked-in", "/w/lead")[1]
+                          ["unrecorded_questions"]], ["PR を閉じますか？"])
 
     def test_an_ordinary_word_before_a_number_leaves_it_in_the_rows_repository(self) -> None:
         # PR #176 review: in "merge #10", merge was read as a repository, so #10 went unread.
