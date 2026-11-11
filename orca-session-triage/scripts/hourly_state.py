@@ -1530,7 +1530,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":
-                workspaces = [*args.asked_in, worktree()]
+                workspaces = [*answer_evidence.asking_worktrees(args), worktree()]
                 args.asked_in.extend(Path(item["asked_in"]) for item in data["questions"].values()
                                      if item.get("asked_in"))
                 if lead := appointed_lead(data):

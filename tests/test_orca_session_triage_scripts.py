@@ -5767,14 +5767,19 @@ class HourlyStateTests(unittest.TestCase):
                          ["API の鍵を作り直しますか？"])
 
     def test_a_workspace_with_no_record_yet_is_read_for_unrecorded_questions(self) -> None:
-        # PR #176 review: with no question recorded, a run that recorded none of its questions showed nothing.
-        for workspace, asked in (("-w-triage", "今夜の実行を止めますか？"), ("-w-lead", "PR を閉じますか？")):
-            write_jsonl(self.root / f"claude/projects/{workspace}/run.jsonl", [{
-                **assistant({"type": "tool_use", "name": "AskUserQuestion", "id": f"toolu_{workspace}",
+        # PR #176 review: with no question recorded, a run that recorded none of its questions showed nothing, and a
+        # relative --asked-in was read as no workspace.
+        here = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, here)
+        projects = self.root / "claude/projects"
+        for workspace, asked in (("/w/triage", "今夜の実行を止めますか？"), (str(Path.cwd() / "lead"), "PR を閉じますか？")):
+            write_jsonl(scan.claude_project_dir(projects, workspace) / "run.jsonl", [{
+                **assistant({"type": "tool_use", "name": "AskUserQuestion", "id": f"toolu_{len(asked)}",
                              "input": {"questions": [{"question": asked}]}}),
                 "timestamp": "2026-11-10T01:05:00.000Z"}])
 
-        _, pending = self.call("pending", "--asked-in", "/w/lead")
+        _, pending = self.call("pending", "--asked-in", "lead")
         self.assertEqual(sorted(item["question"] for item in pending["unrecorded_questions"]),
                          ["PR を閉じますか？", "今夜の実行を止めますか？"])
         # PR #176 review: a later run records it with that call's session and time, and it is accounted for.
@@ -5782,7 +5787,7 @@ class HourlyStateTests(unittest.TestCase):
         question = self.source("question.txt", unrecorded["question"])
         self.call("asked", "--row", "/w/lane", "--decision", "stop:tonight", "--final-message-file", question,
                   "--question-file", question, "--asked-at", unrecorded["since"], "--session", unrecorded["session"])
-        self.assertEqual([item["question"] for item in self.call("pending", "--asked-in", "/w/lead")[1]
+        self.assertEqual([item["question"] for item in self.call("pending", "--asked-in", "lead")[1]
                           ["unrecorded_questions"]], ["PR を閉じますか？"])
 
     def test_an_ordinary_word_before_a_number_leaves_it_in_the_rows_repository(self) -> None:
