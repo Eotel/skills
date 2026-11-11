@@ -121,8 +121,8 @@ the choice and the note with the user in one question before handing it to a
 lane as permission; the hook does not judge whether they disagree. Record the
 checked answer with `hourly_state.py answered --replace-reason-file`. The
 same hook names each answered question whose inbox ask (the one showing it, or
-the ask of a question recorded unanswered in this session or with the same
-wording) a later ask of the same lane withdrew or names. Read that ask's text
+the ask of an unanswered record with the same wording or made in this session
+just before this call) a later ask of the same lane withdrew or names. Read that ask's text
 and choices and check the answer still fits before recording and relaying it.
 While the Mac's 1-minute load is above 300, a PreToolUse hook
 (`scripts/bash_timeout.py`) raises each Bash call's timeout to 600000 when it

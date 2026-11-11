@@ -12,7 +12,7 @@ with each wait on the user's own action (`user-wait`) read now the way it was re
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -1043,32 +1043,45 @@ def unpaired(questions: list[hourly_runs.Question],
     return [question for index, question in enumerate(questions) if index not in paired], used
 
 
-def unrecorded_questions(data: dict, projects: Path) -> list[dict]:
-    """The questions of each AskUserQuestion still waiting for its answer (no tool_result) in the transcripts of the
-    workspaces questions were recorded in (each record's `asked_in`: the triage workspace), read as
-    `hourly_runs.py --questions` reads them, that no record accounts for. The records of that workspace asked in the
-    RECORDED_BEFORE up to the call (only those of the call's own session when a record names one) are paired with its
-    questions (unpaired), and each question left over is unrecorded. The calls are taken in order, and a record
-    paired with an earlier call, answered or not, is not paired again. A record rarely repeats AskUserQuestion's
-    wording, so their count decides and the words only pick which is left: on 2026-11-10 a run put three questions
-    and recorded two, and no tool showed the third."""
+def paired_calls(records: list[dict], path: Path) -> Iterator[
+        tuple[list[hourly_runs.Question], list[dict], list[hourly_runs.Question]]]:
+    """Each AskUserQuestion call of a transcript, in order, with the records paired with it and its questions no
+    record accounts for. A call pairs (unpaired) with the records asked in the RECORDED_BEFORE up to it, only those of
+    its session when a record names one, that no earlier call, answered or not, was paired with."""
+    calls: dict[str, list[hourly_runs.Question]] = {}
+    for question in hourly_runs.conversation(path).questions:
+        calls.setdefault(question.tool_use_id, []).append(question)
+    unused = [item for item in records if item.get("session") in (None, path.stem)]
+    for asked in calls.values():
+        at = scan_sessions.parse_time(asked[0].asked_at)
+        kept = [item for item in unused if at is not None
+                and (when := scan_sessions.parse_time(item["asked_at"])) is not None
+                and at - RECORDED_BEFORE <= when <= at]
+        left, used = unpaired(asked, kept)
+        taken = [kept[index] for index in sorted(used)]
+        unused = [item for item in unused if not any(item is record for record in taken)]
+        yield asked, taken, left
+
+
+def call_records(records: list[dict], transcript: Path, tool_use_id: str) -> list[dict]:
+    """The records paired with the AskUserQuestion call `tool_use_id` of the transcript (paired_calls)."""
+    return next((taken for asked, taken, _ in paired_calls(records, transcript)
+                 if asked[0].tool_use_id == tool_use_id), [])
+
+
+def unrecorded_questions(data: dict, projects: Path, workspaces: list[Path]) -> list[dict]:
+    """The questions of each AskUserQuestion still waiting for its answer (no tool_result), read as
+    `hourly_runs.py --questions` reads them, that no record accounts for (paired_calls), in the transcripts of
+    `workspaces` (the current one and each --asked-in) and of the workspaces questions were recorded in (each record's
+    `asked_in`: the triage workspace). A record rarely repeats AskUserQuestion's wording, so their count decides and
+    the words only pick which is left: on 2026-11-10 a run put three questions and recorded two, and no tool showed
+    the third."""
     records = [item for item in data["questions"].values() if item.get("asked_in")]
     found = []
-    for workspace in dict.fromkeys(item["asked_in"] for item in records):
+    for workspace in dict.fromkeys([*map(str, workspaces), *(item["asked_in"] for item in records)]):
         here = [item for item in records if item["asked_in"] == workspace]
         for path in answer_evidence.transcripts_of(projects, [Path(workspace)]):
-            calls: dict[str, list[hourly_runs.Question]] = {}
-            for question in hourly_runs.conversation(path).questions:
-                calls.setdefault(question.tool_use_id, []).append(question)
-            unused = [item for item in here if item.get("session") in (None, path.stem)]
-            for asked in calls.values():
-                at = scan_sessions.parse_time(asked[0].asked_at)
-                kept = [item for item in unused if at is not None
-                        and (when := scan_sessions.parse_time(item["asked_at"])) is not None
-                        and at - RECORDED_BEFORE <= when <= at]
-                left, used = unpaired(asked, kept)
-                taken = {id(kept[index]) for index in used}
-                unused = [item for item in unused if id(item) not in taken]
+            for asked, _, left in paired_calls(here, path):
                 if not asked[0].result_received:
                     found.extend({"name": Path(workspace).name, "workspace": workspace, "session": path.stem,
                                   "tool_use_id": question.tool_use_id, "state": "unrecorded",
@@ -1512,13 +1525,14 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":
+                workspaces = [*args.asked_in, worktree()]
                 args.asked_in.extend(Path(item["asked_in"]) for item in data["questions"].values()
                                      if item.get("asked_in"))
                 if lead := appointed_lead(data):
                     args.asked_in.append(lead)
                 result = pending(data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())),
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
-                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser()))
+                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
             elif args.action == "get":
                 result = next(({"id": args.id, **data[kind][args.id]} for kind in
                                ("questions", "handoffs", "requests", "user_waits", "left") if args.id in data[kind]),

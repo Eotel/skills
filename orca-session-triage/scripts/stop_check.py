@@ -150,7 +150,8 @@ def noted_outward_answers(hook_input: dict[str, Any]) -> list[str]:
 def reissued_answers(hook_input: dict[str, Any], state: Path, entries: list[dict]) -> list[str]:
     """Each answered question's ask that later asks of the same lane withdrew or name, as `ask X（question）→ Y`.
     Its ask is the inbox ask that shows the question (as `inbox_read.py questions` prints it), or the ask of a
-    question hourly_state.py recorded unanswered in this session or with the same wording."""
+    question hourly_state.py recorded unanswered with the same wording or for this very call (call_records: a
+    record of this session made just before it, which no earlier call took)."""
     response = hook_input.get("tool_response")
     if hook_input.get("tool_name") != "AskUserQuestion" or not isinstance(response, dict) or not isinstance(
             response.get("answers"), dict):
@@ -158,13 +159,16 @@ def reissued_answers(hook_input: dict[str, Any], state: Path, entries: list[dict
     answered = set(response["answers"])
     asks = {str(entry["id"]): shown for entry in entries if entry.get("kind") == "ask" and entry.get("id")
             for shown in answer_evidence.questions_of(entry) if shown in answered}
+    transcript, call = hook_input.get("transcript_path"), hook_input.get("tool_use_id")
     try:
-        recorded = hourly_state.read(state)["questions"].values()
+        recorded = list(hourly_state.read(state)["questions"].values())
+        mine = [item for item in recorded if item.get("session") == hook_input.get("session_id")]
+        this_call = (hourly_state.call_records(mine, Path(transcript), call)
+                     if mine and transcript and call and Path(transcript).is_file() else [])
     except (OSError, ValueError):
-        recorded = []
-    for item in recorded:
+        recorded, this_call = [], []
+    for item in [*this_call, *(item for item in recorded if item.get("question") in answered)]:
         if (item.get("answer") is None and not item.get("withdrawn_at")
-                and (item.get("session") == hook_input.get("session_id") or item.get("question") in answered)
                 and (ask := hourly_state.question_ask(item, entries))):
             asks.setdefault(ask[0], item["question"])
     return [f"ask {ask_id[:8]}（{hourly_state.excerpt(question)}）→ ask {reissue.id[:8]}（{reissue.ts}、"

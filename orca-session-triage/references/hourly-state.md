@@ -165,7 +165,8 @@ names is CLOSED; each unanswered question's `prs` lists them with their
 An unanswered question whose inbox ask a later ask withdrew carries `reissued`,
 as in `stale-asks`. `unrecorded_questions` lists the questions of an
 AskUserQuestion still waiting for its answer in the transcripts of the
-workspaces questions were recorded in, beyond the records that account for
+current workspace, each `--asked-in` worktree, and the workspaces questions
+were recorded in, beyond the records that account for
 it: the records of that workspace asked in the 30 minutes up to the call (of
 the call's own session when they name one, and not paired with an earlier
 call) pair with its questions, and each

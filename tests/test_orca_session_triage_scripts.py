@@ -5766,6 +5766,18 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([item["question"] for item in self.call("pending")[1]["unrecorded_questions"]],
                          ["API の鍵を作り直しますか？"])
 
+    def test_a_workspace_with_no_record_yet_is_read_for_unrecorded_questions(self) -> None:
+        # PR #176 review: with no question recorded, a run that recorded none of its questions showed nothing.
+        for workspace, asked in (("-w-triage", "今夜の実行を止めますか？"), ("-w-lead", "PR を閉じますか？")):
+            write_jsonl(self.root / f"claude/projects/{workspace}/run.jsonl", [{
+                **assistant({"type": "tool_use", "name": "AskUserQuestion", "id": f"toolu_{workspace}",
+                             "input": {"questions": [{"question": asked}]}}),
+                "timestamp": "2026-11-10T01:05:00.000Z"}])
+
+        _, pending = self.call("pending", "--asked-in", "/w/lead")
+        self.assertEqual(sorted(item["question"] for item in pending["unrecorded_questions"]),
+                         ["PR を閉じますか？", "今夜の実行を止めますか？"])
+
     def test_an_ordinary_word_before_a_number_leaves_it_in_the_rows_repository(self) -> None:
         # PR #176 review: in "merge #10", merge was read as a repository, so #10 went unread.
         lane = self.lane()
@@ -7335,14 +7347,32 @@ class StopCheckTests(unittest.TestCase):
                    "asked_at": "2026-11-10T13:10:00+00:00", "session": "s1", "answer": None}}}))
         question = {"question": "CI が通ったら merge しますか？", "header": "merge",
                     "options": [{"label": "CI が通ったら進める", "description": "CI を待つ"}]}
-        hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
-                "cwd": "/w/triage", "tool_input": {"questions": [question]},
-                "tool_response": {"questions": [question], "answers": {question["question"]: "CI が通ったら進める"}}}
-        with patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(stopcheck.main(self.root), 0)
-        decision = json.loads(out.getvalue())
-        self.assertEqual(decision["decision"], "block")
+        later = {"question": "今夜の実行を止めますか？", "header": "実行",
+                 "options": [{"label": "止める", "description": "今夜は流さない"}]}
+        transcript = self.root / "s1.jsonl"
+        write_jsonl(transcript, [
+            {**assistant({"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_a", "input": {"questions": [question]}}),
+             "timestamp": "2026-11-10T13:10:30.000Z"},
+            {**user([{"type": "tool_result", "tool_use_id": "toolu_a", "content": "CI が通ったら進める"}]),
+             "timestamp": "2026-11-10T13:11:00.000Z"},
+            {**assistant({"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_b", "input": {"questions": [later]}}),
+             "timestamp": "2026-11-10T13:20:00.000Z"}])
+
+        def decided(asked: dict, call: str) -> dict | None:
+            hook = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "session_id": "s1",
+                    "cwd": "/w/triage", "transcript_path": str(transcript), "tool_use_id": call,
+                    "tool_input": {"questions": [asked]},
+                    "tool_response": {"questions": [asked], "answers": {asked["question"]: asked["options"][0]["label"]}}}
+            with patch.object(stopcheck.sys, "stdin", io.StringIO(json.dumps(hook))), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(stopcheck.main(self.root), 0)
+            return json.loads(out.getvalue()) if out.getvalue() else None
+
+        decision = decided(question, "toolu_a") or {}
+        self.assertEqual(decision.get("decision"), "block")
         self.assertIn(f"ask {old[:8]}（infra-aws#526 を merge しますか？）→ ask {new[:8]}", decision["reason"])
+        # The record went with the earlier call: an answer to another question in the same session names nothing.
+        self.assertIsNone(decided(later, "toolu_b"))
 
     def test_hourly_question_hook_requires_a_handoff_from_this_run(self) -> None:
         orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
