@@ -53,8 +53,10 @@ board's done cards; close what the user approves.
   last reply, or the `↳ Recap:` under that turn's end when the reply scrolled
   off, is the message. A local Codex tab with no recent rollout is read the
   same way (its tab is read even while Orca shows it working): a reply under
-  its turn-end line is the row's `orca_message` (`from: screen`), so Jev and
-  the review queue read it instead of calling the row `unstarted`.
+  its turn-end line is the row's `orca_message` (`from: screen`, `at` from
+  the line's `• HH:MM`), so Jev and the review queue read it instead of
+  calling the row `unstarted`; it is the row's final message also over an
+  older Claude transcript (a lane Codex took over).
   A Claude tab whose screen ends on the status line of a running turn
   (`· Composing… (17m 47s · …`, with no turn-end line or ⏺ below it) makes the
   row `working` (`screen_progress`, reason 「the tab's screen shows Claude

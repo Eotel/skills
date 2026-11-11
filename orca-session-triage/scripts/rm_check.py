@@ -74,6 +74,9 @@ TERRAFORM_DIR = ".terraform"
 # captured after the directory; an interpolation in it (${each.key}) stands for any one path segment.
 ARCHIVE_OUTPUT = 'output_path\\s*=\\s*"\\$\\{path\\.module\\}/%s/([^"]+)"'
 INTERPOLATION = re.compile(r"\$\{[^}]*\}")
+# HCL's comments, and the top-level block headers terraform fmt starts at the line's start (data "archive_file" "x" {).
+HCL_COMMENT = re.compile(r"/\*.*?\*/|(?:#|//)[^\n]*", re.DOTALL)
+HCL_BLOCK = re.compile(r"^[a-z_]+\b[^\n{]*\{", re.MULTILINE)
 # An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
@@ -336,7 +339,7 @@ def tool_output(worktree: Path, rel: str) -> str | None:
         module = PurePosixPath(name)
         if module.suffix == ".tf" and module.parent == path.parent:
             try:
-                found = writes.findall((worktree / module).read_text(errors="replace"))
+                found = archive_outputs(writes, (worktree / module).read_text(errors="replace"))
             except OSError:
                 continue
             if found:
@@ -348,6 +351,14 @@ def tool_output(worktree: Path, rel: str) -> str | None:
                               for name in names):
         return None
     return "archives Terraform's archive_file writes (%s)" % ", ".join(map(str, outputs))
+
+
+def archive_outputs(writes: re.Pattern[str], text: str) -> list[str]:
+    """The output_path names `writes` captures inside the archive_file blocks of a Terraform file, comments left out."""
+    text = HCL_COMMENT.sub("", text)
+    starts = [found.start() for found in HCL_BLOCK.finditer(text)] + [len(text)]
+    blocks = [text[start:end] for start, end in zip(starts, starts[1:])]
+    return [name for block in blocks if '"archive_file"' in block.split("{", 1)[0] for name in writes.findall(block)]
 
 
 def ignore_source(worktree: Path, rel: str) -> str:

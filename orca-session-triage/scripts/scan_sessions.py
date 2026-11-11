@@ -640,6 +640,11 @@ def latest_message(row: dict) -> tuple[str, str] | None:
     claude_at, codex_at = claude.get("final_at"), latest.get("last_assistant_at")
     if codex_spoke and claude_at and codex_at and codex_at > claude_at:
         return "codex", latest["last_assistant"]
+    # A Codex tab's reply, read from its screen, that came after Claude's last word (a lane Codex took over).
+    shown = row.get("orca_message") or {}
+    shown_at, said_at = parse_time(shown.get("at")), parse_time(claude_at)
+    if shown.get("from") == "screen" and shown_at and said_at and shown_at > said_at:
+        return "orca", shown["text"]
     return "claude", claude["final_text"]
 
 
@@ -902,6 +907,8 @@ TOOL_RESULT = "⎿"
 # status line ("• Working (12s • esc to interrupt)") is not a reply.
 CODEX_REPLY = "• "
 CODEX_TURN_END = re.compile(r"[─━ ]*Worked for \d[^•·─━]*(?:[•·] *\d{1,2}:\d{2})?[─━ ]*")
+# The local clock time a turn-end line ends with ("Worked for 14m 48s • 15:06").
+TURN_CLOCK = re.compile(r"[•·] *(\d{1,2}):(\d{2})")
 CODEX_ACTION = re.compile(r"• (?:(?:Edited|Added|Deleted) .+\(\+\d+ -\d+\)|Working \(.+\))\s*")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
@@ -1188,14 +1195,31 @@ def resumed_after_limit(row: dict, claude_screens: list[dict]) -> tuple[str, str
     return line, screen_message(screen)
 
 
-def codex_tab_message(terms: list[dict], screens: Screens) -> str:
-    """The last reply a local Codex tab shows under a turn-end line ("Worked for … • HH:MM"), or ""."""
-    said = ""
+def turn_clock(line: str, now: float) -> str | None:
+    """The UTC time of a turn-end line's local "• HH:MM", on the last day it is not later than `now`."""
+    found = TURN_CLOCK.search(line)
+    if not found:
+        return None
+    local = datetime.fromtimestamp(now).astimezone()
+    try:
+        at = local.replace(hour=int(found[1]), minute=int(found[2]), second=0, microsecond=0)
+    except ValueError:
+        return None
+    if at > local:
+        at -= timedelta(days=1)
+    return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def codex_tab_message(terms: list[dict], screens: Screens, now: float) -> tuple[str, str | None]:
+    """(the last reply a local Codex tab shows under a turn-end line ("Worked for … • HH:MM"), the time that line
+    gives or None), or ("", None)."""
+    said, at = "", None
     for screen in agent_screens(terms, screens, None, "codex"):
         lines = screen_lines(screen)
-        if screen_agent(screen) == "codex" and any(CODEX_TURN_END.fullmatch(line.strip()) for line in lines):
-            said = codex_screen_message(lines) or said
-    return said
+        ends = [line.strip() for line in lines if CODEX_TURN_END.fullmatch(line.strip())]
+        if screen_agent(screen) == "codex" and ends and (reply := codex_screen_message(lines)):
+            said, at = reply, turn_clock(ends[-1], now)
+    return said, at
 
 
 def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = None,
@@ -1557,9 +1581,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                        "at": iso_time(newest.get("updatedAt"))}
             elif screen_said:
                 row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
-        elif not row["codex"] and (codex_said := codex_tab_message(terms, screens)):
+        elif not row["codex"] and (codex_said := codex_tab_message(terms, screens, now))[0]:
             # A Codex this Mac keeps no recent rollout of finished a turn its tab still shows.
-            row["orca_message"] = {"text": codex_said, "at": None, "from": "screen"}
+            row["orca_message"] = {"text": codex_said[0], "at": codex_said[1], "from": "screen"}
         claude_screens = agent_screens(terms, screens, w.get("_environment"), "claude")
         row["screen_progress"] = next((line for screen in claude_screens if (line := claude_progress(screen))), None)
         resumed = resumed_after_limit(row, claude_screens)

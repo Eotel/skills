@@ -1355,18 +1355,25 @@ class ClassifyTests(unittest.TestCase):
     def test_a_local_codex_tab_without_a_recent_rollout_is_judged_from_its_screen(self) -> None:
         # 2026-11-11: four uv-migration Codex lanes were "unstarted" while their tabs showed them waiting on a secret.
         reply = "CI は Ruff 成功、残る3 job は引き続き CORELIB_PAT 設定待ちです。"
+        ended = datetime.fromtimestamp(NOW - 600)  # the tab prints the local clock
         screen = {"source": "screen", "tail": [
-            "• Ran gh pr checks 764", "  └ lint pass", "• " + reply, "", "  Worked for 14m 48s • 15:06",
+            "• Ran gh pr checks 764", "  └ lint pass", "• " + reply, "", f"  Worked for 14m 48s • {ended:%H:%M}",
             "› Ask Codex to do anything", "  GPT-6.1-Sol xhigh · ~/orca/workspaces/app/uv"]}
+        # A lane Codex took over from Claude: the older Claude transcript's last word is not how it stands.
+        self.claude_says("/w/took", user("go"), {**assistant(text("Done. PR #9 is merged.")),
+                                                 "timestamp": "2027-01-15T05:00:00Z"})
         judged = []
-        [row] = scan.build_inventory(
-            [worktree("/w/uv", "done", agent="codex")], [terminal("/w/uv", "codex", "term_u")], self.projects, {},
+        rows = {r["path"]: r for r in scan.build_inventory(
+            [worktree("/w/uv", "done", agent="codex"),
+             worktree("/w/took", "done", agent="codex", pr={"number": 9, "state": "merged"})],
+            [terminal("/w/uv", "codex", "term_u"), terminal("/w/took", "codex", "term_t")], self.projects, {},
             "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(0.1, "blocked_on_others"),
-            screens={(None, "term_u"): screen})
+            screens={(None, "term_u"): screen, (None, "term_t"): screen})}
+        row = rows["/w/uv"]
 
-        self.assertEqual(row["orca_message"], {"text": reply, "at": None, "from": "screen"})
-        self.assertEqual((row["class"], judged), ("stalled", [reply]))
-        self.assertEqual([entry["path"] for entry in scan.review_queue([row])], ["/w/uv"])
+        self.assertEqual(row["orca_message"], {"text": reply, "at": "2027-01-15T07:50:00Z", "from": "screen"})
+        self.assertEqual((row["class"], rows["/w/took"]["class"], judged), ("stalled", "stalled", [reply, reply]))
+        self.assertEqual([entry["path"] for entry in scan.review_queue(list(rows.values()))], ["/w/uv", "/w/took"])
         # Its tab is read even while Orca shows the Codex working.
         busy = [worktree("/w/uv", "working", agent="codex")]
         self.assertEqual([t["handle"] for t in scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], set())],
@@ -3686,7 +3693,8 @@ class RmCheckTests(unittest.TestCase):
                    "terraform/modules/lambda/main.tf": 'data "archive_file" "fn" {\n'
                                                        '  output_path = "${path.module}/zip/${each.key}.zip"\n}\n',
                    "terraform/modules/backup/main.tf": 'data "archive_file" "build" {\n'
-                                                       '  output_path = "${path.module}/zip/build.zip"\n}\n',
+                                                       '  output_path = "${path.module}/zip/build.zip"\n'
+                                                       '  # output_path = "${path.module}/zip/unique-backup.zip"\n}\n',
                    "terraform/modules/other/main.tf": "# no archive here\n"}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
