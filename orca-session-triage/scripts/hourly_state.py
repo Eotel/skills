@@ -1078,14 +1078,15 @@ def unrecorded_questions(data: dict, projects: Path, workspaces: list[Path]) -> 
     """The questions of each AskUserQuestion still waiting for its answer (no tool_result), read as
     `hourly_runs.py --questions` reads them, that no record accounts for (paired_calls), in the transcripts of
     `workspaces` (the current one and each --asked-in) and of the workspaces questions were recorded in (each record's
-    `asked_in`: the triage workspace). A record rarely repeats AskUserQuestion's wording, so their count decides and
-    the words only pick which is left: on 2026-11-10 a run put three questions and recorded two, and no tool showed
-    the third."""
+    `asked_in`: the triage workspace). A transcript pairs with the records of its workspace and those naming its
+    session, wherever they were recorded (a run records the lead's question it read with --asked-in). A record
+    rarely repeats AskUserQuestion's wording, so their count decides and the words only pick which is left: on
+    2026-11-10 a run put three questions and recorded two, and no tool showed the third."""
     records = [item for item in data["questions"].values() if item.get("asked_in")]
     found = []
     for workspace in dict.fromkeys([*map(str, workspaces), *(item["asked_in"] for item in records)]):
-        here = [item for item in records if item["asked_in"] == workspace]
         for path in answer_evidence.transcripts_of(projects, [Path(workspace)]):
+            here = [item for item in records if item["asked_in"] == workspace or item.get("session") == path.stem]
             for asked, _, left in paired_calls(here, path):
                 if not asked[0].result_received:
                     found.extend({"name": Path(workspace).name, "workspace": workspace, "session": path.stem,

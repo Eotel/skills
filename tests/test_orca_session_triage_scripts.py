@@ -5773,8 +5773,9 @@ class HourlyStateTests(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, here)
         projects = self.root / "claude/projects"
-        for workspace, asked in (("/w/triage", "#5 の今夜の実行を止めますか？"), (str(Path.cwd() / "lead"), "PR を閉じますか？")):
-            write_jsonl(scan.claude_project_dir(projects, workspace) / "run.jsonl", [{
+        for workspace, session, asked in (("/w/triage", "old-run", "#5 の今夜の実行を止めますか？"),
+                                          (str(Path.cwd() / "lead"), "lead-run", "PR を閉じますか？")):
+            write_jsonl(scan.claude_project_dir(projects, workspace) / f"{session}.jsonl", [{
                 **assistant({"type": "tool_use", "name": "AskUserQuestion", "id": f"toolu_{len(asked)}",
                              "input": {"questions": [{"question": asked}]}}),
                 "timestamp": "2026-11-10T01:05:00.000Z"}])
@@ -5792,8 +5793,13 @@ class HourlyStateTests(unittest.TestCase):
                                     "--final-message-file", question, "--question-file", question,
                                     "--asked-at", unrecorded["since"], "--session", unrecorded["session"])
         self.assertEqual(recorded["session"], unrecorded["session"])
-        self.assertEqual([item["question"] for item in self.call("pending", "--asked-in", "lead")[1]
-                          ["unrecorded_questions"]], ["PR を閉じますか？"])
+        (left,) = self.call("pending", "--asked-in", "lead")[1]["unrecorded_questions"]
+        self.assertEqual(left["question"], "PR を閉じますか？")
+        # Recorded here, a question the lead's session put is accounted for by its session.
+        self.call("asked", "--row", "/w/lane", "--decision", "close:pr", "--final-message-file", question,
+                  "--question-file", self.source("lead.txt", left["question"]), "--asked-at", left["since"],
+                  "--session", left["session"])
+        self.assertEqual(self.call("pending", "--asked-in", "lead")[1]["unrecorded_questions"], [])
 
     def test_an_ordinary_word_before_a_number_leaves_it_in_the_rows_repository(self) -> None:
         # PR #176 review: in "merge #10", merge was read as a repository, so #10 went unread.
