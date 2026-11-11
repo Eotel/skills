@@ -14,7 +14,8 @@ prints only a line starting with ネットワーク断 (also on stderr), writes 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -639,6 +640,11 @@ def latest_message(row: dict) -> tuple[str, str] | None:
     claude_at, codex_at = claude.get("final_at"), latest.get("last_assistant_at")
     if codex_spoke and claude_at and codex_at and codex_at > claude_at:
         return "codex", latest["last_assistant"]
+    # A Codex tab's reply, read from its screen, that came after Claude's last word (a lane Codex took over).
+    shown = row.get("orca_message") or {}
+    shown_at, said_at = parse_time(shown.get("at")), parse_time(claude_at)
+    if shown.get("from") == "screen" and shown_at and said_at and shown_at > said_at:
+        return "orca", shown["text"]
     return "claude", claude["final_text"]
 
 
@@ -775,6 +781,8 @@ OLD_MARKER_REASON = "old decision marker in comment: an agent is in its turn"
 
 
 NO_SESSION_REASON = "no agent session in this worktree"
+# A meaningful tab Orca gives no handle is listed by its title after this.
+NO_HANDLE = "(no handle) "
 
 
 def classify(row: dict, decision_marker: str) -> tuple[str, list[str]]:
@@ -796,11 +804,15 @@ def classify(row: dict, decision_marker: str) -> tuple[str, list[str]]:
         return "stalled", [stop_line(stop)]
     reasons = waiting_reasons(row, decision_marker)
     mail = [mail_reason(row["unread_mail"])] if row.get("unread_mail") else []
+    progress = row.get("screen_progress")
     # An agent works past a decision it marked: the marker alone no longer waits on anyone.
-    if reasons == [MARKER_REASON] and turn_runs(row):
+    if reasons == [MARKER_REASON] and (turn_runs(row) or progress):
         return "working", [OLD_MARKER_REASON]
     if reasons:
         return "waiting", reasons + mail
+    # The tab's screen is newer than a transcript or Orca state that says the turn ended.
+    if progress:
+        return "working", [f"{SCREEN_WORKING_REASON}: {progress}"]
     has_transcript = {"claude": bool(row["claude"]), "codex": bool(row["codex"])}
     silent = sorted({t["agent"] for t in row["terminals"] if t["agent"] in has_transcript
                      and not row.get("orca_message")
@@ -828,8 +840,10 @@ def classify(row: dict, decision_marker: str) -> tuple[str, list[str]]:
         return "finished", ["PR merged"]
     if row["status"] == "completed" and (row["linked_pr"] or {}).get("state") != "open":
         return "finished", ["board status completed"]
-    # Another Mac's tab may show its agent only on its screen; this Mac's transcripts are read directly.
-    screen_agent_tab = row.get("environment") and any(t["agent"] for t in row["terminals"])
+    # Another Mac's tab may show its agent only on its screen; this Mac's transcripts are read directly, and a
+    # local Codex with no recent rollout spoke on its tab's screen.
+    screen_agent_tab = ((row.get("environment") or (row.get("orca_message") or {}).get("from") == "screen")
+                        and any(t["agent"] for t in row["terminals"]))
     if not (row["agents"] or row["claude"] or row["codex"] or screen_agent_tab):
         return "stalled", [NO_SESSION_REASON]
     return "stalled", [state] if state else []
@@ -876,7 +890,12 @@ SCREEN_TAIL_LINES = 8
 RULE = re.compile(r"[─━]+")
 # Claude Code's reply bullet and the line it leaves when a turn ends ("✻ Baked for 3m 2s").
 CLAUDE_LINE_STARTS = re.compile(r"⏺ |✻ \S+ for ")
+CLAUDE_TURN_END = re.compile(r"✻ \S+ for ")
 CLAUDE_MODE_LINE = "⏵⏵ "
+# The status line Claude Code shows while its turn runs: a spinner glyph, a verb, and how long the turn has run
+# ("· Composing… (17m 47s · ↓ 11.9k tokens · thinking more with xhigh effort)", "✢ Honking… (1m 24s · ↓ 3.3k tokens)").
+CLAUDE_PROGRESS = re.compile(r"[·✢✳✶✻✽] \S+… \((?:\d+h )?(?:\d+m )?\d+s\b")
+SCREEN_WORKING_REASON = "the tab's screen shows Claude working"
 # A ⏺ line that names a tool call ("⏺ Bash(git push)", "⏺ serena - find_symbol (MCP)(…)"), sums up collapsed calls
 # ("… (ctrl+o to expand)"), or is followed by a tool result (⎿) is not a reply.
 TOOL_CALL = re.compile(r"⏺ (?:[A-Za-z][\w.:-]*\(|.*\(MCP\))")
@@ -888,7 +907,10 @@ TOOL_RESULT = "⎿"
 # status line ("• Working (12s • esc to interrupt)") is not a reply.
 CODEX_REPLY = "• "
 CODEX_TURN_END = re.compile(r"[─━ ]*Worked for \d[^•·─━]*(?:[•·] *\d{1,2}:\d{2})?[─━ ]*")
+# The local clock time a turn-end line ends with ("Worked for 14m 48s • 15:06").
+TURN_CLOCK = re.compile(r"[•·] *(\d{1,2}):(\d{2})")
 CODEX_ACTION = re.compile(r"• (?:(?:Edited|Added|Deleted) .+\(\+\d+ -\d+\)|Working \(.+\))\s*")
+CODEX_WORKING = re.compile(r"• Working \(")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
@@ -1112,6 +1134,108 @@ def screen_message(screen: dict) -> str:
     else:
         return ""
     return "\n".join(line[2:] if line.startswith("  ") else line.strip() for line in block).strip()
+
+
+def claude_progress(screen: dict) -> str | None:
+    """The status line of a Claude turn that runs now: the screen's last one, with no turn-end line, reply, or tool
+    call below it (a resized terminal can leave an old copy above them)."""
+    lines = [line.strip() for line in screen_lines(screen)]
+    found = max((index for index, line in enumerate(lines) if CLAUDE_PROGRESS.match(line)), default=None)
+    if found is None or any(CLAUDE_TURN_END.match(line) or line.startswith("⏺ ") for line in lines[found + 1:]):
+        return None
+    return lines[found]
+
+
+# The start of a transcript's limit error looked for on the screen.
+LIMIT_HEAD = 40
+
+
+def limit_notices(lines: list[str], error: str) -> list[int]:
+    """The indexes of the stripped screen lines a usage-limit notice ends on, worded as the rule knows or as the
+    transcript's error, also where a narrow terminal wrapped it onto the next line (mid-word or at a space)."""
+    head = error.strip().splitlines()[0][:LIMIT_HEAD] if error.strip() else ""
+
+    def shows(text: str) -> bool:
+        return bool(USAGE_LIMIT.search(text) or head and head in text)
+
+    return [index for index, line in enumerate(lines)
+            if shows(line) or index and not shows(lines[index - 1])
+            and any(shows(lines[index - 1] + glue + line) for glue in ("", " "))]
+
+
+def turn_after_limit(screen: dict, error: str = "") -> str | None:
+    """The turn-end or running status line of a Claude turn that ran after the screen's last usage-limit notice, or
+    after one that scrolled off: a reply or tool call (⏺) below the notice, then that line. The notice's own turn
+    ends with a turn-end line too ("✻ Baked for 1s · done 9:02"), but with no ⏺ between. `error` is the
+    transcript's limit error, found on the screen even when its wording is new."""
+    lines = [line.strip() for line in screen_lines(screen)]
+    notice = max(limit_notices(lines, error), default=-1)
+    replied = next((index for index in range(notice + 1, len(lines)) if lines[index].startswith("⏺ ")), None)
+    if replied is None:
+        return None
+    return next((line for line in reversed(lines[replied + 1:])
+                 if CLAUDE_TURN_END.match(line) or CLAUDE_PROGRESS.match(line)), None)
+
+
+def agent_screens(terms: list[dict], screens: Screens, environment: str | None, agent: str) -> list[dict]:
+    """The rendered screens of the tabs Orca names `agent` in, or whose screen shows it when Orca names none."""
+    found = []
+    for term in terms:
+        screen = rendered(screens.get((environment, term.get("handle"))))
+        if screen and (term.get("agentIdentity") or screen_agent(screen)) == agent:
+            found.append(screen)
+    return found
+
+
+def resumed_after_limit(row: dict, claude_screens: list[dict]) -> tuple[str, str] | None:
+    """(the screen's line, its last reply) when the usage limit that ended the row's Claude transcript is past: a
+    Claude tab shows a later turn, and none shows the notice as its last word. A lane resumed in another account
+    writes a transcript elsewhere, so the one read here still ends at the limit."""
+    stop = stop_reason(row)
+    if not (stop and stop["kind"] == "usage_limit" and stop["agent"] == "claude"):
+        return None
+    later = [(line, screen) for screen in claude_screens if (line := turn_after_limit(screen, stop["error"]))]
+    stopped = any(limit_notices([line.strip() for line in screen_lines(screen)], stop["error"])
+                  and not turn_after_limit(screen, stop["error"]) for screen in claude_screens)
+    if not later or stopped:
+        return None
+    line, screen = later[0]
+    return line, screen_message(screen)
+
+
+def turn_clock(line: str, now: float) -> str | None:
+    """The UTC time of a turn-end line's local "• HH:MM", on the last day it is not later than `now`, at the minute's
+    last second: a Codex that merged its PR replies within the same minute, and its reply has to stay after it."""
+    found = TURN_CLOCK.search(line)
+    if not found:
+        return None
+    local = datetime.fromtimestamp(now).astimezone()
+    try:
+        at = local.replace(hour=int(found[1]), minute=int(found[2]), second=0, microsecond=0)
+    except ValueError:
+        return None
+    if at > local:
+        at -= timedelta(days=1)
+    return (at + timedelta(seconds=59)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def codex_tab_message(terms: list[dict], screens: Screens) -> tuple[str, str | None]:
+    """(the newest reply the worktree's local Codex tabs show under a turn-end line ("Worked for … • HH:MM"), the
+    time that line gives or None), or ("", None). The line's clock is read on the last day it is not later than the
+    tab's last output, so a tab idle for days does not look new; a tab with no time counts as the oldest."""
+    shown = []
+    for term in terms:
+        screen = rendered(screens.get((None, term.get("handle"))))
+        if not screen or screen_agent(screen) != "codex" or term.get("agentIdentity") not in (None, "codex"):
+            continue
+        lines = [line.strip() for line in screen_lines(screen)]
+        ends = [index for index, line in enumerate(lines) if CODEX_TURN_END.fullmatch(line)]
+        if not ends or any(CODEX_WORKING.match(line) for line in lines[ends[-1] + 1:]):
+            continue  # no turn ended, or a later one runs
+        last_output = term.get("lastOutputAt")
+        if reply := codex_screen_message(screen_lines(screen)):
+            shown.append((reply, turn_clock(lines[ends[-1]], last_output / 1000) if last_output is not None else None))
+    return max(shown, key=lambda found: found[1] or "", default=("", None))
 
 
 def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = None,
@@ -1473,11 +1597,24 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                        "at": iso_time(newest.get("updatedAt"))}
             elif screen_said:
                 row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
+        elif not row["codex"] and (codex_said := codex_tab_message(terms, screens))[0]:
+            # A Codex this Mac keeps no recent rollout of finished a turn its tab still shows.
+            row["orca_message"] = {"text": codex_said[0], "at": codex_said[1], "from": "screen"}
+        claude_screens = agent_screens(terms, screens, w.get("_environment"), "claude")
+        row["screen_progress"] = next((line for screen in claude_screens if (line := claude_progress(screen))), None)
+        resumed = resumed_after_limit(row, claude_screens)
+        if resumed:
+            # The screen's reply stands for the transcript's limit notice; it carries no time.
+            row["claude"] = {**(row["claude"] or {}), "api_error": None, "api_error_kind": None,
+                             **({"final_text": resumed[1], "final_at": None} if resumed[1] else {})}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
-        latest = None if turn_runs(row) or cut_off(row) else latest_message(row)
+        latest = None if turn_runs(row) or cut_off(row) or row["screen_progress"] else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["stop"] = stop_reason(row)
         row["class"], row["reasons"] = classify(row, decision_marker)
+        if resumed:
+            row["reasons"] = [*row["reasons"], "the transcript's usage limit is past: the tab's screen shows a "
+                                               f"later turn ({resumed[0]})"]
         row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
         row["class"], row["reasons"] = with_processes(row, now)
         if decision_marker and (marked := re.search(re.escape(decision_marker) + r"[:：]?\s*(.+)",
@@ -1496,7 +1633,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             if row["class"] in ("finished", "unstarted", "unsure"):
                 row["class"] = "stalled"
         row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
-        row["meaningful_tabs"] = [t.get("handle") or "(no handle) " + (t.get("title") or "")
+        row["meaningful_tabs"] = [t.get("handle") or NO_HANDLE + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
     return rows
@@ -1872,8 +2009,11 @@ def mail_reason(unread: list[dict]) -> str:
 
 def final_message_at(row: dict) -> datetime | None:
     """When the final message Jev read was written, or None."""
-    if (row.get("jev") or {}).get("source") == "codex":
+    source = (row.get("jev") or {}).get("source")
+    if source == "codex":
         return parse_time((row.get("codex") or [{}])[-1].get("last_assistant_at"))
+    if source == "orca":
+        return parse_time((row.get("orca_message") or {}).get("at"))
     return parse_time((row.get("claude") or {}).get("final_at"))
 
 
@@ -2484,18 +2624,22 @@ def collect_worktrees_and_terminals(orca: str, ps_json: str | None = None, termi
 ORCA_TIMEOUT = 60
 
 
-def screen_targets(worktrees: list[dict], terminals: list[dict]) -> list[dict]:
+def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Collection[str] | None = None) -> list[dict]:
     """Tabs of done or waiting worktrees, agent tabs of worktrees Orca keeps no agent for (a background
-    session's hooks do not reach it), remote worktrees with no agent message, and remote shells without
-    output metadata: read their cards, permission prompts, questions, final replies, and bare prompts."""
+    session's hooks do not reach it), remote worktrees with no agent message, Codex tabs of local worktrees with
+    no Codex rollout in `codex_cwds`, and remote shells without output metadata: read their cards, permission
+    prompts, questions, final replies, and bare prompts."""
     idle = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if any(a.get("state") in ("done", "waiting") for a in w.get("agents") or [])}
     untracked = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees if not w.get("agents")}
     bare = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if w.get("_environment") and not orca_said(w)}
+    quiet_codex = set() if codex_cwds is None else {
+        (None, w.get("worktreeId")) for w in worktrees if not w.get("_environment") and w["path"] not in codex_cwds}
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
         or (key in untracked and t.get("agentIdentity"))
+        or (key in quiet_codex and t.get("agentIdentity") == "codex")
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
             and t.get("lastOutputAt") is None))]
 
@@ -2614,18 +2758,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                        help="print one line per done card (handle, agent, interrupted, first 60 draft characters, "
                             "whether its screen composer is empty, Orca's last message, and screen end), closable tab, and "
                             "meaningful tab, each led by the worktree's name and class as in --rows")
-    views.add_argument("--row", metavar="NAME",
-                       help="print one row as JSON with fixed keys: " + ", ".join(ROW_KEYS) + ". "
-                            "Strings are never null, `final` is the newest "
-                            "final message of Claude, Codex, or Orca, `transcripts` is "
-                            '{"claude": [path…], "codex": [path…]}, and `github` is owner/repo from origin; '
-                            "NAME is repo/name, the last path segment (with optional ENVIRONMENT:: on another "
-                            "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
-                            "or " + REVIEW_DIR)
+    parser.add_argument("--row", metavar="NAME", action="append", default=[],
+                        help="print one row as JSON with fixed keys: " + ", ".join(ROW_KEYS) + ". "
+                             "Strings are never null, `final` is the newest "
+                             "final message of Claude, Codex, or Orca, `transcripts` is "
+                             '{"claude": [path…], "codex": [path…]}, and `github` is owner/repo from origin; '
+                             "NAME is repo/name, the last path segment (with optional ENVIRONMENT:: on another "
+                             "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
+                             "or " + REVIEW_DIR + ". With --rm-specs, repeatable: the spec of each named row")
     views.add_argument("--rm-specs", action="store_true",
                        help="with --from, print <path> <PR|-> for this Mac's open_pr_cleanup rows and finished "
                             "rows without meaningful tabs, for rm-check-batch; another Mac's rows are counted on "
-                            "stderr, and --summary prints their rm-check-batch --host commands")
+                            "stderr, and --summary prints their rm-check-batch --host commands. With --row NAME "
+                            "(repeatable), only the named rows, a finished one also while its tabs remain; a row "
+                            "left out is named on stderr with why, and the exit status is 1")
     views.add_argument("--wake", action="store_true",
                        help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
@@ -2658,6 +2804,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--wake needs --from")
     if args.classes and not args.rows:
         parser.error("--class needs --rows")
+    if args.row and (other := next((flag for flag, on in (("--summary", args.summary), ("--rows", args.rows),
+                                                          ("--cards", args.cards), ("--wake", args.wake)) if on), None)):
+        parser.error(f"argument --row: not allowed with argument {other}")
+    if len(args.row) > 1 and not args.rm_specs:
+        parser.error("--row is repeatable only with --rm-specs")
+    if args.transcripts and args.rm_specs:
+        parser.error("--transcripts needs --row without --rm-specs")
     if args.transcripts and not args.row:
         parser.error("--transcripts needs --row")
     return args
@@ -2673,10 +2826,11 @@ def write_review_queue(path: str, rows: list[dict], verdicts: dict | None = None
 
 def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = False,
                   scan_file: Path | None = None) -> None:
-    counts = {}
-    for row in rows:
-        counts[row["class"]] = counts.get(row["class"], 0) + 1
-    print("classes: " + ", ".join(f"{name}={count}" for name, count in sorted(counts.items())))
+    # The class --rows --class keeps (the verdict's, else the scan's), with the scan's own count where it differs.
+    shown = Counter((row.get("verdict") or {}).get("class") or row["class"] for row in rows)
+    scanned = Counter(row["class"] for row in rows)
+    print("classes: " + ", ".join(f"{name}={shown[name]}" + (f" (scan: {scanned[name]})" if scanned[name] != shown[name]
+                                                            else "") for name in sorted(set(shown) | set(scanned))))
     queue = review_queue(rows, verdicts, force=force_review)
     print(f"review queue: {len(queue)}")
     for row in queue:
@@ -2941,6 +3095,13 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     once nothing moved after the scan. Finished and open_pr_cleanup rows include their rm_check.py command.
     """
     lead = f"{row_name(row)} | {class_label((row.get('verdict') or {}).get('class') or row['class'], row['class'])}"
+    where = ["--environment", row["environment"]] if row.get("environment") else []
+
+    def read(handle: str | None) -> str:
+        # The handle goes behind --terminal: `orca terminal read HANDLE` is an unknown command.
+        return (" | read: " + shlex.join(["orca", "terminal", "read", "--terminal", handle, *where])
+                if handle and not handle.startswith(NO_HANDLE) else "")
+
     lines = []
     for card in row.get("done_cards") or []:
         said = " ".join((card.get("last_message") or "").split())
@@ -2951,10 +3112,10 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
                  else card.get("draft_text") or ("yes" if card["draft"] else "-"))
         composer = {True: "empty", False: "has text"}.get(card.get("composer_empty"), "unknown")
         excerpt = (said[:160] + ("…" if len(said) > 160 else "")) or "-"
-        lines.append(f"{lead} | {who} | draft {draft} | composer {composer} | {excerpt} | screen: "
-                     + (" ⏎ ".join(card.get("screen_tail") or []) or "-"))
+        lines.append(f"{lead} | {who}{read(card.get('handle'))} | draft {draft} | composer {composer} | {excerpt}"
+                     " | screen: " + (" ⏎ ".join(card.get("screen_tail") or []) or "-"))
     lines.extend(f"{lead} | closable {handle}" for handle in row.get("closable") or [])
-    lines.extend(f"{lead} | meaningful {handle}" for handle in row.get("meaningful_tabs") or [])
+    lines.extend(f"{lead} | meaningful {handle}{read(handle)}" for handle in row.get("meaningful_tabs") or [])
     if scan_file and row.get("closable"):
         lines.append(f"{lead} | close: " + shlex.join([str(CLOSE_TABS), "--from", str(scan_file),
                                                       *row["closable"]]))
@@ -3029,7 +3190,7 @@ def main(argv: list[str] | None = None) -> int:
     reach = Reach()
     judge = jev_judge(key, reach=reach) if key else (lambda message: None)
     # Orca state read from files has no live tabs to read.
-    screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals))
+    screens = {} if args.ps_json else read_screens(args.orca, screen_targets(worktrees, terminals, set(codex)))
     claude_root = str(Path(args.claude_projects).expanduser())
     processes = {} if args.ps_json else worktree_processes(
         [w["path"] for w in worktrees if not w.get("_environment")], Path(PROCESS_CPU).expanduser(), time.time())
@@ -3106,9 +3267,38 @@ def wake_line(row: dict, stop: StopReason) -> str:
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 
 
+def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
+    """Print `<path> <PR|->` for each named row a removal check may take: an open PR cleanup row, or a finished one
+    even while its tabs remain (rm_check.py names the tabs to close). Every other row is named on stderr with why,
+    and makes the exit status 1; an unknown name prints nothing."""
+    try:
+        selected = [select_row(rows, name) for name in names]
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
+    left_out = 0
+    # A row named twice (by name and by path) is printed once.
+    for row in {id(row): row for row in selected}.values():
+        shown = (row.get("verdict") or {}).get("class") or row["class"]
+        if answer := row.get("removal_decision"):
+            why = f"removal decision {answer['decided_at']} {answer['answer']}"
+        elif not (row.get("open_pr_cleanup") or shown == "finished"):
+            why = f"class {class_label(shown, row['class'])} is neither finished nor open PR cleanup"
+        elif row.get("environment"):
+            why = "on another Mac: " + rm_check_command(row, scan_file)
+        else:
+            print(f"{row['path']} {pr_number(row) or '-'}")
+            continue
+        left_out += 1
+        print(f"{row_name(row)}: left out: {why}", file=sys.stderr)
+    return 1 if left_out else 0
+
+
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
+    if args.row and args.rm_specs:
+        return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute())
     if args.row:
-        return print_row(rows, args.row, args.transcripts)
+        return print_row(rows, args.row[0], args.transcripts)
     if args.rows:
         if args.sort == "final":
             rows = sorted(rows, key=lambda row: parse_time(row_final_at(row)) or

@@ -19,7 +19,10 @@ changes on its host before applying the same rule; the scan leaves those git
 facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
 <host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. The process check below protects work running
 in a tab. To check worktrees of several repositories in one call, give
-`rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory.
+`rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory:
+`scan_sessions.py --from SCAN_JSON --rm-specs --row NAME …` prints those specs
+for the rows you name, finished ones whose tabs remain included, instead of
+building them by hand.
 Its `--archive-scratch` passes that option to each `rm_check.py`, and
 `--remove-ok` runs steps 3 and 4 below for each worktree whose check is `ok`
 with no `containers`, putting the result in that worktree's line as `removal`
@@ -46,7 +49,9 @@ Run these per worktree, in order.
    an OPEN PR whose head equals HEAD clears the unmerged-commit check, and the
    PR's fetched base branch becomes the base. Without it the base is the
    remote branch the worktree started from, else the remote's default branch,
-   and when HEAD is not in that base, gh is asked for a MERGED PR of the
+   else (no `origin/HEAD`, `origin/main`, or `origin/master`, as in a
+   repository with no remote) the local `main` or `master`, which `notes`
+   name, and when HEAD is not in that base, gh is asked for a MERGED PR of the
    checked-out branch whose head is HEAD: one found counts as `--pr` (`notes`
    names it). With no PR given or found, HEAD outside that base, and HEAD in
    the branch's upstream (a pushed `release/…` branch with no PR), that upstream
@@ -120,6 +125,15 @@ Run these per worktree, in order.
      whose generator `GENERATED_BY` in `rm_check.py` names (only while that
      generator is tracked in the worktree and names the output's file name,
      such as `.claude/.venv-missing` from `.claude/hooks/worktree_create.sh`),
+     an ignored tool output beside the tracked file it is built from (Cargo's
+     `target/` beside `Cargo.toml`, Tauri's `gen/schemas/` beside
+     `tauri.conf.json`, a directory whose every zip is one a Terraform
+     `archive_file` block beside it (comments left out) declares with `output_path =
+     "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
+     standing for one path segment, and a
+     `.terraform/` whose `terraform.tfstate` names a backend other than
+     `local`; `notes` give the tool and the ignore file, line, and pattern
+     that exclude it),
      and an ignored directory holding only these and empty files (`web/var/`).
      Add a generator there after reading the tracked file that writes the
      output. They do
@@ -222,7 +236,8 @@ Closing drops Orca's resume record, not the transcript: `claude --resume
 
 A row's `done_cards` are the agents whose turn ended; the board keeps each one
 in Done until its tab closes. `scan_sessions.py --cards` prints each card with
-its tab, the first 60 characters of Orca's draft (`-` when none, `unknown`
+its tab and the command that reads its screen (`orca terminal read --terminal
+HANDLE`), the first 60 characters of Orca's draft (`-` when none, `unknown`
 when the screen was not read), whether the screen's input line is empty
 (`composer empty` / `has text`), Orca's copy of its last message, and the end
 of its screen. Orca's draft can be Claude's suggestion rather than the user's
