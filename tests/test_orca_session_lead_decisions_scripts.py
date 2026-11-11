@@ -129,6 +129,32 @@ class LeadDecisionsTests(unittest.TestCase):
             self.assertIn("1,000 万円のまま", result.stderr)
         self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 5)
 
+    def test_an_answer_on_an_asana_item_keeps_the_value_it_puts_there(self) -> None:
+        # An answer that moved 担当 in words only could not be compared with Asana, which kept the old assignee for days.
+        assignee, complete = "asana:assignee:acme/app#12", "asana:complete:acme/app#12"
+        answer_file = self.root / "answer.txt"
+        answer_file.write_text("未完了のまま", encoding="utf-8")
+
+        many = self.run_tool("record-many", stdin=json.dumps(
+            {"decision": assignee, "answer": "担当を reviewer に", "value": "1200000000000001"}, ensure_ascii=False))
+        single = self.run_tool("record", "--decision", complete, "--answer-file", str(answer_file), "--value", "false")
+
+        for result in (many, single):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(item["decision"], item["value"]) for item in json.loads(self.run_tool("show").stdout)],
+                         [(assignee, "1200000000000001"), (complete, False)])
+
+    def test_a_value_its_item_cannot_hold_writes_nothing(self) -> None:
+        for line, reason in (({"decision": "asana:complete:o/r#1", "answer": "完了", "value": "done"}, "true or false"),
+                             ({"decision": "asana:assignee:o/r#1", "answer": "reviewer に", "value": "reviewer-login"},
+                              "Asana user gid"),
+                             ({"decision": "merge:o/r#1", "answer": "merge する", "value": "yes"}, "asana:<item>")):
+            with self.subTest(line=line):
+                result = self.run_tool("record-many", stdin=json.dumps(line, ensure_ascii=False))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertFalse(self.log.exists())
+
     def test_an_empty_answer_is_refused_and_nothing_is_written(self) -> None:
         answer_file = self.root / "empty.txt"
         answer_file.write_text("  \n", encoding="utf-8")
