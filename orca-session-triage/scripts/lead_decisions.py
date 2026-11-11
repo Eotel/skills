@@ -2,8 +2,11 @@
 """Record the lead's answers to questions an hourly triage run handed off, and list the open ones.
 
 The lead never types into a scheduled triage tab, so it appends each answer here with `record`,
-or several at once with `record-many` (JSON Lines of {"decision", "answer", "decided_at"?}: every
-line is checked first, and nothing is written while one is wrong).
+or several at once with `record-many` (JSON Lines of {"decision", "answer", "decided_at"?, "value"?}:
+every line is checked first, and nothing is written while one is wrong).
+An answer on an Asana 99 item (asana:<item>:<owner/repo>#<number>) may carry the value it puts
+there, which asana99_status.py compares with Asana: true or false for complete, an Asana user gid
+for assignee, an option name for priority, review-state and pr-state. No other key takes a value.
 Every hourly run reads the log, drops answered questions from its handoff, and follows the answers.
 Records are only appended; a later record for the same decision replaces the earlier answer, and
 `show --history` also prints the answers it replaced, with their times. `record` and `record-many`
@@ -41,7 +44,8 @@ DEFAULT_LOG = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
 HANDED_OFF_LOG = Path("~/.cache/orca-session-triage/handed-off.jsonl")
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
-ANSWER_KEYS = frozenset(("decision", "answer", "decided_at"))
+ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value"))
+ASANA_ITEM = re.compile(r"asana:(?P<item>complete|priority|assignee|review-state|pr-state):")
 JST = timezone(timedelta(hours=9))
 EXCERPT = 160
 # A record that only says an answer was passed on decides nothing: on 2026-11-06 「中継済み（12:2x send
@@ -55,13 +59,14 @@ class Decision:
     decision: str
     answer: str
     decided_at: str
+    value: str | bool | None = None  # what an answer on an Asana 99 item puts there (answer_value)
 
     @classmethod
     def parse(cls, raw: str, where: str) -> Decision:
         try:
             item = json.loads(raw)
             return cls(id=str(item["id"]), decision=str(item["decision"]), answer=str(item["answer"]),
-                       decided_at=str(item["decided_at"]))
+                       decided_at=str(item["decided_at"]), value=item.get("value"))
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
 
@@ -130,6 +135,26 @@ def decided_at(value: str | None) -> str:
     if parsed.tzinfo is None:
         raise ValueError(f"the time {value} needs a timezone offset")
     return parsed.isoformat()
+
+
+def answer_value(decision: str, value: object) -> str | bool | None:
+    """The value an answer puts in its Asana 99 item; ValueError says why the item cannot hold it."""
+    if value is None:
+        return None
+    match = ASANA_ITEM.match(decision)
+    if not match:
+        raise ValueError("a value goes only with an answer on an Asana item (asana:<item>:<owner/repo>#<number>)")
+    item = match["item"]
+    if item == "complete":
+        if isinstance(value, bool) or value in ("true", "false"):
+            return value if isinstance(value, bool) else value == "true"
+        raise ValueError("the value of an asana:complete: answer must be true or false")
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        raise ValueError(f"the value of an asana:{item}: answer must be non-empty text")
+    if item == "assignee" and not text.isdigit():
+        raise ValueError("the value of an asana:assignee: answer must be an Asana user gid")
+    return text
 
 
 def lines(log: Path) -> Iterator[tuple[str, str]]:
@@ -217,8 +242,9 @@ def answer_line(raw: str) -> Decision:
     when = item.get("decided_at")
     if when is not None and not isinstance(when, str):
         raise ValueError("decided_at must be an ISO 8601 time with its timezone offset")
-    return Decision(id=uuid.uuid4().hex, decision=str(texts["decision"]).strip(),
-                    answer=str(texts["answer"]).strip(), decided_at=decided_at(when))
+    decision = str(texts["decision"]).strip()
+    return Decision(id=uuid.uuid4().hex, decision=decision, answer=str(texts["answer"]).strip(),
+                    decided_at=decided_at(when), value=answer_value(decision, item.get("value")))
 
 
 def checked_line(number: int, raw: str) -> Decision | BadLine:
@@ -436,9 +462,12 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                         help="the key the hourly handoff gave the question, e.g. remove:ENVIRONMENT::PATH")
     record.add_argument("--answer-file", type=Path, required=True, help="UTF-8 file with the exact answer")
     record.add_argument("--decided-at", help="original ISO 8601 time when recording an earlier answer")
+    record.add_argument("--value", help="for an asana:<item>: key, the value the answer puts in that item: "
+                                        "true or false (complete), an Asana user gid (assignee), or an option name")
     many = commands.add_parser(
         "record-many", help='append several answers from JSON Lines of {"decision": KEY, "answer": TEXT, '
-                            '"decided_at": ISO time with offset (optional)}; a wrong line writes nothing')
+                            '"decided_at": ISO time with offset (optional), "value": what an asana:<item>: answer '
+                            'puts in that item (optional)}; a wrong line writes nothing')
     many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     show = commands.add_parser("show", help="print the latest answer for each decision")
     show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
@@ -472,7 +501,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
             if not decision:
                 raise ValueError("--decision is empty")
             entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=non_empty(args.answer_file),
-                             decided_at=decided_at(args.decided_at))
+                             decided_at=decided_at(args.decided_at), value=answer_value(decision, args.value))
             warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)
             result: object = asdict(entry)

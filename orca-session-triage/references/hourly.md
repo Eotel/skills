@@ -149,7 +149,11 @@ of ours with requested changes not yet addressed and no live agent in a
 workspace linked to it: it needs a lane, started with
 `spawn-lane --topic <PR URL>` so later sweeps see the lane as 「指摘対応確認」.
 A 「指摘対応確認」 row needs a check that the linked lane is working on the
-changes.
+changes. A 「再依頼確認」 row is an Open PR that Asana marks 指摘対応済み（未承認）
+while its task is still assigned to the PR author: check that the reviewer was
+requested again, and assign the task to that reviewer. A 「答えと違う」 row is a
+lead answer whose recorded value Asana does not hold: write the answer with
+`asana_pr.py ensure`.
 
 In every hourly run on a Mac that has `~/.cache/orca-briefs/bin/topic`, run
 `topic check --all`. Each drift row names the record, what disagrees, and the
@@ -256,7 +260,11 @@ The lead records an answer with
 `lead_decisions.py record --decision KEY --answer-file FILE`, and several with
 `lead_decisions.py record-many --file FILE` (or on standard input), one JSON
 object per line: `{"decision": KEY, "answer": TEXT}`, adding `"decided_at"`
-(ISO 8601 with its offset) for an earlier answer. It checks every line first,
+(ISO 8601 with its offset) for an earlier answer. An answer on an Asana 99
+item also takes `"value"`, what it puts there (`record --value`): `true` or
+`false` for `complete`, the Asana user gid for `assignee`, the option name for
+the others. `asana99_status.py` shows a 「答えと違う」 row while Asana holds
+another value; without `"value"` it cannot compare. `record-many` checks every line first,
 names each wrong one, and records nothing until all are right; do not call
 `record` in a shell loop. When the lead relays the answer to a lane, it uses
 `send --decision <answer> --key KEY` instead (repeat per key, with `--ask <id>`
