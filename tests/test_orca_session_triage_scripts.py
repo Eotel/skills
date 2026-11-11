@@ -1362,18 +1362,27 @@ class ClassifyTests(unittest.TestCase):
         # A lane Codex took over from Claude: the older Claude transcript's last word is not how it stands.
         self.claude_says("/w/took", user("go"), {**assistant(text("Done. PR #9 is merged.")),
                                                  "timestamp": "2027-01-15T05:00:00Z"})
+        # Of two Codex tabs, the newer turn's reply stands, whichever tab Orca lists last.
+        older = {"source": "screen", "tail": [
+            "• Done. PR #9 is merged.", "", f"  Worked for 3m 2s • {datetime.fromtimestamp(NOW - 3600):%H:%M}",
+            "› Ask Codex to do anything"]}
         judged = []
         rows = {r["path"]: r for r in scan.build_inventory(
             [worktree("/w/uv", "done", agent="codex"),
-             worktree("/w/took", "done", agent="codex", pr={"number": 9, "state": "merged"})],
-            [terminal("/w/uv", "codex", "term_u"), terminal("/w/took", "codex", "term_t")], self.projects, {},
+             worktree("/w/took", "done", agent="codex", pr={"number": 9, "state": "merged"}),
+             worktree("/w/two", "done", agent="codex", pr={"number": 9, "state": "merged"})],
+            [terminal("/w/uv", "codex", "term_u"), terminal("/w/took", "codex", "term_t"),
+             terminal("/w/two", "codex", "term_new"), terminal("/w/two", "codex", "term_old")], self.projects, {},
             "要判断", now=NOW, judge=lambda message: judged.append(message) or verdict(0.1, "blocked_on_others"),
-            screens={(None, "term_u"): screen, (None, "term_t"): screen})}
+            screens={(None, "term_u"): screen, (None, "term_t"): screen, (None, "term_new"): screen,
+                     (None, "term_old"): older})}
         row = rows["/w/uv"]
 
         self.assertEqual(row["orca_message"], {"text": reply, "at": "2027-01-15T07:50:00Z", "from": "screen"})
-        self.assertEqual((row["class"], rows["/w/took"]["class"], judged), ("stalled", "stalled", [reply, reply]))
-        self.assertEqual([entry["path"] for entry in scan.review_queue(list(rows.values()))], ["/w/uv", "/w/took"])
+        self.assertEqual([rows[path]["class"] for path in ("/w/uv", "/w/took", "/w/two")], ["stalled"] * 3)
+        self.assertEqual(judged, [reply] * 3)
+        self.assertEqual([entry["path"] for entry in scan.review_queue(list(rows.values()))],
+                         ["/w/uv", "/w/took", "/w/two"])
         # Its tab is read even while Orca shows the Codex working.
         busy = [worktree("/w/uv", "working", agent="codex")]
         self.assertEqual([t["handle"] for t in scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], set())],
@@ -1842,7 +1851,7 @@ class NextStepFactTests(unittest.TestCase):
 
     def test_a_pr_merged_after_the_final_message_ends_the_wait_it_reported(self) -> None:
         numbers = {name: number for number, name in enumerate(
-            ("merged-later", "codex-merged-later", "merged-before", "continues", "other-head"), 7)}
+            ("merged-later", "codex-merged-later", "merged-before", "continues", "other-head", "codex-took-over"), 7)}
 
         def stalled(path: str, said_at: str, status: str = "blocked_on_others", source: str = "claude") -> dict:
             transcripts = ({"claude": {"final_text": "PR を出しました。レビュー待ちです。", "final_at": said_at},
@@ -1858,7 +1867,11 @@ class NextStepFactTests(unittest.TestCase):
                 stalled("/w/codex-merged-later", "2026-10-06T07:25:00.000Z", source="codex"),
                 stalled("/w/merged-before", "2026-10-06T07:40:00.000Z"),
                 stalled("/w/continues", "2026-10-06T07:25:00.000Z", status="in_progress"),
-                stalled("/w/other-head", "2026-10-06T07:25:00.000Z")]
+                stalled("/w/other-head", "2026-10-06T07:25:00.000Z"),
+                # Jev read a Codex tab's reply, newer than both Claude's last word and the merge.
+                {**stalled("/w/codex-took-over", "2026-10-06T07:25:00.000Z"),
+                 "jev": {"source": "orca", "asks": 0.1, "status": "blocked_on_others", "confidence": 0.9},
+                 "orca_message": {"text": "CORELIB_PAT 設定待ちです。", "at": "2026-10-06T07:50:00Z", "from": "screen"}}]
         git = {"branch": "fix-a", "head": "aaa", "dirty": 0, "unpushed": 0, "github": "acme/app"}
         heads = {numbers["other-head"]: "zzz"}
 
@@ -1877,6 +1890,7 @@ class NextStepFactTests(unittest.TestCase):
         self.assertEqual(result["/w/merged-before"][0], "stalled")
         self.assertEqual(result["/w/continues"][0], "stalled")
         self.assertEqual(result["/w/other-head"][0], "stalled")
+        self.assertEqual(result["/w/codex-took-over"][0], "stalled")
 
     def test_a_merged_pr_finishes_a_row_no_agent_ran_in(self) -> None:
         # Orca's PR link is often missing or stale; the lookup by branch sees the merge.

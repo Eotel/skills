@@ -1211,15 +1211,15 @@ def turn_clock(line: str, now: float) -> str | None:
 
 
 def codex_tab_message(terms: list[dict], screens: Screens, now: float) -> tuple[str, str | None]:
-    """(the last reply a local Codex tab shows under a turn-end line ("Worked for … • HH:MM"), the time that line
-    gives or None), or ("", None)."""
-    said, at = "", None
+    """(the newest reply the worktree's local Codex tabs show under a turn-end line ("Worked for … • HH:MM"), the
+    time that line gives or None), or ("", None). A tab whose line gives no time counts as the oldest."""
+    shown = []
     for screen in agent_screens(terms, screens, None, "codex"):
         lines = screen_lines(screen)
         ends = [line.strip() for line in lines if CODEX_TURN_END.fullmatch(line.strip())]
         if screen_agent(screen) == "codex" and ends and (reply := codex_screen_message(lines)):
-            said, at = reply, turn_clock(ends[-1], now)
-    return said, at
+            shown.append((reply, turn_clock(ends[-1], now)))
+    return max(shown, key=lambda found: found[1] or "", default=("", None))
 
 
 def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = None,
@@ -1993,8 +1993,11 @@ def mail_reason(unread: list[dict]) -> str:
 
 def final_message_at(row: dict) -> datetime | None:
     """When the final message Jev read was written, or None."""
-    if (row.get("jev") or {}).get("source") == "codex":
+    source = (row.get("jev") or {}).get("source")
+    if source == "codex":
         return parse_time((row.get("codex") or [{}])[-1].get("last_assistant_at"))
+    if source == "orca":
+        return parse_time((row.get("orca_message") or {}).get("at"))
     return parse_time((row.get("claude") or {}).get("final_at"))
 
 
