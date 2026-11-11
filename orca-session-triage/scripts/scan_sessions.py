@@ -1210,15 +1210,20 @@ def turn_clock(line: str, now: float) -> str | None:
     return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def codex_tab_message(terms: list[dict], screens: Screens, now: float) -> tuple[str, str | None]:
+def codex_tab_message(terms: list[dict], screens: Screens) -> tuple[str, str | None]:
     """(the newest reply the worktree's local Codex tabs show under a turn-end line ("Worked for … • HH:MM"), the
-    time that line gives or None), or ("", None). A tab whose line gives no time counts as the oldest."""
+    time that line gives or None), or ("", None). The line's clock is read on the last day it is not later than the
+    tab's last output, so a tab idle for days does not look new; a tab with no time counts as the oldest."""
     shown = []
-    for screen in agent_screens(terms, screens, None, "codex"):
+    for term in terms:
+        screen = rendered(screens.get((None, term.get("handle"))))
+        if not screen or screen_agent(screen) != "codex" or term.get("agentIdentity") not in (None, "codex"):
+            continue
         lines = screen_lines(screen)
         ends = [line.strip() for line in lines if CODEX_TURN_END.fullmatch(line.strip())]
-        if screen_agent(screen) == "codex" and ends and (reply := codex_screen_message(lines)):
-            shown.append((reply, turn_clock(ends[-1], now)))
+        last_output = term.get("lastOutputAt")
+        if ends and (reply := codex_screen_message(lines)):
+            shown.append((reply, turn_clock(ends[-1], last_output / 1000) if last_output is not None else None))
     return max(shown, key=lambda found: found[1] or "", default=("", None))
 
 
@@ -1581,7 +1586,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                        "at": iso_time(newest.get("updatedAt"))}
             elif screen_said:
                 row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
-        elif not row["codex"] and (codex_said := codex_tab_message(terms, screens, now))[0]:
+        elif not row["codex"] and (codex_said := codex_tab_message(terms, screens))[0]:
             # A Codex this Mac keeps no recent rollout of finished a turn its tab still shows.
             row["orca_message"] = {"text": codex_said[0], "at": codex_said[1], "from": "screen"}
         claude_screens = agent_screens(terms, screens, w.get("_environment"), "claude")

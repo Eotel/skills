@@ -54,7 +54,8 @@ board's done cards; close what the user approves.
   off, is the message. A local Codex tab with no recent rollout is read the
   same way (its tab is read even while Orca shows it working): a reply under
   its turn-end line is the row's `orca_message` (`from: screen`, `at` from
-  the line's `• HH:MM`), so Jev and the review queue read it instead of
+  the line's `• HH:MM` on the day of the tab's last output; the newest such
+  reply across the worktree's Codex tabs), so Jev and the review queue read it instead of
   calling the row `unstarted`; it is the row's final message also over an
   older Claude transcript (a lane Codex took over).
   A Claude tab whose screen ends on the status line of a running turn
