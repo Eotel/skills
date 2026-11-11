@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 yomiyasu_diff.py - 元の文と書き直した文を比べ、変わった箇所をすべて出し、意味が変わる恐れと規則の見直し候補を挙げる。
 
@@ -26,7 +27,7 @@ yomiyasu_diff.py - 元の文と書き直した文を比べ、変わった箇所�
 """
 
 from __future__ import annotations
-__version__ = "2.5.0"
+__version__ = "3.0.0"
 
 import os
 import errno
@@ -54,17 +55,20 @@ if __name__ == "__main__":
     sys.dont_write_bytecode = True
 _VISIBILITY_NAMES = ("analyze_markdown", "inline_protected_spans", "unicode_whitespace", "decode_source",
                      "normalize_doc_type", "normalize_reader", "context_label", "DOC_TYPES",
-                     "WordsError", "resolve_words", "current_directory", "words_context", "words_label")
+                     "WordsError", "resolve_words", "current_directory", "words_context", "words_label",
+                     "input_path_problem")
 try:
     try:
         if __package__:
             from .markdown_visibility import analyze_markdown, inline_protected_spans, unicode_whitespace, decode_source
             from .markdown_visibility import normalize_doc_type, normalize_reader, context_label, DOC_TYPES
             from .markdown_visibility import WordsError, resolve_words, current_directory, words_context, words_label
+            from .markdown_visibility import input_path_problem
         else:
             from markdown_visibility import analyze_markdown, inline_protected_spans, unicode_whitespace, decode_source
             from markdown_visibility import normalize_doc_type, normalize_reader, context_label, DOC_TYPES
             from markdown_visibility import WordsError, resolve_words, current_directory, words_context, words_label
+            from markdown_visibility import input_path_problem
     except SyntaxError as error:
         # 隣の markdown_visibility.py が壊れている。ほかの読めないときと同じく ImportError にする（スクリプトでは終了コード3）。
         raise ImportError(
@@ -112,6 +116,7 @@ try:
         WordsError = _visibility_module.WordsError
         resolve_words = _visibility_module.resolve_words
         current_directory = _visibility_module.current_directory
+        input_path_problem = _visibility_module.input_path_problem
         words_context = _visibility_module.words_context
         words_label = _visibility_module.words_label
 except ImportError as _import_error:
@@ -11147,7 +11152,7 @@ def report(d: dict) -> str:
 
 
 def read_text(path: str | Path) -> str:
-    with Path(path).open(encoding='utf-8') as handle:
+    with open(path, encoding='utf-8') as handle:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
         return handle.read()
 
 
@@ -11156,7 +11161,7 @@ def read_text(path: str | Path) -> str:
 _EXIT_CODES = """終了コード:
   0  比べ終わり、--fail-on の条件に当たらなかった（候補の有無によらない）。--endings の正常終了、-h と --version も0
   1  --fail-on=meaning-risk の条件に当たった（数値、否定、主語と目的語の入れ替え、文の種類・引用の書き方・確度・状態の語・約束・許可の言い方・選ぶ範囲・因果の恐れが1件以上）
-  2  使い方か入力の誤り（ファイルを開けない、UTF-8 として読めない、標準入力を読めない、使えない --stance、--fail-on、--doc-type、--reader の値、ファイルの数の誤り、語の一覧を読めない（--words のフォルダがない、UTF-8 でない、1万行を超える）、--words と --no-words を一緒に指定した）
+  2  使い方か入力の誤り（ファイルを開けない、読まないファイル（作業フォルダの外、名前が点で始まる部分を含むパス）を渡した、UTF-8 として読めない、標準入力を読めない、使えない --stance、--fail-on、--doc-type、--reader の値、ファイルの数の誤り、語の一覧を読めない（--words のフォルダがない、UTF-8 でない、1万行を超える、flag.txt か flag-patterns.txt に使えない行がある。ファイルの中身の誤りは、ファイルの名前と行番号を出す）、--words と --no-words を一緒に指定した）
   3  予期しない内部の誤り（標準エラーにトレースバックを出す）か、出力先が閉じられて結果を最後まで書けなかった"""
 _USAGE = ("yomiyasu_diff.py [--stance 立場] [--doc-type 種類] [--reader 読者] [--json] [--fail-on meaning-risk]\n"
           "                        [--words フォルダ | --no-words] [--material 資料 ...] 元の文 書き直した文\n"
@@ -11273,9 +11278,11 @@ def _build_parser() -> _ArgumentParser:
     options.add_argument("--reader", metavar="読者",
                          help="想定する読者の知識（値は yomiyasu_lint.py と同じ）。表示と JSON に残すだけで、判定は変わりません。")
     options.add_argument("--words", metavar="フォルダ",
-                         help="語の一覧（allow.txt と flag.txt）のフォルダ（値は yomiyasu_lint.py と同じ）。省くと、作業ディレクトリから"
+                         help="語の一覧（allow.txt と flag.txt。名前と正規表現を書く flag-patterns.txt も置けます）のフォルダ"
+                              "（値は yomiyasu_lint.py と同じ）。省くと、作業ディレクトリから"
                               "上へたどった git の最上位（.git のあるフォルダ。git の外では作業ディレクトリ）の .yomiyasu-words/ を"
-                              "探します。diff では一覧の場所と語の数を表示と JSON に書きます（差分と候補は変わりません）。")
+                              "探します。linked worktree にこのフォルダがなければ、元の checkout の一覧を探します。"
+                              "diff では一覧の場所と語の数を表示と JSON に書きます（差分と候補は変わりません）。")
     options.add_argument("--no-words", action="store_true",
                          help="語の一覧を探さず、読みません（--words と一緒には使えません）。")
     options.add_argument("--material", action="append", dest="materials", metavar="資料",
@@ -11341,11 +11348,20 @@ def _fail_on_line(total: int, counted: int, risks: Sequence = ()) -> str:
                                if any(r["kind"] == kind for r in risks)), counted))
 
 
+def _path_problem(path: str) -> str | None:
+    """コマンドラインで渡されたファイルを読まないときの誤りの文か None（3.0.0。markdown_visibility.input_path_problem）。"""
+    reason = input_path_problem(path)
+    if reason is None:
+        return None
+    return "Error opening file {}: {}。このファイルを渡すときは、標準入力から渡してください（ファイルの名前の代わりに - を渡します。1か所だけ）".format(
+        path, reason)
+
+
 def _read_input(path: str | Path) -> tuple:
     """ファイルか標準入力（-）を読み、(文字列, decode_source の情報, None) か (None, None, 誤りの文) を返す。"""
     if path != "-":
         try:
-            with Path(path).open('rb') as handle:
+            with open(path, 'rb') as handle:  # noqa: PTH123 -- open the given string as is, so 'x.md/' fails as in 3.0.0
                 data = handle.read()
         except (OSError, ValueError) as error:
             reason = getattr(error, "strerror", None) or error
@@ -11443,6 +11459,12 @@ def _run(argv: list[str] | None) -> int:
             words = resolve_words(current_directory(), args.words, args.no_words)
         except WordsError as error:
             _error(str(error))
+            return 2
+    for path in list(files) + list(args.materials):
+        # 3.0.0: 作業フォルダの外のファイルと、点で始まる部分を含むパスは、どれかを読む前に断る
+        problem = _path_problem(path)
+        if problem:
+            _error(problem)
             return 2
     texts, infos = [], []
     for path in files:
