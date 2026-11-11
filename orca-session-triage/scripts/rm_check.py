@@ -70,8 +70,10 @@ TAURI_CONFIGS = ("tauri.conf.json", "tauri.conf.json5", "Tauri.toml")
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
-# A tracked Terraform file's archive_file writing into a directory beside it: output_path = "${path.module}/zip/…".
-ARCHIVE_OUTPUT = 'output_path\\s*=\\s*"\\$\\{path\\.module\\}/%s/'
+# A tracked Terraform file's archive_file writing into a directory beside it: output_path = "${path.module}/zip/…",
+# captured after the directory; an interpolation in it (${each.key}) stands for any one path segment.
+ARCHIVE_OUTPUT = 'output_path\\s*=\\s*"\\$\\{path\\.module\\}/%s/([^"]+)"'
+INTERPOLATION = re.compile(r"\$\{[^}]*\}")
 # An ignored directory of nothing but logs (django-environ's DEBUG app.log) holds no one's work.
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
@@ -329,16 +331,23 @@ def tool_output(worktree: Path, rel: str) -> str | None:
     if not files or any(file.is_symlink() or file.suffix != ".zip" for file in files):
         return None
     writes = re.compile(ARCHIVE_OUTPUT % re.escape(path.name))
-    beside = git(worktree, "ls-files", "-z", "--", str(path.parent)).stdout.split("\0")
-    for name in beside:
+    outputs: dict[PurePosixPath, list[re.Pattern[str]]] = {}
+    for name in git(worktree, "ls-files", "-z", "--", str(path.parent)).stdout.split("\0"):
         module = PurePosixPath(name)
         if module.suffix == ".tf" and module.parent == path.parent:
             try:
-                if writes.search((worktree / module).read_text(errors="replace")):
-                    return "archives Terraform's archive_file writes (%s)" % module
+                found = writes.findall((worktree / module).read_text(errors="replace"))
             except OSError:
                 continue
-    return None
+            if found:
+                outputs[module] = [re.compile("[^/]+".join(map(re.escape, INTERPOLATION.split(output))))
+                                   for output in found]
+    # Every zip has to be one an archive_file declares: a hand-made zip beside them is someone's.
+    names = [file.relative_to(source).as_posix() for file in files]
+    if not outputs or not all(any(output.fullmatch(name) for found in outputs.values() for output in found)
+                              for name in names):
+        return None
+    return "archives Terraform's archive_file writes (%s)" % ", ".join(map(str, outputs))
 
 
 def ignore_source(worktree: Path, rel: str) -> str:

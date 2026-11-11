@@ -3683,6 +3683,10 @@ class RmCheckTests(unittest.TestCase):
                    "src-tauri/tauri.conf.json": "{}\n", "terraform/devel/main.tf": 'terraform { backend "s3" {} }\n',
                    "terraform/modules/dms/monitor.tf": 'data "archive_file" "restart" {\n'
                                                        '  output_path = "${path.module}/zip/restart.zip"\n}\n',
+                   "terraform/modules/lambda/main.tf": 'data "archive_file" "fn" {\n'
+                                                       '  output_path = "${path.module}/zip/${each.key}.zip"\n}\n',
+                   "terraform/modules/backup/main.tf": 'data "archive_file" "build" {\n'
+                                                       '  output_path = "${path.module}/zip/build.zip"\n}\n',
                    "terraform/modules/other/main.tf": "# no archive here\n"}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
@@ -3696,18 +3700,21 @@ class RmCheckTests(unittest.TestCase):
                    "terraform/devel/.terraform/terraform.tfstate": json.dumps({"backend": {"type": "s3"}}),
                    "terraform/devel/.terraform/providers/aws": "provider",
                    "terraform/local/.terraform/terraform.tfstate": json.dumps({"backend": {"type": "local"}}),
-                   "terraform/modules/dms/zip/restart.zip": "zip", "terraform/modules/other/zip/kept.zip": "zip"}
+                   "terraform/modules/dms/zip/restart.zip": "zip", "terraform/modules/lambda/zip/notify.zip": "zip",
+                   "terraform/modules/backup/zip/unique-backup.zip": "zip", "terraform/modules/other/zip/kept.zip": "zip"}
         for name, content in outputs.items():
             (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
             (self.wt / name).write_text(content)
 
         code, result = self.run_main()
 
-        # Being ignored is no sign on its own: a local backend, and zips nothing tracked writes, are held.
+        # Being ignored is no sign on its own: a local backend, and zips no tracked archive_file declares, are held.
         self.assertEqual((code, [item["path"] for item in result["held"]]),
-                         (1, ["terraform/local/.terraform/", "terraform/modules/other/zip/"]))
+                         (1, ["terraform/local/.terraform/", "terraform/modules/backup/zip/",
+                              "terraform/modules/other/zip/"]))
         self.assertEqual(sorted(result["regenerable"]), ["src-tauri/gen/schemas/", "src-tauri/target/",
-                                                         "terraform/devel/.terraform/", "terraform/modules/dms/zip/"])
+                                                         "terraform/devel/.terraform/", "terraform/modules/dms/zip/",
+                                                         "terraform/modules/lambda/zip/"])
         self.assertIn("src-tauri/target/ is Cargo's build output (src-tauri/Cargo.toml), ignored by "
                       "src-tauri/.gitignore:1:/target/", result["notes"])
         self.assertIn("terraform/modules/dms/zip/ is archives Terraform's archive_file writes "

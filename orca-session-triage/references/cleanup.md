@@ -127,8 +127,10 @@ Run these per worktree, in order.
      such as `.claude/.venv-missing` from `.claude/hooks/worktree_create.sh`),
      an ignored tool output beside the tracked file it is built from (Cargo's
      `target/` beside `Cargo.toml`, Tauri's `gen/schemas/` beside
-     `tauri.conf.json`, a directory of zip files a Terraform `archive_file`
-     beside it writes with `output_path = "${path.module}/<dir>/…"`, and a
+     `tauri.conf.json`, a directory whose every zip is one a Terraform
+     `archive_file` beside it declares with `output_path =
+     "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
+     standing for one path segment, and a
      `.terraform/` whose `terraform.tfstate` names a backend other than
      `local`; `notes` give the tool and the ignore file, line, and pattern
      that exclude it),
