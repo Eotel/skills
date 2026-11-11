@@ -20,7 +20,8 @@ For a key naming PRs or issues (`merge:owner/repo#12+#14`, `spawn:owner/repo#159
 type, state, updatedAt, whether it was updated after that hand-off, named inbox reports, and values
 from --asana-status when given; an issue also names the Orca worktrees working on it.
 GitHub is read with one query per repository, and Orca once, only when a key names an issue. `show --match` and `--since-last-handoff` print
-one line per matching answer, newest first in JST, marking remove keys whose paths still exist.
+one line per matching answer, newest first in JST, marking remove keys whose paths still exist; a line cuts
+its answer at 160 characters and then says 「…（続きは --json）」, and `--json` prints those answers whole.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value"))
 ASANA_ITEM = re.compile(r"asana:(?P<item>complete|priority|assignee|review-state|pr-state):")
 JST = timezone(timedelta(hours=9))
 EXCERPT = 160
+CUT = "…（続きは --json）"
 # A record that only says an answer was passed on decides nothing: on 2026-11-06 「中継済み（12:2x send
 # montly-report）」 hid 「1,000 万円のまま」, recorded under the same key the hour before.
 DELIVERY_ONLY = re.compile(r"(?:(?:中継|送達|送信|転送)済み|中継した|送った|伝えた)(?:[（(][^）)]*[）)])?[。.]?")
@@ -431,9 +433,27 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     return {"unanswered": unanswered, "settled": settled}
 
 
+@dataclass(frozen=True)
+class ShownAnswer:
+    """A matching answer as `show --match` prints it: its record, its time, and the marks on its line."""
+    item: Decision
+    when: datetime | None
+    marks: tuple[str, ...]
+
+    def line(self) -> str:
+        stamp = self.when.astimezone(JST).isoformat(timespec="seconds") if self.when else self.item.decided_at
+        answer = " ".join(self.item.answer.split())
+        cut = answer[:EXCERPT] + (CUT if len(answer) > EXCERPT else "")
+        marks = "".join(f" {mark}" for mark in self.marks)
+        return f"{stamp} {self.item.decision}{marks}  {cut}"
+
+    def view(self) -> dict[str, object]:
+        return {**asdict(self.item), "marks": list(self.marks)}
+
+
 def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None,
-                 replaced: frozenset[str] = frozenset()) -> list[str]:
-    """One line per matching answer, newest first, with times in JST, marking the records `replaced` names."""
+                 replaced: frozenset[str] = frozenset()) -> list[ShownAnswer]:
+    """Each matching answer, newest first, marking a `remove:` key whose path exists and the records `replaced` names."""
     selected = []
     for item in items:
         when = moment(item.decided_at)
@@ -445,11 +465,10 @@ def show_answers(items: Iterable[Decision], words: list[str], since: datetime | 
     selected.sort(key=lambda pair: pair[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     shown = []
     for when, item in selected:
-        stamp = when.astimezone(JST).isoformat(timespec="seconds") if when else item.decided_at
         path = item.decision.removeprefix("remove:").split("::", 1)[-1]
-        pending = " 未実行" if item.decision.startswith("remove:") and Path(path).expanduser().exists() else ""
-        pending += " 置き換え済み" if item.id in replaced else ""
-        shown.append(f"{stamp} {item.decision}{pending}  {' '.join(item.answer.split())[:EXCERPT]}")
+        pending = item.decision.startswith("remove:") and Path(path).expanduser().exists()
+        marks = (("未実行",) if pending else ()) + (("置き換え済み",) if item.id in replaced else ())
+        shown.append(ShownAnswer(item, when, marks))
     return shown
 
 
@@ -473,6 +492,9 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
     show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
     show.add_argument("--since-last-handoff", action="store_true",
                       help="answers since the newest saved handoff, newest first in JST")
+    show.add_argument("--json", action="store_true",
+                      help="with --match or --since-last-handoff, print the matching answers whole as a JSON list "
+                           "of their records, each with the `marks` its line gives (未実行, 置き換え済み)")
     show.add_argument("--history", action="store_true",
                       help="also print the answers a later record of the same key replaced, with their times: "
                            "under `replaced` in the JSON, marked 置き換え済み in the lines")
@@ -524,7 +546,11 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                     if since is None:
                         raise ValueError(f"invalid handoff sent_at: {saved.sent_at}")
                 replaced = frozenset(item.id for found in keys.values() for item in found[:-1])
-                print("\n".join(show_answers(items, args.match, since, replaced)))
+                shown = show_answers(items, args.match, since, replaced)
+                if args.json:
+                    print(json.dumps([answer.view() for answer in shown], ensure_ascii=False, indent=2))
+                else:
+                    print("\n".join(answer.line() for answer in shown))
                 return 0
             result = [{**asdict(found[-1]), "replaced": [asdict(item) for item in found[:-1]]} if args.history
                       else asdict(found[-1]) for found in keys.values()]
