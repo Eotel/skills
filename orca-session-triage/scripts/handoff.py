@@ -268,8 +268,7 @@ def decision_asks(values: list[str], keys: list[str]) -> dict[str, str]:
 def session_signature() -> str | None:
     """<session name>（HH:MM の定時） from this Claude Code session's record; None, said on stderr, when it
     cannot be read: the name is never guessed."""
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
-    record = config / "sessions" / f"{os.environ.get('CLAUDE_PID', '')}.json"
+    record = hourly_state.session_record()
     try:
         session = json.loads(record.read_text(encoding="utf-8"))
         name, started = session["name"].strip(), datetime.fromtimestamp(session["startedAt"] / 1000)

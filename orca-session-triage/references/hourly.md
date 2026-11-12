@@ -215,7 +215,7 @@ first, which then stays unread for this run. Each handoff it sends is kept in
 `handoff.py last` prints the newest, so read the previous run's handoff with it
 rather than from transcripts. The
 lead asks the user and directs the lanes. End without
-starting a watch or changing the workspace comment.
+starting a watch or changing the workspace comment (`hourly_state.py comment`).
 Include each 「レビューの番」 PR URL and its command, or the missing source to
 confirm, in this run's handoff to the lead. Do not start its review in the
 hourly tab while another lead is appointed. Hand each 「指摘対応担当」 PR to the
@@ -311,8 +311,9 @@ until the lead observes that its recorded symptom is gone. Then:
   row has no command, confirm the PR's source before starting. The independent
   review is a draft; do not submit a GitHub review from this step. For
   「指摘対応担当」, start the lane in this run with `spawn-lane --topic <PR URL>`.
-- Record each new question as `references/hourly-state.md` says, ask with
-  AskUserQuestion, and set the triage workspace's Orca comment to「要判断: …」.
+- Record each new question as `references/hourly-state.md` says and ask with
+  AskUserQuestion. Recording it sets the triage workspace's Orca comment to
+  「要判断: …」 (「The triage workspace's comment」 there).
   Keep the tab with that unanswered question open. A later run works through
   other rows and never repeats the recorded question. Once answered, record
   the answer before directing a lane. Other rows' verdicts are acted on in
@@ -321,8 +322,9 @@ until the lead observes that its recorded symptom is gone. Then:
 - When nothing needs the user, end with one line and no question.
 - Before the comment, run the retrospective in a forked Agent as
   `references/retro.md` describes and wait for its one-line result.
-- Last, set the triage workspace's comment to the run time and what the run
-  did, so the board shows the last run.
+- Last, run `~/.claude/skills/orca-session-triage/scripts/hourly_state.py
+  comment --result "<what the run did>"`, so the board shows the last run
+  below the open questions.
 - Leave no Monitor or other background job in this tab after the turn. A
   background job makes Orca report the tab as working and delays the next
   hourly run. Publishing an Artifact starts a live

@@ -5045,6 +5045,8 @@ class HourlyStateTests(unittest.TestCase):
                                               "ORCA_WORKTREE_ID": "repo::/w/triage",
                                               "ORCA_WORKTREE_PATH": "/w/triage",
                                               "ORCA_TERMINAL_HANDLE": "term_triage",
+                                              # Not the Orca tab that runs the tests.
+                                              "ORCA_PANE_KEY": "",
                                               "CLAUDE_CODE_SESSION_ID": "triage-run"})
         environment.start()
         self.addCleanup(environment.stop)
@@ -5059,6 +5061,62 @@ class HourlyStateTests(unittest.TestCase):
         with redirect_stdout(out):
             code = hourly_state.main(["--state-file", str(self.state), *args])
         return code, json.loads(out.getvalue())
+
+    def comment_orca(self, hourly_workspace: str) -> Path:
+        """An Orca CLI whose hourly triage automation runs in hourly_workspace; it logs every other call it gets."""
+        script, log = self.root / "orca", self.root / "orca-calls.jsonl"
+        script.write_text(
+            "#!/usr/bin/env python3\nimport json, sys\nargs = sys.argv[1:]\n"
+            "if args[:2] == ['automations', 'list']:\n"
+            f"    print(json.dumps({{'result': {{'automations': [{triage_automation('a1', hourly_workspace)!r}]}}}}))\n"
+            "else:\n"
+            f"    open({str(log)!r}, 'a').write(json.dumps(args) + '\\n')\n"
+            "    print(json.dumps({'result': {}}))\n")
+        script.chmod(0o755)
+        return log
+
+    def test_hourly_workspace_comment_shows_its_open_questions_and_the_last_run(self) -> None:
+        log = self.comment_orca("/w/triage")
+        started = datetime(2026, 11, 12, 14, 0, 30)
+        (self.root / "claude" / "sessions").mkdir(parents=True)
+        (self.root / "claude" / "sessions" / "77.json").write_text(json.dumps(
+            {"name": "triage-run", "startedAt": int(started.timestamp() * 1000)}))
+        message = self.source("message.txt", "Ready.")
+        merge = self.source("merge.txt", "PR を merge しますか？\n根拠: レビュー済み")
+        publish = self.source("publish.txt", "公開は明日でよいですか？")
+        answer = self.source("answer.txt", "merge する")
+        reason = self.source("reason.txt", "担当が取り下げた")
+        with patch.dict(os.environ, {"ORCA_CLI_COMMAND": str(self.root / "orca"), "ORCA_PANE_KEY": "tab:leaf",
+                                     "CLAUDE_PID": "77"}):
+            _, first = self.call("asked", "--row", "/w/a", "--decision", "merge", "--final-message-file", message,
+                                 "--question-file", merge)
+            _, second = self.call("asked", "--row", "/w/b", "--decision", "publish", "--final-message-file", message,
+                                  "--question-file", publish)
+            self.assertEqual(self.call("comment", "--result", "2 問を伺った")[0], 0)
+            # The lead records the answer from its own workspace.
+            with patch.dict(os.environ, {"ORCA_WORKTREE_ID": "repo::/w/lead", "ORCA_WORKTREE_PATH": "/w/lead"}):
+                self.call("answered", "--id", first["id"], "--answer-file", answer)
+                self.call("withdraw", "--id", second["id"], "--reason-file", reason)
+
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual({tuple(call[:4]) for call in calls}, {("worktree", "set", "--worktree", "path:/w/triage")})
+        run = "14:00 の定時: 2 問を伺った"
+        self.assertEqual([call[call.index("--comment") + 1] for call in calls], [
+            "要判断: PR を merge しますか？", "要判断: PR を merge しますか？／公開は明日でよいですか？",
+            f"要判断: PR を merge しますか？／公開は明日でよいですか？\n{run}", f"要判断: 公開は明日でよいですか？\n{run}", run])
+
+    def test_asked_leaves_the_comment_of_a_workspace_without_the_hourly_run_unless_told(self) -> None:
+        log = self.comment_orca("/w/hourly")
+        message = self.source("message.txt", "Ready.")
+        question = self.source("question.txt", "進めますか？")
+        with patch.dict(os.environ, {"ORCA_CLI_COMMAND": str(self.root / "orca"), "ORCA_PANE_KEY": "tab:leaf"}):
+            self.call("asked", "--row", "/w/a", "--decision", "one", "--final-message-file", message,
+                      "--question-file", question)
+            self.assertFalse(log.exists())
+            self.call("asked", "--row", "/w/a", "--decision", "two", "--final-message-file", message,
+                      "--question-file", question, "--comment")
+        self.assertEqual([json.loads(line)[-2] for line in log.read_text().splitlines()],
+                         ["要判断: 進めますか？／進めますか？"])
 
     def test_pending_lists_only_open_items_each_with_its_id(self) -> None:
         message = self.source("message.txt", "Should B start?\n")
