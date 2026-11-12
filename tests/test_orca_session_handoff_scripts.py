@@ -49,7 +49,7 @@ class HandoffTests(unittest.TestCase):
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True,
                               env={**os.environ, "ORCA_WORKTREE_ID": "repo1::/w/triage", "TRIAGE_HOST": "mac-a",
-                                   "ORCA_TERMINAL_HANDLE": "term_me",
+                                   "ORCA_TERMINAL_HANDLE": "term_me", "ORCA_PANE_KEY": "",
                                    "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl"),
                                    "CLAUDE_CONFIG_DIR": str(self.root), "CLAUDE_PID": "86520", **(env or {})})
 
@@ -155,6 +155,78 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("投稿しない", result.stderr)
         self.assertNotIn(older["id"], result.stderr)
         self.assertFalse(self.sent.exists())
+
+    def test_seen_takes_reflected_reports_and_answers_off_the_reasons_one_by_one(self) -> None:
+        # 11/11 10:09: three reports and an answer the body already held kept it from being sent, and --force
+        # skipped every check.
+        ask = {"id": "f439c015-aaaa-bbbb-cccc-000000000001", "ts": "2026-11-10T08:00:00+09:00", "kind": "ask",
+               "worktree": "lane", "text": "投稿してよいですか"}
+        scanned = {"id": "s1", "ts": "2026-11-10T09:00:00+09:00", "kind": "info", "worktree": "a", "text": "走査の前"}
+        other = {"id": "o1", "ts": "2026-11-10T09:06:46+09:00", "kind": "info", "host": "mac-a",
+                 "worktree": "triage", "handle": "term_02", "text": "02:00 の定時のタブからの訂正"}
+        seen = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in (ask, scanned))
+        self.inbox.write_text(seen + json.dumps(other, ensure_ascii=False) + "\n")
+        (self.root / "ask-answers.jsonl").write_text(json.dumps(
+            {"id": ask["id"], "ts": "2026-11-10T09:02:00+09:00", "how": "send", "note": "投稿しない"},
+            ensure_ascii=False) + "\n")
+        self.body.write_text("ask f439c015 は投稿しないと答えがあった。02:00 のタブの訂正も反映した\n")
+        since = str(len(seen.encode()))
+
+        one = self.run_tool("--since", since, "--seen", "o1")
+        both = self.run_tool("--since", since, "--seen", "o1", "--seen", "f439c015")
+
+        self.assertEqual(one.returncode, 1)
+        self.assertNotIn("id=o1", one.stderr)
+        self.assertIn(f"answered {ask['id']}", one.stderr)
+        self.assertEqual(both.returncode, 0, both.stderr)
+        self.assertTrue(self.sent.exists())
+
+    def test_refuses_while_a_later_scheduled_run_began_or_was_skipped_for_this_one(self) -> None:
+        # 11/12: the 10:00 run worked past noon; the 11:00 run was skipped for it and the 12:00 run began unseen.
+        self.inbox.write_text("")
+        orca = self.root / "orca"
+        hour, ten = 3_600_000, int(datetime(2026, 11, 12, 10, 0).timestamp() * 1000)
+        runs = [{"status": "dispatched", "scheduledFor": ten + hour, "startedAt": ten + hour + 480_000,
+                 "terminalPaneKey": "pane-11"},
+                {"status": "dispatched", "scheduledFor": ten, "startedAt": ten + 422_000, "terminalPaneKey": "pane-10"}]
+        orca.write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            "automations = [{'id': 'a1', 'prompt': '/orca-session-triage hourly', 'workspaceId': 'repo1::/w/triage'}]\n"
+            f"runs = {[{**run, 'trigger': 'scheduled', 'workspaceId': 'repo1::/w/triage'} for run in runs]!r}\n"
+            "result = {'automations': automations} if sys.argv[1:3] == ['automations', 'list'] else {'runs': runs}\n"
+            "print(json.dumps({'result': result}))\n")
+        orca.chmod(0o755)
+        env = {"ORCA_CLI_COMMAND": str(orca), "ORCA_PANE_KEY": "pane-10"}
+
+        refused = self.run_tool("--since", "0", env=env)
+        self.assertFalse(self.sent.exists())
+        forced = self.run_tool("--since", "0", "--force", env=env)
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("11/12 11:00 の定時の回が始まった（dispatched、11/12 11:08 開始、pane pane-11）", refused.stderr)
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertTrue(self.sent.exists())
+
+    def test_search_prints_the_matching_lines_and_keys_of_each_saved_handoff_since_a_time(self) -> None:
+        # 11/11 20:14: grep of the saved JSON hit ugrep's limits, and a script read the body under the wrong key.
+        self.handoffs.mkdir()
+        for name, sent_at, text, keys in (
+                ("20261111T060000.000000Z", "2026-11-11T06:00:00+00:00", "muse を消す\n別の行", ["remove:muse"]),
+                ("20261111T110000.000000Z", "2026-11-11T11:00:00+00:00", "持ち越し: muse の PR\n関係ない行",
+                 ["spawn:plinth::x", "merge:other"]),
+                ("20261111T120000.000000Z", "2026-11-11T12:00:00+00:00", "当たらない本文", [])):
+            (self.handoffs / f"{name}.json").write_text(json.dumps(
+                {"text": text, "kind": "ask", "decisions": keys, "sent_at": sent_at, "next_offset": 0},
+                ensure_ascii=False))
+
+        result = subprocess.run([sys.executable, str(SCRIPT), "search", "MUSE", "plinth", "--since",
+                                 "2026-11-11T10:00:00+00:00", "--handoffs-dir", str(self.handoffs)],
+                                capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f"2026-11-11T11:00:00+00:00 ask {self.handoffs / '20261111T110000.000000Z.json'}",
+            "  持ち越し: muse の PR", "  決定キー: spawn:plinth::x"])
 
     def test_send_signs_the_end_with_the_session_name_and_start_time_in_place_of_the_body_signature(self) -> None:
         self.inbox.write_text("")

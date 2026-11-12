@@ -15,7 +15,13 @@ full context of an `info` is needed. Both modes leave the cursor unchanged.
 For a large inbox, `read --summary` shows each entry on one line with its
 `id=` and the first 160 characters of its text, and `read --id ID[,ID]` prints
 only those entries in full, wherever the cursor stands (an acknowledged one is
-marked 既読). An id may be its first 8 or more characters, as handoffs and
+marked 既読). Every read marks an ask, or one of its questions, that
+`~/.cache/orca-briefs/ask-answers.jsonl` records answered with
+「回答済み（MM/DD HH:MM・how）」: do not hand it off as open. When a scheduled
+run of this workspace due after this tab's run began, or the precheck skipped
+one because this run was still working, `read` first prints a 「注意:」 line
+with that run's time, status, and pane: the later run owns the read position
+and the handoff, so leave them to it. An id may be its first 8 or more characters, as handoffs and
 `~/.cache/orca-briefs/bin/inbox` print it; one naming several entries lists them
 and prints nothing. `read --text WORD` searches every entry's whole text and
 structured questions, ignoring case and wherever the cursor stands, and prints
@@ -213,7 +219,11 @@ past the run's own handoff entry, unless another report reached the inbox
 first, which then stays unread for this run. Each handoff it sends is kept in
 `~/.cache/orca-session-triage/handoffs/` with its kind, keys, and time;
 `handoff.py last` prints the newest, so read the previous run's handoff with it
-rather than from transcripts. The
+rather than from transcripts. `handoff.py search WORD [WORD...] [--since
+ISO|HH:MM]` prints each kept handoff whose text or decision keys hold any word
+(case ignored), with its time, kind, and file, then the matching lines and
+keys: find whether an earlier run handed a line off with it, not by grepping
+the JSON. The
 lead asks the user and directs the lanes. End without
 starting a watch or changing the workspace comment (`hourly_state.py comment`).
 Include each 「レビューの番」 PR URL and its command, or the missing source to
@@ -235,7 +245,11 @@ as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 each key it sends. It also refuses, and prints what it found, while a report
 from another tab of this workspace (a parallel scheduled run) or an answer to an
 ask the body names reached the inbox or the answer records after `--since`:
-fix the body from them, or pass `--force` to send it as written. Before writing the handoff, run `lead_decisions.py
+fix the body from them, then pass `--seen ID` (repeat per id: a report's id or
+an answered ask's, or their first 8 or more characters) for each one the body
+now reflects. It also refuses while a later scheduled run began or was skipped
+for this run, as `read` prints it. `--force` sends past every check as
+written, so use `--seen` for what the body already holds. Before writing the handoff, run `lead_decisions.py
 unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]}`.
 Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and
 `handoff_count`. Settled keys include the decision or bound ask's answer record;

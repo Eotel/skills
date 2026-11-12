@@ -1,12 +1,17 @@
 """Identify the scheduled triage turns from Orca's automation run records."""
 
+from datetime import datetime
 import json
 import os
+import re
 import subprocess
 from typing import Any
 
 # The scheduled triage automation's prompt starts the hourly run; the tools find the automation by it.
 HOURLY_PROMPT = "/orca-session-triage hourly"
+# What precheck.py prints when it skips a run because a scheduled turn of the workspace is still working.
+TURN_WORKING = re.compile(r"skip: a scheduled turn in .+ is working")
+STARTED = ("dispatched", "completed")
 
 
 def orca_result(orca: str, *args: str) -> dict[str, Any]:
@@ -92,6 +97,40 @@ def cursor_owner(orca: str = "orca") -> tuple[bool, dict[str, Any] | None]:
     live = live_panes(orca_result(orca, "terminal", "list")["terminals"]) if failed_first else frozenset()
     run = latest_run(runs, live)
     return run is not None and pane == run.get("terminalPaneKey"), run
+
+
+def later_runs(orca: str = "orca") -> list[dict[str, Any]]:
+    """The scheduled runs of this tab's workspace due after this tab's own run, oldest first, that started a tab of
+    their own (one marked dispatch_failed while its tab is connected included), or that the precheck skipped while
+    a scheduled turn worked: this tab's, which is still in its turn. None outside a scheduled run's tab."""
+    pane = os.environ.get("ORCA_PANE_KEY")
+    workspace = workspace_path(os.environ.get("ORCA_WORKTREE_ID") or os.environ.get("ORCA_WORKTREE_PATH"))
+    if not pane or not workspace:
+        return []
+    runs = scheduled_runs(orca, workspace)
+    own = next((run for run in runs if run.get("terminalPaneKey") == pane), None)
+    if own is None:
+        return []
+    after = [run for run in reversed(runs) if (run.get("scheduledFor") or 0) > (own.get("scheduledFor") or 0)]
+    live = (live_panes(orca_result(orca, "terminal", "list")["terminals"])
+            if any(run.get("status") == "dispatch_failed" for run in after) else frozenset())
+    return [run for run in after if run.get("status") in STARTED
+            or run.get("status") == "dispatch_failed" and run.get("terminalPaneKey") in live
+            or run.get("status") == "skipped_precheck"
+            and TURN_WORKING.match(((run.get("precheckResult") or {}).get("stdout") or "").strip())]
+
+
+def local_minute(epoch_ms: object) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime("%m/%d %H:%M") if isinstance(epoch_ms, (int, float)) else "-"
+
+
+def later_run_note(run: dict[str, Any]) -> str:
+    """A run of later_runs as one line: when it was due, what happened and when, and its tab's pane."""
+    due, started = local_minute(run.get("scheduledFor")), local_minute(run.get("startedAt"))
+    if run.get("status") == "skipped_precheck":
+        return f"注意: {due} の定時の回は、この回が動いていたため skipped_precheck になった（{started}）"
+    return (f"注意: この回の後に {due} の定時の回が始まった（{run.get('status')}、{started} 開始、"
+            f"pane {run.get('terminalPaneKey') or '-'}）。既読位置と引き継ぎはその回のもの")
 
 
 def current_pane(orca: str = "orca") -> bool:

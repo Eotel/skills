@@ -6581,9 +6581,75 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 class InboxReadTests(unittest.TestCase):
     def setUp(self) -> None:
-        external = patch.dict(os.environ, {"ORCA_CLI_COMMAND": "missing-orca-for-offline-tests"})
+        # Not the Orca tab that runs the tests, nor this Mac's answer records.
+        answers = tempfile.TemporaryDirectory()
+        self.addCleanup(answers.cleanup)
+        external = patch.dict(os.environ, {"ORCA_CLI_COMMAND": "missing-orca-for-offline-tests", "ORCA_PANE_KEY": "",
+                                           "TRIAGE_ASK_ANSWERS": str(Path(answers.name) / "answers.jsonl")})
         external.start()
         self.addCleanup(external.stop)
+
+    def test_read_names_the_scheduled_runs_after_this_tab_s_run_before_the_entries(self) -> None:
+        # 11/12: the 10:00 run worked past noon; the 11:00 run was skipped for it and the 12:00 run began unseen.
+        hour, ten = 3_600_000, int(datetime(2026, 11, 12, 10, 0).timestamp() * 1000)
+        runs = [{"status": "dispatched", "scheduledFor": ten + 2 * hour, "startedAt": ten + 2 * hour + 480_000,
+                 "terminalPaneKey": "pane-12"},
+                {"status": "skipped_precheck", "scheduledFor": ten + hour, "startedAt": ten + hour + 136_000,
+                 "terminalPaneKey": None,
+                 "precheckResult": {"stdout": "skip: a scheduled turn in /w/triage is working\n"}},
+                {"status": "dispatched", "scheduledFor": ten, "startedAt": ten + 422_000, "terminalPaneKey": "pane-10"},
+                {"status": "completed", "scheduledFor": ten - hour, "startedAt": ten - hour, "terminalPaneKey": "p-9"}]
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            inbox, orca = base / "inbox.jsonl", base / "orca"
+            write_jsonl(inbox, [{"id": "abcd1234", "kind": "info", "ts": "2026-11-12T12:09:00+09:00",
+                                 "worktree": "lane", "text": "経過"}])
+            orca.write_text(
+                "#!/usr/bin/env python3\nimport json, sys\n"
+                f"automations = {[triage_automation('a1', '/w/triage')]!r}\n"
+                f"runs = {[{**run, 'trigger': 'scheduled', 'workspaceId': 'repo1::/w/triage'} for run in runs]!r}\n"
+                "result = {'automations': automations} if sys.argv[1:3] == ['automations', 'list'] else {'runs': runs}\n"
+                "print(json.dumps({'result': result}))\n")
+            orca.chmod(0o755)
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(base / "read.offset"),
+                                         "ORCA_CLI_COMMAND": str(orca), "ORCA_PANE_KEY": "pane-10",
+                                         "ORCA_WORKTREE_ID": "repo1::/w/triage"}), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(inbox_read.main(["read", "--summary"]), 0)
+        self.assertEqual(out.getvalue().splitlines()[:3], [
+            "注意: 11/12 11:00 の定時の回は、この回が動いていたため skipped_precheck になった（11/12 11:02）",
+            "注意: この回の後に 11/12 12:00 の定時の回が始まった（dispatched、11/12 12:08 開始、pane pane-12）。"
+            "既読位置と引き継ぎはその回のもの",
+            "2026-11-12T12:09:00+09:00 info - lane id=abcd1234  経過"])
+
+    def test_read_marks_the_asks_and_questions_the_answer_records_hold(self) -> None:
+        # 11/11 19:20: three asks answered by then were read from --summary as open and put in a handoff.
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            inbox, answers = base / "inbox.jsonl", base / "answers.jsonl"
+            write_jsonl(inbox, [
+                {"id": "aaaa1111", "kind": "ask", "ts": "t1", "worktree": "a", "text": "merge しますか？"},
+                {"id": "bbbb2222", "kind": "ask", "ts": "t2", "worktree": "b", "text": "2 問です",
+                 "questions": [{"header": "merge", "question": "merge しますか？"},
+                               {"header": "base", "question": "base は main ですか？"}]},
+                {"id": "cccc3333", "kind": "ask", "ts": "t3", "worktree": "c", "text": "未回答"}])
+            write_jsonl(answers, [{"id": "aaaa1111", "ts": "2026-11-11T19:15:14+09:00", "how": "send"},
+                                  {"id": "bbbb2222:1", "ts": "2026-11-11T19:20:00+09:00", "how": "answered"}])
+            outputs = {}
+            for mode in ("--summary", "--brief"):
+                with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers),
+                                             "TRIAGE_READ_OFFSET": str(base / "read.offset")}), \
+                        redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(inbox_read.main(["read", mode]), 0)
+                outputs[mode] = out.getvalue().splitlines()
+        summary, brief = outputs["--summary"], outputs["--brief"]
+        self.assertIn("t1 ask - a id=aaaa1111 回答済み（11/11 19:15・send）  merge しますか？", summary)
+        self.assertIn("t2 ask - b id=bbbb2222  2 問です  [質問 2 件: merge（回答済み 11/11 19:20・answered）・base]",
+                      summary)
+        self.assertIn("t3 ask - c id=cccc3333  未回答", summary)
+        self.assertIn("t1 ask - a id=aaaa1111 回答済み（11/11 19:15・send）", brief)
+        self.assertIn("Q1 id=bbbb2222:1 [merge] 回答済み（11/11 19:20・answered） merge しますか？（推奨: None）", brief)
+        self.assertIn("Q2 id=bbbb2222:2 [base] base は main ですか？（推奨: None）", brief)
 
     def test_open_asks_distinguishes_an_old_claim_from_a_question_still_on_screen(self) -> None:
         with tempfile.TemporaryDirectory() as root:
