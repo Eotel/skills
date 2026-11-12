@@ -27,6 +27,28 @@ For `asked --decision`, use the same subject and action across runs, such as
 | Nothing will answer it | `withdraw --id ID --reason-file FILE` closes a question no answer will settle, keeping the reason and time; it is not the user's answer. |
 | User promises “when A settles, give B the task” | Record `promise --from-row A --to-row B --condition CONDITION --task TASK`. Every run checks undelivered promises against the latest A result. When the condition holds, send B the task as the Boundary permits. Record `delivered --id ID --delivery queued` or `--delivery turn_started` once that delivery is confirmed. |
 
+## The triage workspace's comment
+
+The script writes the triage workspace's Orca comment from the state with
+`orca worktree set --worktree path:<workspace> --comment`; do not write it by
+hand. Its first line is 「要判断: 」 and the first line of each question asked
+in that workspace still open, joined with 「／」; its second line is the last
+run's 「HH:MM の定時: <result>」. A line with nothing to show is left out, and
+with neither the comment is cleared.
+
+- `asked` and `asked-many` write it in the workspace of the hourly triage
+  automation, read from Orca in an Orca tab. `--comment` writes it in another
+  workspace, and `--no-comment` skips it.
+- `answered`, `answered-many`, and `withdraw` rewrite the comment of the
+  workspace the question was asked in, once the script has written that
+  comment, so an answer the lead records takes the question off.
+- `comment --result "<what the run did>"` sets the run's line, HH:MM being
+  when this Claude Code session started, and writes the comment. `comment`
+  without `--result` writes it again with the saved line.
+
+A comment Orca did not take is named on stderr; the record stands. `comment`
+then exits 1.
+
 ## User requests and their symptoms
 
 The lead records each new user request with `request-open --original-file FILE

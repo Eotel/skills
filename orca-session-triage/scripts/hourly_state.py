@@ -7,6 +7,11 @@ it atomically, so a waiting session and a new run cannot lose each other's edits
 `stale-asks --from SCAN_JSON` sets each waiting row of a saved scan against the lane's inbox
 reports and the answers answer_evidence.py finds, and names the questions left in front of no one,
 with each wait on the user's own action (`user-wait`) read now the way it was recorded to be checked.
+
+The triage workspace's Orca comment is written from the state: `asked` and `asked-many` (by default in the workspace
+of the hourly triage automation) start it with 「要判断: 」 and the first line of each question asked there still
+open, `answered` and `withdraw` take a settled one off, and `comment --result TEXT` adds the run's line,
+「HH:MM の定時: TEXT」, after them.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import uuid
 
 import answer_evidence
 import hourly_runs
+import hourly_runtime
 import inbox_read
 import lead_decisions
 import scan_sessions
@@ -67,6 +73,9 @@ JST = timezone(timedelta(hours=9))
 ANSWERED_AT = "{answered_at}"
 CLOCK = re.compile(r"(?<![\d:+])([01]?\d|2[0-3]):([0-5])([\dx])(?!\d)")
 ANSWER_CLOCK_SLACK = 10
+# A comment that starts with scan_sessions' decision marker makes the workspace a waiting row.
+DECISION_MARKER = "要判断"
+HEADLINE = 60  # characters of a question's first line in the comment
 
 
 @dataclass(frozen=True)
@@ -404,6 +413,61 @@ def appointed_lead(state: dict) -> Path | None:
     return Path(lead["worktree"]) if lead.get("worktree") else None
 
 
+def hourly_workspace(orca: str, workspace: str) -> bool:
+    """Whether the hourly triage automation runs in the workspace. Outside an Orca tab it is not, and Orca is not
+    asked."""
+    if not os.environ.get("ORCA_PANE_KEY"):
+        return False
+    here = os.path.realpath(workspace)
+    return any(hourly_runtime.workspace_path(automation.get("workspaceId")) == here
+               for automation in hourly_runtime.hourly_automations(orca))
+
+
+def headline(question: str) -> str:
+    first = next((line.strip() for line in question.splitlines() if line.strip()), "")
+    return first[:HEADLINE] + ("…" if len(first) > HEADLINE else "")
+
+
+def workspace_comment(data: dict, workspace: str) -> str:
+    """「要判断: 」 and the headline of each question asked in the workspace still open, in the order recorded, then
+    the line of its last run; either is left out when there is none, so with neither the comment is empty."""
+    asked = [headline(item["question"]) for item in data["questions"].values()
+             if item.get("asked_in") == workspace and item["answer"] is None and not item.get("withdrawn_at")]
+    lines = [f"{DECISION_MARKER}: " + "／".join(asked)] if asked else []
+    run = data["comments"].get(workspace, {}).get("run")
+    return "\n".join([*lines, *([run] if run else [])])
+
+
+def write_comment(orca: str, workspace: str, text: str) -> str | None:
+    """Set the workspace's Orca comment (an empty text clears it); None once Orca took it, else why it did not."""
+    try:
+        hourly_runtime.orca_result(orca, "worktree", "set", "--worktree", f"path:{workspace}", "--comment", text)
+    except READ_ERRORS as error:
+        said = " ".join(str(getattr(error, "stderr", "") or "").split())
+        return f"作業場 {workspace} の Orca のコメントを書けなかった: {error}{f'（{said[:200]}）' if said else ''}"
+    return None
+
+
+def session_record() -> Path:
+    """This Claude Code session's record, which names the session and when it started."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
+    return config / "sessions" / f"{os.environ.get('CLAUDE_PID', '')}.json"
+
+
+def run_line(result: str) -> tuple[str, str | None]:
+    """「HH:MM の定時: RESULT」 at the local time this session started, and, when its record cannot be read, why the
+    time is now's instead."""
+    text = " ".join(result.split())
+    if not text:
+        raise ValueError("--result is empty")
+    record = session_record()
+    try:
+        started, why = datetime.fromtimestamp(json.loads(record.read_text(encoding="utf-8"))["startedAt"] / 1000), None
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as error:
+        started, why = datetime.now(), f"回の始まりを {record} から読めず、今の時刻で書いた: {error!r}"
+    return f"{started:%H:%M} の定時: {text}", why
+
+
 def row_question(row: dict, final: dict) -> str:
     # The question --row shows, then what a scan saved before marker_question existed leaves.
     if question := scan_sessions.row_question(row).strip():
@@ -625,14 +689,17 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
 
 def read(path: Path) -> dict:
     if not path.exists():
-        return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}, "user_waits": {}}
+        return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}, "user_waits": {},
+                "comments": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1 or any(
             not isinstance(data.get(key), dict) for key in ("left", "questions", "handoffs")) or any(
-                not isinstance(data.get(key, {}), dict) for key in ("requests", "user_waits")):
+                not isinstance(data.get(key, {}), dict) for key in ("requests", "user_waits", "comments")):
         raise ValueError(f"invalid hourly state: {path}")
     data.setdefault("requests", {})
     data.setdefault("user_waits", {})
+    # By workspace whose Orca comment this script writes: {"run": the line of its last run, or None}.
+    data.setdefault("comments", {})
     return data
 
 
@@ -1461,6 +1528,21 @@ def main(argv: list[str] | None = None) -> int:
     delivered = commands.add_parser("delivered", help="mark a promised task sent to its lane")
     delivered.add_argument("--id", required=True)
     delivered.add_argument("--delivery", required=True, choices=("queued", "turn_started"))
+    comment = commands.add_parser(
+        "comment", help="write this workspace's Orca comment from the state: 「要判断: 」 and the first line of each "
+                        "question asked here still open, then the run's line; exit 1 when Orca does not take it")
+    comment.add_argument("--result", help="what this run did: the run's line becomes 「HH:MM の定時: RESULT」, HH:MM "
+                                          "the local time this Claude Code session started; without it the saved "
+                                          "line stays")
+    for command in (asked, asked_many):
+        command.add_argument("--comment", action=argparse.BooleanOptionalAction,
+                             help="write the asking workspace's Orca comment as `comment` does (default: in the "
+                                  "workspace of the hourly triage automation, read from an Orca tab)")
+    for command in (asked, asked_many, answered, answered_many, withdraw, comment):
+        command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                             help="Orca CLI that writes the comment (default: $ORCA_CLI_COMMAND or orca); answered "
+                                  "and withdraw rewrite the comment of the workspace the question was asked in, "
+                                  "once this script has written it")
     args = parser.parse_args(argv)
     path = Path(args.state_file).expanduser()
     if args.action == "stale-asks":
@@ -1519,6 +1601,16 @@ def main(argv: list[str] | None = None) -> int:
                  if args.action in ("asked-many", "answered-many") else "")
         notices: list[str] = []  # printed on stderr after the output
         skipped = False
+        here = str(worktree())
+        comment_here: bool = args.action == "comment"
+        if args.action in ("asked", "asked-many"):
+            comment_here = args.comment
+            if comment_here is None:
+                try:
+                    comment_here = hourly_workspace(args.orca, here)
+                except READ_ERRORS as error:
+                    comment_here = False
+                    notices.append(f"定時の作業場かを Orca から読めず、Orca のコメントを書いていない: {error}")
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
             read_only = ("show", "get", "pending", "left-now", "requests-needing-owner")
             writes = args.action not in read_only or intake is not None
@@ -1561,11 +1653,29 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "answered-many":
                 result = record_lines(checked_lines(given, answering_line),
                                       lambda answering: record_answer(data, answering))
+            elif args.action == "comment":
+                entry = data["comments"].setdefault(here, {"run": None})
+                if args.result is not None:
+                    entry["run"], why = run_line(args.result)
+                    notices.extend([why] if why else [])
+                view: dict[str, Any] = {"workspace": here, "comment": workspace_comment(data, here)}
+                result = view
             else:
                 result = data if args.action == "show" else change(data, args)
+            items = result if isinstance(result, list) else [result]
+            # A question answered or withdrawn from another tab (the lead's) rewrites the comment of the workspace it
+            # was asked in, once this script writes that comment.
+            commented = ([item["asked_in"] for item in items if item.get("asked_in") in data["comments"]]
+                         if args.action in ("answered", "answered-many", "withdraw") else [here] if comment_here else [])
+            for workspace in commented:
+                data["comments"].setdefault(workspace, {"run": None})
             if writes:
                 save(path, data)
-        items = result if isinstance(result, list) else [result]
+            for workspace in dict.fromkeys(commented):
+                if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
+                    if args.action == "comment":
+                        raise ValueError(why)
+                    notices.append(why + "。記録は済んでいる。その作業場で hourly_state.py comment を実行して書き直す")
         if args.action in ("asked", "asked-many"):
             notices[:0] = [f"注意: {found['issue']} を閉じる・名指しする PR が、問いの根拠（{found['since'] or '時刻不明'}）"
                            "の後に merge されています: " + "、".join(f"{pr['pr']} {pr['merged_at']}" for pr in found["prs"])
