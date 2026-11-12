@@ -5,8 +5,11 @@
 byte position to `ack`; only a read without --kind, --source, --id, --since, or --text
 prints it, so an entry a filter hid is never acknowledged. `read --text WORD` searches every
 entry's whole text, before or after the cursor, and prints each match's header with the lines
-holding WORD. `initialize` starts a new cursor at the current end only after the lead has
-handled all existing inbox entries.
+holding WORD. Every read marks an ask, or one of its questions, the answer records hold
+「回答済み（MM/DD HH:MM・how）」. In a scheduled run's tab, `read` first prints a 「注意:」 line for each
+scheduled run of the workspace due after this one that began, or that the precheck skipped because this run
+was still working: the later run owns the cursor and the handoff. `initialize` starts a new cursor at the
+current end only after the lead has handled all existing inbox entries.
 `watch` is the lead's Monitor: it prints every new ask and done, advances its own
 cursor, and names each ask left unanswered for 15 minutes.
 
@@ -32,8 +35,8 @@ the batch and lists them under `claimed`, so another tab does not ask them again
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import fcntl
@@ -145,6 +148,8 @@ class ReadOptions:
     ids: frozenset[str] | None = None
     since: datetime | None = None
     text: str | None = None
+    # The answer records (answer_records), by id: the asks and questions shown marked 回答済み.
+    answers: Mapping[str, dict] = field(default_factory=dict)
 
     @property
     def filtered(self) -> bool:
@@ -246,28 +251,38 @@ def source_of(item: dict) -> str:
     return f"{item['repo']}/{worktree}" if item.get("repo") else worktree
 
 
-def asked_questions(item: dict) -> list[dict]:
-    return [question for question in questions_of(item) if isinstance(question, dict)]
+def question_note(item: dict, number: int, answers: Mapping[str, dict]) -> str:
+    return answer_note(answers.get(f"{item.get('id')}:{number}"))
 
 
-def summary_line(item: dict) -> str:
+def summary_line(item: dict, answers: Mapping[str, dict] | None = None) -> str:
     """`<ts> <kind> <host> <source> id=<id>  <first 160 characters>`, as `read --summary` prints an entry,
-    then the headers of an ask's structured questions."""
+    then the headers of an ask's structured questions; an ask or question `answers` holds is marked 回答済み."""
+    answers = answers or {}
     label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
-    location = source_of(item) + (f" id={item['id']}" if item.get("id") else "")
+    location = entry_location(item, answers)
     compact = " ".join((item.get("text") or "").split())
-    asked = asked_questions(item)
-    headers = f"  [質問 {len(asked)} 件: {'・'.join(str(q.get('header')) for q in asked)}]" if asked else ""
+    asked = [str(question.get("header")) + (f"（回答済み {note}）" if (note := question_note(item, number, answers)) else "")
+             for number, question in enumerate(questions_of(item), 1) if isinstance(question, dict)]
+    headers = f"  [質問 {len(asked)} 件: {'・'.join(asked)}]" if asked else ""
     return f"{label} {location}  {compact[:160]}" + ("…" if len(compact) > 160 else "") + headers
 
 
-def full_text(item: dict) -> str:
-    """An entry's text, then each structured question with the id that answers it (`send --ask <id>:<n>`)."""
+def entry_location(item: dict, answers: Mapping[str, dict]) -> str:
+    """The entry's source and id, then 回答済み when `answers` holds the whole ask."""
+    note = answer_note(answers.get(item["id"])) if item.get("id") else ""
+    return source_of(item) + (f" id={item['id']}" if item.get("id") else "") + (f" 回答済み（{note}）" if note else "")
+
+
+def full_text(item: dict, answers: Mapping[str, dict] | None = None) -> str:
+    """An entry's text, then each structured question with the id that answers it (`send --ask <id>:<n>`), marked
+    回答済み when `answers` holds it."""
     lines = [item.get("text") or ""]
     for number, question in enumerate(questions_of(item), 1):
         if not isinstance(question, dict):
             continue
-        label = f"Q{number} id={item.get('id')}:{number} [{question.get('header')}]"
+        note = question_note(item, number, answers or {})
+        label = f"Q{number} id={item.get('id')}:{number} [{question.get('header')}]" + (f" 回答済み（{note}）" if note else "")
         asked = f"{question.get('question')}（推奨: {question.get('recommended')}）"
         # The context (what the work is and what choosing does) comes before the question it explains.
         lines.extend((f"{label} {question['context']}", f"  {asked}") if question.get("context")
@@ -279,9 +294,9 @@ def full_text(item: dict) -> str:
     return "\n".join(lines)
 
 
-def entry_header(item: dict) -> str:
+def entry_header(item: dict, answers: Mapping[str, dict] | None = None) -> str:
     label = " ".join(str(item.get(key) or "-") for key in ("ts", "kind", "host"))
-    return f"{label} {source_of(item)}" + (f" id={item['id']}" if item.get("id") else "")
+    return f"{label} {entry_location(item, answers or {})}"
 
 
 def near_sources(entries: list[dict], wanted: str) -> list[str]:
@@ -314,14 +329,14 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
             if not shown_by_filters(item, options):
                 continue
             if options.summary:
-                print(summary_line(item))
+                print(summary_line(item, options.answers))
                 shown += 1
                 continue
-            body = full_text(item)
+            body = full_text(item, options.answers)
             if options.brief and item.get("kind") == "info":
                 compact = " ".join(body.split())
                 body = compact[:160] + ("…" if len(compact) > 160 else "")
-            print(f"{entry_header(item)}\n{body}\n")
+            print(f"{entry_header(item, options.answers)}\n{body}\n")
             shown += 1
         except (ValueError, TypeError, AttributeError):
             if not options.filtered:
@@ -368,10 +383,10 @@ def read_text(inbox: Path, cursor: Path, options: ReadOptions) -> None:
     stands: its header, acknowledged ones marked 既読, then every line holding it."""
     wanted, found = (options.text or "").casefold(), False
     for _, acknowledged, item in placed_entries(inbox, cursor, options):
-        hits = [line for line in full_text(item).splitlines() if wanted in line.casefold()]
+        hits = [line for line in full_text(item, options.answers).splitlines() if wanted in line.casefold()]
         if hits:
             found = True
-            print(f"{entry_header(item)}{' 既読' if acknowledged else ''}\n" + "\n".join(hits) + "\n")
+            print(f"{entry_header(item, options.answers)}{' 既読' if acknowledged else ''}\n" + "\n".join(hits) + "\n")
     if not found:
         print(f"inbox-read: no entry holds {options.text}", file=sys.stderr)
 
@@ -394,7 +409,7 @@ def read_ids(inbox: Path, cursor: Path, options: ReadOptions) -> None:
     if missing:
         raise ValueError("no entry has id " + ",".join(missing))
     for _, acknowledged, item in sorted({placed.end: placed for found in hits.values() for placed in found}.values()):
-        print(f"{entry_header(item)}{' 既読' if acknowledged else ''}\n{full_text(item)}\n")
+        print(f"{entry_header(item, options.answers)}{' 既読' if acknowledged else ''}\n{full_text(item, options.answers)}\n")
 
 
 def inbox_entries(inbox: Path) -> list[dict]:
@@ -411,18 +426,34 @@ def inbox_entries(inbox: Path) -> list[dict]:
     return entries
 
 
-def answered_ids(path: Path) -> frozenset[str]:
+def answer_records(path: Path) -> dict[str, dict]:
+    """The first answer record of each id (an ask, or `<ask id>:<n>`), in the order they were recorded."""
     if not path.exists():
-        return frozenset()
-    found = set()
+        return {}
+    found: dict[str, dict] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
         except ValueError:
             continue
         if isinstance(record, dict) and isinstance(record.get("id"), str):
-            found.add(record["id"])
-    return frozenset(found)
+            found.setdefault(record["id"], record)
+    return found
+
+
+def answered_ids(path: Path) -> frozenset[str]:
+    return frozenset(answer_records(path))
+
+
+def answer_note(record: dict | None) -> str:
+    """「MM/DD HH:MM・how」 at the time the record gives, as it was recorded; empty without a record."""
+    if record is None:
+        return ""
+    try:
+        when = datetime.fromisoformat(str(record.get("ts"))).strftime("%m/%d %H:%M")
+    except ValueError:
+        when = str(record.get("ts") or "-")
+    return f"{when}・{record.get('how') or '-'}"
 
 
 def asked_at(item: dict) -> datetime | None:
@@ -784,6 +815,16 @@ def owner_line(run: dict) -> str:
         return f"pane {run.get('terminalPaneKey') or '-'}, {run.get('status') or '-'}; transcript unread: {error}"
 
 
+def later_run_notes(orca: str, tool: str) -> list[str]:
+    """A line for each scheduled run due after this tab's run that began, or that the precheck skipped for it
+    (hourly_runtime.later_runs); when Orca cannot be read, none, and why on stderr under the tool's name."""
+    try:
+        return [hourly_runtime.later_run_note(run) for run in hourly_runtime.later_runs(orca)]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        print(f"{tool}: 後の定時の回を Orca から読めなかった: {error}", file=sys.stderr)
+        return []
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -871,7 +912,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "read":
             source = SourceFilter.of(args.source, inbox_entries(inbox)) if args.source is not None else None
             options = ReadOptions(brief=args.brief, kinds=args.kind, source=source, summary=args.summary,
-                                  ids=args.ids, since=args.since, text=args.text)
+                                  ids=args.ids, since=args.since, text=args.text,
+                                  answers=answer_records(answers_path()))
+            for note in later_run_notes(os.environ.get("ORCA_CLI_COMMAND", "orca"), "inbox-read"):
+                print(note)
             (read_ids if args.ids else read_text if args.text is not None else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":

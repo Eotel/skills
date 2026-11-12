@@ -15,7 +15,12 @@ the exact text, kind, keys, time, and NEXT_OFFSET; `last` prints the newest.
 `send` does not send, and prints why, while a report another tab of this workspace sent (another
 scheduled run: after the Mac sleeps, several run at once) or an answer to an ask the body names
 (by its first 8 characters or more) reached the inbox or the answer records after --since; read them
-and fix the body, or pass --force to send it as written.
+and fix the body, then pass --seen ID for each one the body now reflects (a report's id, an answer's ask id, or
+their first 8 characters or more). It does not send either while a scheduled run of this workspace due after this
+tab's run began, or the precheck skipped one because this run was still working, and prints that run's time and
+pane: the later run owns the read position and the handoff. --force sends past every check as written.
+`search WORD...` prints each kept handoff whose text or decision keys hold any of the words (case ignored): its
+time, kind, and file, then the matching lines and keys.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
 latest message of its own (also while a turn runs or after an API error such as a usage limit ended it),
@@ -39,7 +44,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import answer_evidence
 import inbox_read
@@ -142,13 +147,20 @@ def late_reports(reports: list[dict]) -> list[str]:
             f"{report_head(item)}  {excerpt(item.get('text'))}" for item in reports]
 
 
+class Reason(NamedTuple):
+    """Something `send` will not send past: the id `--seen` names it by, and the line it prints."""
+    id: str
+    line: str
+
+
 def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_read.Sender, handle: str,
-              answers: Path) -> list[str]:
+              answers: Path) -> list[Reason]:
     """What reached the inbox or the answer records after `since` that the handoff may repeat or contradict:
     each report another tab of this workspace sent (`handle` is this tab's), and each answer recorded since then
     to an ask the body names by its first 8 characters or more."""
-    found = [f"{report_head(item)} (another tab of this workspace: {item.get('handle') or '-'})  "
-             f"{excerpt(item.get('text'))}" for item in after if sender.sent(item) and item.get("handle", "") != handle]
+    found = [Reason(str(item.get("id") or ""), f"{report_head(item)} (another tab of this workspace: "
+                    f"{item.get('handle') or '-'})  {excerpt(item.get('text'))}")
+             for item in after if sender.sent(item) and item.get("handle", "") != handle]
     named = {item["id"] for item in [*before, *after] if item.get("kind") == "ask" and isinstance(item.get("id"), str)
              and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
     read_at = max(filter(None, (scan_sessions.parse_time(item.get("ts")) for item in before)), default=None)
@@ -159,9 +171,37 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
     for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
         if ask in named and (read_at is None or at is None or at > read_at):
-            found.append(f"- answered {record['id']} at {record.get('ts') or '-'} ({record.get('how') or '-'})  "
-                         f"{excerpt(record.get('note'))}")
+            found.append(Reason(str(record["id"]), f"- answered {record['id']} at {record.get('ts') or '-'} "
+                                f"({record.get('how') or '-'})  {excerpt(record.get('note'))}"))
     return found
+
+
+def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
+    """The lines of the reasons no --seen value names (inbox_read.names: an exact id or an 8+ character prefix)."""
+    return [reason.line for reason in reasons if not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
+
+
+def search(directory: Path, words: list[str], since: datetime | None) -> int:
+    """Print each kept handoff sent at or after `since` whose text or decision keys hold a word, oldest first."""
+    folded = [word.casefold() for word in words]
+    found = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            saved = SavedHandoff(**json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError) as error:
+            print(f"handoff: skipped a damaged saved handoff {path}: {error}", file=sys.stderr)
+            continue
+        sent = scan_sessions.parse_time(saved.sent_at)
+        if since is not None and (sent is None or sent < since):
+            continue
+        hits = [*(f"  {line}" for line in saved.text.splitlines() if any(word in line.casefold() for word in folded)),
+                *(f"  決定キー: {key}" for key in saved.decisions if any(word in key.casefold() for word in folded))]
+        if hits:
+            found += 1
+            print(f"{saved.sent_at} {saved.kind} {path}", *hits, sep="\n")
+    if not found:
+        print(f"handoff: no kept handoff in {directory} holds {' or '.join(words)}", file=sys.stderr)
+    return 0
 
 
 def lead_claude(projects: Path, worktree: str) -> dict | None:
@@ -294,12 +334,18 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
         raise ValueError(f"empty handoff: {args.body_file}")
     inbox = args.inbox.expanduser()
     before, after, end = inbox_around(inbox, args.since)
-    if not args.force and (found := overtaken(body, before, after, sender,
-                                              os.environ.get("ORCA_TERMINAL_HANDLE", ""), inbox_read.answers_path())):
+    if not args.force and (later := inbox_read.later_run_notes(args.orca, "handoff")):
+        print("handoff: not sent: a later scheduled run of this workspace began, or was skipped because this run was "
+              "still working. Leave the handoff to the run that owns the read position; --force sends it as written:",
+              *later, sep="\n", file=sys.stderr)
+        return 1
+    found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
+                      inbox_read.answers_path())
+    if not args.force and (left := unseen(found, args.seen)):
         print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
-              "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; --force sends it "
-              "as written:",
-              *found, sep="\n", file=sys.stderr)
+              "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; then pass --seen ID "
+              "for each one the body reflects, or --force to send it as written:",
+              *left, sep="\n", file=sys.stderr)
         return 1
     reports = late_reports(after)
     facts = ["—— 送る直前に道具が足した事実 ——",
@@ -366,9 +412,14 @@ def main(argv: list[str] | None = None) -> int:
                               help="a handed-off question's key, as given to lead_decisions.py; repeat per question")
     send_command.add_argument("--decision-ask", action="append", default=[], metavar="KEY=ID",
                               help="bind a --decision key to an inbox ask id; repeat per key")
+    send_command.add_argument("--seen", action="append", default=[], metavar="ID",
+                              help="a report or answered ask the body already reflects, by its id or first 8+ "
+                                   "characters, taken off the reasons not to send; repeat per id")
     send_command.add_argument("--force", action="store_true",
-                              help="send even though another tab of this workspace reported, or an ask the body "
-                                   "names was answered, after --since")
+                              help="send past every check: a later scheduled run, another tab's reports, and "
+                                   "answers to the asks the body names")
+    send_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                              help="Orca CLI executable that lists the later scheduled runs (default: %(default)s)")
     send_command.add_argument("--kind", choices=("ask", "info"), default="ask",
                               help="triage-notify kind (default: ask)")
     send_command.add_argument("--inbox", type=Path, default=Path(os.environ.get("TRIAGE_INBOX") or INBOX),
@@ -380,8 +431,17 @@ def main(argv: list[str] | None = None) -> int:
     send_command.add_argument("--notify", default=NOTIFY, help="triage-notify executable (default: %(default)s)")
     commands.add_parser("last", parents=[kept],
                         help="print the newest kept handoff: its time, kind, NEXT_OFFSET, keys, then its text")
+    search_command = commands.add_parser(
+        "search", parents=[kept],
+        help="print each kept handoff whose text or decision keys hold any WORD (case ignored): its time, kind, and "
+             "file, then the matching lines and keys")
+    search_command.add_argument("words", nargs="+", metavar="WORD")
+    search_command.add_argument("--since", type=inbox_read.since_time,
+                                help="only handoffs sent at or after this ISO time or most recent local HH:MM")
     args = parser.parse_args(argv)
     try:
+        if args.action == "search":
+            return search(args.handoffs_dir.expanduser(), args.words, args.since)
         if args.action == "last":
             path, handoff = SavedHandoff.newest(args.handoffs_dir.expanduser())
             print(handoff.shown(path))
