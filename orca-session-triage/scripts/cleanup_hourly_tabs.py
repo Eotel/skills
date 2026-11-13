@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 import hourly_runtime
@@ -207,8 +208,9 @@ def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes:
         problems.append("title is spinning")
     if screen.get("source") != "screen":
         problems.append("rendered screen unavailable")
-    if scan_sessions.has_draft(screen):
-        problems.append("unsent draft")
+    if scan_sessions.has_draft(screen) and scan_sessions.composer_empty(screen) is not True:
+        problems.append(f"unsent draft: draft_text={scan_sessions.draft_excerpt(screen)!r}, "
+                        f"composer_empty={scan_sessions.composer_empty(screen)}")
     tail = screen.get("tail") or []
     lines = tail if isinstance(tail, list) else tail.splitlines()
     visible = "\n".join(lines[-15:])
@@ -233,6 +235,61 @@ def no_pending_questions(state_file: Path, pane: str) -> bool:
         for question in questions.values())
 
 
+def worktree_page(orca: str) -> dict:
+    try:
+        return hourly_runtime.orca_result(orca, "worktree", "ps")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        time.sleep(2)
+        return hourly_runtime.orca_result(orca, "worktree", "ps")
+
+
+def settled_selector(state_file: Path, pane: str, transcript: Path, screen: dict) -> bool:
+    """Only dismiss a visible AskUserQuestion with a complete, settled record of its batch."""
+    import hourly_state
+
+    prompt = scan_sessions.question_prompt(screen, pane)
+    if screen.get("source") != "screen" or not prompt or scan_sessions.permission_prompt(screen, pane):
+        return False
+    if not state_file.exists():
+        return False
+    records = [item for item in json.loads(state_file.read_text())["questions"].values()
+               if item.get("owner_pane") == pane and item.get("session") in (None, transcript.stem)]
+    pending = [(asked, taken, left) for asked, taken, left in hourly_state.paired_calls(records, transcript)
+               if not asked[0].result_received]
+    return bool(pending) and all(
+        not left and len(taken) == len(asked)
+        and all(item.get("answer") is not None or item.get("withdrawn_at") for item in taken)
+        for asked, taken, left in pending) and any(
+            question.question and question.question in prompt["question"]
+            for asked, _, _ in pending for question in asked)
+
+
+def dismiss_settled(args: argparse.Namespace, term: dict, pane: str) -> dict | None:
+    """Dismiss once, send the settlement, then require the completed turn and a fresh idle screen."""
+    handle = term["handle"]
+    hourly_runtime.orca_result(args.orca, "terminal", "send", "--terminal", handle, "--text", "\x1b")
+    read = hourly_runtime.orca_result(args.orca, "terminal", "read", "--terminal", handle, "--screen")
+    screen = read.get("terminal") or read
+    if screen.get("source") != "screen" or scan_sessions.composer_empty(screen) is not True:
+        return None
+    sent = hourly_runtime.orca_result(args.orca, "terminal", "send", "--terminal", handle,
+                                      "--text", "別のタブで答え済み", "--enter", "--wait-submit", "10")
+    if "turn_started" not in (sent.get("prompt") or {}).get("stages", []):
+        return None
+    hourly_runtime.orca_result(args.orca, "terminal", "wait", "--terminal", handle,
+                               "--for", "tui-idle", "--timeout-ms", "20000")
+    page = worktree_page(args.orca)
+    agents = [agent for row in page["worktrees"]
+              if os.path.realpath(row["path"]) == os.path.realpath(args.workspace)
+              for agent in row.get("agents") or []
+              if agent.get("paneKey") == pane or agent.get("parentPaneKey") == pane]
+    if not agents or any(agent.get("state") != "done" or (agent.get("mainAgent") or {}).get("state") != "done"
+                         for agent in agents) or not no_pending_questions(args.state_file, pane):
+        return None
+    read = hourly_runtime.orca_result(args.orca, "terminal", "read", "--terminal", handle, "--screen")
+    return read.get("terminal") or read
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", default=hourly_runtime.workspace_path(
@@ -250,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runs = hourly_runtime.scheduled_runs(args.orca, args.workspace)
         terminals = hourly_runtime.orca_result(args.orca, "terminal", "list")["terminals"]
-        page = hourly_runtime.orca_result(args.orca, "worktree", "ps")
+        page = worktree_page(args.orca)
         row = next((row for row in page["worktrees"]
                     if os.path.realpath(row["path"]) == os.path.realpath(args.workspace)), None)
         if row is None:
@@ -274,8 +331,19 @@ def main(argv: list[str] | None = None) -> int:
             screen = read.get("terminal") or read
             problems = close_blockers(term, transcript, screen, args.min_idle_minutes,
                                       datetime.now(timezone.utc))
+            selector_blockers = {"unanswered conversation question", "screen shows active input or work",
+                                 "empty composer is not visible"}
+            if (problems and not (set(problems) - selector_blockers)
+                    and settled_selector(args.state_file, run["terminalPaneKey"], transcript, screen)):
+                screen = dismiss_settled(args, term, run["terminalPaneKey"])
+                if screen is None:
+                    print(f"keep: {label}: settlement sent or selector dismissed; idle turn not confirmed")
+                    continue
+                problems = close_blockers(term, transcript, screen, 0, datetime.now(timezone.utc))
             if problems:
-                print(f"keep: {label}: " + "; ".join(problems))
+                print(f"keep: {label}: " + "; ".join(problems)
+                      + f" | draft_text={scan_sessions.draft_excerpt(screen)!r}, "
+                        f"composer_empty={scan_sessions.composer_empty(screen)}")
                 continue
             final_text, _, final_at = latest_exchange(transcript)
             when = scan_sessions.parse_time(final_at)
@@ -285,7 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
             print(f"closed: {term['handle']}: {run['status']} scheduled run, idle transcript and empty composer")
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        print(f"keep: could not verify previous tabs: {error}")
+        detail = error.stderr if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        print(f"keep: could not verify previous tabs: {detail.strip()}")
         return 1
     return 0
 

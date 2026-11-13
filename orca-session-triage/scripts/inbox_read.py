@@ -54,6 +54,7 @@ from typing import Literal, NamedTuple, cast
 
 import answer_evidence
 import hourly_runtime
+import json_output
 
 
 ReportKind = Literal["ask", "done", "info"]
@@ -866,6 +867,8 @@ def main(argv: list[str] | None = None) -> int:
                                    "age_minutes} instead; open_questions holds each unanswered question's "
                                    "number, header, question, options, and recommended")
     open_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"))
+    open_command.add_argument("--out", type=Path, metavar="FILE",
+                              help="atomically write JSON to FILE instead of stdout (implies --json)")
     open_command.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                               help="transcripts used to check whether a claimed question is still being asked")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
@@ -968,10 +971,10 @@ def main(argv: list[str] | None = None) -> int:
                 order = [question.id for question in pending_questions(open_asks(entries, frozenset()))]
                 print(json.dumps(question_batch(pending_questions(asks), args.after, order, claims),
                                  ensure_ascii=False, indent=2))
-            elif args.json:
+            elif args.json or args.out:
                 claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 asks = close_held_notices(asks, answers_path())
-                print(json.dumps([open_ask_view(ask, now, claims) for ask in asks], ensure_ascii=False, indent=2))
+                json_output.emit([open_ask_view(ask, now, claims) for ask in asks], args.out)
             else:
                 claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 for ask in close_held_notices(asks, answers_path()):

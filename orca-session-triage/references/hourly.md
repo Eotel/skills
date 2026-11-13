@@ -139,13 +139,39 @@ by hand.
 ## In the run
 
 At the start, run
-`~/.claude/skills/orca-session-triage/scripts/cleanup_hourly_tabs.py`.
-This checks Orca's run, terminal and agent records before closing previous
+`~/.claude/skills/orca-session-triage/scripts/hourly_read.py`.
+It runs cleanup, lead-state, open-asks, unanswered decisions, pending hourly
+state, the last handoff, scan, backlog-watch, Asana status, and topic checks in
+parallel. After a successful scan it runs stale-asks against that scan. Each
+invocation prints its unique directory under `~/.cache/orca-session-triage/reads`
+and writes `results.json` there with every command, exit code, stdout, stderr,
+and successful JSON result path. Read the files directly, including when the
+command ran in the background; terminal completion messages are not JSON.
+An error or timeout in one command leaves the other reads available. A failed
+scan skips stale-asks. Inspect every nonzero or skipped exit status before
+using the results. `--help` lists workspace, output, and timeout options.
+
+For an individual read, `inbox_read.py open-asks --out FILE`,
+`handoff.py lead-state --out FILE`, and `hourly_state.py stale-asks --from
+SCAN_JSON --out FILE` publish complete JSON atomically without stdout.
+`open-asks --out` implies JSON. `stale-asks --summary` is a separate text mode.
+
+`cleanup_hourly_tabs.py` checks Orca's run, terminal and agent records before closing previous
 scheduled tabs. It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
 latest conversation has an unanswered AskUserQuestion or no final message, its
 transcript is missing or active within five minutes, or its rendered screen
-shows a draft or a nonempty input field. Before closing a tab, it prints each
+shows a draft or a nonempty input field. A rendered `composer_empty: true`
+overrides Orca's stale draft; a tab kept after a screen read shows `draft_text`
+and `composer_empty`. A failed `worktree ps` is retried once after two seconds;
+a second failure keeps the tabs and prints Orca's stderr.
+When the only blockers are an old AskUserQuestion selector and its missing
+final message, cleanup checks the entire batch against hourly state. Only when
+every question is recorded and answered or withdrawn does it send Esc and
+「別のタブで答え済み」. It then requires a started and ended response, idle agent
+state, settled questions, and a fresh empty composer before closing. A missing
+record or unconfirmed response keeps the tab.
+Before closing a tab, it prints each
 line of its final message that asks the user something as
 `carry: HANDLE: LINE`; add each to this run's list of what awaits the user
 (the handoff, when another tab leads). When Orca has no provider session ID,

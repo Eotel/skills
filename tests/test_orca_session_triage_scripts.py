@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from email.message import Message
 from types import ModuleType
-from typing import Literal, NotRequired, TypedDict, Unpack
+from typing import Literal, NotRequired, TextIO, TypedDict, Unpack
 
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -22,7 +22,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from threading import Event
+from threading import Barrier, Event
 import time
 import unittest
 from unittest.mock import patch
@@ -4795,6 +4795,122 @@ class HandoffProposalTests(unittest.TestCase):
 
 
 class HourlyStateTests(unittest.TestCase):
+    def test_hourly_reads_publish_complete_json_files_without_stdout(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text("[]")
+        (self.root / "inbox.jsonl").write_text("")
+        orca_replies: dict[tuple[str, ...], dict] = {
+                       ("worktree", "ps"): {"worktrees": [{"path": "/w/lead", "agents": []}]},
+                       ("terminal", "list"): {"terminals": []}}
+        def orca(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if args[0] == "ps":
+                return subprocess.CompletedProcess(args, 0, "")
+            return subprocess.CompletedProcess(args, 0, json.dumps({"result": orca_replies[tuple(args[1:-1])]}))
+        commands = [(hourly_state.main, ["--state-file", str(self.state), "stale-asks", "--from", str(saved)]),
+                    (inbox_read.main, ["open-asks"]),
+                    (handoff.main, ["lead-state", "--lead-worktree", "/w/lead", "--orca", "fake-orca",
+                                    "--claude-projects", str(self.root / "projects"),
+                                    "--handoffs-dir", str(self.root / "handoffs")])]
+        for main, args in commands:
+            destination = self.root / "output" / "read.json"
+            destination.parent.mkdir(exist_ok=True)
+            destination.write_text('{"previous": true}')
+            published = []
+            replace = os.replace
+            def publish(source: str, target: str) -> None:
+                self.assertEqual(json.loads(destination.read_text()), {"previous": True})
+                published.append(json.loads(Path(source).read_text()))
+                replace(source, target)
+            with self.subTest(command=args), patch("subprocess.run", side_effect=orca), \
+                    patch("os.replace", side_effect=publish), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(main([*args, "--out", str(destination)]), 0)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(published, [json.loads(destination.read_text())])
+            self.assertEqual(list(destination.parent.iterdir()), [destination])
+            destination.write_text('{"previous": true}')
+            with self.subTest(write_failure=args), patch("subprocess.run", side_effect=orca), \
+                    patch("os.replace", side_effect=OSError("fixture disk error")), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(main([*args, "--out", str(destination)]), 1)
+            self.assertEqual(json.loads(destination.read_text()), {"previous": True})
+            self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_answers_to_withdrawn_questions_name_replacement_and_do_not_discard_other_answers(self) -> None:
+        message = self.source("question.txt", "公開しますか？")
+        reason = self.source("reason.txt", "選択肢が変わった")
+        answer = self.source("answer.txt", "公開する")
+        def ask(decision: str) -> dict:
+            return self.call("asked", "--row", "/w/lane", "--decision", decision,
+                             "--final-message-file", message, "--question-file", message)[1]
+        old, new, other = ask("old"), ask("new"), ask("other")
+        self.call("withdraw", "--id", old["id"], "--reason-file", reason, "--replaced-by", new["id"])
+        code, shown, err = self.run_main("answered", "--id", old["id"], "--answer-file", answer)
+        self.assertEqual(code, 2)
+        self.assertIn(new["id"], err)
+        self.assertEqual(json.loads(shown)["replaced_by"], new["id"])
+        lines = self.source("answers.jsonl", "".join(json.dumps({"id": item["id"], "answer": "公開する"}) + "\n"
+                                                    for item in (old, other)))
+        code, shown, err = self.run_main("answered-many", "--file", lines)
+        self.assertEqual(code, 2)
+        self.assertIn(new["id"], err)
+        self.assertEqual(json.loads(shown)[1]["answer"], "公開する")
+        questions = self.call("show")[1]["questions"]
+        self.assertIsNone(questions[old["id"]]["answer"])
+        self.assertIsNone(questions[new["id"]]["answer"])
+        self.assertEqual(questions[other["id"]]["answer"], "公開する")
+
+    def test_asked_and_asked_many_create_a_fresh_question_after_withdrawal(self) -> None:
+        message = self.source("question.txt", "公開しますか？")
+        reason = self.source("reason.txt", "問いを出し直す")
+        args = ["--row", "/w/lane", "--decision", "publish", "--final-message-file", message,
+                "--question-file", message]
+        _, first = self.call("asked", *args)
+        self.call("withdraw", "--id", first["id"], "--reason-file", reason)
+        _, second = self.call("asked", *args)
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertNotIn("withdrawn_at", second)
+        self.assertEqual(self.call("asked", *args)[1]["id"], second["id"])
+        self.call("withdraw", "--id", second["id"], "--reason-file", reason)
+        lines = self.source("asked.jsonl", json.dumps({"row": "/w/lane", "decision": "publish",
+                            "final_message": "公開しますか？", "question": "公開しますか？"}) + "\n")
+        code, (third,) = self.call("asked-many", "--file", lines)
+        self.assertEqual(code, 0)
+        self.assertNotIn(third["id"], (first["id"], second["id"]))
+        self.assertEqual(len(self.call("show")[1]["questions"]), 3)
+
+    def test_stale_asks_runs_a_user_wait_command_again_and_omits_completed_waits(self) -> None:
+        message = self.source("wait.txt", "登録を済ませる")
+        ready = self.root / "ready file"
+        saved = self.root / "scan.json"
+        saved.write_text("[]")
+        (self.root / "inbox.jsonl").write_text("")
+        command = f"test -f {shlex.quote(str(ready))}"
+        with patch.dict(os.environ, {"ORCA_WORKTREE_ID": "repo::" + str(self.root)}):
+            code, wait = self.call("user-wait", "--text-file", message, "--check-command", command)
+        self.assertEqual(code, 0)
+        code, stale = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual((code, [item["id"] for item in stale]), (0, [wait["id"]]))
+        self.assertEqual(stale[0]["checks"][0]["exit_code"], 1)
+        ready.touch()
+        self.assertEqual(self.call("stale-asks", "--from", str(saved)), (0, []))
+
+    def test_stale_asks_uses_later_lane_reports_as_progress_after_an_answer(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/lane", "repo": "app", "class": "waiting", "claude": {
+            "last_user_at": "2026-11-11T01:00:00Z", "final_at": "2026-11-11T01:05:00Z", "final_text": "待ちます"}}]))
+        ask = {"id": "ab12cd34-0000-ask", "ts": "2026-11-11T01:02:00Z",
+               "kind": "ask", "worktree": "lane", "repo": "app", "text": "公開しますか？"}
+        write_jsonl(self.root / "answers.jsonl", [{"id": ask["id"], "ts": "2026-11-11T01:30:00Z",
+                                                   "how": "send", "note": "公開する"}])
+        for kind, repo, at, expected in (("done", "app", "01:40", []), ("info", "app", "01:40", []),
+                                        ("info", "other", "01:40", ["stopped_after_answer"]),
+                                        ("info", "app", "01:20", ["stopped_after_answer"])):
+            with self.subTest(kind=kind, repo=repo, at=at):
+                write_jsonl(self.root / "inbox.jsonl", [ask, {"id": "progress", "kind": kind,
+                    "repo": repo, "worktree": "lane", "ts": f"2026-11-11T{at}:00Z", "text": "適用済み"}])
+                code, stale = self.call("stale-asks", "--from", str(saved))
+                self.assertEqual((code, [item["state"] for item in stale]), (0, expected))
+
     def test_stale_asks_does_not_reopen_a_shared_question_already_covered_by_answers(self) -> None:
         saved = self.root / "scan.json"
         (self.root / "inbox.jsonl").write_text("")
@@ -6257,7 +6373,174 @@ class PrecheckTests(unittest.TestCase):
         self.assertIn("runtime not reachable", out.getvalue())
 
 
+class HourlyCleanupCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.transcript = self.root / "old-session.jsonl"
+        write_jsonl(self.transcript, [{**assistant(text("終了しました")), "timestamp": "2026-10-26T08:00:00Z"}])
+        self.state = self.root / "state.json"
+        self.status = self.root / "status.json"
+        self.status.write_text(json.dumps({"entries": {"old:leaf": {
+            "worktreeId": "repo::/w/triage", "providerSession": {
+                "id": "old-session", "transcriptPath": str(self.transcript)}}}}))
+        self.ps_failures = 0
+        self.sent = []
+        self.closed = []
+        self.response_started = True
+        self.response_active = False
+        self.screen = {"source": "screen", "tail": ["────────", "❯", "────────"]}
+
+    def test_cleanup_dismisses_only_a_selector_whose_entire_batch_is_recorded_settled(self) -> None:
+        questions = ["公開しますか？", "確認を終えましたか？"]
+        for settled, extra, started, active in ((True, False, True, False), (False, False, True, False),
+                                               (True, True, True, False), (True, False, False, False),
+                                               (True, False, True, True)):
+            expect_close = settled and not extra and started and not active
+            with self.subTest(settled=settled, unrecorded=extra, started=started, active=active):
+                self.closed.clear()
+                self.sent.clear()
+                self.response_started, self.response_active = started, active
+                write_jsonl(self.transcript, [{**assistant({"type": "tool_use", "name": "AskUserQuestion",
+                    "id": "toolu_1", "input": {"questions": [{"question": q} for q in questions]}}),
+                    "timestamp": "2026-10-26T08:00:00Z"}])
+                records = {"q1": {"owner_pane": "old:leaf", "session": "old-session", "asked_in": "/w/triage",
+                    "asked_at": "2026-10-26T07:59:00Z", "question": questions[0], "answer": "はい"},
+                    "q2": {"owner_pane": "old:leaf", "session": "old-session", "asked_in": "/w/triage",
+                    "asked_at": "2026-10-26T07:59:00Z", "question": questions[1], "answer": None,
+                    "withdrawn_at": "2026-10-26T08:01:00Z" if settled else None}}
+                if extra:
+                    records.pop("q2")
+                self.state.write_text(json.dumps({"questions": records}))
+                self.screen = {"source": "screen", "tail": ["────────", questions[0], "❯ 1. はい", "2. いいえ",
+                                                                  "Enter to select · ↑/↓ to navigate · Esc to cancel"]}
+                code, shown = self.call()
+                self.assertEqual(code, 0)
+                self.assertEqual(bool(self.closed), expect_close, shown)
+                self.assertEqual(bool(self.sent), settled and not extra)
+                if expect_close:
+                    self.assertEqual(self.sent[0], ["terminal", "send", "--terminal", "old", "--text", "\x1b"])
+                    self.assertIn("別のタブで答え済み", self.sent[1])
+                    self.assertIn("closed:", shown)
+
+    def orca(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[1:-1]
+        if command == ["automations", "list"]:
+            result = {"automations": [triage_automation("hourly", "/w/triage")]}
+        elif command == ["automations", "runs", "--id", "hourly"]:
+            result = {"runs": [{"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "now:leaf",
+                       "workspaceId": "repo::/w/triage", "startedAt": 2},
+                      {"status": "completed", "trigger": "scheduled", "terminalPaneKey": "old:leaf",
+                       "workspaceId": "repo::/w/triage", "startedAt": 1,
+                       "usage": {"providerSessionId": "old-session"}}]}
+        elif command == ["terminal", "list"]:
+            result = {"terminals": [{"worktreeId": "repo::/w/triage", "tabId": name, "leafId": "leaf",
+                       "handle": name, "connected": True} for name in ("now", "old")]}
+        elif command == ["worktree", "ps"]:
+            if self.ps_failures:
+                self.ps_failures -= 1
+                raise subprocess.CalledProcessError(2, args, stderr="Orca runtime is reconnecting")
+            state = "working" if self.response_active and len(self.sent) >= 2 else "done"
+            result = {"worktrees": [{"path": "/w/triage", "agents": [{"paneKey": "old:leaf", "state": state,
+                       "mainAgent": {"state": state}}]}]}
+        elif command[:2] == ["terminal", "read"]:
+            result = self.screen
+        elif command[:2] == ["terminal", "send"]:
+            self.sent.append(command)
+            result = {"prompt": {"stages": ["input_accepted"] + (["turn_started"] if self.response_started else [])}}
+            self.screen = {"source": "screen", "tail": ["────────", "❯", "────────"]}
+            if "--enter" in command:
+                with self.transcript.open("a") as stream:
+                    stream.write(json.dumps(tool_result("answered elsewhere", {})) + "\n")
+                    stream.write(json.dumps({**assistant(text("終了しました")),
+                                             "timestamp": "2026-10-26T08:10:00Z"}) + "\n")
+        elif command[:2] == ["terminal", "wait"]:
+            result = {"completed": True}
+        elif command[:2] == ["terminal", "close"]:
+            self.closed.append(command)
+            result = {}
+        else:
+            self.fail(f"unexpected Orca call: {args}")
+        return subprocess.CompletedProcess(args, 0, json.dumps({"result": result}))
+
+    def call(self) -> tuple[int, str]:
+        with patch("subprocess.run", side_effect=self.orca), redirect_stdout(io.StringIO()) as out:
+            code = cleanup_hourly.main(["--workspace", "/w/triage", "--orca", "fixture-orca",
+                "--state-file", str(self.state), "--agent-status-file", str(self.status)])
+        return code, out.getvalue()
+
+    def test_cleanup_retries_worktree_ps_once_and_keeps_orca_stderr_on_failure(self) -> None:
+        with patch("time.sleep") as sleep:
+            self.ps_failures = 1
+            code, shown = self.call()
+            self.assertEqual(code, 0)
+            self.assertEqual(len(self.closed), 1)
+            sleep.assert_called_once_with(2)
+            self.closed.clear()
+            self.ps_failures = 2
+            code, shown = self.call()
+        self.assertEqual((code, self.closed), (1, []))
+        self.assertIn("keep:", shown)
+        self.assertIn("Orca runtime is reconnecting", shown)
+
+
+class HourlyReadTests(unittest.TestCase):
+    def test_parallel_reads_keep_outputs_and_report_each_failure_in_a_unique_run_directory(self) -> None:
+        hourly_read = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            initial = Barrier(10, timeout=5)
+            seen = []
+            def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
+                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                seen.append(args)
+                stale = "stale-asks" in args
+                if not stale:
+                    initial.wait()
+                if Path(args[0]).name == "topic":
+                    stderr.write("topic unavailable\n")
+                    return subprocess.CompletedProcess(args, 7)
+                if Path(args[0]).name == "backlog-watch":
+                    raise subprocess.TimeoutExpired(args, 30)
+                if "--out" in args:
+                    Path(args[args.index("--out") + 1]).write_text("[]")
+                elif Path(args[0]).name == "asana99_status.py":
+                    Path(args[1]).write_text("[]")
+                else:
+                    stdout.write("[]\n")
+                return subprocess.CompletedProcess(args, 0)
+            with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()) as out:
+                code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
+            self.assertEqual(code, 1)
+            [run_dir] = directory.iterdir()
+            result = json.loads((run_dir / "results.json").read_text())
+            self.assertEqual(len(seen), 11)
+            self.assertEqual({item["name"]: item["exit_code"] for item in result}, {
+                "cleanup-hourly-tabs": 0, "lead-state": 0, "open-asks": 0, "unanswered": 0,
+                "pending": 0, "handoff-last": 0, "scan": 0, "backlog-watch": 124,
+                "asana99-status": 0, "topic-check": 7, "stale-asks": 0})
+            self.assertEqual(json.loads((run_dir / "scan.json").read_text()), [])
+            self.assertEqual(json.loads((run_dir / "lead-state.json").read_text()), [])
+            self.assertEqual(json.loads((run_dir / "asana99-status.json").read_text()), [])
+            self.assertIn("topic unavailable", (run_dir / "topic-check.stderr").read_text())
+            self.assertIn("topic-check: exit 7", out.getvalue())
+            self.assertIn(str(run_dir), out.getvalue())
+
+
 class HourlyTabCleanupTests(unittest.TestCase):
+    def test_rendered_empty_composer_overrides_an_old_orca_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            transcript = Path(root) / "session.jsonl"
+            write_jsonl(transcript, [{**assistant(text("終了しました")), "timestamp": "2026-10-26T08:00:00Z"}])
+            now = datetime(2026, 10, 26, 9, tzinfo=timezone.utc)
+            screen = {"source": "screen", "draft": "古い提案", "tail": ["────────", "❯", "────────"]}
+            self.assertEqual(cleanup_hourly.close_blockers({}, transcript, screen, 5, now), [])
+            screen["tail"] = ["────────", "❯ まだ送っていない文", "────────"]
+            blockers = cleanup_hourly.close_blockers({}, transcript, screen, 5, now)
+            self.assertTrue(any("draft_text='古い提案'" in reason and "composer_empty=False" in reason
+                                for reason in blockers))
+
     def test_detached_scheduled_tabs_match_recorded_panes_and_transcripts(self) -> None:
         for run_pane, run_status in (("old:leaf", "completed"), (None, "completed"),
                                      ("old:leaf", "dispatch_failed"), (None, "dispatch_failed")):
