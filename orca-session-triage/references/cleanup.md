@@ -159,6 +159,8 @@ Run these per worktree, in order.
      Untracked or ignored standalone clones in `local-deps/` also count as disposable when each is
      clean, has no stash or ignored work to preserve, owns no linked worktree,
      and HEAD and every local branch/tag are on actual origin branches or tags.
+     Clones with initialized submodules or stored `.git/modules` repositories
+     stay for inspection: their child repositories may hold unpublished work.
      The remote refs are read once per clone. `notes` name each verified clone; a failed
      check names the clone in `reasons`. The check leaves the copies on disk.
    - `containers` lists docker compose projects defined inside the worktree.

@@ -469,6 +469,12 @@ def clone_check(copy: Path) -> list[str]:
               if line.startswith("worktree ") and Path(line.removeprefix("worktree ")).resolve() != copy.resolve()]
     if worktrees.returncode or linked:
         blockers.append("linked worktrees remain or could not be checked: " + ", ".join(linked))
+    entries = git(copy, "ls-files", "--stage", "-z")
+    initialized = [rel for entry in entries.stdout.split("\0") if entry.startswith("160000 ")
+                   and (rel := entry.partition("\t")[2]) and (copy / rel / ".git").exists()]
+    modules = copy / ".git/modules"
+    if entries.returncode or initialized or (modules.is_dir() and any(modules.iterdir())):
+        blockers.append("submodule repositories need preservation: " + ", ".join(initialized or [str(modules)]))
     refs = origin_refs(copy, branches_and_tags=True)
     local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
     if local.returncode:

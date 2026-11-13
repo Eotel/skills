@@ -4200,6 +4200,30 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(str(linked.resolve()), " ".join(result["reasons"]))
         self.assertTrue((linked / ".git").is_file())
 
+    def test_local_dependency_clones_keep_initialized_submodule_history(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(copy, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(remote), "child")
+        git(copy, "commit", "-q", "-am", "submodule")
+        git(copy, "push", "-q", "origin", "main")
+        child = copy / "child"
+        original = git(child, "rev-parse", "HEAD")
+        git(child, "config", "user.email", "t@example.com")
+        git(child, "config", "user.name", "t")
+        git(child, "checkout", "-q", "-b", "unpublished")
+        (child / "app.txt").write_text("unpublished child history\n")
+        git(child, "commit", "-q", "-am", "child work")
+        git(child, "checkout", "-q", "--detach", original)
+        self.assertEqual(git(copy, "status", "--porcelain"), "")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("submodule", " ".join(result["reasons"]))
+
     def test_a_tracked_dependency_gitlink_change_still_blocks_removal(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
