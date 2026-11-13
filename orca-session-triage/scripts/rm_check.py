@@ -438,7 +438,39 @@ class IgnoredPaths(NamedTuple):
     held: list[Held]
 
 
-def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
+def dependency_clones(worktree: Path, rel: str) -> list[Path]:
+    """Standalone clones at an untracked/ignored local-deps path containing nothing else."""
+    path = PurePosixPath(rel)
+    if not path.parts or path.parts[0] != "local-deps" or len(path.parts) > 2:
+        return []
+    source = worktree / rel
+    if source.is_symlink() or not source.is_dir():
+        return []
+    copies = sorted(source.iterdir()) if len(path.parts) == 1 else [source]
+    return copies if copies and all(not copy.is_symlink() and (copy / ".git").is_dir()
+                                   and not (copy / ".git").is_symlink() for copy in copies) else []
+
+
+def clone_check(copy: Path) -> list[str]:
+    """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
+    blockers = []
+    status = git(copy, "status", "--porcelain", "--untracked-files=all")
+    if status.returncode or status.stdout.strip():
+        blockers.append("uncommitted changes or git status failed")
+    stash = git(copy, "stash", "list")
+    if stash.returncode or stash.stdout.strip():
+        blockers.append("stash remains or could not be checked")
+    ignored = ignored_paths(copy, None)
+    if ignored.review or ignored.nested or ignored.lock_holders:
+        blockers.append("ignored paths or live locks to preserve: " + ", ".join(
+            [*ignored.review, *(str(path) for path in ignored.nested), *map(str, ignored.lock_holders)]))
+    head = git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()
+    if not head or not on_remote(copy, head, live=True):
+        blockers.append("HEAD is on no verified remote branch or tag")
+    return blockers
+
+
+def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths:
     """(review, regenerable, nested, notes, lock_holders, records, held): ignored paths that hold something and are
     neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
     test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
@@ -456,8 +488,8 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
         if not entry.startswith("!! ") or is_cache(entry[3:]):
             continue
         rel = entry[3:]
-        source, copy = Path(worktree) / rel, Path(main) / rel
-        if holds_nothing(source) or same_tree(source, copy):
+        source, copy = Path(worktree) / rel, Path(main) / rel if main is not None else None
+        if holds_nothing(source) or (copy is not None and same_tree(source, copy)):
             continue
         if rel == SCHEDULED_LOCK and not source.is_symlink() and (holder := lock_holder(source)) is not None:
             if holder.running:
@@ -468,6 +500,16 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
         found = nested_worktrees(source)
         if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
             nested.extend(found)
+            continue
+        if clones := dependency_clones(Path(worktree), rel):
+            for clone in clones:
+                if blockers := clone_check(clone):
+                    review.append("%s (%s)" % (clone, "; ".join(blockers)))
+                    held.append({"path": str(clone), "kind": "clone", "reason": "; ".join(blockers),
+                                 "decision": "変更と stash を保存し、HEAD が remote にあることを確かめてください"})
+                else:
+                    regenerable.append(str(clone.relative_to(worktree)))
+                    notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
             continue
         if holds_only_regenerable(source, Path(worktree)) or generated(Path(worktree), rel):
             regenerable.append(rel)
@@ -480,7 +522,7 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
             regenerable.append(rel)
             notes.append("%s is %s, ignored by %s" % (rel, tool, ignore_source(Path(worktree), rel)))
             continue
-        where = "not in main checkout" if not copy.exists() else "differs from main checkout"
+        where = "not in main checkout" if copy is None or not copy.exists() else "differs from main checkout"
         keys = None
         if source.name == ".env" and source.is_file():
             keys = env_keys_beyond_example(source)
@@ -493,20 +535,23 @@ def ignored_paths(worktree: str | Path, main: str | Path) -> IgnoredPaths:
         if kind := record_kind(Path(worktree), rel):
             records.append({"path": rel, "kind": kind})
         else:
-            held.append(held_file(source, rel, copy.exists(), keys))
+            held.append(held_file(source, rel, copy is not None and copy.exists(), keys))
     return IgnoredPaths(review, regenerable, nested, notes, holders, records, held)
 
 
-def on_remote(worktree: Path, head: str) -> bool:
+def on_remote(worktree: Path, head: str, *, live: bool = False) -> bool:
     """Whether a remote branch holds HEAD, or (asked over the network) a ref of origin points at it."""
-    if git(worktree, "branch", "-r", "--contains", head).stdout.strip():
+    if not live and git(worktree, "branch", "-r", "--contains", head).stdout.strip():
         return True
     try:
-        refs = subprocess.run(["git", "-C", str(worktree), "ls-remote", "origin"],
+        refs = subprocess.run(["git", "-C", str(worktree), "ls-remote", *(["--heads", "--tags"] if live else []), "origin"],
                               capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return refs.returncode == 0 and any(line.split("\t")[0] == head for line in refs.stdout.splitlines())
+    return refs.returncode == 0 and any(
+        oid == head or (live and name.startswith("refs/heads/")
+                        and git(worktree, "merge-base", "--is-ancestor", head, oid).returncode == 0)
+        for line in refs.stdout.splitlines() if len(parts := line.split("\t")) == 2 for oid, name in [parts])
 
 
 def nested_check(copy: Path) -> dict:
@@ -736,14 +781,22 @@ def pipe_ends() -> dict[int, tuple[str | None, str | None]]:
     return ends
 
 
-def output_readers() -> set[int]:
-    """The commands this check's output is piped through (`rm_check.py | jq | ...`), each reading the one before."""
+def output_readers(processes: dict[int, tuple[int, str]] | None = None) -> set[int]:
+    """Readers of this check's output or an ancestor wrapper's output, following only actual pipe connections."""
     if not stat.S_ISFIFO(os.fstat(1).st_mode):
         return set()
     ends = pipe_ends()
     readers: set[int] = set()
-    # A subshell and the command it runs both read the pipe they inherit.
-    pipes = {ends.get(os.getpid(), (None, None))[1]} - {None}
+    # A batch wrapper captures this check's stdout before printing it into its own pipeline.
+    table = processes if processes is not None else process_table() or {}
+    ancestors = set()
+    pid = os.getpid()
+    while pid not in ancestors:
+        ancestors.add(pid)
+        if pid not in table:
+            break
+        pid = table[pid][0]
+    pipes = {ends[pid][1] for pid in ancestors if pid in ends} - {None}
     while pipes:
         found = {pid for pid, (stdin, _) in ends.items() if stdin in pipes} - readers
         readers |= found
@@ -796,7 +849,7 @@ def processes_in(worktree: str, locks: dict[int, str] | None = None) -> list[dic
     if cwds is None:
         return None
     found: list[UsingProcess] = [{**item, **({"cwd": cwds[item["pid"]]} if item["pid"] in cwds else {})}
-             for item in processes_using(worktree, processes, cwds, output_readers(), locks)]
+             for item in processes_using(worktree, processes, cwds, output_readers(processes), locks)]
     own_tab = tab_root(os.getpid(), processes)
     roots = {item["pid"]: root for item in found
              if (root := tab_root(item["pid"], processes)) is not None and root != own_tab}
@@ -865,6 +918,18 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
     changes, bytecode = working_changes(worktree)
+    clone_notes = []
+    for rel in changes[:]:
+        if clones := dependency_clones(Path(worktree), rel):
+            checked = [(clone, clone_check(clone)) for clone in clones]
+            for clone, problems in checked:
+                if problems:
+                    blockers.append("%s (%s)" % (clone, "; ".join(problems)))
+                else:
+                    clone_notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
+            if all(not problems for _, problems in checked):
+                changes.remove(rel)
+                bytecode.append(rel)
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -896,6 +961,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
     review, regenerable, nested, notes, lock_holders, records, held_files = ignored_paths(worktree, main)
+    notes.extend(clone_notes)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
@@ -1120,6 +1186,17 @@ def within(rel: str, named: str) -> bool:
     """Whether the worktree path `rel` is `named` or lies inside it."""
     path, inside = PurePosixPath(rel.rstrip("/")), PurePosixPath(named)
     return path == inside or inside in path.parents
+
+
+def untracked_exec_plans(worktree: Path, base: str | None, pr: dict | None) -> tuple[str, ...]:
+    """Untracked Markdown exec plans absent from a merged PR's base, with no tracked changes to preserve."""
+    if (not pr or pr.get("state") != "MERGED" or not base or not ref_exists(worktree, base)
+            or git(worktree, "diff", "--quiet", "HEAD", "--").returncode != 0):
+        return ()
+    paths = git(worktree, "ls-files", "--others", "--exclude-standard", "-z", "--", "docs/exec-plans/")
+    return tuple(rel for rel in paths.stdout.split("\0") if rel and PurePosixPath(rel).suffix == ".md"
+                 and (worktree / rel).is_file() and not (worktree / rel).is_symlink()
+                 and git(worktree, "cat-file", "-e", f"{base}:{rel}").returncode != 0)
 
 
 def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
@@ -1465,7 +1542,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     def movable_now(result: dict) -> tuple[str, ...]:
         """The scratch folders and named paths, and with --archive-scratch the work records this check found."""
         found = (item["path"].rstrip("/") for item in result["records"]) if args.archive_scratch else ()
-        return (*movable, *found)
+        plans = untracked_exec_plans(Path(worktree), base, pr) if args.archive_scratch else ()
+        return (*movable, *found, *plans)
 
     copied = []
     # Nothing is written to main while anything else keeps the worktree.

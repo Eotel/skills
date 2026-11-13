@@ -32,6 +32,11 @@ JSON (`<name> | ok=… | removal=… | reasons=…`, reasons naming only `.yomiy
 left out): read those lines rather than parsing the JSON. After the worktrees,
 either form lists every held file in one block (`確認が要るファイル`, one line
 each with the worktree, reason, and decision): ask the user about them together.
+With `--from SCAN_JSON`, batch reads the same saved verdicts as `--rm-specs`.
+It counts a scanned meaningful tab only while `orca terminal list` still lists
+it. With `--remove-ok`, it closes the row's scanned tabs through `close_tabs.py`
+before checking; without it, a tab blocker explains that `--remove-ok` closes
+the tabs before removal. Tabs whose worktree moved after the scan stay open.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -111,6 +116,10 @@ Run these per worktree, in order.
      `.claude/settings.local.json`, are settings main would run with and stay
      held. With `--detach-nested` as well, nested copies and these
      folders go together.
+     For a MERGED PR, the option also archives untracked
+     `docs/exec-plans/**/*.md` files absent from the base, using the same
+     verified copy and manifest. Any tracked change or another untracked
+     file keeps those plans in place.
    - `regenerable` lists what a tool writes again from tracked files or
      installed packages with no one's input: untracked Python bytecode, and,
      among ignored paths, generated sources (`__generated__/`, GraphQL codegen's
@@ -147,6 +156,10 @@ Run these per worktree, in order.
      since a `build/` the repository does not ignore may be new source, and a
      `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its
      records.
+     Standalone clones in `local-deps/` also count as disposable when each is
+     clean, has no stash or ignored work to preserve, and HEAD is on an
+     actual origin branch or tag. `notes` name each verified clone; a failed
+     check names the clone in `reasons`. The check leaves the copies on disk.
    - `containers` lists docker compose projects defined inside the worktree.
      When docker does not answer in 20 seconds, a worktree with a compose file
      (`compose*.y*ml`, `docker-compose*.y*ml`) is blocked until it does; one
@@ -164,7 +177,8 @@ Run these per worktree, in order.
      and current directory; a `node` server or another job is left running and
      reported. The live holder of an ignored `.claude/scheduled_tasks.lock` is
      listed here with `lock`, not as a path to review. The commands the check's
-     output is piped into are not listed.
+     output is piped into are not listed, including readers of a batch
+     wrapper's output. Other processes in the same process group still count.
    - `nested_worktrees` lists worktrees of other repositories inside the
      checkout (such as `local-deps/<repo>`), each with its own `blockers`
      (uncommitted changes, ignored paths to open, HEAD on no remote). A tracked

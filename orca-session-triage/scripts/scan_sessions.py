@@ -2374,6 +2374,17 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                          datetime.min.replace(tzinfo=timezone.utc))
             row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
                                        "decided_at": answer.decided_at}
+        names = {row["path"], row_identity(row), row_name(row),
+                 f"{row.get('repo')}/{Path(row['path']).name}"}
+        if not row.get("environment"):
+            names.update((Path(row["path"]).name, f"local::{row['path']}"))
+        wake_keys = {f"wake:{name}" for name in names}
+        answered = [answer for key, answer in decisions.items()
+                    if any(key == prefix or key.startswith(prefix + "::") for prefix in wake_keys)]
+        row.pop("wake_decision", None)
+        if answered:
+            answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or EPOCH)
+            row["wake_decision"] = {"answer": answer.answer, "decided_at": answer.decided_at}
     return rows
 
 
@@ -3250,12 +3261,36 @@ def reset_time(value: str | None, now: datetime, failed_at: datetime | None) -> 
         return None
 
 
+def stopped_claude_tab(row: dict, candidates: list[str]) -> str | None:
+    """Resolve a stopped transcript through its live sessions/<pid>.json and the process's Orca handle."""
+    transcript = (row.get("claude") or {}).get("transcript")
+    if row.get("environment") or not transcript:
+        return None
+    processes = process_table()
+    pids = set()
+    for directory in claude_session_dirs():
+        for path in directory.glob("*.json"):
+            record = read_json_file(path)
+            if not isinstance(record, dict) or record.get("sessionId") != Path(transcript).stem:
+                continue
+            pid = record.get("pid")
+            if isinstance(pid, int) and "claude" in processes.get(pid, (0, ""))[1]:
+                pids.add(pid)
+    chains = [ancestry(pid, processes) for pid in pids]
+    handles = rm_check.process_handles(sorted({pid for chain in chains for pid in chain})) if chains else {}
+    matched = {handle for chain in chains
+               if (handle := next((handles[pid] for pid in chain if handles.get(pid) in candidates), None))}
+    return next(iter(matched)) if len(matched) == 1 else None
+
+
 def wake_line(row: dict, stop: StopReason) -> str:
     """name | the stopped agent's tab, or its candidates when several agent tabs could be it | what it needs |
     the error."""
     tabs = [t["handle"] for t in row.get("terminals") or [] if t.get("handle") and t.get("agent")
             and (stop["agent"] is None or t["agent"] == stop["agent"])]
     tab = tabs[0] if len(tabs) == 1 else f"不明（{', '.join(tabs)}）" if tabs else None
+    if len(tabs) > 1 and stop["agent"] == "claude":
+        tab = stopped_claude_tab(row, tabs) or tab
     action = (f"利用上限: {stop['resets'] or '戻る時刻は不明'} まで待つ" if stop["kind"] == "usage_limit"
               else WAKE_ACTIONS[stop["kind"]])
     if stop["kind"] == "usage_limit":
@@ -3263,6 +3298,8 @@ def wake_line(row: dict, stop: StopReason) -> str:
         resets = reset_time(stop["resets"], now, parse_time(row_final_at(row)))
         if resets and resets <= now:
             action = "利用上限: 解除済み・起こせる" + ("（タブの開き直しが必要）" if not tabs else "")
+        if (answer := row.get("wake_decision")) and "起こさない" in answer["answer"]:
+            action = f"利用上限: {answer['decided_at']} " + " ".join(answer["answer"].split())
     error = " ".join(stop["error"].split())
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 

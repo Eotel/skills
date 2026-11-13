@@ -177,7 +177,10 @@ board's done cards; close what the user approves.
   (`usage_limit`, with the time it `resets`), an expired login (`login`, a
   person logs in), or another error waking would repeat (`other`, such as a
   safeguard flag; a person reads it). `--from SCAN_JSON --wake` prints each
-  such row with its agent's tab and what it needs.
+  such row with its agent's tab and what it needs. For multiple local Claude
+  tabs, it matches the stopped transcript's session record to the live
+  process's `ORCA_TERMINAL_HANDLE`. A usage-limit row shows the latest
+  `wake:<row>::*` answer and time when that answer says 「起こさない」.
 - **Review queue**: run the scan with
   `--review-out ~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}/review-queue.json`.
   When every GitHub query or every Jev call failed to connect, the scan prints
