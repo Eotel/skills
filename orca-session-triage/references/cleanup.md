@@ -156,7 +156,7 @@ Run these per worktree, in order.
      since a `build/` the repository does not ignore may be new source, and a
      `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its
      records.
-     Standalone clones in `local-deps/` also count as disposable when each is
+     Untracked or ignored standalone clones in `local-deps/` also count as disposable when each is
      clean, has no stash or ignored work to preserve, and HEAD is on an
      actual origin branch or tag. `notes` name each verified clone; a failed
      check names the clone in `reasons`. The check leaves the copies on disk.

@@ -921,6 +921,8 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     clone_notes = []
     for rel in changes[:]:
         if clones := dependency_clones(Path(worktree), rel):
+            if tracked(Path(worktree), PurePosixPath(rel)):
+                continue
             checked = [(clone, clone_check(clone)) for clone in clones]
             for clone, problems in checked:
                 if problems:

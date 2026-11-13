@@ -4159,6 +4159,24 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
 
+    def test_a_tracked_dependency_gitlink_change_still_blocks_removal(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(self.wt, "add", "local-deps/lib")
+        git(self.wt, "commit", "-q", "-m", "pin dependency")
+        git(self.main, "merge", "-q", "feature")
+        (copy / "app.txt").write_text("updated dependency\n")
+        git(copy, "commit", "-q", "-am", "dependency update")
+        git(copy, "push", "-q", "origin", "main")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("local-deps/lib", result["uncommitted"])
+
     def test_nested_worktrees_on_a_remote_are_detached_and_others_block(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(Path(self.tmp.name), "init", "--bare", "-q", str(remote))
