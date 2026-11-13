@@ -464,9 +464,20 @@ def clone_check(copy: Path) -> list[str]:
     if ignored.review or ignored.nested or ignored.lock_holders:
         blockers.append("ignored paths or live locks to preserve: " + ", ".join(
             [*ignored.review, *(str(path) for path in ignored.nested), *map(str, ignored.lock_holders)]))
-    head = git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()
-    if not head or not on_remote(copy, head, live=True):
-        blockers.append("HEAD is on no verified remote branch or tag")
+    worktrees = git(copy, "worktree", "list", "--porcelain")
+    linked = [line.removeprefix("worktree ") for line in worktrees.stdout.splitlines()
+              if line.startswith("worktree ") and Path(line.removeprefix("worktree ")).resolve() != copy.resolve()]
+    if worktrees.returncode or linked:
+        blockers.append("linked worktrees remain or could not be checked: " + ", ".join(linked))
+    refs = origin_refs(copy, branches_and_tags=True)
+    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
+    if local.returncode:
+        blockers.append("local branches and tags could not be checked")
+    tips = [("HEAD", git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()),
+            *(line.split(" ", 1) for line in local.stdout.splitlines())]
+    unsaved = [name for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
+    if unsaved:
+        blockers.append("local refs are on no verified remote branch or tag: " + ", ".join(unsaved))
     return blockers
 
 
@@ -539,19 +550,29 @@ def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths
     return IgnoredPaths(review, regenerable, nested, notes, holders, records, held)
 
 
-def on_remote(worktree: Path, head: str, *, live: bool = False) -> bool:
-    """Whether a remote branch holds HEAD, or (asked over the network) a ref of origin points at it."""
-    if not live and git(worktree, "branch", "-r", "--contains", head).stdout.strip():
-        return True
+def origin_refs(worktree: Path, *, branches_and_tags: bool = False) -> list[tuple[str, str]] | None:
+    """One live snapshot of origin's refs; None when origin could not be read."""
     try:
-        refs = subprocess.run(["git", "-C", str(worktree), "ls-remote", *(["--heads", "--tags"] if live else []), "origin"],
+        refs = subprocess.run(["git", "-C", str(worktree), "ls-remote",
+                               *(["--heads", "--tags"] if branches_and_tags else []), "origin"],
                               capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return refs.returncode == 0 and any(
-        oid == head or (live and name.startswith("refs/heads/")
-                        and git(worktree, "merge-base", "--is-ancestor", head, oid).returncode == 0)
-        for line in refs.stdout.splitlines() if len(parts := line.split("\t")) == 2 for oid, name in [parts])
+        return None
+    return [(parts[0], parts[1]) for line in refs.stdout.splitlines()
+            if len(parts := line.split("\t")) == 2] if refs.returncode == 0 else None
+
+
+def remote_contains(worktree: Path, oid: str, refs: Sequence[tuple[str, str]]) -> bool:
+    """A local object is on one advertised origin ref, using locally available history for branch ancestry."""
+    return any(remote_oid == oid or (name.startswith("refs/heads/")
+                                    and git(worktree, "merge-base", "--is-ancestor", oid, remote_oid).returncode == 0)
+               for remote_oid, name in refs)
+
+
+def on_remote(worktree: Path, head: str) -> bool:
+    """Whether a remote branch holds HEAD, or (asked over the network) a ref of origin points at it."""
+    return (bool(git(worktree, "branch", "-r", "--contains", head).stdout.strip())
+            or any(oid == head for oid, _ in origin_refs(worktree) or []))
 
 
 def nested_check(copy: Path) -> dict:

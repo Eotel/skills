@@ -4159,6 +4159,47 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
 
+    def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(copy, "checkout", "-q", "-b", "draft")
+        (copy / "app.txt").write_text("unpublished work\n")
+        git(copy, "commit", "-q", "-am", "draft")
+        git(copy, "checkout", "-q", "main")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("refs/heads/draft", " ".join(result["reasons"]))
+        git(copy, "push", "-q", "origin", "draft")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (0, True), result)
+
+        git(copy, "checkout", "-q", "--detach", "draft")
+        (copy / "app.txt").write_text("tagged local work\n")
+        git(copy, "commit", "-q", "-am", "local tag")
+        git(copy, "tag", "local-only")
+        git(copy, "checkout", "-q", "main")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("refs/tags/local-only", " ".join(result["reasons"]))
+
+    def test_local_dependency_clones_keep_the_repository_of_an_external_linked_worktree(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        linked = Path(self.tmp.name) / "external-worktree"
+        git(copy, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn(str(linked.resolve()), " ".join(result["reasons"]))
+        self.assertTrue((linked / ".git").is_file())
+
     def test_a_tracked_dependency_gitlink_change_still_blocks_removal(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))

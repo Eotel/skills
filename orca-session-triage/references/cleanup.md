@@ -157,8 +157,9 @@ Run these per worktree, in order.
      `.gitignore` of `*` alone is no sign either: yomiyasu writes one over its
      records.
      Untracked or ignored standalone clones in `local-deps/` also count as disposable when each is
-     clean, has no stash or ignored work to preserve, and HEAD is on an
-     actual origin branch or tag. `notes` name each verified clone; a failed
+     clean, has no stash or ignored work to preserve, owns no linked worktree,
+     and HEAD and every local branch/tag are on actual origin branches or tags.
+     The remote refs are read once per clone. `notes` name each verified clone; a failed
      check names the clone in `reasons`. The check leaves the copies on disk.
    - `containers` lists docker compose projects defined inside the worktree.
      When docker does not answer in 20 seconds, a worktree with a compose file
