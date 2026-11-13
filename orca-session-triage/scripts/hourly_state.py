@@ -38,6 +38,7 @@ import answer_evidence
 import hourly_runs
 import hourly_runtime
 import inbox_read
+import json_output
 import lead_decisions
 import scan_sessions
 
@@ -326,6 +327,13 @@ def check_now(check: dict) -> dict:
     """A user-wait check read now. A PR check gets `state`, gh's bucket of its runs of that name (fail, cancel, pending,
     pass, skipping, the first of these any run has), or `missing` when the PR has none; a secret gets, per
     repository, whether it holds the secret. `unread` says why gh could not read one, instead of a state."""
+    if check["kind"] == "command":
+        try:
+            result = subprocess.run(["/bin/sh", "-c", check["command"]], cwd=check["cwd"],
+                                    capture_output=True, text=True, timeout=GH_TIMEOUT)
+            return {**check, "exit_code": result.returncode, "unread": None}
+        except (OSError, subprocess.SubprocessError) as error:
+            return {**check, "exit_code": None, "unread": str(error)}
     if check["kind"] == "pr_check":
         runs, why = gh_json(["pr", "checks", str(check["number"]), "-R", check["repo"], "--json", "name,bucket"])
         if why is None and not isinstance(runs, list):
@@ -345,6 +353,8 @@ def check_now(check: dict) -> dict:
 
 
 def check_done(check: dict) -> bool:
+    if check["kind"] == "command":
+        return check["exit_code"] == 0
     if check["kind"] == "pr_check":
         return check["state"] == "pass"
     return all(holder["present"] for holder in check["repos"])
@@ -357,6 +367,8 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
         if wait["closed_at"] is not None:
             continue
         checks = [check_now(check) for check in wait["checks"]]
+        if all(map(check_done, checks)):
+            continue
         since = scan_sessions.parse_time(wait["started_at"]) or now
         items.append({"row": wait["row"], "name": Path(wait["row"].split("::", 1)[-1]).name if wait["row"] else "-",
                       "state": "user_wait", "id": key, "since": wait["started_at"], "question": excerpt(wait["text"]),
@@ -366,6 +378,9 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
 
 
 def check_line(check: dict) -> str:
+    if check["kind"] == "command":
+        return f"{check['command']}: " + (f"読めない（{check['unread']}）" if check["unread"]
+                                         else f"exit {check['exit_code']}")
     if check["kind"] == "pr_check":
         return (f"{check['repo']}#{check['number']} {check['name']} "
                 + (f"読めない（{check['unread']}）" if check["unread"] else check["state"]))
@@ -640,6 +655,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if later:
             first = min(answer.at for answer, _ in later)
             answer, ask = max(later, key=lambda pair: pair[0].at)
+            if any(at > answer.at and item.get("kind") in ("done", "info") for at, item in lane):
+                continue
             asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
             found.append((first, {**view, "state": "stopped_after_answer", "since": first.isoformat(),
                                   "question": excerpt(asked) or view["question"],
@@ -873,10 +890,16 @@ class Answering:
     replace_reason: str | None = None
 
 
+def current_question(data: dict, asking: Asking) -> str | None:
+    return next((key for key, item in reversed(list(data["questions"].items()))
+                 if item["row"] == asking.row and item["decision"] == asking.decision
+                 and not item.get("withdrawn_at")), None)
+
+
 def new_references(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
     """By key, the issues and PRs each question not yet recorded names (question_references)."""
     return question_references({asking.key: {"row": asking.row, "question": asking.question}
-                                for asking in askings if asking.key not in data["questions"]})
+                                for asking in askings if current_question(data, asking) is None})
 
 
 def record_question(data: dict, asking: Asking, references: dict[str, list[dict]]) -> dict:
@@ -884,12 +907,14 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
     A question another session already put (`asking.session`) is recorded all the same: it only accounts for that
     call. A recorded question names its session (CLAUDE_CODE_SESSION_ID by default), its transcript's name."""
     refs = references.get(asking.key) or []
-    if (asking.key not in data["questions"] and asking.session is None and refs
+    existing = current_question(data, asking)
+    if (existing is None and asking.session is None and refs
             and all(ref.get("state") == "CLOSED" for ref in refs)):
         return {"state": "settled", "recorded": False, "row": asking.row, "question": asking.question,
                 "evidence": refs}
-    new = asking.key not in data["questions"]
-    data["questions"].setdefault(asking.key, {"row": asking.row, "decision": asking.decision,
+    new = existing is None
+    key = existing or (asking.key if asking.key not in data["questions"] else uuid.uuid4().hex[:16])
+    data["questions"].setdefault(key, {"row": asking.row, "decision": asking.decision,
                                               "final_message": asking.final_message,
                                               "question": asking.question, "asked_at": asking.asked_at,
                                               "owner_pane": os.environ.get("ORCA_PANE_KEY"),
@@ -897,7 +922,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": asking.key, **data["questions"][asking.key],
+    return {"id": key, **data["questions"][key],
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -959,7 +984,7 @@ def record_answer(data: dict, answering: Answering) -> dict:
         raise ValueError(f"unknown question id: {key}")
     question = data["questions"][key]
     if question.get("withdrawn_at"):
-        raise ValueError(f"question was withdrawn at {question['withdrawn_at']}: {question['withdrawal_reason']}")
+        return {"id": key, **question, "state": "withdrawn", "recorded": False}
     # A recorded answer keeps its time, so recording the same text again changes nothing.
     when = (question["answered_at"] if question["answer"] is not None and not answering.replace_reason
             else recorded_at(answering.answered_at))
@@ -1237,9 +1262,13 @@ def change(data: dict, args: argparse.Namespace) -> dict:
             request["closure_evidence"] = evidence
         return {"id": args.id, **request}
     if args.action == "user-wait":
-        checks = [*(pr_check(ref, name) for ref, name in args.pr_check), *map(secret_check, args.secret)]
+        if any(not command.strip() for command in args.check_command):
+            raise ValueError("--check-command must not be empty")
+        checks = [*(pr_check(ref, name) for ref, name in args.pr_check), *map(secret_check, args.secret),
+                  *({"kind": "command", "command": command, "cwd": str(worktree())}
+                    for command in args.check_command)]
         if not checks:
-            raise ValueError("give --pr-check or --secret: a user wait is recorded with how to check it")
+            raise ValueError("give --pr-check, --secret or --check-command: a user wait needs a check")
         text, row = file_text(args.text_file), owner_name(args.row) if args.row is not None else None
         key = identifier("user-wait", text, row, checks)
         data["user_waits"].setdefault(key, {"text": text, "row": row, "started_at": recorded_at(args.started_at),
@@ -1272,12 +1301,20 @@ def change(data: dict, args: argparse.Namespace) -> dict:
     if args.action == "withdraw":
         question = data["questions"][args.id]
         reason = file_text(args.reason_file)
+        if args.replaced_by is not None:
+            replacement = data["questions"].get(args.replaced_by)
+            if replacement is None or args.replaced_by == args.id or replacement.get("withdrawn_at"):
+                raise ValueError("--replaced-by must name another existing question that is not withdrawn")
+            if question.get("replaced_by") not in (None, args.replaced_by):
+                raise ValueError("question already has a different replacement")
         if question["answer"] is not None:
             raise ValueError("question already has an answer")
         if question.get("withdrawn_at") and question["withdrawal_reason"] != reason:
             raise ValueError("question already withdrawn; inspect its reason before changing it")
         if not question.get("withdrawn_at"):
             question.update(withdrawn_at=stamp(), withdrawal_reason=reason)
+        if args.replaced_by is not None:
+            question["replaced_by"] = args.replaced_by
         return {"id": args.id, **question}
     if args.action == "promise":
         key = identifier(args.from_row, args.to_row, args.condition, args.task)
@@ -1428,7 +1465,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="the rows scan_sessions.py printed as JSON")
     stale.add_argument("--verdicts", default=scan_sessions.VERDICTS_FILE,
                        help="the careful reads' verdict store whose verdicts the rows take (default: %(default)s)")
-    stale.add_argument("--summary", action="store_true", help="print one line per row with its age, ask id, and question")
+    stale_output = stale.add_mutually_exclusive_group()
+    stale_output.add_argument("--summary", action="store_true",
+                               help="print one line per row with its age, ask id, and question")
+    stale_output.add_argument("--out", type=Path, metavar="FILE",
+                               help="atomically write JSON to FILE instead of stdout")
     stale.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                        help="Orca CLI used to check the current state of claimed questions")
     stale.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG,
@@ -1450,6 +1491,9 @@ def main(argv: list[str] | None = None) -> int:
                            help="a check run on that PR that passes once the user acts, e.g. license/cla; repeat")
     user_wait.add_argument("--secret", nargs="+", action="append", default=[], metavar="NAME_THEN_REPO",
                            help="a secret name, then the OWNER/NAME of each repository that must hold it; repeat")
+    user_wait.add_argument("--check-command", action="append", default=[], metavar="COMMAND",
+                           help="trusted read-only /bin/sh command; run on every stale-asks in this workspace, "
+                                f"exit 0 means done, timeout {GH_TIMEOUT}s; repeat, all checks must pass")
     user_wait_close = commands.add_parser("user-wait-close", help="close a user wait once its result is seen")
     user_wait_close.add_argument("--id", required=True)
     user_wait_close.add_argument("--evidence-file", required=True)
@@ -1520,6 +1564,7 @@ def main(argv: list[str] | None = None) -> int:
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
+    withdraw.add_argument("--replaced-by", metavar="ID", help="the existing question that replaces this one")
     promise = commands.add_parser("promise", help="remember when one lane's result should go to another")
     promise.add_argument("--from-row", required=True)
     promise.add_argument("--to-row", required=True)
@@ -1583,8 +1628,14 @@ def main(argv: list[str] | None = None) -> int:
         except READ_ERRORS as error:
             print(f"hourly state: {error}", file=sys.stderr)
             return 1
-        print(summary(result, datetime.now(timezone.utc)) if args.summary
-              else json.dumps(result, ensure_ascii=False, indent=2))
+        try:
+            if args.summary:
+                print(summary(result, datetime.now(timezone.utc)))
+            else:
+                json_output.emit(result, args.out)
+        except OSError as error:
+            print(f"hourly state: {error}", file=sys.stderr)
+            return 1
         return 0
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1683,6 +1734,12 @@ def main(argv: list[str] | None = None) -> int:
                            for item in items for found in item.get("merged_after_basis") or []]
         if args.action in ("answered", "answered-many"):
             notices.extend(reissue_notices(items))
+        if args.action in ("asked", "asked-many", "answered", "answered-many"):
+            for item in items:
+                if item.get("withdrawn_at"):
+                    skipped = True
+                    notices.append(f"記録しなかった: 既存 {item['id']}（取り下げ済み）"
+                                   + (f"。置き換え先: {item['replaced_by']}" if item.get("replaced_by") else ""))
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1

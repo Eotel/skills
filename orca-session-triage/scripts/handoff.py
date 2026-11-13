@@ -49,6 +49,7 @@ from typing import NamedTuple, Protocol
 import answer_evidence
 import inbox_read
 import hourly_state
+import json_output
 import lead_decisions
 import scan_sessions
 
@@ -402,6 +403,8 @@ def main(argv: list[str] | None = None) -> int:
              "unanswered (rejected) since the newest kept handoff")
     state_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                                help="Orca CLI executable (default: %(default)s)")
+    state_command.add_argument("--out", type=Path, metavar="FILE",
+                               help="atomically write JSON to FILE instead of stdout")
     send_command = commands.add_parser("send", parents=[kept, lead],
                                        help="add the reports and lead state of the moment and the run's signature, "
                                             "then send")
@@ -452,8 +455,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "lead-state":
             if not args.lead_worktree:
                 raise ValueError("--lead-worktree or an appointed lead in --state-file is required")
-            print(json.dumps(lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca,
-                                          args.handoffs_dir.expanduser()), ensure_ascii=False, indent=2))
+            json_output.emit(lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca,
+                                          args.handoffs_dir.expanduser()), args.out)
             return 0
         return send(args, triage_notify(Path(args.notify).expanduser()), inbox_read.Sender.of(workspace()))
     except subprocess.CalledProcessError as error:
