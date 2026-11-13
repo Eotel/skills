@@ -2344,6 +2344,48 @@ class ScanCommandTests(unittest.TestCase):
         self.assertIn("まで待つ", lines[2])
         self.assertIn("まで待つ", lines[3])
 
+    def test_wake_honors_the_latest_answer_across_a_rows_wake_keys(self) -> None:
+        import lead_decisions
+
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/app/limit", "repo": "app", "class": "stalled",
+                                      "stop": {"kind": "usage_limit", "action": "wait", "agent": "claude",
+                                               "error": "usage limit", "resets": "2020-01-01T00:00:00Z"}}]))
+        log = self.dir / "decisions.jsonl"
+        lead_decisions.append(log,
+            lead_decisions.Decision("old", "wake:limit::first", "起こす", "2026-11-11T10:00:00+09:00"),
+            lead_decisions.Decision("new", "wake:app/limit::weekly-limit", "起こさない。返答待ち", "2026-11-12T11:00:00+09:00"),
+            lead_decisions.Decision("other", "wake:limit-other::later", "起こす", "2026-11-13T10:00:00+09:00"))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake", "--decisions-file", str(log)]), 0)
+        self.assertIn("2026-11-12T11:00:00+09:00 起こさない。返答待ち", out.getvalue())
+        self.assertNotIn("起こせる", out.getvalue())
+
+        lead_decisions.append(log, lead_decisions.Decision(
+            "resume", "wake:/w/app/limit::resume", "起こす", "2026-11-13T11:00:00+09:00"))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake", "--decisions-file", str(log)]), 0)
+        self.assertIn("起こせる", out.getvalue())
+
+    def test_wake_selects_the_tab_running_the_stopped_claude_transcript(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/app/stopped", "class": "stalled",
+            "claude": {"transcript": "/projects/w/stopped-session.jsonl"},
+            "stop": {"kind": "connection", "action": "wake", "agent": "claude",
+                     "error": "API Error: Connection lost", "resets": None},
+            "terminals": [{"handle": handle, "agent": "claude"} for handle in ("term_a", "term_b", "term_c")]}]))
+        sessions = self.dir / "sessions"
+        sessions.mkdir()
+        write_jsonl(sessions / "20.json", [{"pid": 20, "sessionId": "stopped-session", "cwd": "/elsewhere"}])
+        write_jsonl(sessions / "30.json", [{"pid": 30, "sessionId": "another-session", "cwd": "/w/app/stopped"}])
+        with patch.object(scan, "claude_session_dirs", return_value=[sessions]), \
+                patch.object(scan, "process_table", return_value={20: (10, "claude"), 10: (1, "zsh"), 30: (1, "claude")}), \
+                patch.object(scan.rm_check, "process_handles", return_value={10: "term_b", 30: "term_c"}), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+        self.assertIn("stopped | term_b |", out.getvalue())
+        self.assertNotIn("不明", out.getvalue())
+
     def test_time_only_reset_stays_on_the_date_implied_by_the_failure(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/limit", "class": "stalled", "claude": {
@@ -3228,6 +3270,19 @@ class RmCheckTests(unittest.TestCase):
         result = json.loads(completed.stdout)
         self.assertEqual((result["ok"], result["processes"]), (True, []), completed.stderr)
 
+    def test_the_reader_of_a_batch_wrappers_output_does_not_block(self) -> None:
+        wrapper = Path(self.tmp.name) / "batch.py"
+        wrapper.write_text("import subprocess, sys\n"
+                           "result = subprocess.run(sys.argv[1:], capture_output=True, text=True)\n"
+                           "print(result.stdout)\n")
+        args = [sys.executable, str(wrapper), sys.executable, str(rmcheck.__file__), str(self.wt), "-",
+                "--base", "main", "--no-docker"]
+        reader = [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"]
+        completed = subprocess.run(["/bin/sh", "-c", shlex.join(args) + " | " + shlex.join(reader)],
+                                   cwd=self.wt, capture_output=True, text=True)
+        result = json.loads(completed.stdout)
+        self.assertEqual((result["ok"], result["processes"]), (True, []), result)
+
     def test_a_worker_beside_the_reader_of_its_output_still_blocks(self) -> None:
         # The reader writes to /dev/null, which a worker in the same process group reads.
         out = Path(self.tmp.name) / "out.json"
@@ -3496,6 +3551,55 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("PR #7", " ".join(result["notes"]))
         self.assertEqual(lookups[0][:5], ["gh", "pr", "list", "--head", "feature"])
         self.assertEqual((other_code, other["blockers"]), (1, ["HEAD %s is not in main" % head[:8]]))
+
+    def test_archive_scratch_moves_only_untracked_exec_plan_markdown_absent_from_a_merged_pr_base(self) -> None:
+        plan = self.wt / "docs/exec-plans/active/remaining.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("Remaining work\n")
+        archive = Path(self.tmp.name) / "archive"
+        args = ("--pr", "7", "--base", "main", "--archive-scratch", "--archive-dir", str(archive))
+        pr = {"number": 7, "state": "MERGED", "headRefOid": git(self.wt, "rev-parse", "HEAD"), "baseRefName": "main"}
+
+        for state in (None, {**pr, "state": "OPEN"}):
+            code, result = self.run_main_without_base(*args, pr=state)
+            self.assertEqual((code, result["archived"]), (1, []))
+            self.assertTrue(plan.exists())
+        for other in (self.wt / "draft.txt", plan.with_suffix(".txt"), self.wt / "app.txt"):
+            with self.subTest(other=other):
+                other.write_text("keep this\n")
+                code, result = self.run_main_without_base(*args, pr=pr)
+                self.assertEqual((code, result["archived"]), (1, []))
+                self.assertTrue(plan.exists())
+                if other.name == "app.txt":
+                    other.write_text("v1\n")
+                else:
+                    other.unlink()
+
+        code, result = self.run_main_without_base(*args, pr=pr)
+        self.assertEqual((code, result["ok"]), (0, True))
+        self.assertFalse(plan.exists())
+        moved = result["archived"]
+        self.assertEqual([(item["from"], item["verified"]) for item in moved], [(str(plan.resolve()), True)])
+        self.assertEqual(Path(moved[0]["to"]).read_text(), "Remaining work\n")
+
+    def test_archive_scratch_keeps_an_untracked_plan_that_is_still_in_base(self) -> None:
+        rel = "docs/exec-plans/plan.md"
+        base_plan = self.main / rel
+        base_plan.parent.mkdir(parents=True)
+        base_plan.write_text("Base plan\n")
+        git(self.main, "add", rel)
+        git(self.main, "commit", "-q", "-m", "plan")
+        git(self.wt, "merge", "-q", "main")
+        git(self.wt, "rm", "-q", rel)
+        git(self.wt, "commit", "-q", "-m", "finish plan")
+        plan = self.wt / rel
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("New local work\n")
+        pr = {"number": 7, "state": "MERGED", "headRefOid": git(self.wt, "rev-parse", "HEAD"), "baseRefName": "main"}
+        code, result = self.run_main_without_base("--pr", "7", "--base", "main", "--archive-scratch",
+                                                 "--archive-dir", str(Path(self.tmp.name) / "archive"), pr=pr)
+        self.assertEqual((code, result["archived"]), (1, []))
+        self.assertEqual(plan.read_text(), "New local work\n")
 
     def test_archive_scratch_moves_records_only_when_they_alone_keep_the_worktree(self) -> None:
         (self.wt / ".yomiyasu" / "inputs").mkdir(parents=True)
@@ -4007,6 +4111,136 @@ class RmCheckTests(unittest.TestCase):
             self.assertEqual(merged_pr_head.main(argv), 1)
         self.assertEqual(out.getvalue(), "")
         self.assertIn("OPEN", err.getvalue())
+
+    def test_local_dependency_clones_are_disposable_only_when_clean_stash_free_and_on_a_remote(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copies = [self.wt / "local-deps" / name for name in ("first", "second")]
+        for copy in copies:
+            git(self.main, "clone", "-q", str(remote), str(copy))
+            git(copy, "config", "user.email", "t@example.com")
+            git(copy, "config", "user.name", "t")
+
+        for ignored in (False, True):
+            with self.subTest(ignored=ignored):
+                (self.main / ".git/info/exclude").write_text("local-deps/\n" if ignored else "")
+                code, result = self.run_main()
+                self.assertEqual((code, result["ok"]), (0, True), result)
+                self.assertTrue(all(str(copy.resolve()) in " ".join(result["notes"]) for copy in copies))
+                self.assertTrue(all(copy.exists() for copy in copies))
+
+        changed = copies[1]
+        (changed / ".env").write_text("LOCAL=keep\n")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
+        (changed / ".env").unlink()
+        (changed / "app.txt").write_text("local work\n")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
+        git(changed, "stash", "push", "-q")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn("stash", " ".join(result["reasons"]))
+
+        git(changed, "stash", "pop", "-q")
+        git(changed, "commit", "-q", "-am", "unpushed")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
+
+        git(changed, "tag", "-a", "-m", "saved", "saved")
+        git(changed, "push", "-q", "origin", "refs/tags/saved")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (0, True), result)
+        git(changed, "push", "-q", "origin", ":refs/tags/saved")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
+
+    def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(copy, "checkout", "-q", "-b", "draft")
+        (copy / "app.txt").write_text("unpublished work\n")
+        git(copy, "commit", "-q", "-am", "draft")
+        git(copy, "checkout", "-q", "main")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("refs/heads/draft", " ".join(result["reasons"]))
+        git(copy, "push", "-q", "origin", "draft")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (0, True), result)
+
+        git(copy, "checkout", "-q", "--detach", "draft")
+        (copy / "app.txt").write_text("tagged local work\n")
+        git(copy, "commit", "-q", "-am", "local tag")
+        git(copy, "tag", "local-only")
+        git(copy, "checkout", "-q", "main")
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("refs/tags/local-only", " ".join(result["reasons"]))
+
+    def test_local_dependency_clones_keep_the_repository_of_an_external_linked_worktree(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        linked = Path(self.tmp.name) / "external-worktree"
+        git(copy, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn(str(linked.resolve()), " ".join(result["reasons"]))
+        self.assertTrue((linked / ".git").is_file())
+
+    def test_local_dependency_clones_keep_initialized_submodule_history(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(copy, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(remote), "child")
+        git(copy, "commit", "-q", "-am", "submodule")
+        git(copy, "push", "-q", "origin", "main")
+        child = copy / "child"
+        original = git(child, "rev-parse", "HEAD")
+        git(child, "config", "user.email", "t@example.com")
+        git(child, "config", "user.name", "t")
+        git(child, "checkout", "-q", "-b", "unpublished")
+        (child / "app.txt").write_text("unpublished child history\n")
+        git(child, "commit", "-q", "-am", "child work")
+        git(child, "checkout", "-q", "--detach", original)
+        self.assertEqual(git(copy, "status", "--porcelain"), "")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("submodule", " ".join(result["reasons"]))
+
+    def test_a_tracked_dependency_gitlink_change_still_blocks_removal(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/lib"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        git(self.wt, "add", "local-deps/lib")
+        git(self.wt, "commit", "-q", "-m", "pin dependency")
+        git(self.main, "merge", "-q", "feature")
+        (copy / "app.txt").write_text("updated dependency\n")
+        git(copy, "commit", "-q", "-am", "dependency update")
+        git(copy, "push", "-q", "origin", "main")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False), result)
+        self.assertIn("local-deps/lib", result["uncommitted"])
 
     def test_nested_worktrees_on_a_remote_are_detached_and_others_block(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
