@@ -247,13 +247,16 @@ literal word, ignoring case. `--since` applies to the search; `user_messages`
 still starts at the newest handoff. HH:MM means its most recent occurrence in
 local time. Search reads the current transcript.
 
-Pending questions answered through shared hourly state or ask-answers carry
+Pending questions answered through shared hourly state or delivered answers in ask-answers carry
 `answered_elsewhere` (the answer time) and `answer_source`. A call whose every
 question is answered also carries the last answer time and `close_selector`
 commands, listing every heading, for tabs showing the matching selector. Read
 the answer evidence before running one; the command checks the screen again.
 A partial batch has annotations only on its answered questions and no close
-command. Reading lead-state never closes a selector.
+command. Administrative answered marks are not answer evidence. Identical
+hourly question wording under different lanes or decisions stays unannotated;
+inbox questions must also identify one ask uniquely. Reading lead-state never
+closes a selector.
 `--claude-projects` selects the transcript root for both commands.
 Do not sign the body: it ends the
 text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and

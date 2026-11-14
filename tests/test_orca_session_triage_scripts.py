@@ -5070,12 +5070,14 @@ class HandoffProposalTests(unittest.TestCase):
             self.assertEqual(partial["questions"][0]["answered_elsewhere"], "2026-11-14T01:02:00Z")
             self.assertNotIn("answered_elsewhere", partial["questions"][1])
             self.assertNotIn("close_selector", partial)
-            write_jsonl(self.root / "answers.jsonl", [{"id": "ask-one:2", "ts": "2026-11-14T01:03:00Z", "how": "send"}])
+            write_jsonl(self.root / "answers.jsonl", [
+                {"id": "ask-one:2", "ts": "2026-11-14T01:02:30Z", "how": "inbox_read.py answered"},
+                {"id": "ask-one:2", "ts": "2026-11-14T01:03:00Z", "how": "send"}])
             code, shown, err = self.call("lead-state")
 
         self.assertEqual(code, 0, err)
         call = json.loads(shown)["pending_questions"][0]
-        self.assertEqual(call["answered_elsewhere"], "2026-11-14T01:03:00Z")
+        self.assertEqual(call["answered_elsewhere"], "2026-11-14T01:03:00+00:00")
         self.assertEqual(call["questions"][1]["answer_source"], "ask-answers ask-one:2")
         self.assertEqual([shlex.split(command) for command in call["close_selector"]], [[
             str(Path(handoff.NOTIFY).with_name("close-selector").expanduser()), "term_lead", "release's approval", "merge"]])
@@ -5092,13 +5094,32 @@ class HandoffProposalTests(unittest.TestCase):
                    ("terminal", "list"): {"terminals": []}}
         with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
                 args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
-            for how, ids in [("send", ["a", "b"]), ("triage-notify --withdraws", ["a"])]:
+            for how, ids in [("send", ["a", "b"]), ("triage-notify --withdraws", ["a"]),
+                             ("inbox_read.py answered", ["a"])]:
                 with self.subTest(how=how, ids=ids):
                     write_jsonl(self.inbox, [{"kind": "ask", "id": key, "questions": [question]} for key in ids])
                     write_jsonl(self.root / "answers.jsonl", [{"id": "a", "ts": "2026-11-14T02:00:00Z", "how": how}])
                     code, shown, err = self.call("lead-state")
                     self.assertEqual(code, 0, err)
                     self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
+
+    def test_lead_state_leaves_identical_hourly_questions_from_different_decisions_open(self) -> None:
+        question = {"header": "merge", "question": "Merge?"}
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "first": {"row": "/w/first", "decision": "merge:first", "question": "Merge?", "answer": None},
+                "other": {"row": "/w/other", "decision": "merge:other", "question": "Merge?", "answer": "Yes",
+                          "answered_at": "2026-11-14T02:00:00Z"}}}))
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": [question]}}), "timestamp": "2026-11-14T01:00:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            code, shown, err = self.call("lead-state")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
 
     def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},

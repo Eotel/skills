@@ -284,17 +284,21 @@ def question_text(value: str) -> str:
 def annotate_elsewhere(pending: list[dict], state: dict, tabs: list[dict]) -> None:
     """Attach timestamped shared answers, and commands only for completely answered selectors on screen."""
     entries = hourly_state.inbox_entries()
-    records = inbox_read.answer_records(inbox_read.answers_path())
-    answered = [dict(item, source=f"hourly_state {key}") for key, item in state["questions"].items()
-                if item.get("answer") is not None and not item.get("withdrawn_at")]
+    delivered = list(answer_evidence.delivered(inbox_read.answers_path()))
     for call in pending:
         asked_at = scan_sessions.parse_time(call.get("asked_at"))
         for question in call["questions"]:
             wanted = question_text(str(question.get("question") or ""))
             if not wanted or asked_at is None:
                 continue
-            candidates = [(item.get("answered_at"), item["source"]) for item in answered
-                          if wanted == question_text(str(item.get("question") or ""))]
+            recorded = [(key, item) for key, item in state["questions"].items()
+                        if wanted == question_text(str(item.get("question") or ""))]
+            identities = {(item.get("row"), item.get("decision"), item.get("ask_id"))
+                          if item.get("row") or item.get("decision") or item.get("ask_id") else (key,)
+                          for key, item in recorded}
+            # Repeated wording for different lanes or decisions is not an identity.
+            candidates = [(item.get("answered_at"), f"hourly_state {key}") for key, item in recorded
+                          if len(identities) == 1 and item.get("answer") is not None and not item.get("withdrawn_at")]
             matching = [(ask, number) for ask in entries if ask.get("kind") == "ask"
                         for number, original in enumerate(inbox_read.questions_of(ask), 1)
                         if isinstance(original, dict)
@@ -305,10 +309,8 @@ def annotate_elsewhere(pending: list[dict], state: dict, tabs: list[dict]) -> No
             # A repeated question alone cannot identify which inbox ask this selector puts.
             if len(matching) == 1:
                 ask, number = matching[0]
-                for key in (str(ask["id"]), f"{ask['id']}:{number}"):
-                    record = records.get(key)
-                    if record and "withdraw" not in str(record.get("how") or ""):
-                        candidates.append((record.get("ts"), f"ask-answers {key}"))
+                candidates.extend((answer.at.isoformat(), f"ask-answers {answer.ask_id}") for answer in delivered
+                                  if answer.ask_id in (str(ask["id"]), f"{ask['id']}:{number}"))
             later = [(at, str(stamp), source) for stamp, source in candidates
                      if (at := scan_sessions.parse_time(stamp)) is not None and at >= asked_at]
             if later:
