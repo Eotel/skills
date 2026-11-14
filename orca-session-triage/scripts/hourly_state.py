@@ -35,6 +35,7 @@ from typing import Any, Protocol
 import uuid
 
 import answer_evidence
+import ask_state
 import hourly_runs
 import hourly_runtime
 import inbox_read
@@ -42,7 +43,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 
-DEFAULT_STATE = "~/.cache/orca-session-triage/hourly-state.json"
+DEFAULT_STATE = os.environ.get("TRIAGE_HOURLY_STATE", "~/.cache/orca-session-triage/hourly-state.json")
 # Beside the state file: {"repos": ["owner/name", ...]} whose open issues become requests.
 ISSUE_REPOS = "issue-repos.json"
 REPO_SLUG = re.compile(r"[\w.-]+/[\w.-]+")
@@ -500,7 +501,7 @@ def row_question(row: dict, final: dict) -> str:
 
 def blocked_by_user(row: dict) -> bool:
     verdict = row.get("verdict") or {}
-    return verdict.get("class") == "blocked" and bool(re.search(
+    return verdict.get("class") == "blocked" and bool(verdict.get("needs_user")) and bool(re.search(
         r"三浦|miura", str(verdict.get("waits_on") or row.get("waits_on") or ""), re.IGNORECASE))
 
 
@@ -611,8 +612,14 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        verdict = row.get("verdict") or {}
+        received = [{**report_view(item), "worktree": item.get("worktree"), "repo": item.get("repo")}
+                    for item in entries if item.get("kind") in ("info", "done")
+                    and said_at is not None and (at := scan_sessions.parse_time(item.get("ts"))) is not None
+                    and at > said_at and waiting_sender(str(verdict.get("waits_on") or ""), item)]
         if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
                 and not blocked_by_user(row) and not any(keys.values()) and not shared_pending
+                and not received
                 and not (in_progress and (progress_question or counted))):
             continue
         comment = row.get("comment") or ""
@@ -621,6 +628,9 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 "question": excerpt(question), "merge_question": scan_sessions.asks_merge(question, comment),
                 "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
+        view.update(waits_on=verdict.get("waits_on"), next_step=verdict.get("next_step"))
+        view["waiting_reports"] = received
+        view["asking"] = ask_state.for_row(state, identity, latest_decisions)
         if blocked_by_user(row):
             proven = [answer for _, _, proof in counted for answer in proof]
             if proven:
@@ -702,6 +712,17 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     return [{**item, "age_minutes": int((now - at).total_seconds() // 60),
              **({"answer_age_minutes": int((now - (scan_sessions.parse_time(item["answer"]["at"]) or now)).total_seconds() // 60)}
                 if item["answer"] else {})} for at, item in found]
+
+
+def waiting_sender(waits_on: str, report: dict) -> bool:
+    """Match the named worker as a token, keeping repo-qualified names from matching another repo."""
+    name = str(report.get("worktree") or "")
+    if not name:
+        return False
+    repo = str(report.get("repo") or "")
+    names = [f"{repo}/{name}"] if repo else []
+    return any(re.search(r"(?<![A-Za-z0-9_/.-])" + re.escape(value) + r"(?![A-Za-z0-9_/.-])", waits_on)
+               for value in [*names, name])
 
 
 def read(path: Path) -> dict:
@@ -874,6 +895,7 @@ class Asking:
     ask: str | None = None  # the full id of the inbox ask it was taken from
     based_at: str | None = None  # when what the question rests on was said: that ask's time
     session: str | None = None  # the session that put it; None for this one (CLAUDE_CODE_SESSION_ID)
+    header: str | None = None
 
     @property
     def key(self) -> str:
@@ -917,12 +939,13 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
     data["questions"].setdefault(key, {"row": asking.row, "decision": asking.decision,
                                               "final_message": asking.final_message,
                                               "question": asking.question, "asked_at": asking.asked_at,
+                                              "header": asking.header,
                                               "owner_pane": os.environ.get("ORCA_PANE_KEY"),
                                               "session": asking.session or os.environ.get("CLAUDE_CODE_SESSION_ID"),
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": key, **data["questions"][key],
+    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, asking.row),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1003,7 +1026,7 @@ def record_answer(data: dict, answering: Answering) -> dict:
     return {"id": key, **question}
 
 
-ASKED_KEYS = frozenset(("ask", "row", "final_message", "decision", "question", "asked_at", "covers", "session"))
+ASKED_KEYS = frozenset(("ask", "row", "final_message", "decision", "question", "asked_at", "covers", "session", "header"))
 ANSWERED_KEYS = frozenset(("id", "decision", "answer", "answered_at", "replace_reason"))
 
 
@@ -1078,6 +1101,7 @@ def asking_line(raw: str, inbox: Inbox) -> Asking:
     return Asking(row=row, decision=line_text(item, "decision"), final_message=message,
                   question=line_text(item, "question"), asked_at=recorded_at(when),
                   covers=tuple(key.strip() for key in covers), ask=ask.get("id"), based_at=ask.get("ts"),
+                  header=line_text(item, "header") if "header" in item else None,
                   session=line_text(item, "session") if "session" in item else None)
 
 
@@ -1291,7 +1315,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
             raise ValueError("decision is empty")
         asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
                         question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
-                        covers=tuple(args.covers), session=args.session)
+                        covers=tuple(args.covers), session=args.session, header=args.header)
         return record_question(data, asking, new_references(data, [asking]))
     if args.action == "answered":
         return record_answer(data, Answering(
@@ -1394,6 +1418,12 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                 line += f" | 伺っていない（claim のみ、{claimed['inactive_minutes']} 分）{claimed['by']}"
             else:
                 line += f" | 伺い中 {claimed['by']}（{claimed['at']}〜）。重ねて伺わない"
+        for asking in item.get("asking") or []:
+            line += f" | 伺い中 {asking['by']}（{asking['at']}、{', '.join(asking['keys'])}）。重ねて伺わない"
+        for report in item.get("waiting_reports") or []:
+            line += f" | 待ち先から届いた（{report['ts']}・報告 {report['id']}・{report['worktree']}）"
+        if item.get("waits_on"):
+            line += f" | waits_on={item['waits_on']} | next_step={item.get('next_step') or ''}"
         if item.get("related_issues_closed"):
             line += " | 関わる issue が閉じた（" + ", ".join(
                 f"{ref['ref']} {ref['state']}" for ref in item["related_issues"]) + "）"
@@ -1418,6 +1448,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-file", default=DEFAULT_STATE, help="shared hourly state JSON path")
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("show", help="read all saved decisions, questions, handoffs, requests, and user waits")
+    asking = commands.add_parser("asking", help="list the rows and decision keys being asked, with workspace and time")
+    asking.add_argument("--summary", action="store_true", help="one 伺い中 line per question")
+    asking.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG)
     pending_command = commands.add_parser(
         "pending", help="list open items with their ids (an unanswered question with the prs its #numbers name and the "
                         "later asks that withdrew its ask as reissued), settled questions with evidence, unrecorded "
@@ -1524,6 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
     asked.add_argument("--decision", required=True, help="stable subject and action, e.g. merge:PR#10")
     asked.add_argument("--final-message-file", required=True)
     asked.add_argument("--question-file", required=True)
+    asked.add_argument("--header", help="the AskUserQuestion header, for matching a question before it opens")
     asked.add_argument("--asked-at", help="original ISO 8601 time when importing a question")
     asked.add_argument("--session", help="the session that put it, when importing a question another session put "
                                          "(an unrecorded question's session in pending); default: this one")
@@ -1663,7 +1697,7 @@ def main(argv: list[str] | None = None) -> int:
                     comment_here = False
                     notices.append(f"定時の作業場かを Orca から読めず、Orca のコメントを書いていない: {error}")
         with (path.parent / (path.name + ".lock")).open("a+") as lock:
-            read_only = ("show", "get", "pending", "left-now", "requests-needing-owner")
+            read_only = ("show", "get", "pending", "asking", "left-now", "requests-needing-owner")
             writes = args.action not in read_only or intake is not None
             fcntl.flock(lock, fcntl.LOCK_EX if writes else fcntl.LOCK_SH)
             data = read(path)
@@ -1673,6 +1707,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.action == "left-now":
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": left_matches}
+            elif args.action == "asking":
+                result = [ask_state.view(item) for item in ask_state.active(
+                    data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())))]
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":
@@ -1743,7 +1780,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
-    if args.action == "pending" and args.summary and isinstance(result, dict):
+    if args.action == "asking" and args.summary and isinstance(result, list):
+        for item in result:
+            print(f"伺い中 {item['by']}（{item['at']}）行 {item['row']} | 鍵 {', '.join(item['keys'])} | {item['question']}")
+    elif args.action == "pending" and args.summary and isinstance(result, dict):
         print("\n".join(line for kind, items in result.items()
                         if (line := summary(items, datetime.now(timezone.utc), kind))))
     else:

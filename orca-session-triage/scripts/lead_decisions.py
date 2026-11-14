@@ -40,9 +40,10 @@ from typing import Protocol
 import uuid
 
 import inbox_read
+import ask_state
 
-DEFAULT_LOG = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
-HANDED_OFF_LOG = Path("~/.cache/orca-session-triage/handed-off.jsonl")
+DEFAULT_LOG = Path(os.environ.get("TRIAGE_LEAD_DECISIONS", "~/.cache/orca-session-triage/lead-decisions.jsonl"))
+HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session-triage/handed-off.jsonl"))
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value"))
@@ -368,17 +369,7 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 def ask_answers(path: Path) -> dict[str, dict]:
     """The same answered ids open-asks uses, with their complete answer records."""
-    ids = inbox_read.answered_ids(path)
-    found = {}
-    if ids:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"] in ids:
-                found[item["id"]] = item
-    return found
+    return inbox_read.answer_records(path)
 
 
 def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
@@ -394,12 +385,14 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
-                  workers: IssueWorkers, decisions: list[str] | None = None) -> dict[str, list[dict]]:
+                  workers: IssueWorkers, decisions: list[str] | None = None,
+                  state: dict | None = None) -> dict[str, list[dict]]:
     """Open keys with their hand-off history and PR facts, and settled keys with the answering record."""
     history: dict[str, list[HandOff]] = {}
     for item in handed:
         history.setdefault(item.decision, []).append(item)
-    keys = list(dict.fromkeys(decisions)) if decisions else list(history)
+    keys = list(dict.fromkeys(decisions)) if decisions else list(dict.fromkeys([
+        *history, *(key for item in ask_state.active(state or {}, answered) for key in item["keys"] if key)]))
     asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
     settled = []
     last = {}
@@ -408,7 +401,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         answer = (asdict(answered[key]) if key in answered else
                   next((found for entry in reversed(history.get(key, []))
                         if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
-        if answer is not None:
+        delivered = answer is not None and (key in answered or genuine_answer(answer))
+        if delivered:
             settled.append({"decision": key, "answer": answer})
         else:
             last[key] = item
@@ -427,10 +421,24 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         row = {"decision": key, "handed_off_at": at,
                "first_handed_off_at": history[key][0].handed_off_at if item else None,
                "handoff_count": len(history.get(key, [])), "prs": views}
+        if state is not None and (asking := ask_state.for_key(state, key, entries)):
+            row["asking"] = asking
+        candidates = [found for entry in history.get(key, [])
+                      if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))
+                      and not genuine_answer(found)]
+        if candidates:
+            row["candidates"] = candidates
         if named[key]:
             row["reports"] = decision_reports(key, named[key], at, entries)
         unanswered.append(row)
     return {"unanswered": unanswered, "settled": settled}
+
+
+def genuine_answer(answer: dict) -> bool:
+    """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
+    parts = answer.get("answers")
+    return (all(genuine_answer(part) for part in parts) if isinstance(parts, list)
+            else answer.get("how") in ("send", "send --decision"))
 
 
 @dataclass(frozen=True)
@@ -506,6 +514,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
         "unanswered", help="print unanswered keys with hand-off history and PR facts, and settled keys with answers; "
                            "without --decision, include every handed-off key")
     unanswered.add_argument("--decision", action="append", help="repeat once per question")
+    unanswered.add_argument("--state-file", type=Path, default=Path("~/.cache/orca-session-triage/hourly-state.json"),
+                            help="hourly questions being asked, with workspace and time")
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")
     unanswered.add_argument("--asana-status", type=Path, help="OUT_JSON already written by asana99_status.py")
@@ -561,10 +571,14 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                       json.loads(args.asana_status.expanduser().read_text(encoding="utf-8"))} if args.asana_status else {})
             result = open_handoffs(handed_off(args.handed_off_file.expanduser()), latest(records(log)), read_prs,
                                    ask_answers(inbox_read.answers_path().expanduser()), entries, asana,
-                                   orca_issue_workers(args.orca), args.decision)
+                                   orca_issue_workers(args.orca), args.decision,
+                                   state=handoff.hourly_state.read(args.state_file.expanduser()))
             if args.summary:
                 for item in result["unanswered"]:
-                    print(item["decision"])
+                    print(item["decision"] + "".join(
+                        f" | 伺い中 {asking['by']}（{asking['at']}）" for asking in item.get("asking") or []))
+                    for candidate in item.get("candidates") or []:
+                        print(f"  candidates: {json.dumps(candidate, ensure_ascii=False)}")
                 print(f"settled: {len(result['settled'])}")
                 return 0
     except (OSError, ValueError, LookupError) as error:
