@@ -2395,13 +2395,16 @@ def removal_approved(row: dict) -> bool:
     text = str((row.get("removal_decision") or {}).get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
     text = re.sub(r"rm_check(?:\.py)?\s*(?:が\s*)?ok\s*なら|検査が通れば", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"タブを閉じてから|--archive-scratch\s*で(?:作業記録を|控えに)?移してから", "", text)
     if re.search(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|"
-                 r"たら|れば|なら|次第|まで|後に|消すか|消せない|"
+                 r"たら|れば|なら|次第|まで|から|後に|後で|消すか|消せない|(?:消す|削除する)な|"
                  r"\b(?:keep|defer|do not remove|don't remove)\b", text, re.IGNORECASE):
         return False
-    return bool(re.search(r"消す(?=$|[\s。、（()）」])|消します|消して(?:よい|いい|ください|構わない|かまわない)|"
-                          r"削除(?:する|して(?:よい|いい|ください))|\b(?:remove it|ready to remove)\b",
-                          text, re.IGNORECASE))
+    # English answers are whole commands: a substring cannot establish approval or its timing.
+    if re.fullmatch(r"\s*(?:remove it|ready to remove)\s*[.!]?\s*", text, re.IGNORECASE):
+        return True
+    return bool(re.search(r"(?:消す|消します|消して(?:よい|いい|ください|構わない|かまわない)|"
+                          r"削除(?:する|して(?:よい|いい|ください)))(?=$|[\s。、（()）」])", text))
 
 
 def removal_facts(row: dict) -> str:

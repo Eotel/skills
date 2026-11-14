@@ -2722,7 +2722,7 @@ class ScanCommandTests(unittest.TestCase):
     def test_removal_specs_honor_approval_but_keep_retained_rows_and_print_scan_values(self) -> None:
         saved = self.dir / "scan.json"
         decisions = self.dir / "decisions.jsonl"
-        names = ("approved", "keep", "defer", "conditional", "unknown")
+        names = ("approved", "keep", "defer", "conditional", "negated", "not-ready", "after", "unknown")
         rows = [{"path": f"/w/app/{name}", "repo": "app", "class": "unsure", "meaningful_tabs": ["term_idle"]}
                 for name in names]
         saved.write_text(json.dumps(rows))
@@ -2731,7 +2731,10 @@ class ScanCommandTests(unittest.TestCase):
                                for name, answer in (("approved", "指揮: rm_check が ok なら作業場を消してよい"),
                                                     ("keep", "結果が出るまで残す。その後に消す"),
                                                     ("defer", "保留。使っている人が終えたら消してよい"),
-                                                    ("conditional", "PR が merge されたら消す"))])
+                                                    ("conditional", "PR が merge されたら消す"),
+                                                    ("negated", "削除するな"),
+                                                    ("not-ready", "not ready to remove"),
+                                                    ("after", "remove it after the experiment finishes"))])
         for named in ([], [f"--row={name}" for name in names]):
             with self.subTest(named=bool(named)), redirect_stdout(io.StringIO()) as out, \
                     redirect_stderr(io.StringIO()) as err:
