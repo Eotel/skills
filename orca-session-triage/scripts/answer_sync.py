@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 import fcntl
 import json
 import os
@@ -23,13 +24,18 @@ def handoff_keys(ids: list[str], entries: list[dict], handed_off: Path, saved: P
     if not reports:
         return set()
     known = list(lead_decisions.handed_off(handed_off))
-    keys = {item.decision for report in reports for item in known
-            if item.ask_id == report["id"] or re.search(r"(?<![A-Za-z0-9_/.-])" + re.escape(item.decision)
-                + r"(?![A-Za-z0-9_/.-])", str(report.get("text") or ""))}
-    for path in saved.glob("*.json"):
+    exact = {}
+    for path in sorted(saved.glob("*.json"), reverse=True):
         item = json.loads(path.read_text(encoding="utf-8"))
-        if any(str(report.get("text") or "").strip() == str(item.get("text") or "").strip() for report in reports):
-            keys.update(item.get("decisions") or [])
+        exact.setdefault(str(item.get("text") or "").strip(), item.get("decisions") or [])
+    keys = set()
+    for report in reports:
+        text = str(report.get("text") or "").strip()
+        if text in exact:
+            keys.update(exact[text])
+        else:
+            keys.update(item.decision for item in known if item.ask_id == report["id"] or re.search(
+                r"(?<![A-Za-z0-9_/.-])" + re.escape(item.decision) + r"(?![A-Za-z0-9_/.-])", text))
     return keys
 
 
@@ -70,17 +76,23 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 raise ValueError(f"ask {key} already has a different delivered answer; inspect it before replacing it")
         if ids and all(key in records for key in ids):
             when = max(records[key]["ts"] for key in ids)
-        records.update({key: {"id": key, "note": answer, "ts": when} for key in ids})
+        if how in ("send", "send --decision"):
+            records.update({key: {"id": key, "note": answer, "ts": when} for key in ids})
         touched = [ref for value in ids if (ref := ask_state.reference(value, entries))]
         keys = dict(decisions or {})
         known = {item.decision for item in lead_decisions.handed_off(handed_off_file)}
-        known.update(lead_decisions.latest(lead_decisions.records(decisions_file)))
+        latest = lead_decisions.latest(lead_decisions.records(decisions_file))
+        known.update(latest)
         known.update(key for item in data["questions"].values()
                      for key in [item.get("decision") or "", *(item.get("covers") or [])])
         for key in known:
             if ((ref := ask_state.reference(key, entries)) and any(ask_state.overlaps(ref, given) for given in touched)
                     and ask_state.covered(ref, list(records), entries)):
                 keys.setdefault(key, answer_text(ref, records, entries))
+        for key, text in keys.items():
+            if key in latest and latest[key].answer != text and (datetime.fromisoformat(latest[key].decided_at)
+                                                                > datetime.fromisoformat(when)):
+                raise ValueError(f"{key} has a newer lead decision; the delivered answer was not replayed over it")
         changed = []
         for key, item in data["questions"].items():
             if item.get("withdrawn_at"):
@@ -88,13 +100,21 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             refs = ask_state.references(item, entries)
             covered = (refs and any(ask_state.overlaps(ref, given) for ref in refs for given in touched)
                        and all(ask_state.covered(ref, list(records), entries) for ref in refs))
-            key_answers = [keys[value] for value in item.get("covers") or [] if value in keys]
-            if not covered and not (key_answers and len(key_answers) == len(item["covers"])):
+            bindings = item.get("covers") or ([item["decision"]] if item.get("decision") in keys else [])
+            if bindings:
+                available = {value: latest[value].answer for value in bindings if value in latest
+                             and (datetime.fromisoformat(latest[value].decided_at)
+                                  >= datetime.fromisoformat(item["asked_at"]))}
+                available.update(keys)
+                if not all(value in available for value in bindings) or not any(value in keys for value in bindings):
+                    continue
+                parts = list(dict.fromkeys(available[value] for value in bindings))
+            elif covered:
+                parts = list(dict.fromkeys(answer_text(ref, records, entries) for ref in refs))
+            else:
                 continue
-            parts = list(dict.fromkeys(answer_text(ref, records, entries) for ref in refs)) if covered else list(dict.fromkeys(key_answers))
             text = "\n".join(parts) or answer
             changed.append(hourly_state.record_answer(data, hourly_state.Answering(id=key, answer=text, answered_at=when)))
-        latest = lead_decisions.latest(lead_decisions.records(decisions_file))
         new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when)
                for key, text in keys.items() if key not in latest or latest[key].answer != text]
         if new:

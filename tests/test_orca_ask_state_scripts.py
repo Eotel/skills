@@ -122,6 +122,22 @@ class AskStateTests(unittest.TestCase):
         decisions = {item["decision"]: item for item in map(json.loads, self.log.read_text().splitlines())}
         self.assertEqual(decisions[self.KEY]["answer"], "公開する\n待つ")
 
+    def test_mixed_decisions_wait_for_every_cover_and_a_replay_preserves_a_newer_correction(self) -> None:
+        question = self.ask(covers=[self.KEY, "remove:/w/other"])
+        def deliver() -> subprocess.CompletedProcess[str]:
+            return subprocess.run([sys.executable, "-c", f"import answer_sync; answer_sync.record([{self.ASK!r}], '公開する', 'send', at={self.AT!r})"],
+                                  cwd=SCRIPTS, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(deliver().returncode, 0)
+        self.assertIsNone(json.loads(self.state.read_text())["questions"][question["id"]]["answer"])
+        with self.log.open("a") as stream:
+            stream.write(json.dumps({"id": "correction", "decision": self.KEY, "answer": "止める",
+                                     "decided_at": "2026-11-14T09:05:00+00:00"}) + "\n")
+        before = self.log.read_text()
+        replay = deliver()
+        self.assertNotEqual(replay.returncode, 0)
+        self.assertIn("newer lead decision", replay.stderr)
+        self.assertEqual(self.log.read_text(), before)
+
     def test_keyed_handoff_requires_each_answer_and_writes_nothing_on_missing_key(self) -> None:
         text = "merge:repo#1\nkeep:/w/a\n—— 送る直前に道具が足した事実 ——"
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "text": text}])
@@ -137,6 +153,26 @@ class AskStateTests(unittest.TestCase):
                                "--decision", "keep:/w/a=残す")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([item["answer"] for item in map(json.loads, self.log.read_text().splitlines())], ["merge する", "残す"])
+
+    def test_saved_handoff_decisions_override_incidental_keys_and_its_note_does_not_become_the_answer(self) -> None:
+        text = "残す判断を伺う\n—— 送る直前に道具が足した事実 ——\n報告: merge:repo#1 は回答済み"
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "text": text}])
+        saved = self.root / "handoffs"
+        saved.mkdir()
+        (saved / "saved.json").write_text(json.dumps({"text": text, "decisions": ["keep:/w/current"]}))
+        self.write_lines(self.handed, [{"decision": key, "handed_off_at": self.AT}
+                                      for key in ("keep:/w/current", "merge:repo#1")])
+        question = self.ask(covers=["keep:/w/current"])
+        state = json.loads(self.state.read_text())
+        state["questions"][question["id"]]["ask_id"] = self.ASK
+        self.state.write_text(json.dumps(state))
+        result = self.run_tool("inbox_read.py", "answered", self.ASK, "--note", "別のタブで答えた",
+                               "--decision", "keep:/w/current=残す", "--state-file", str(self.state),
+                               "--decisions-file", str(self.log), "--handed-off-file", str(self.handed),
+                               "--handoffs-dir", str(saved))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.state.read_text())["questions"][question["id"]]["answer"], "残す")
+        self.assertEqual(json.loads(self.log.read_text())["decision"], "keep:/w/current")
 
     def test_note_only_answer_is_a_candidate_and_asked_keys_show_the_asking_workspace(self) -> None:
         self.ask()
@@ -193,6 +229,17 @@ class AskStateTests(unittest.TestCase):
         self.state.write_text(json.dumps(state))
         self.write_lines(self.answers, [{"id": self.ASK, "ts": self.AT, "how": "send", "note": "公開する"}])
         self.question = {**self.question, "question": "別の公開を進めますか？", "header": "公開"}
+        self.assertEqual(self.hook().stdout, "")
+
+    def test_guard_allows_different_numbered_questions_from_the_same_worker(self) -> None:
+        self.ask(key=f"ask:worker::{self.ASK}:1", covers=[f"answer:worker::{self.ASK}:1"])
+        state = json.loads(self.state.read_text())
+        state["questions"]["lead-question"] = {
+            "row": "/w/worker", "decision": f"ask:worker::{self.ASK}:2", "covers": [f"answer:worker::{self.ASK}:2"],
+            "question": "次の公開を進めますか？", "header": "次の公開", "answer": None,
+            "asked_in": "/w/lead", "session": "lead-session", "asked_at": self.AT}
+        self.state.write_text(json.dumps(state))
+        self.question = {**self.question, "question": "次の公開を進めますか？", "header": "次の公開"}
         self.assertEqual(self.hook().stdout, "")
 
 

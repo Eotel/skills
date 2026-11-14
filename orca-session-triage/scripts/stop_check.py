@@ -164,14 +164,13 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
             if item.get("answer") is not None:
                 reasons.append(f"「{header or text}」は hourly_state の回答済みの問いです（{item.get('answered_at')}）。答えを読んでください。")
         related = {value for item in matched for value in [item.get("decision"), *(item.get("covers") or [])]}
-        rows = {item.get("row") for item in matched}
         for item in ask_state.active(state):
             same = ask_state.same_workspace(item["by"], cwd)
             if same and (not item["session"] or item["session"] == session):
                 continue
             bindings = ask_state.references(item["record"], entries)
             overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
-            if item["row"] in rows or related.intersection(item["keys"]) or overlap:
+            if item["record"] in matched or related.intersection(item["keys"]) or overlap:
                 reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")
     return deny(list(dict.fromkeys(reasons)))
 
