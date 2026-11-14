@@ -5612,6 +5612,15 @@ class HourlyStateTests(unittest.TestCase):
         questions = self.call("show")[1]["questions"]
         self.assertIsNone(questions[recorded[0]["id"]]["answer"])
         self.assertEqual(questions[recorded[1]["id"]]["answer"], "Second answer")
+        second = questions[recorded[1]["id"]]
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
+            sync.record([f"{ask_id}:1"], "First answer", "send", at="2026-11-13T09:03:00Z",
+                        state_file=self.state, decisions_file=self.root / "lead.jsonl",
+                        handed_off_file=self.root / "handed.jsonl")
+        questions = self.call("show")[1]["questions"]
+        self.assertEqual(questions[recorded[0]["id"]]["answer"], "First answer")
+        self.assertEqual(questions[recorded[1]["id"]], second)
 
         write_jsonl(lines, [{"ask": f"{ask_id}:1", "decision": "new-first", "question": "First?"},
                             {"ask": f"{ask_id}:3", "decision": "invalid", "question": "Third?"}])
