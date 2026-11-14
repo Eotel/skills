@@ -56,6 +56,15 @@ def saved_sessions(path: Path, workspace: str) -> dict[str, PaneSession]:
     return sessions
 
 
+def tab_label(term: dict[str, Any], runs: list[dict[str, Any]]) -> str:
+    """Keep the local scheduled/start times beside every per-tab decision."""
+    timings = "; ".join(
+        f"run {run.get('status') or '-'}, "
+        f"scheduled={hourly_runtime.local_minute(run.get('scheduledFor'))}, "
+        f"started={hourly_runtime.local_minute(run.get('startedAt'))}" for run in runs)
+    return f"{term.get('handle') or hourly_runtime.pane_key(term)} ({timings or 'run -, scheduled=-, started=-'})"
+
+
 def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agents: list[dict[str, Any]],
                workspace: str, current_pane: str | None,
                sessions: dict[str, PaneSession] | None = None) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
@@ -75,10 +84,12 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
         if not matches and term.get("orphaned") and term.get("connected"):
             matches = [run for run, transcript in transcripts
                        if saved and transcript and transcript.stem == saved.session_id]
-        if not matches and not term.get("orphaned"):
+        label = tab_label(term, matches)
+        if not matches:
+            print(f"keep: {label}: run の記録に無い")
             continue
         if len(matches) != 1:
-            print(f"keep: {term.get('handle') or pane}: no unique scheduled run and transcript")
+            print(f"keep: {label}: no unique scheduled run and transcript")
             continue
         run = matches[0]
         owned_agents = [agent for agent in agents
@@ -95,7 +106,7 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
                                    for agent in owned_agents):
             problems.append("agent or background work is active or unknown")
         if problems:
-            print(f"keep: {term.get('handle') or pane} (run {run.get('status')}): " + "; ".join(problems))
+            print(f"keep: {label}: " + "; ".join(problems))
             continue
         yield {**run, "terminalPaneKey": pane}, term
 
@@ -318,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         recorded = [session.transcript for session in sessions.values() if session.transcript]
         for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current,
                                     sessions):
-            label = f"{term['handle']} (run {run.get('status')})"
+            label = tab_label(term, [run])
             if not no_pending_questions(args.state_file, run["terminalPaneKey"]):
                 print(f"keep: {label} may have an unanswered question")
                 continue
@@ -351,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             for line in requests(final_text or ""):
                 print(f"carry: {term['handle']}: {final_at or '日時不明'}{old}: {line}")
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
-            print(f"closed: {term['handle']}: {run['status']} scheduled run, idle transcript and empty composer")
+            print(f"closed: {label}: idle transcript and empty composer")
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         detail = error.stderr if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
         print(f"keep: could not verify previous tabs: {detail.strip()}")
