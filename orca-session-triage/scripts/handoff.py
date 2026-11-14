@@ -19,13 +19,24 @@ and fix the body, then pass --seen ID for each one the body now reflects (a repo
 their first 8 characters or more). It does not send either while a scheduled run of this workspace due after this
 tab's run began, or the precheck skipped one because this run was still working, and prints that run's time and
 pane: the later run owns the read position and the handoff. --force sends past every check as written.
+An answer delivered by this same source worktree and session is labelled 「（この回の送信）」 and needs no --seen.
+The shared answer writer records that source for send and inbox_read.py answered; older records or an unknown
+session still need --seen, and an administrative answered mark is not a delivery.
 `search WORD...` prints each kept handoff whose text or decision keys hold any of the words (case ignored): its
 time, kind, and file, then the matching lines and keys.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
 latest message of its own (also while a turn runs or after an API error such as a usage limit ended it),
 unanswered questions and ask times, the questions answered (`answered`) and closed unanswered (`rejected`,
-with ask and close times) since the newest kept handoff, and undelivered queued input. Both commands
+with ask and close times) since the newest kept handoff, and undelivered queued input. It includes the
+current transcript path and timestamped user_messages since that handoff (excluding task notifications).
+`lead-state --grep WORD [--since HH:MM|ISO]` adds matching timestamped transcript events in `matches`:
+lead and user speech, AskUserQuestion calls, and tool results (literal WORD, case ignored).
+Pending questions answered in hourly state or ask-answers carry answered_elsewhere (the answer's time).
+A fully answered selector visible on a tab gets a heading-checked close-selector command; this read sends nothing.
+Like the scan, lead-state clears a past connection error when the rendered Claude screen shows a later
+reply/tool call and running status line; a usage limit also accepts a completed later turn.
+Both commands
 default to the lead appointed in the shared hourly state when --lead-worktree is omitted.
 `send` ends the text with the run's signature, <session name>（HH:MM の定時）: the name ListAgents
 prints first and the local time the session started, from $CLAUDE_CONFIG_DIR/sessions/$CLAUDE_PID.json
@@ -42,6 +53,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 from typing import NamedTuple, Protocol
@@ -152,6 +164,7 @@ class Reason(NamedTuple):
     """Something `send` will not send past: the id `--seen` names it by, and the line it prints."""
     id: str
     line: str
+    own: bool = False
 
 
 def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_read.Sender, handle: str,
@@ -169,17 +182,22 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
         records = answers.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         records = []
+    source = inbox_read.answer_sender()
     for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
         if ask in named and (read_at is None or at is None or at > read_at):
+            own = bool(source["session"] and record.get("sender") == source
+                       and record.get("how") in answer_evidence.DELIVERED)
             found.append(Reason(str(record["id"]), f"- answered {record['id']} at {record.get('ts') or '-'} "
-                                f"({record.get('how') or '-'})  {excerpt(record.get('note'))}"))
+                                f"({record.get('how') or '-'})" + ("（この回の送信）" if own else "")
+                                + f"  {excerpt(record.get('note'))}", own))
     return found
 
 
 def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
     """The lines of the reasons no --seen value names (inbox_read.names: an exact id or an 8+ character prefix)."""
-    return [reason.line for reason in reasons if not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
+    return [reason.line for reason in reasons if not reason.own
+            and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
 
 
 def search(directory: Path, words: list[str], since: datetime | None) -> int:
@@ -240,7 +258,91 @@ def last_said(entries: list[dict]) -> dict[str, str | None]:
     return {"at": None, "text": None}
 
 
-def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> dict[str, object]:
+def transcript_events(entries: list[dict]) -> list[dict]:
+    """Readable, timestamped speech, questions, and tool results from the current transcript."""
+    events = []
+    for entry in entries:
+        at = entry.get("timestamp")
+        if scan_sessions.is_real_user_message(entry):
+            events.append({"at": at, "kind": "user", "text": scan_sessions.user_text(entry)})
+        message = scan_sessions.message_of(entry)
+        if entry.get("isApiErrorMessage") or message.get("model") == "<synthetic>":
+            continue
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if entry.get("type") == "assistant" and block.get("type") == "text":
+                events.append({"at": at, "kind": "assistant", "text": block.get("text") or ""})
+            elif (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                  and block.get("name") == "AskUserQuestion"):
+                events.append({"at": at, "kind": "AskUserQuestion", "id": block.get("id"),
+                               "text": json.dumps(block.get("input") or {}, ensure_ascii=False)})
+            elif block.get("type") == "tool_result":
+                result = block.get("content")
+                text = result if isinstance(result, str) else "\n".join(
+                    part["text"] for part in result or []
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str))
+                events.append({"at": at, "kind": "tool_result", "id": block.get("tool_use_id"), "text": text})
+    return events
+
+
+def question_text(value: str) -> str:
+    """Compare a recorded question without its trailing choice list."""
+    return " ".join(re.split(r"選択肢[:：]|\n\s*- ", value, maxsplit=1)[0].split())
+
+
+def annotate_elsewhere(pending: list[dict], state: dict, tabs: list[dict]) -> None:
+    """Attach timestamped shared answers, and commands only for completely answered selectors on screen."""
+    entries = hourly_state.inbox_entries()
+    delivered = list(answer_evidence.delivered(inbox_read.answers_path()))
+    for call in pending:
+        asked_at = scan_sessions.parse_time(call.get("asked_at"))
+        for question in call["questions"]:
+            wanted = question_text(str(question.get("question") or ""))
+            if not wanted or asked_at is None:
+                continue
+            recorded = [(key, item) for key, item in state["questions"].items()
+                        if wanted == question_text(str(item.get("question") or ""))
+                        and (not question.get("header") or not item.get("header")
+                             or question["header"] == item["header"])]
+            identities = {(item.get("row"), item.get("decision"), item.get("ask_id"))
+                          if item.get("row") or item.get("decision") or item.get("ask_id") else (key,)
+                          for key, item in recorded}
+            # Repeated wording for different lanes or decisions is not an identity.
+            candidates = [(item.get("answered_at"), f"hourly_state {key}") for key, item in recorded
+                          if len(identities) == 1 and item.get("answer") is not None and not item.get("withdrawn_at")]
+            matching = [(ask, number) for ask in entries if ask.get("kind") == "ask"
+                        for number, original in enumerate(inbox_read.questions_of(ask), 1)
+                        if isinstance(original, dict)
+                        and wanted in {question_text(str(original.get("question") or "")),
+                                       question_text(answer_evidence.shown_question(original))}
+                        and (not question.get("header") or not original.get("header")
+                             or question["header"] == original["header"])]
+            # A repeated question alone cannot identify which inbox ask this selector puts.
+            if len(matching) == 1:
+                ask, number = matching[0]
+                candidates.extend((answer.at.isoformat(), f"ask-answers {answer.ask_id}") for answer in delivered
+                                  if answer.ask_id in (str(ask["id"]), f"{ask['id']}:{number}"))
+            later = [(at, str(stamp), source) for stamp, source in candidates
+                     if (at := scan_sessions.parse_time(stamp)) is not None and at >= asked_at]
+            if later:
+                _, stamp, source = min(later)
+                question.update(answered_elsewhere=stamp, answer_source=source)
+        if not call["questions"] or not all(question.get("answered_elsewhere") for question in call["questions"]):
+            continue
+        call["answered_elsewhere"] = max((at, question["answered_elsewhere"]) for question in call["questions"]
+                                         if (at := scan_sessions.parse_time(question["answered_elsewhere"])) is not None)[1]
+        headings = [str(question.get("header") or question.get("question") or "") for question in call["questions"]]
+        call["close_selector"] = [shlex.join([str(Path(NOTIFY).with_name("close-selector").expanduser()),
+                                              tab["handle"], *headings]) for tab in tabs
+                                  if all(heading in "\n".join(tab["screen_tail"]) for heading in headings)
+                                  and any(hint in "\n".join(tab["screen_tail"])
+                                          for hint in ("Enter to select", "enter select"))]
+
+
+def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
+                 state: dict | None = None, grep: str | None = None, since: datetime | None = None) -> dict[str, object]:
     """The lead's Orca state, newest transcript, unanswered questions, questions closed unanswered since the
     newest handoff kept in `handoffs`, and rendered tab tails."""
     page = scan_sessions.orca_payload(orca, ["worktree", "ps"])
@@ -249,19 +351,31 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
         raise LookupError(f"lead worktree is missing from Orca: {worktree}")
     terminals = scan_sessions.orca_payload(orca, ["terminal", "list"])["terminals"]
     tabs = []
+    screens: scan_sessions.Screens = {}
     for term in terminals:
         if term.get("worktreeId") != row["worktreeId"] or not term.get("handle"):
             continue
         result = scan_sessions.orca_payload(orca, ["terminal", "read", "--terminal", term["handle"], "--screen"])
-        tabs.append({"handle": term["handle"], "screen_tail": scan_sessions.screen_tail(result.get("terminal") or result)})
+        screen = result.get("terminal") or result
+        screens[(None, term["handle"])] = screen
+        tabs.append({"handle": term["handle"], "screen_tail": scan_sessions.screen_tail(screen)})
     claude = lead_claude(projects, worktree)
+    resumed = scan_sessions.resumed_after_error({"claude": claude, "codex": []},
+                                               scan_sessions.agent_screens(terminals, screens, None, "claude"))
+    if resumed and claude:
+        claude.update(api_error=None, api_error_kind=None)
     final: dict[str, str | None] = {"at": None, "text": None}
     questions = {}
     queued = []
+    transcript = None
+    events = []
     if claude:
         transcript = Path(claude["transcript"])
         entries = scan_sessions.load_jsonl(transcript)
+        events = transcript_events(entries)
         final = last_said(entries)
+        if resumed and resumed.text:
+            final = {"at": None, "text": resumed.text}
         # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
         last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
         for entry in entries[last + 1:]:
@@ -272,25 +386,38 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path) -> di
                 if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
                         and block.get("name") == "AskUserQuestion"):
                     questions[block.get("id")] = {"id": block.get("id"), "asked_at": entry.get("timestamp"),
-                                                   "questions": (block.get("input") or {}).get("questions", [])}
+                                                   "questions": [dict(question) for question in
+                                                                 (block.get("input") or {}).get("questions", [])]}
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
         queued = scan_sessions.queued_input(transcript)
     # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
     transcripts = list(dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
                                       *([Path(claude["transcript"])] if claude else [])]))
-    since = last_sent_at(handoffs)
-    rejected = answer_evidence.rejected_questions(transcripts, since)
+    handoff_since = last_sent_at(handoffs)
+    rejected = answer_evidence.rejected_questions(transcripts, handoff_since)
+    if questions:
+        annotate_elsewhere(list(questions.values()),
+                           state if state is not None else hourly_state.read(Path(hourly_state.DEFAULT_STATE).expanduser()), tabs)
     agents = [{"type": agent.get("agentType"), "state": agent.get("state"),
                "state_started_at": scan_sessions.iso_time(agent.get("stateStartedAt")),
                "stopped_at": scan_sessions.iso_time(agent.get("stateStartedAt"))
                if agent.get("state") in ("done", "waiting") else None,
                "main_agent": agent.get("mainAgent")} for agent in row.get("agents") or []]
-    return {"worktree": worktree, "agents": agents, "final": final,
+    result: dict[str, object] = {"worktree": worktree, "agents": agents, "final": final,
+            "transcript": str(transcript) if transcript else None,
+            "user_messages": [{"at": event["at"], "text": event["text"]} for event in events
+                              if event["kind"] == "user" and (handoff_since is None
+                                  or (at := scan_sessions.parse_time(event["at"])) is not None and at >= handoff_since)],
             "api_error": claude.get("api_error") if claude else None,
             "pending_questions": list(questions.values()),
-            "answered": answer_evidence.answered_questions(transcripts, since), "rejected": rejected,
+            "answered": answer_evidence.answered_questions(transcripts, handoff_since), "rejected": rejected,
             "terminals": tabs, "queued_input": queued}
+    if grep is not None:
+        result["matches"] = [event for event in events if grep.casefold() in event["text"].casefold()
+                             and (since is None or (at := scan_sessions.parse_time(event["at"])) is not None
+                                  and at >= since)]
+    return result
 
 
 def decision_asks(values: list[str], keys: list[str]) -> dict[str, str]:
@@ -342,6 +469,8 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
         return 1
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
+    if own := [reason.line for reason in found if reason.own]:
+        print("handoff: this run's deliveries need no --seen:", *own, sep="\n", file=sys.stderr)
     if not args.force and (left := unseen(found, args.seen)):
         print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
               "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; then pass --seen ID "
@@ -393,18 +522,26 @@ def main(argv: list[str] | None = None) -> int:
         "lead-state", parents=[kept, lead],
         description="JSON keys: worktree (path), agents (type, state, state_started_at, stopped_at, main_agent), "
                     "final (at, text: the lead's newest message of its own, past a running turn or an API error), "
-                    "api_error (the error text that ended the last turn, or null), "
-                    "pending_questions (id, asked_at, questions with choices), "
+                    "api_error (an unrecovered turn error, or null after the rendered screen proves recovery), "
+                    "transcript (current transcript path, or null), "
+                    "user_messages (at, text: user speech since the newest kept handoff, no task notifications), "
+                    "pending_questions (id, asked_at, questions with choices; answered_elsewhere is the answer time, "
+                    "answer_source names its shared record; a fully answered call has close_selector commands), "
                     "answered (questions answered since the newest kept handoff: id, asked_at, answered_at, "
                     "answers by question, notes by question), "
                     "rejected (questions closed unanswered since the newest kept handoff, with ask/close times), "
-                    "terminals (handle, screen_tail), queued_input (undelivered instructions and enqueue times).",
+                    "terminals (handle, screen_tail: 画面の末尾の行の配列（文字列ではない）), "
+                    "queued_input (undelivered instructions and enqueue times). "
+                    "With --grep: matches (at, kind, text, optional tool id), filtered by --since.",
         help="print the appointed lead's current state as JSON, with the questions answered (answered) and closed "
              "unanswered (rejected) since the newest kept handoff")
     state_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                                help="Orca CLI executable (default: %(default)s)")
     state_command.add_argument("--out", type=Path, metavar="FILE",
                                help="atomically write JSON to FILE instead of stdout")
+    state_command.add_argument("--grep", metavar="WORD", help="add transcript events containing literal WORD (case ignored)")
+    state_command.add_argument("--since", type=inbox_read.since_time, metavar="HH:MM|ISO",
+                               help="only --grep events at or after this ISO time or most recent local HH:MM")
     send_command = commands.add_parser("send", parents=[kept, lead],
                                        help="add the reports and lead state of the moment and the run's signature, "
                                             "then send")
@@ -455,8 +592,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "lead-state":
             if not args.lead_worktree:
                 raise ValueError("--lead-worktree or an appointed lead in --state-file is required")
+            if args.since is not None and args.grep is None:
+                raise ValueError("lead-state --since requires --grep WORD")
             json_output.emit(lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca,
-                                          args.handoffs_dir.expanduser()), args.out)
+                                          args.handoffs_dir.expanduser(), state=hourly_state.read(args.state_file.expanduser()),
+                                          grep=args.grep, since=args.since), args.out)
             return 0
         return send(args, triage_notify(Path(args.notify).expanduser()), inbox_read.Sender.of(workspace()))
     except subprocess.CalledProcessError as error:

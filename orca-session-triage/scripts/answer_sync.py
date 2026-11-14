@@ -101,6 +101,11 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             covered = (refs and any(ask_state.overlaps(ref, given) for ref in refs for given in touched)
                        and all(ask_state.covered(ref, list(records), entries) for ref in refs))
             bindings = item.get("covers") or ([item["decision"]] if item.get("decision") in keys else [])
+            source = ask_state.reference(item.get("ask_id") or "", entries)
+            if source and source[1]:
+                # Completing a whole-ask key must not replace a selected part with combined answers.
+                bindings = [value for value in bindings if (ref := ask_state.reference(value, entries)) is None
+                            or ref[0] != source[0] or ref[1] and ref[1] <= source[1]]
             if bindings:
                 available = {value: latest[value].answer for value in bindings if value in latest
                              and (datetime.fromisoformat(latest[value].decided_at)

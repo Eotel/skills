@@ -1157,30 +1157,30 @@ def claude_progress(screen: dict) -> str | None:
     return lines[found]
 
 
-# The start of a transcript's limit error looked for on the screen.
-LIMIT_HEAD = 40
+# The start of a transcript's error looked for on the screen.
+ERROR_HEAD = 40
 
 
-def limit_notices(lines: list[str], error: str) -> list[int]:
-    """The indexes of the stripped screen lines a usage-limit notice ends on, worded as the rule knows or as the
+def error_notices(lines: list[str], error: str) -> list[int]:
+    """The indexes of the stripped screen lines an error notice ends on, worded as a known usage limit or as the
     transcript's error, also where a narrow terminal wrapped it onto the next line (mid-word or at a space)."""
-    head = error.strip().splitlines()[0][:LIMIT_HEAD] if error.strip() else ""
+    head = error.strip().splitlines()[0][:ERROR_HEAD] if error.strip() else ""
 
     def shows(text: str) -> bool:
-        return bool(USAGE_LIMIT.search(text) or head and head in text)
+        return bool(USAGE_LIMIT.search(text) or API_ENDED.match(text.lstrip("⎿■ ")) or head and head in text)
 
     return [index for index, line in enumerate(lines)
             if shows(line) or index and not shows(lines[index - 1])
             and any(shows(lines[index - 1] + glue + line) for glue in ("", " "))]
 
 
-def turn_after_limit(screen: dict, error: str = "") -> str | None:
-    """The turn-end or running status line of a Claude turn that ran after the screen's last usage-limit notice, or
+def turn_after_error(screen: dict, error: str = "") -> str | None:
+    """The turn-end or running status line of a Claude turn that ran after the screen's last error notice, or
     after one that scrolled off: a reply or tool call (⏺) below the notice, then that line. The notice's own turn
     ends with a turn-end line too ("✻ Baked for 1s · done 9:02"), but with no ⏺ between. `error` is the
-    transcript's limit error, found on the screen even when its wording is new."""
+    transcript's error, found on the screen even when its wording is new."""
     lines = [line.strip() for line in screen_lines(screen)]
-    notice = max(limit_notices(lines, error), default=-1)
+    notice = max(error_notices(lines, error), default=-1)
     replied = next((index for index in range(notice + 1, len(lines)) if lines[index].startswith("⏺ ")), None)
     if replied is None:
         return None
@@ -1198,20 +1198,28 @@ def agent_screens(terms: list[dict], screens: Screens, environment: str | None, 
     return found
 
 
-def resumed_after_limit(row: dict, claude_screens: list[dict]) -> tuple[str, str] | None:
-    """(the screen's line, its last reply) when the usage limit that ended the row's Claude transcript is past: a
+class ResumedTurn(NamedTuple):
+    kind: str
+    line: str
+    text: str
+
+
+def resumed_after_error(row: dict, claude_screens: list[dict]) -> ResumedTurn | None:
+    """Evidence that the connection error or usage limit that ended the row's Claude transcript is past: a
     Claude tab shows a later turn, and none shows the notice as its last word. A lane resumed in another account
-    writes a transcript elsewhere, so the one read here still ends at the limit."""
+    writes a transcript elsewhere, so the one read here still ends at the error. A connection error needs
+    a later reply/tool call and a running status line; a limit also accepts a completed later turn."""
     stop = stop_reason(row)
-    if not (stop and stop["kind"] == "usage_limit" and stop["agent"] == "claude"):
+    if not (stop and stop["kind"] in ("usage_limit", "connection") and stop["agent"] == "claude"):
         return None
-    later = [(line, screen) for screen in claude_screens if (line := turn_after_limit(screen, stop["error"]))]
-    stopped = any(limit_notices([line.strip() for line in screen_lines(screen)], stop["error"])
-                  and not turn_after_limit(screen, stop["error"]) for screen in claude_screens)
+    later = [(line, screen) for screen in claude_screens if (line := turn_after_error(screen, stop["error"]))
+             and (stop["kind"] == "usage_limit" or CLAUDE_PROGRESS.match(line))]
+    stopped = any(error_notices([line.strip() for line in screen_lines(screen)], stop["error"])
+                  and not turn_after_error(screen, stop["error"]) for screen in claude_screens)
     if not later or stopped:
         return None
     line, screen = later[0]
-    return line, screen_message(screen)
+    return ResumedTurn(stop["kind"], line, screen_message(screen))
 
 
 def turn_clock(line: str, now: float) -> str | None:
@@ -1616,19 +1624,20 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["orca_message"] = {"text": codex_said[0], "at": codex_said[1], "from": "screen"}
         claude_screens = agent_screens(terms, screens, w.get("_environment"), "claude")
         row["screen_progress"] = next((line for screen in claude_screens if (line := claude_progress(screen))), None)
-        resumed = resumed_after_limit(row, claude_screens)
+        resumed = resumed_after_error(row, claude_screens)
         if resumed:
-            # The screen's reply stands for the transcript's limit notice; it carries no time.
+            # The screen's reply stands for the transcript's old error; it carries no time.
             row["claude"] = {**(row["claude"] or {}), "api_error": None, "api_error_kind": None,
-                             **({"final_text": resumed[1], "final_at": None} if resumed[1] else {})}
+                             **({"final_text": resumed.text, "final_at": None} if resumed.text else {})}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
         latest = None if turn_runs(row) or cut_off(row) or row["screen_progress"] else latest_message(row)
         row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["stop"] = stop_reason(row)
         row["class"], row["reasons"] = classify(row, decision_marker)
         if resumed:
-            row["reasons"] = [*row["reasons"], "the transcript's usage limit is past: the tab's screen shows a "
-                                               f"later turn ({resumed[0]})"]
+            error_kind = "usage limit" if resumed.kind == "usage_limit" else "connection error"
+            row["reasons"] = [*row["reasons"], f"the transcript's {error_kind} is past: the tab's screen shows a "
+                                               f"later turn ({resumed.line})"]
         row["processes"] = [] if remote else (processes or {}).get(w["path"], [])
         row["class"], row["reasons"] = with_processes(row, now)
         if decision_marker and (marked := re.search(re.escape(decision_marker) + r"[:：]?\s*(.+)",

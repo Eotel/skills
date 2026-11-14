@@ -400,6 +400,8 @@ def question_ask(item: dict, entries: list[dict]) -> tuple[str, frozenset[int]] 
     """The full id of the inbox ask a recorded question came from, and the numbers of that ask's questions it puts
     (none when it puts the whole ask or they are unknown): the ask an `asked-many` "ask" line recorded, else the one
     its `ask:<lane>::<id>[:<n>[+<n>…]]` decision names."""
+    if ":" in str(item.get("ask_id") or ""):
+        return ask_state.reference(item["ask_id"], entries)
     found = ASK_DECISION.fullmatch(str(item.get("decision") or ""))
     wanted = item.get("ask_id") or (found[1] if found else None)
     ids = [str(entry["id"]) for entry in entries
@@ -892,7 +894,7 @@ class Asking:
     question: str
     asked_at: str
     covers: tuple[str, ...] = ()
-    ask: str | None = None  # the full id of the inbox ask it was taken from
+    ask: str | None = None  # the full inbox ask id, optionally followed by :<question number>
     based_at: str | None = None  # when what the question rests on was said: that ask's time
     session: str | None = None  # the session that put it; None for this one (CLAUDE_CODE_SESSION_ID)
     header: str | None = None
@@ -1071,11 +1073,13 @@ class Inbox:
 
     def lane(self, ask_id: str) -> tuple[str, str, dict]:
         """The scan row of the worktree that sent the ask, found by its tab (which tells two Macs' same path apart),
-        else by its repository, the ask's text (the lane's final message), and the ask."""
-        found = [item for item in self.asks if inbox_read.names(str(item["id"]), ask_id)]
-        if len(found) != 1:
-            raise ValueError(f"ask {ask_id} names {len(found)} asks in the inbox")
-        ask = found[0]
+        else by its repository, the ask's text (the lane's final message), and the ask.
+        A numbered reference is range-checked like send --ask and retained in the returned id."""
+        resolved = inbox_read.checked_answer_ids(ask_id, self.asks)
+        if len(resolved) != 1:
+            raise ValueError(f"ask must name one inbox ask or question: {ask_id}")
+        bound = resolved[0]
+        ask = next(item for item in self.asks if item["id"] == bound.partition(":")[0])
         named = [row for row in self.rows if Path(row["path"]).name == ask.get("worktree")]
         lanes = [row for row in named if ask.get("handle") and any(
             term.get("handle") == ask["handle"] for term in row.get("terminals") or [])] or [
@@ -1083,7 +1087,7 @@ class Inbox:
         if len(lanes) != 1:
             raise ValueError(f"ask {ask_id} from {ask.get('worktree')} matches {len(lanes)} scan rows; give row: "
                              + (", ".join(scan_sessions.row_identity(row) for row in lanes) or "(none)"))
-        return scan_sessions.row_identity(lanes[0]), line_text(ask, "text"), ask
+        return scan_sessions.row_identity(lanes[0]), line_text(ask, "text"), {**ask, "id": bound}
 
 
 def asking_line(raw: str, inbox: Inbox) -> Asking:
@@ -1565,8 +1569,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="a lead decision key this question covers; repeat per key")
     asked_many = commands.add_parser(
         "asked-many", help='record several questions from JSON Lines of {"decision", "question", "asked_at"?, '
-                           '"covers"?: [KEY, ...], "session"?} with either "ask": an inbox ask id (or its first 8 or more '
-                           'characters), whose lane and text become the row and final message, or "row" and '
+                           '"covers"?: [KEY, ...], "session"?} with either "ask": ID or ID:N (ID may be its first '
+                           '8 or more characters; N selects one question), whose lane and text become the row and final message, or "row" and '
                            '"final_message"; every line is checked first, and a wrong one writes nothing. A line '
                            'whose #numbers are all CLOSED is not recorded: each is named after the output '
                            '(記録しなかった: 行 N), and the exit code is 2')

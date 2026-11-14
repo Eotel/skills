@@ -248,14 +248,39 @@ overrides it, and `--state-file` selects the shared state for both `send` and
 `lead-state`. `handoff.py lead-state` prints JSON with `worktree` (path),
 `agents` (states and stop times), `final` (the lead's newest message of its
 own and its time, also while a turn runs or after an API error such as a usage
-limit ended it), `api_error` (that error's text, or null),
-`pending_questions` (unanswered questions, choices, and ask times), `answered`
+limit ended it), `api_error` (that error's text, or null), `transcript` (the
+current conversation's path, or null), `user_messages` (the user's ordinary
+messages since the newest kept handoff, with `at` and `text`, excluding task
+notifications), `pending_questions` (unanswered questions, choices, and ask times), `answered`
 (questions answered since the newest kept handoff, with the choice and note per
 question and ask and answer times), `rejected`
 (questions closed without an answer since the newest kept handoff, with ask and
 close times), `queued_input` (undelivered instructions and enqueue times), and
-`terminals` (handles and screen tails);
+`terminals` (handles and `screen_tail`, an array of the screen's last lines,
+not a string);
 `--orca` selects its CLI.
+`lead-state --grep WORD [--since HH:MM|ISO]` adds `matches`: timestamped lead
+and user speech, AskUserQuestion calls, and text tool results containing the
+literal word, ignoring case. `--since` applies to the search; `user_messages`
+still starts at the newest handoff. HH:MM means its most recent occurrence in
+local time. Search reads the current transcript.
+
+The scan and lead-state treat a connection error as past when the rendered
+Claude screen shows a later reply/tool call (⏺) and a running status line,
+with no tab still ending at the error. The old notice may have scrolled off.
+Then `api_error` is null and `final` comes from the screen, with an unknown
+time (`at: null`). A usage limit also accepts a completed later turn.
+
+Pending questions answered through shared hourly state or delivered answers in ask-answers carry
+`answered_elsewhere` (the answer time) and `answer_source`. A call whose every
+question is answered also carries the last answer time and `close_selector`
+commands, listing every heading, for tabs showing the matching selector. Read
+the answer evidence before running one; the command checks the screen again.
+A partial batch has annotations only on its answered questions and no close
+command. Administrative answered marks are not answer evidence. Identical
+hourly question wording under different lanes or decisions stays unannotated;
+inbox questions must also identify one ask uniquely. Reading lead-state never
+closes a selector.
 `--claude-projects` selects the transcript root for both commands.
 Do not sign the body: it ends the
 text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and
@@ -294,8 +319,12 @@ from another tab of this workspace (a parallel scheduled run) or an answer to an
 ask the body names reached the inbox or the answer records after `--since`:
 fix the body from them, then pass `--seen ID` (repeat per id: a report's id or
 an answered ask's, or their first 8 or more characters) for each one the body
-now reflects. It also refuses while a later scheduled run began or was skipped
-for this run, as `read` prints it. `--force` sends past every check as
+now reflects. A delivered answer whose recorded sender worktree and session
+both match this run is labelled 「（この回の送信）」 and needs no `--seen`.
+Answer records from `send` and `inbox_read.py answered` now include that source;
+an older record or an unknown session keeps the usual check. It also refuses
+while a later scheduled run began or was skipped for this run, as `read`
+prints it. `--force` sends past every check as
 written, so use `--seen` for what the body already holds. Before writing the handoff, run `lead_decisions.py
 unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]}`.
 Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and

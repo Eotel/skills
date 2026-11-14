@@ -1377,6 +1377,31 @@ class ClassifyTests(unittest.TestCase):
         for path in ("/w/limited", "/w/reworded", "/w/wrapped"):
             self.assertEqual((rows[path]["class"], rows[path]["stop"]["kind"]), ("stalled", "usage_limit"))
 
+    def test_a_past_connection_error_does_not_stall_a_tab_showing_a_new_reply_and_running_line(self) -> None:
+        error = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+        progress = "✽ Transmuting… (14m 25s · ↓ 2.7k tokens · thinking with xhigh effort)"
+        screens = {
+            "resumed": [error, "⏺ 検査を続けています。", progress],
+            "scrolled": ["⏺ 検査を続けています。", progress],
+            "stopped": ["⏺ 前の検査です。", progress, error, "❯"],
+            "new_error": [error, "⏺ 検査を続けています。", progress, "⎿  API Error: Can't reach the API server", "❯"],
+            "finished": [error, "⏺ 検査を続けています。", "✻ Cooked for 4m 14s · done 14:04", "❯"]}
+        for name in screens:
+            self.claude_says(f"/w/{name}", user("go"), {**assistant(text(error)), "isApiErrorMessage": True,
+                                                      "error": "server_error"})
+        rows = {row["path"]: row for row in scan.build_inventory(
+            [worktree(f"/w/{name}", "done") for name in screens],
+            [terminal(f"/w/{name}", "claude", f"term_{name}") for name in screens], self.projects, {},
+            "要判断", now=NOW, judge=lambda message: verdict(),
+            screens={(None, f"term_{name}"): {"source": "screen", "tail": lines} for name, lines in screens.items()})}
+        for name in ("resumed", "scrolled"):
+            self.assertEqual(rows[f"/w/{name}"]["class"], "working")
+            self.assertIsNone(rows[f"/w/{name}"]["stop"])
+            self.assertIsNone(rows[f"/w/{name}"]["claude"]["api_error"])
+        for name in ("stopped", "new_error", "finished"):
+            self.assertEqual(rows[f"/w/{name}"]["class"], "stalled")
+            self.assertEqual(rows[f"/w/{name}"]["stop"]["kind"], "connection")
+
     def test_a_local_codex_tab_without_a_recent_rollout_is_judged_from_its_screen(self) -> None:
         # 2026-11-11: four uv-migration Codex lanes were "unstarted" while their tabs showed them waiting on a secret.
         reply = "CI は Ruff 成功、残る3 job は引き続き CORELIB_PAT 設定待ちです。"
@@ -4981,7 +5006,9 @@ class HandoffProposalTests(unittest.TestCase):
         self.body = self.root / "body.txt"
         self.body.write_text("handoff body")
         self.handed = self.root / "handed.jsonl"
-        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude")})
+        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+                                              "TRIAGE_INBOX": str(self.inbox),
+                                              "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")})
         environment.start()
         self.addCleanup(environment.stop)
         processes = patch.object(handoff.scan_sessions, "process_table", return_value={})
@@ -5011,6 +5038,26 @@ class HandoffProposalTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][:3], ["fake-notify", "--kind", "ask"])
         self.assertEqual([(item.decision, item.ask_id) for item in handoff.lead_decisions.handed_off(self.handed)],
                          [("keep:/w/a", "ask1"), ("keep:/w/b", None)])
+
+    def test_send_exempts_only_answers_delivered_by_this_worktree_and_conversation(self) -> None:
+        ask_id = "f439c015-aaaa-bbbb-cccc-000000000001"
+        write_jsonl(self.inbox, [{"id": ask_id, "ts": "2026-11-14T00:00:00Z", "kind": "ask",
+                                  "worktree": "lane", "text": "Publish?"}])
+        self.body.write_text("ask f439c015 は答えを届けた")
+        with patch.dict(os.environ, {"ORCA_WORKTREE_ID": "repo::/w/triage", "CLAUDE_CODE_SESSION_ID": "run-1",
+                                      "CODEX_THREAD_ID": "", "CLAUDE_SESSION_ID": ""}):
+            inbox_read.record_answers(self.root / "answers.jsonl", [ask_id], "send --decision", "Publish")
+        for worktree_path, session, allowed in [("/w/triage", "run-1", True), ("/w/triage", "run-2", False),
+                                                  ("/w/other", "run-1", False), ("/w/triage", "", False)]:
+            with self.subTest(worktree=worktree_path, session=session), \
+                    patch.dict(os.environ, {"ORCA_WORKTREE_ID": f"repo::{worktree_path}",
+                                             "CLAUDE_CODE_SESSION_ID": session, "CODEX_THREAD_ID": "",
+                                             "CLAUDE_SESSION_ID": "", "CLAUDE_PID": ""}), \
+                    patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)):
+                code, output, error = self.send()
+                self.assertEqual(code, 0 if allowed else 1, error)
+                self.assertEqual("この回の送信" in error, allowed)
+                self.assertEqual("NEXT_OFFSET=" in output, allowed)
 
     def test_lead_state_reads_agents_questions_and_screen_from_the_appointed_worktree(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
@@ -5095,6 +5142,146 @@ class HandoffProposalTests(unittest.TestCase):
         self.assertEqual(result["answered"], [{"id": "after", "asked_at": "2026-11-09T01:20:00Z",
                                                "answered_at": "2026-11-09T01:21:00Z", "answers": {"Merge?": "Wait"},
                                                "notes": {"Merge?": "CI の後で"}}])
+        self.assertEqual(result["transcript"], str(self.projects / "-w-lead" / "lead.jsonl"))
+        self.assertEqual(result["user_messages"], [{"at": "2026-11-09T01:30:00Z", "text": "続けて"}])
+
+    def test_lead_state_clears_only_a_connection_error_followed_by_a_new_reply_and_running_line(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        error = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+        progress = "✽ Transmuting… (14m 25s · ↓ 2.7k tokens · thinking with xhigh effort)"
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            assistant(text("前の発言")), {**assistant(text(error)), "isApiErrorMessage": True, "error": "server_error"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": [terminal("/w/lead", "claude", "term_lead")]}}
+        for lines, recovered in [([error, "⏺ 検査を続けています。", progress], True),
+                                  ([error, "⏺ 検査を続けています。", progress,
+                                    "⎿  API Error: Can't reach the API server", "❯"], False),
+                                  (["⏺ 前の発言", progress, error, "❯"], False)]:
+            with self.subTest(recovered=recovered), patch("subprocess.run", side_effect=lambda args, **kwargs:
+                    subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+                replies[("terminal", "read", "--terminal", "term_lead", "--screen")] = {
+                    "terminal": {"source": "screen", "tail": lines}}
+                code, shown, err = self.call("lead-state")
+            self.assertEqual(code, 0, err)
+            result = json.loads(shown)
+            self.assertEqual(result["api_error"], None if recovered else error)
+            self.assertEqual(result["final"]["text"], "検査を続けています。" if recovered else "前の発言")
+
+    def test_lead_state_searches_speech_questions_and_text_tool_results_with_times(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        question = {"questions": [{"header": "release", "question": "MUSE を出しますか？"}]}
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**user("muse: earlier permission"), "timestamp": "2026-11-14T00:58:00Z"},
+            {**assistant(text("muse: before")), "timestamp": "2026-11-14T00:59:00Z"},
+            {**user("MUSE は出してよい"), "timestamp": "2026-11-14T01:00:00Z"},
+            {**user("<task-notification>MUSE: done</task-notification>"), "timestamp": "2026-11-14T01:01:00Z"},
+            {**assistant(text("muse: ready")), "timestamp": "2026-11-14T01:02:00Z"},
+            {**assistant({"type": "tool_use", "id": "ask", "name": "AskUserQuestion", "input": question}),
+             "timestamp": "2026-11-14T01:03:00Z"},
+            {**user([{"type": "tool_result", "tool_use_id": "tool", "content": [
+                {"type": "text", "text": "muse: CI passed"}, {"type": "image", "data": "not-text"}]}]),
+             "timestamp": "2026-11-14T01:04:00Z"},
+            {**assistant(text("MUSE error")), "timestamp": "2026-11-14T01:05:00Z", "isApiErrorMessage": True}])
+        handoff.SavedHandoff(text="handoff", kind="info", decisions=[], sent_at="2026-11-14T01:00:00Z",
+                             next_offset=0).save(self.root / "handoffs", datetime(2026, 11, 14, 1, tzinfo=timezone.utc))
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            code, shown, err = self.call("lead-state", "--grep", "MuSe", "--since", "2026-11-14T10:00:00+09:00")
+
+        self.assertEqual(code, 0, err)
+        result = json.loads(shown)
+        self.assertEqual(result["user_messages"], [{"at": "2026-11-14T01:00:00Z", "text": "MUSE は出してよい"}])
+        self.assertEqual([(item["at"], item["kind"]) for item in result["matches"]], [
+            ("2026-11-14T01:00:00Z", "user"), ("2026-11-14T01:02:00Z", "assistant"),
+            ("2026-11-14T01:03:00Z", "AskUserQuestion"), ("2026-11-14T01:04:00Z", "tool_result")])
+        self.assertIn("release", result["matches"][2]["text"])
+        self.assertEqual(result["matches"][3]["text"], "muse: CI passed")
+
+    def test_lead_state_marks_elsewhere_answers_and_only_offers_to_close_the_whole_answered_selector(self) -> None:
+        questions = [{"header": "release's approval", "question": "muse を出しますか？"},
+                     {"header": "merge", "question": "muse を merge しますか？"}]
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "release": {"question": questions[0]["question"] + "選択肢: 出す／待つ", "answer": "出す",
+                            "answered_at": "2026-11-14T01:02:00Z"}}}))
+        write_jsonl(self.inbox, [{"kind": "ask", "id": "ask-one", "ts": "2026-11-14T00:00:00Z",
+                                  "questions": questions}])
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": questions}}), "timestamp": "2026-11-14T01:01:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": [terminal("/w/lead", "claude", "term_lead")]},
+                   ("terminal", "read", "--terminal", "term_lead", "--screen"):
+                       {"terminal": {"tail": ["release's approval | merge", "Enter to select"]}}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            _, shown, _ = self.call("lead-state")
+            partial = json.loads(shown)["pending_questions"][0]
+            self.assertEqual(partial["questions"][0]["answered_elsewhere"], "2026-11-14T01:02:00Z")
+            self.assertNotIn("answered_elsewhere", partial["questions"][1])
+            self.assertNotIn("close_selector", partial)
+            write_jsonl(self.root / "answers.jsonl", [
+                {"id": "ask-one:2", "ts": "2026-11-14T01:02:30Z", "how": "inbox_read.py answered"},
+                {"id": "ask-one:2", "ts": "2026-11-14T01:03:00Z", "how": "send"}])
+            code, shown, err = self.call("lead-state")
+
+        self.assertEqual(code, 0, err)
+        call = json.loads(shown)["pending_questions"][0]
+        self.assertEqual(call["answered_elsewhere"], "2026-11-14T01:03:00+00:00")
+        self.assertEqual(call["questions"][1]["answer_source"], "ask-answers ask-one:2")
+        self.assertEqual([shlex.split(command) for command in call["close_selector"]], [[
+            str(Path(handoff.NOTIFY).with_name("close-selector").expanduser()), "term_lead", "release's approval", "merge"]])
+
+    def test_lead_state_does_not_close_from_old_answers_withdrawals_or_ambiguous_asks(self) -> None:
+        question = {"header": "merge", "question": "Merge?"}
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "old": {"question": "Merge?", "answer": "Yes", "answered_at": "2026-11-14T00:00:00Z"}}}))
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": [question]}}), "timestamp": "2026-11-14T01:00:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            for how, ids in [("send", ["a", "b"]), ("triage-notify --withdraws", ["a"]),
+                             ("inbox_read.py answered", ["a"])]:
+                with self.subTest(how=how, ids=ids):
+                    write_jsonl(self.inbox, [{"kind": "ask", "id": key, "questions": [question]} for key in ids])
+                    write_jsonl(self.root / "answers.jsonl", [{"id": "a", "ts": "2026-11-14T02:00:00Z", "how": how}])
+                    code, shown, err = self.call("lead-state")
+                    self.assertEqual(code, 0, err)
+                    self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
+
+    def test_lead_state_leaves_identical_hourly_questions_from_different_decisions_open(self) -> None:
+        question = {"header": "merge", "question": "Merge?"}
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "first": {"row": "/w/first", "decision": "merge:first", "question": "Merge?", "answer": None},
+                "other": {"row": "/w/other", "decision": "merge:other", "question": "Merge?", "answer": "Yes",
+                          "answered_at": "2026-11-14T02:00:00Z"}}}))
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": [question]}}), "timestamp": "2026-11-14T01:00:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            code, shown, err = self.call("lead-state")
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
+            state = json.loads(self.state.read_text())
+            state["questions"]["first"].update(header="merge", answer="No", answered_at="2026-11-14T02:01:00Z")
+            state["questions"]["other"]["header"] = "another merge"
+            self.state.write_text(json.dumps(state))
+            code, shown, err = self.call("lead-state")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(shown)["pending_questions"][0]["questions"][0]["answer_source"],
+                             "hourly_state first")
 
     def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
@@ -5399,6 +5586,48 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([(item["row"], item["decision"], item["final_message"]) for item in recorded],
                          [("mbp16::/w/lane", "release", "A と B のどちらで出しますか？"),
                           ("/w/other", "merge:PR#3", "merge しますか？")])
+
+    def test_asked_many_binds_numbered_ask_parts_and_rejects_an_out_of_range_part(self) -> None:
+        ask_id = "abcd1234-0000-ask"
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "repo": "app", "class": "waiting"}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": ask_id, "kind": "ask", "worktree": "lane", "repo": "app",
+            "ts": "2026-11-13T09:00:00Z", "text": "Two questions", "questions": [
+                {"header": "First", "question": "First?"}, {"header": "Second", "question": "Second?"}]}])
+        lines = self.root / "asked.jsonl"
+        items = [{"ask": f"{ask_id[:8]}:1", "decision": "first", "question": "First?"},
+                 {"ask": f"{ask_id}:2", "decision": f"answer:lane::{ask_id}", "question": "Second?"}]
+        write_jsonl(lines, [{**item, "asked_at": "2026-11-13T09:01:00Z"} for item in items])
+        code, output, error = self.run_main("asked-many", "--file", str(lines), "--from", str(scan_json))
+        self.assertEqual(code, 0, error)
+        recorded = json.loads(output)
+        self.assertEqual([item["ask_id"] for item in recorded], [f"{ask_id}:1", f"{ask_id}:2"])
+
+        sync = importlib.import_module("answer_sync")
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
+            sync.record([f"{ask_id}:2"], "Second answer", "send", at="2026-11-13T09:02:00Z",
+                        state_file=self.state, decisions_file=self.root / "lead.jsonl",
+                        handed_off_file=self.root / "handed.jsonl")
+        questions = self.call("show")[1]["questions"]
+        self.assertIsNone(questions[recorded[0]["id"]]["answer"])
+        self.assertEqual(questions[recorded[1]["id"]]["answer"], "Second answer")
+        second = questions[recorded[1]["id"]]
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
+            sync.record([f"{ask_id}:1"], "First answer", "send", at="2026-11-13T09:03:00Z",
+                        state_file=self.state, decisions_file=self.root / "lead.jsonl",
+                        handed_off_file=self.root / "handed.jsonl")
+        questions = self.call("show")[1]["questions"]
+        self.assertEqual(questions[recorded[0]["id"]]["answer"], "First answer")
+        self.assertEqual(questions[recorded[1]["id"]], second)
+
+        write_jsonl(lines, [{"ask": f"{ask_id}:1", "decision": "new-first", "question": "First?"},
+                            {"ask": f"{ask_id}:3", "decision": "invalid", "question": "Third?"}])
+        code, _, error = self.run_main("asked-many", "--file", str(lines), "--from", str(scan_json))
+        self.assertEqual(code, 1)
+        self.assertIn(":3", error)
+        self.assertEqual(self.call("show")[1]["questions"], questions)
 
     def test_answered_many_records_by_id_or_decision_only_when_every_line_holds(self) -> None:
         message = self.source("message.txt", "Merge?")
