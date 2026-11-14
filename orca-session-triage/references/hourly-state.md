@@ -27,6 +27,13 @@ For `asked --decision`, use the same subject and action across runs, such as
 | Nothing will answer it | `withdraw --id ID --reason-file FILE` closes a question no answer will settle, keeping the reason and time. Add `--replaced-by ID` when an existing question replaces it. `answered` and `answered-many` leave withdrawn questions unanswered, name the replacement on stderr and in `replaced_by`, and exit 2; valid answers in the same batch are still recorded. Inspect the replacement before answering it. |
 | User promises “when A settles, give B the task” | Record `promise --from-row A --to-row B --condition CONDITION --task TASK`. Every run checks undelivered promises against the latest A result. When the condition holds, send B the task as the Boundary permits. Record `delivered --id ID --delivery queued` or `--delivery turn_started` once that delivery is confirmed. |
 
+`asked-many` accepts `ask` as `ID:N` to bind a record to question N of an inbox
+ask, using the same numbering as `claim` and `send --ask`. ID may be an
+unambiguous prefix of eight or more characters. The stored `ask_id` retains
+the full ID and number, and answer synchronization uses that selected part
+even when a decision key names the whole ask. An out-of-range number prevents
+the batch from recording any line.
+
 ## The triage workspace's comment
 
 The script writes the triage workspace's Orca comment from the state with

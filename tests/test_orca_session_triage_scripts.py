@@ -5584,6 +5584,39 @@ class HourlyStateTests(unittest.TestCase):
                          [("mbp16::/w/lane", "release", "A と B のどちらで出しますか？"),
                           ("/w/other", "merge:PR#3", "merge しますか？")])
 
+    def test_asked_many_binds_numbered_ask_parts_and_rejects_an_out_of_range_part(self) -> None:
+        ask_id = "abcd1234-0000-ask"
+        scan_json = self.root / "scan.json"
+        scan_json.write_text(json.dumps([{"path": "/w/lane", "repo": "app", "class": "waiting"}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": ask_id, "kind": "ask", "worktree": "lane", "repo": "app",
+            "ts": "2026-11-13T09:00:00Z", "text": "Two questions", "questions": [
+                {"header": "First", "question": "First?"}, {"header": "Second", "question": "Second?"}]}])
+        lines = self.root / "asked.jsonl"
+        items = [{"ask": f"{ask_id[:8]}:1", "decision": "first", "question": "First?"},
+                 {"ask": f"{ask_id}:2", "decision": f"answer:lane::{ask_id}", "question": "Second?"}]
+        write_jsonl(lines, [{**item, "asked_at": "2026-11-13T09:01:00Z"} for item in items])
+        code, output, error = self.run_main("asked-many", "--file", str(lines), "--from", str(scan_json))
+        self.assertEqual(code, 0, error)
+        recorded = json.loads(output)
+        self.assertEqual([item["ask_id"] for item in recorded], [f"{ask_id}:1", f"{ask_id}:2"])
+
+        sync = importlib.import_module("answer_sync")
+        with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
+            sync.record([f"{ask_id}:2"], "Second answer", "send", at="2026-11-13T09:02:00Z",
+                        state_file=self.state, decisions_file=self.root / "lead.jsonl",
+                        handed_off_file=self.root / "handed.jsonl")
+        questions = self.call("show")[1]["questions"]
+        self.assertIsNone(questions[recorded[0]["id"]]["answer"])
+        self.assertEqual(questions[recorded[1]["id"]]["answer"], "Second answer")
+
+        write_jsonl(lines, [{"ask": f"{ask_id}:1", "decision": "new-first", "question": "First?"},
+                            {"ask": f"{ask_id}:3", "decision": "invalid", "question": "Third?"}])
+        code, _, error = self.run_main("asked-many", "--file", str(lines), "--from", str(scan_json))
+        self.assertEqual(code, 1)
+        self.assertIn(":3", error)
+        self.assertEqual(self.call("show")[1]["questions"], questions)
+
     def test_answered_many_records_by_id_or_decision_only_when_every_line_holds(self) -> None:
         message = self.source("message.txt", "Merge?")
         first, second = (self.call("asked", "--row", row, "--decision", decision, "--final-message-file", message,

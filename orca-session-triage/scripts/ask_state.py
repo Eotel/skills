@@ -28,10 +28,14 @@ def reference(value: str, entries: list[dict]) -> tuple[str, frozenset[int]] | N
 
 def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset[int]]]:
     values = [question.get("decision") or "", *(question.get("covers") or [])]
-    # ask_id identifies the source; a numbered decision narrows that source to its questions.
+    # A whole source id leaves numbered decision keys responsible for narrowing it.
     found = [ref for value in values if (ref := reference(value, entries))]
-    if not found and question.get("ask_id") and (ref := reference(question["ask_id"], entries)):
-        found.append(ref)
+    source = reference(question.get("ask_id") or "", entries)
+    if source and source[1]:
+        # A whole-ask key would widen an explicit part back to every question.
+        found = [source, *(ref for ref in found if ref[0] != source[0])]
+    elif not found and source:
+        found.append(source)
     return list(dict.fromkeys(found))
 
 
