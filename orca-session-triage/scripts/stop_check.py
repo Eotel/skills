@@ -37,13 +37,14 @@ from typing import Any
 import unicodedata
 
 import answer_evidence
+import ask_state
 import handoff
 import hourly_state
 import inbox_read
 import hourly_runtime
 import retro
 
-STATE_DIR = "~/.cache/orca-session-triage"
+STATE_DIR = os.environ.get("TRIAGE_STATE_DIR", "~/.cache/orca-session-triage")
 HOURLY_STATE = hourly_state.DEFAULT_STATE
 TRIAGE_PROMPT = "/orca-session-triage"
 # Kept in the session's state directory: how far the transcript was read and which artifacts are still watched.
@@ -82,6 +83,10 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     if hook_input.get("tool_name") != "AskUserQuestion" or not hook_input.get("cwd"):
         return None
     workspace = hook_input["cwd"]
+    state = read_json(state_dir / "hourly-state.json")
+    lead = (state.get("lead") or {}).get("worktree") if isinstance(state, dict) else None
+    if isinstance(state, dict) and lead and ask_state.same_workspace(lead, workspace):
+        return duplicate_question(hook_input, state)
     try:
         if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
                    for automation in triage_automations(orca, workspace)):
@@ -94,9 +99,10 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     reasons = []
+    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}):
+        reasons.append(duplicated["hookSpecificOutput"]["permissionDecisionReason"])
     if not all(in_japanese(question) for question in questions):
         reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
-    state = read_json(state_dir / "hourly-state.json")
     if not (isinstance(state, dict) and (state.get("lead") or {}).get("worktree")):
         return deny(reasons)
     pane = os.environ.get("ORCA_PANE_KEY")
@@ -117,6 +123,57 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
         reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
     return deny(reasons)
+
+
+def duplicate_question(hook_input: dict, state: dict) -> dict | None:
+    """Name an answered ask or a question another tab has claimed or is already asking."""
+    entries = hourly_state.inbox_entries()
+    answers = inbox_read.answer_records(inbox_read.answers_path())
+    claims = inbox_read.read_claims(inbox_read.claims_path())
+    questions = (hook_input.get("tool_input") or {}).get("questions") or []
+    cwd, session = hook_input["cwd"], hook_input.get("session_id")
+    reasons = []
+    for question in questions:
+        text, header = question.get("question") or "", question.get("header") or ""
+        recorded = list(state.get("questions", {}).values())
+        matched = [item for item in recorded if item.get("question") == text]
+        own = [item for item in recorded if header and item.get("header") == header
+               and item.get("session") == session and ask_state.same_workspace(item.get("asked_in") or "", cwd)
+               and item.get("answer") is None and not item.get("withdrawn_at")]
+        if own:
+            matched.append(max(own, key=lambda item: item.get("asked_at") or ""))
+        refs = [ref for item in matched for ref in ask_state.references(item, entries)]
+        refs.extend((str(entry["id"]), frozenset((number,)))
+                    for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+                    for number, original in enumerate(inbox_read.questions_of(entry), start=1)
+                    if text in (original.get("question"), answer_evidence.shown_question(original))
+                    and (not header or original.get("header") == header))
+        for ref in dict.fromkeys(refs):
+            ask_id, numbers = ref
+            if ask_state.covered(ref, list(answers), entries):
+                times = [record.get("ts") or "時刻不明" for key, record in answers.items()
+                         if key == ask_id or key.startswith(ask_id + ":")
+                         and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
+                reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
+            candidates = [claim for key, claim in claims.items() if key == ask_id
+                          or key.startswith(ask_id + ":") and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
+            for claim in candidates:
+                if not ask_state.same_workspace(claim.by, cwd):
+                    reasons.append(f"「{header or text}」の ask {ask_id} は {claim.by} が claim 中です（{claim.at}）。重ねて伺わないでください。")
+        for item in matched:
+            if item.get("answer") is not None:
+                reasons.append(f"「{header or text}」は hourly_state の回答済みの問いです（{item.get('answered_at')}）。答えを読んでください。")
+        related = {value for item in matched for value in [item.get("decision"), *(item.get("covers") or [])]}
+        rows = {item.get("row") for item in matched}
+        for item in ask_state.active(state):
+            same = ask_state.same_workspace(item["by"], cwd)
+            if same and (not item["session"] or item["session"] == session):
+                continue
+            bindings = ask_state.references(item["record"], entries)
+            overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
+            if item["row"] in rows or related.intersection(item["keys"]) or overlap:
+                reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")
+    return deny(list(dict.fromkeys(reasons)))
 
 
 # An option that sends something out of this session: a post, merge, send, push, or production change.
@@ -369,7 +426,10 @@ def main(handoffs_dir: Path | None = None) -> int:
             json.dump(decision, sys.stdout, ensure_ascii=False)
         return 0
     if hook_input.get("hook_event_name") == "PreToolUse":
-        decision = question_decision(hook_input, orca, Path(STATE_DIR).expanduser(), handoffs_dir)
+        try:
+            decision = question_decision(hook_input, orca, Path(STATE_DIR).expanduser(), handoffs_dir)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            decision = None
         if decision:
             json.dump(decision, sys.stdout, ensure_ascii=False)
         return 0
