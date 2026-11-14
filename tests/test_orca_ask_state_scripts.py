@@ -232,6 +232,8 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual(self.hook().stdout, "")
 
     def test_guard_allows_different_numbered_questions_from_the_same_worker(self) -> None:
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [
+            self.question, {**self.question, "question": "次の公開を進めますか？", "header": "次の公開"}]}])
         self.ask(key=f"ask:worker::{self.ASK}:1", covers=[f"answer:worker::{self.ASK}:1"])
         state = json.loads(self.state.read_text())
         state["questions"]["lead-question"] = {
@@ -240,6 +242,22 @@ class AskStateTests(unittest.TestCase):
             "asked_in": "/w/lead", "session": "lead-session", "asked_at": self.AT}
         self.state.write_text(json.dumps(state))
         self.question = {**self.question, "question": "次の公開を進めますか？", "header": "次の公開"}
+        self.assertEqual(self.hook().stdout, "")
+
+    def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
+        self.ask(key="remove:/w/old", covers=[])
+        state = json.loads(self.state.read_text())
+        old = next(iter(state["questions"].values()))
+        old.update(answer="残す", answered_at=self.AT)
+        state["questions"]["lead-current"] = {
+            **old, "row": "/w/new", "decision": "remove:/w/new", "answer": None,
+            "asked_in": "/w/lead", "session": "lead-session"}
+        self.state.write_text(json.dumps(state))
+        self.assertEqual(self.hook().stdout, "")
+
+    def test_numbered_claim_takeover_overrides_another_workspaces_whole_ask_claim(self) -> None:
+        self.write_lines(self.claims, [{"id": self.ASK, "by": "/w/hourly", "ts": self.AT},
+                                       {"id": self.ASK + ":1", "by": "/w/lead", "ts": self.AT}])
         self.assertEqual(self.hook().stdout, "")
 
 

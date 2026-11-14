@@ -136,18 +136,28 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
     for question in questions:
         text, header = question.get("question") or "", question.get("header") or ""
         recorded = list(state.get("questions", {}).values())
-        matched = [item for item in recorded if item.get("question") == text]
-        own = [item for item in recorded if header and item.get("header") == header
-               and item.get("session") == session and ask_state.same_workspace(item.get("asked_in") or "", cwd)
+        mine = [item for item in recorded if item.get("session") == session
+                and ask_state.same_workspace(item.get("asked_in") or "", cwd)
                and item.get("answer") is None and not item.get("withdrawn_at")]
+        own = [item for item in mine if item.get("question") == text]
+        if not own and header:
+            own = [item for item in mine if item.get("header") == header]
         if own:
-            matched.append(max(own, key=lambda item: item.get("asked_at") or ""))
+            matched = [max(own, key=lambda item: item.get("asked_at") or "")]
+        else:
+            matched = [item for item in recorded if item.get("question") == text]
+            bindings = {(item.get("row"), item.get("decision"), tuple(item.get("covers") or [])) for item in matched}
+            if len(bindings) > 1:
+                matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
-        refs.extend((str(entry["id"]), frozenset((number,)))
-                    for entry in entries if entry.get("kind") == "ask" and entry.get("id")
-                    for number, original in enumerate(inbox_read.questions_of(entry), start=1)
-                    if text in (original.get("question"), answer_evidence.shown_question(original))
-                    and (not header or original.get("header") == header))
+        if not matched:
+            shown = [(str(entry["id"]), frozenset((number,)))
+                     for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+                     for number, original in enumerate(inbox_read.questions_of(entry), start=1)
+                     if text in (original.get("question"), answer_evidence.shown_question(original))
+                     and (not header or original.get("header") == header)]
+            if len({ref[0] for ref in shown}) == 1:
+                refs.extend(shown)
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
             if ask_state.covered(ref, list(answers), entries):
@@ -155,9 +165,11 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
                          if key == ask_id or key.startswith(ask_id + ":")
                          and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
                 reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
-            candidates = [claim for key, claim in claims.items() if key == ask_id
-                          or key.startswith(ask_id + ":") and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
-            for claim in candidates:
+            ask = next(entry for entry in entries if entry.get("id") == ask_id)
+            parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
+            candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
+                          if parts else [claims.get(ask_id)])
+            for claim in dict.fromkeys(claim for claim in candidates if claim):
                 if not ask_state.same_workspace(claim.by, cwd):
                     reasons.append(f"「{header or text}」の ask {ask_id} は {claim.by} が claim 中です（{claim.at}）。重ねて伺わないでください。")
         for item in matched:
