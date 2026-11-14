@@ -4895,7 +4895,9 @@ class HandoffProposalTests(unittest.TestCase):
         self.body = self.root / "body.txt"
         self.body.write_text("handoff body")
         self.handed = self.root / "handed.jsonl"
-        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude")})
+        environment = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+                                              "TRIAGE_INBOX": str(self.inbox),
+                                              "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")})
         environment.start()
         self.addCleanup(environment.stop)
         processes = patch.object(handoff.scan_sessions, "process_table", return_value={})
@@ -5009,6 +5011,94 @@ class HandoffProposalTests(unittest.TestCase):
         self.assertEqual(result["answered"], [{"id": "after", "asked_at": "2026-11-09T01:20:00Z",
                                                "answered_at": "2026-11-09T01:21:00Z", "answers": {"Merge?": "Wait"},
                                                "notes": {"Merge?": "CI の後で"}}])
+        self.assertEqual(result["transcript"], str(self.projects / "-w-lead" / "lead.jsonl"))
+        self.assertEqual(result["user_messages"], [{"at": "2026-11-09T01:30:00Z", "text": "続けて"}])
+
+    def test_lead_state_searches_speech_questions_and_text_tool_results_with_times(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        question = {"questions": [{"header": "release", "question": "MUSE を出しますか？"}]}
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**user("muse: earlier permission"), "timestamp": "2026-11-14T00:58:00Z"},
+            {**assistant(text("muse: before")), "timestamp": "2026-11-14T00:59:00Z"},
+            {**user("MUSE は出してよい"), "timestamp": "2026-11-14T01:00:00Z"},
+            {**user("<task-notification>MUSE: done</task-notification>"), "timestamp": "2026-11-14T01:01:00Z"},
+            {**assistant(text("muse: ready")), "timestamp": "2026-11-14T01:02:00Z"},
+            {**assistant({"type": "tool_use", "id": "ask", "name": "AskUserQuestion", "input": question}),
+             "timestamp": "2026-11-14T01:03:00Z"},
+            {**user([{"type": "tool_result", "tool_use_id": "tool", "content": [
+                {"type": "text", "text": "muse: CI passed"}, {"type": "image", "data": "not-text"}]}]),
+             "timestamp": "2026-11-14T01:04:00Z"},
+            {**assistant(text("MUSE error")), "timestamp": "2026-11-14T01:05:00Z", "isApiErrorMessage": True}])
+        handoff.SavedHandoff(text="handoff", kind="info", decisions=[], sent_at="2026-11-14T01:00:00Z",
+                             next_offset=0).save(self.root / "handoffs", datetime(2026, 11, 14, 1, tzinfo=timezone.utc))
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            code, shown, err = self.call("lead-state", "--grep", "MuSe", "--since", "2026-11-14T10:00:00+09:00")
+
+        self.assertEqual(code, 0, err)
+        result = json.loads(shown)
+        self.assertEqual(result["user_messages"], [{"at": "2026-11-14T01:00:00Z", "text": "MUSE は出してよい"}])
+        self.assertEqual([(item["at"], item["kind"]) for item in result["matches"]], [
+            ("2026-11-14T01:00:00Z", "user"), ("2026-11-14T01:02:00Z", "assistant"),
+            ("2026-11-14T01:03:00Z", "AskUserQuestion"), ("2026-11-14T01:04:00Z", "tool_result")])
+        self.assertIn("release", result["matches"][2]["text"])
+        self.assertEqual(result["matches"][3]["text"], "muse: CI passed")
+
+    def test_lead_state_marks_elsewhere_answers_and_only_offers_to_close_the_whole_answered_selector(self) -> None:
+        questions = [{"header": "release's approval", "question": "muse を出しますか？"},
+                     {"header": "merge", "question": "muse を merge しますか？"}]
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "release": {"question": questions[0]["question"] + "選択肢: 出す／待つ", "answer": "出す",
+                            "answered_at": "2026-11-14T01:02:00Z"}}}))
+        write_jsonl(self.inbox, [{"kind": "ask", "id": "ask-one", "ts": "2026-11-14T00:00:00Z",
+                                  "questions": questions}])
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": questions}}), "timestamp": "2026-11-14T01:01:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": [terminal("/w/lead", "claude", "term_lead")]},
+                   ("terminal", "read", "--terminal", "term_lead", "--screen"):
+                       {"terminal": {"tail": ["release's approval | merge", "Enter to select"]}}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            _, shown, _ = self.call("lead-state")
+            partial = json.loads(shown)["pending_questions"][0]
+            self.assertEqual(partial["questions"][0]["answered_elsewhere"], "2026-11-14T01:02:00Z")
+            self.assertNotIn("answered_elsewhere", partial["questions"][1])
+            self.assertNotIn("close_selector", partial)
+            write_jsonl(self.root / "answers.jsonl", [{"id": "ask-one:2", "ts": "2026-11-14T01:03:00Z", "how": "send"}])
+            code, shown, err = self.call("lead-state")
+
+        self.assertEqual(code, 0, err)
+        call = json.loads(shown)["pending_questions"][0]
+        self.assertEqual(call["answered_elsewhere"], "2026-11-14T01:03:00Z")
+        self.assertEqual(call["questions"][1]["answer_source"], "ask-answers ask-one:2")
+        self.assertEqual([shlex.split(command) for command in call["close_selector"]], [[
+            str(Path(handoff.NOTIFY).with_name("close-selector").expanduser()), "term_lead", "release's approval", "merge"]])
+
+    def test_lead_state_does_not_close_from_old_answers_withdrawals_or_ambiguous_asks(self) -> None:
+        question = {"header": "merge", "question": "Merge?"}
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "handoffs": {},
+            "lead": {"worktree": "/w/lead"}, "questions": {
+                "old": {"question": "Merge?", "answer": "Yes", "answered_at": "2026-11-14T00:00:00Z"}}}))
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            {**assistant({"type": "tool_use", "id": "pending", "name": "AskUserQuestion",
+                          "input": {"questions": [question]}}), "timestamp": "2026-11-14T01:00:00Z"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": []}}
+        with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
+                args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+            for how, ids in [("send", ["a", "b"]), ("triage-notify --withdraws", ["a"])]:
+                with self.subTest(how=how, ids=ids):
+                    write_jsonl(self.inbox, [{"kind": "ask", "id": key, "questions": [question]} for key in ids])
+                    write_jsonl(self.root / "answers.jsonl", [{"id": "a", "ts": "2026-11-14T02:00:00Z", "how": how}])
+                    code, shown, err = self.call("lead-state")
+                    self.assertEqual(code, 0, err)
+                    self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
 
     def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},

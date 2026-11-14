@@ -230,14 +230,30 @@ overrides it, and `--state-file` selects the shared state for both `send` and
 `lead-state`. `handoff.py lead-state` prints JSON with `worktree` (path),
 `agents` (states and stop times), `final` (the lead's newest message of its
 own and its time, also while a turn runs or after an API error such as a usage
-limit ended it), `api_error` (that error's text, or null),
-`pending_questions` (unanswered questions, choices, and ask times), `answered`
+limit ended it), `api_error` (that error's text, or null), `transcript` (the
+current conversation's path, or null), `user_messages` (the user's ordinary
+messages since the newest kept handoff, with `at` and `text`, excluding task
+notifications), `pending_questions` (unanswered questions, choices, and ask times), `answered`
 (questions answered since the newest kept handoff, with the choice and note per
 question and ask and answer times), `rejected`
 (questions closed without an answer since the newest kept handoff, with ask and
 close times), `queued_input` (undelivered instructions and enqueue times), and
-`terminals` (handles and screen tails);
+`terminals` (handles and `screen_tail`, an array of the screen's last lines,
+not a string);
 `--orca` selects its CLI.
+`lead-state --grep WORD [--since HH:MM|ISO]` adds `matches`: timestamped lead
+and user speech, AskUserQuestion calls, and text tool results containing the
+literal word, ignoring case. `--since` applies to the search; `user_messages`
+still starts at the newest handoff. HH:MM means its most recent occurrence in
+local time. Search reads the current transcript.
+
+Pending questions answered through shared hourly state or ask-answers carry
+`answered_elsewhere` (the answer time) and `answer_source`. A call whose every
+question is answered also carries the last answer time and `close_selector`
+commands, listing every heading, for tabs showing the matching selector. Read
+the answer evidence before running one; the command checks the screen again.
+A partial batch has annotations only on its answered questions and no close
+command. Reading lead-state never closes a selector.
 `--claude-projects` selects the transcript root for both commands.
 Do not sign the body: it ends the
 text with `<session name>（HH:MM の定時）`, the name ListAgents prints first and
