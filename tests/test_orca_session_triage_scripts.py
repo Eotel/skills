@@ -2719,6 +2719,28 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines()[0],
                          "classes: stalled=0 (scan: 1), unsure=1, waiting=2 (scan: 1), working=1")
 
+    def test_removal_specs_honor_approval_but_keep_retained_rows_and_print_scan_values(self) -> None:
+        saved = self.dir / "scan.json"
+        decisions = self.dir / "decisions.jsonl"
+        names = ("approved", "keep", "defer", "conditional", "unknown")
+        rows = [{"path": f"/w/app/{name}", "repo": "app", "class": "unsure", "meaningful_tabs": ["term_idle"]}
+                for name in names]
+        saved.write_text(json.dumps(rows))
+        write_jsonl(decisions, [{"id": name, "decision": f"remove:local::/w/app/{name}", "answer": answer,
+                                "decided_at": "2026-11-14T00:00:00Z"}
+                               for name, answer in (("approved", "指揮: rm_check が ok なら作業場を消してよい"),
+                                                    ("keep", "結果が出るまで残す。その後に消す"),
+                                                    ("defer", "保留。使っている人が終えたら消してよい"),
+                                                    ("conditional", "PR が merge されたら消す"))])
+        for named in ([], [f"--row={name}" for name in names]):
+            with self.subTest(named=bool(named)), redirect_stdout(io.StringIO()) as out, \
+                    redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(saved), "--decisions-file", str(decisions), "--rm-specs", *named])
+            self.assertEqual(code, int(bool(named)))
+            self.assertEqual(out.getvalue(), "/w/app/approved -\n")
+            for expected in ("class=unsure", "open_pr_cleanup=False", "removal_decision=", "結果が出るまで残す", "保留"):
+                self.assertIn(expected, err.getvalue())
+
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self) -> None:
         local = {"worktrees": [worktree("/local/w", "done")],
                  "hostScope": {"omittedHostSelectors": [
@@ -6743,6 +6765,8 @@ class HourlyReadTests(unittest.TestCase):
                     Path(args[1]).write_text("[]")
                 else:
                     stdout.write("[]\n")
+                if "--review-out" in args:
+                    Path(args[args.index("--review-out") + 1]).write_text(json.dumps({"rows": [{"path": "/w/a"}]}))
                 return subprocess.CompletedProcess(args, 0)
             with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()) as out:
                 code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
@@ -6760,6 +6784,8 @@ class HourlyReadTests(unittest.TestCase):
             self.assertIn("topic unavailable", (run_dir / "topic-check.stderr").read_text())
             self.assertIn("topic-check: exit 7", out.getvalue())
             self.assertIn(str(run_dir), out.getvalue())
+            self.assertIn(f"review queue: {run_dir.resolve() / 'review-queue.json'}（1 行）／分類: orca-row-classify {run_dir.resolve()}",
+                          out.getvalue())
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
@@ -8606,6 +8632,22 @@ class VerdictStoreTests(unittest.TestCase):
                                     "/w/a": {"class": "blocked", "read": "ka", "queued_at": "g1"},
                                     "/w/c": {"class": "finished", "read": "kc", "queued_at": "g2"}})
         self.assertEqual(json.loads(self.store.read_text()), verdicts)
+
+    def test_hourly_read_verdicts_feed_saved_rows_and_removal_specs_before_the_next_scan(self) -> None:
+        row = {**self.row("/w/app/done", cls="unsure"), "repo": "app", "meaningful_tabs": []}
+        queued = scan.review_queue([row])
+        (self.root / "reads").mkdir()
+        self.write_session("reads/run", "2026-11-14T00:00:00Z", queued, "2026-11-14T00:00:00Z",
+                           [{"path": row["path"], "class": "finished"}])
+        saved = self.root / "reads/run/scan.json"
+        saved.write_text(json.dumps([row]))
+        for options, expected in ((["--rows"], "finished (scan: unsure)"),
+                                  (["--rm-specs"], "/w/app/done -")):
+            with self.subTest(options=options), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--verdicts", str(self.store), *options]), 0)
+            self.assertIn(expected, out.getvalue())
+        self.assertFalse(self.store.exists(), "--from must not write the verdict store")
+        self.assertEqual(scan.absorb_verdicts(self.store)[row["path"]]["class"], "finished")
 
     def test_an_older_session_s_read_does_not_replace_a_newer_one_in_the_store(self) -> None:
         self.write_session("old", "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "read": "k-old"}],

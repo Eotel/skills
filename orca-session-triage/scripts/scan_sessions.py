@@ -2374,6 +2374,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                          datetime.min.replace(tzinfo=timezone.utc))
             row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
                                        "decided_at": answer.decided_at}
+        if answer := row.get("removal_decision"):
+            answer["allows_removal"] = removal_approved(row)
         names = {row["path"], row_identity(row), row_name(row),
                  f"{row.get('repo')}/{Path(row['path']).name}"}
         if not row.get("environment"):
@@ -2386,6 +2388,27 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or EPOCH)
             row["wake_decision"] = {"answer": answer.answer, "decided_at": answer.decided_at}
     return rows
+
+
+def removal_approved(row: dict) -> bool:
+    """An explicit removal answer; retaining or deferring in that answer takes precedence."""
+    text = str((row.get("removal_decision") or {}).get("answer") or "")
+    # The preflight itself proves these conditions. Other future conditions still need a new answer.
+    text = re.sub(r"rm_check(?:\.py)?\s*(?:が\s*)?ok\s*なら|検査が通れば", "", text, flags=re.IGNORECASE)
+    if re.search(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|"
+                 r"たら|れば|なら|次第|まで|後に|消すか|消せない|"
+                 r"\b(?:keep|defer|do not remove|don't remove)\b", text, re.IGNORECASE):
+        return False
+    return bool(re.search(r"消す(?=$|[\s。、（()）」])|消します|消して(?:よい|いい|ください|構わない|かまわない)|"
+                          r"削除(?:する|して(?:よい|いい|ください))|\b(?:remove it|ready to remove)\b",
+                          text, re.IGNORECASE))
+
+
+def removal_facts(row: dict) -> str:
+    """The scan values used when explaining why a row was left out."""
+    shown = (row.get("verdict") or {}).get("class") or row["class"]
+    return (f"class={class_label(shown, row['class'])}, open_pr_cleanup={bool(row.get('open_pr_cleanup'))}, "
+            f"removal_decision={json.dumps(row.get('removal_decision'), ensure_ascii=False)}")
 
 
 def current_verdict(row: dict, verdicts: dict[str, dict]) -> dict | None:
@@ -2496,10 +2519,11 @@ def newer_verdicts(verdicts: dict[str, dict], incoming: dict[str, dict]) -> dict
 
 
 def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dict]:
-    """Fold every session's classed queue (the store's sibling directories) into the store and return it."""
+    """Fold session and hourly reads/<run> classed queues into the store and return it."""
     store = Path(store_path).expanduser()
     verdicts = load_verdicts(store)
-    for queue in sorted(store.parent.glob("*/review-queue.json"), key=lambda p: p.stat().st_mtime):
+    queues = [*store.parent.glob("*/review-queue.json"), *store.parent.glob("reads/*/review-queue.json")]
+    for queue in sorted(queues, key=lambda p: p.stat().st_mtime):
         verdicts = newer_verdicts(verdicts, classed_queue(queue.parent))
     if write:
         write_json_atomically(store, verdicts)
@@ -2850,13 +2874,13 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        if not row.get("removal_decision"):
+        if not row.get("removal_decision") or removal_approved(row):
             print("    " + rm_check_command(row, scan_file))
     open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
-        if not row.get("removal_decision"):
+        if not row.get("removal_decision") or removal_approved(row):
             print("    " + rm_check_command(row, scan_file, remove_ok=True))
     for row in rows:
         if answer := row.get("removal_decision"):
@@ -3317,9 +3341,11 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
     # A row named twice (by name and by path) is printed once.
     for row in {id(row): row for row in selected}.values():
         shown = (row.get("verdict") or {}).get("class") or row["class"]
-        if answer := row.get("removal_decision"):
+        if row.get("pending_handoffs"):
+            why = "未配信の約束の送り先"
+        elif (answer := row.get("removal_decision")) and not removal_approved(row):
             why = f"removal decision {answer['decided_at']} {answer['answer']}"
-        elif not (row.get("open_pr_cleanup") or shown == "finished"):
+        elif not (removal_approved(row) or row.get("open_pr_cleanup") or shown == "finished"):
             why = f"class {class_label(shown, row['class'])} is neither finished nor open PR cleanup"
         elif row.get("environment"):
             why = "on another Mac: " + rm_check_command(row, scan_file)
@@ -3327,7 +3353,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
             print(f"{row['path']} {pr_number(row) or '-'}")
             continue
         left_out += 1
-        print(f"{row_name(row)}: left out: {why}", file=sys.stderr)
+        print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
     return 1 if left_out else 0
 
 
@@ -3347,10 +3373,12 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         remote = 0
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
-            if answer := row.get("removal_decision"):
-                print(f"{row_name(row)}: {answer['decided_at']} {answer['answer']}", file=sys.stderr)
+            if row.get("pending_handoffs"):
                 continue
-            if row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
+            if row.get("removal_decision") and not removal_approved(row):
+                print(f"{row_name(row)}: {removal_facts(row)}", file=sys.stderr)
+                continue
+            if removal_approved(row) or row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
                 if row.get("environment"):
                     remote += 1
                 else:
