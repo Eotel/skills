@@ -5138,8 +5138,16 @@ class HandoffProposalTests(unittest.TestCase):
         with patch("subprocess.run", side_effect=lambda args, **kwargs: subprocess.CompletedProcess(
                 args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
             code, shown, err = self.call("lead-state")
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("answered_elsewhere", json.loads(shown)["pending_questions"][0])
+            state = json.loads(self.state.read_text())
+            state["questions"]["first"].update(header="merge", answer="No", answered_at="2026-11-14T02:01:00Z")
+            state["questions"]["other"]["header"] = "another merge"
+            self.state.write_text(json.dumps(state))
+            code, shown, err = self.call("lead-state")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(shown)["pending_questions"][0]["questions"][0]["answer_source"],
+                             "hourly_state first")
 
     def test_send_defaults_to_the_appointed_lead_and_includes_undelivered_input(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},

@@ -301,7 +301,9 @@ def annotate_elsewhere(pending: list[dict], state: dict, tabs: list[dict]) -> No
             if not wanted or asked_at is None:
                 continue
             recorded = [(key, item) for key, item in state["questions"].items()
-                        if wanted == question_text(str(item.get("question") or ""))]
+                        if wanted == question_text(str(item.get("question") or ""))
+                        and (not question.get("header") or not item.get("header")
+                             or question["header"] == item["header"])]
             identities = {(item.get("row"), item.get("decision"), item.get("ask_id"))
                           if item.get("row") or item.get("decision") or item.get("ask_id") else (key,)
                           for key, item in recorded}
