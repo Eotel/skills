@@ -6763,6 +6763,25 @@ class HourlyReadTests(unittest.TestCase):
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
+    def test_unmatched_workspace_tabs_are_kept_with_a_reason(self) -> None:
+        terms = [{"worktreeId": "repo::/w/triage", "tabId": name, "leafId": "leaf",
+                  "handle": name, "connected": True, "orphaned": orphaned}
+                 for name, orphaned in (("restored", False), ("detached", True))]
+        terms.append({**terms[0], "handle": "elsewhere", "worktreeId": "repo::/w/other"})
+        with patch.object(cleanup_hourly.hourly_runtime, "scheduled_runs", return_value=[]), \
+                patch.object(cleanup_hourly.hourly_runtime, "orca_result", side_effect=[
+                    {"terminals": terms}, {"worktrees": [{"path": "/w/triage", "agents": []}]}]) as calls, \
+                redirect_stdout(io.StringIO()) as out:
+            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", "/missing/status.json"])
+        self.assertEqual(code, 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        for handle, line in zip(("restored", "detached"), lines):
+            self.assertIn(f"keep: {handle}", line)
+            self.assertIn("run の記録に無い", line)
+            self.assertIn("scheduled=-, started=-", line)
+        self.assertEqual(calls.call_count, 2)  # no screen read, send, or close without a run
+
     def test_rendered_empty_composer_overrides_an_old_orca_draft(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             transcript = Path(root) / "session.jsonl"
@@ -6788,7 +6807,8 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     runs = [{"status": "dispatched", "trigger": "scheduled", "terminalPaneKey": "current:leaf",
                              "workspaceId": "repo::/w/triage", "startedAt": 1793008800000},
                             {"status": run_status, "trigger": "scheduled", "terminalPaneKey": run_pane,
-                             "workspaceId": "repo::/w/triage", "startedAt": 1793005200000}]
+                             "workspaceId": "repo::/w/triage", "scheduledFor": 1793005140000,
+                             "startedAt": 1793005210000}]
                     terms = [{"worktreeId": "repo::/w/triage", "tabId": "current", "leafId": "leaf",
                               "handle": "current-handle", "connected": True},
                              {"worktreeId": "repo::/w/triage", "tabId": "pty:old", "leafId": "pty:old",
@@ -6834,8 +6854,13 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     lines = out.getvalue().splitlines()
                     carried = ["carry: old-handle: 2026-10-26T09:02:00Z [前日以前]: どちらの案にしますか？"] if "？" in final else []
                     self.assertEqual(lines[:len(carried)], carried)
-                    self.assertIn(f"closed: old-handle: {run_status} scheduled run", lines[len(carried)])
-                    self.assertIn("other-handle: no unique scheduled run and transcript", lines[-1])
+                    self.assertIn("closed: old-handle", lines[len(carried)])
+                    self.assertIn(f"run {run_status}", lines[len(carried)])
+                    due = datetime.fromtimestamp(1793005140).strftime("%m/%d %H:%M")
+                    started = datetime.fromtimestamp(1793005210).strftime("%m/%d %H:%M")
+                    self.assertIn(f"scheduled={due}, started={started}", lines[len(carried)])
+                    self.assertIn("keep: other-handle", lines[-1])
+                    self.assertIn("run の記録に無い", lines[-1])
                     self.assertEqual(len(lines), len(carried) + 2)
 
     def test_transcript_lookup_finds_unique_scheduled_start_without_usage(self) -> None:
@@ -6857,8 +6882,8 @@ class HourlyTabCleanupTests(unittest.TestCase):
             self.assertIsNone(cleanup_hourly.transcript_for(run, home))
 
     def test_only_completed_idle_older_scheduled_tab_is_a_candidate(self) -> None:
-        runs = [{"status": "dispatched", "terminalPaneKey": "current"},
-                {"status": "completed", "terminalPaneKey": "old"}]
+        runs: list[dict[str, object]] = [{"status": "dispatched", "terminalPaneKey": "current"},
+                                      {"status": "completed", "terminalPaneKey": "old"}]
         terms = [{"worktreeId": "repo::/w/triage", "tabId": "old", "leafId": "leaf",
                   "handle": "old-handle", "connected": True, "orphaned": False}]
         runs[1]["terminalPaneKey"] = "old:leaf"
@@ -6866,7 +6891,13 @@ class HourlyTabCleanupTests(unittest.TestCase):
         self.assertEqual([term["handle"] for _, term in cleanup_hourly.prior_tabs(
             runs, terms, agents, "/w/triage", "current")], ["old-handle"])
         agents[0]["state"] = "working"  # a background job still owns the old tab
-        self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
+        runs[1].update(scheduledFor=1793005140000, startedAt=1793005210000)
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
+        self.assertIn("keep: old-handle", out.getvalue())
+        due = datetime.fromtimestamp(1793005140).strftime("%m/%d %H:%M")
+        started = datetime.fromtimestamp(1793005210).strftime("%m/%d %H:%M")
+        self.assertIn(f"scheduled={due}, started={started}", out.getvalue())
         agents[0]["state"] = "done"
         runs[1]["status"] = "dispatched"
         self.assertEqual(list(cleanup_hourly.prior_tabs(runs, terms, agents, "/w/triage", "current")), [])
