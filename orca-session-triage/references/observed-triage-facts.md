@@ -12,3 +12,5 @@
 - AskUserQuestion の答えで、選んだ選択肢（投稿・merge など外へ出す操作）とメモが食い違うときは、許可として担当へ渡す前に読みを 1 問で確かめる。先にメモ付きのまま渡したら、確かめた答えで上書きを送る <!-- triage-retro:a39ef175-0051-5f45-a8c5-12ae7f2a7eb5 -->
 - Actions の支払い上限の確認: org の billing API は 410 と admin:org 要求で読めない。最新 run の job を gh api repos/O/R/check-runs/JOB_ID/annotations で読むと課金で未起動かが分かる。 <!-- triage-retro:94336769-5eed-53ba-9af2-07f628ebed4c -->
 - 組織の secret が repo に渡っているかは、gh secret list --org（組織の管理者以外は 403）ではなく、gh api repos/<o>/<r>/actions/organization-secrets で読む。repo の secret は gh secret list -R で読む。 <!-- triage-retro:4974278a-ada9-57d1-8614-a51d99d22fa1 -->
+- 定時のタブが作業場のコメント（要判断・回の結果）を書くときは orca worktree set --worktree path:<作業場のパス> --comment "<文>" を使う。orca worktree --help には comment が出ないので、命令は orca --help で引く <!-- triage-retro:ea956139-2a62-5106-9cd3-71aca0de687d -->
+- 担当の投稿文の下書きに「分かりやすく」と返されたら、担当へ戻さず定時のタブが書き直し、伝える点を番号で問いに書き、全文を preview に入れて聞き直す。項目名だけでなく何に使うかを書く。 <!-- triage-retro:e82f8cc6-aa1e-545e-b840-2d2b77e33520 -->
