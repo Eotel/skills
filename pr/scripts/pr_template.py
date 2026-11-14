@@ -138,8 +138,8 @@ def repo_template(repo_dir: Path) -> Path | None:
     return found[0] if found else None
 
 
-def target_owner(repo_dir: Path) -> str:
-    """Owner of the repository a PR from this checkout goes to: a fork's parent, else origin."""
+def target_repository(repo_dir: Path) -> str:
+    """The repository a PR from this checkout goes to: a fork's parent, else origin."""
     url = _run(("git", "remote", "get-url", "origin"), repo_dir).strip()
     match = _REMOTE_RE.search(url.removesuffix("/").removesuffix(".git"))
     if match is None:
@@ -152,7 +152,18 @@ def target_owner(repo_dir: Path) -> str:
     parents = [
         line.strip() for line in output.splitlines() if _REPO_RE.fullmatch(line.strip())
     ]
-    return (parents[0] if parents else match["repo"]).split("/")[0]
+    return parents[0] if parents else match["repo"]
+
+
+def recent_pr_titles(repo_dir: Path, target: str) -> list[str]:
+    """Five recent PR titles, including closed and merged PRs, at the destination."""
+    output = _run(
+        ("gh", "pr", "list", "--repo", target, "--state", "all", "--limit", "5",
+         "--json", "title", "--jq", ".[].title | @json"),
+        repo_dir,
+    )
+    # JSON strings keep multiline titles intact and distinguish gh's debug lines.
+    return [json.loads(line) for line in output.splitlines() if line.startswith('"')]
 
 
 def own_owners(repo_dir: Path) -> frozenset[str]:
@@ -172,12 +183,13 @@ def builtin(kind: BuiltinKind) -> Template:
     return Template(kind, ASSETS / f"{kind}.md")
 
 
-def pick(repo_dir: Path) -> Template:
+def pick(repo_dir: Path, target: str | None = None) -> Template:
     """Choose the template the body must follow."""
     path = repo_template(repo_dir)
     if path is not None:
         return Template("repo", path)
-    owned = target_owner(repo_dir).lower() in own_owners(repo_dir)
+    owner = (target or target_repository(repo_dir)).split("/")[0]
+    owned = owner.lower() in own_owners(repo_dir)
     return builtin("review-first" if owned else "show-me")
 
 
@@ -356,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    pick_parser = commands.add_parser("pick", help="print the template as JSON")
+    pick_parser = commands.add_parser("pick", help="print the template and recent destination PR titles as JSON")
     pick_parser.add_argument("--repo-dir", type=Path, default=Path.cwd())
     check_parser = commands.add_parser(
         "check",
@@ -386,8 +398,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        target = None
+        titles: list[str] = []
+        history_error = None
+        if args.command == "pick":
+            try:
+                target = target_repository(args.repo_dir)
+                titles = recent_pr_titles(args.repo_dir, target)
+            except Undecided as error:
+                history_error = str(error)
         template = (
-            builtin(args.kind) if getattr(args, "kind", None) else pick(args.repo_dir)
+            builtin(args.kind) if getattr(args, "kind", None) else pick(args.repo_dir, target)
         )
         if args.command == "pick":
             print(
@@ -396,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
                         "kind": template.kind,
                         "template": str(template.path),
                         "headings": template.headings,
+                        "target_repository": target,
+                        "recent_pr_titles": titles,
+                        "recent_pr_titles_error": history_error,
                     },
                     ensure_ascii=False,
                 )

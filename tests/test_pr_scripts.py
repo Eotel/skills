@@ -25,6 +25,16 @@ spec.loader.exec_module(pr_template)
 # gh in this setup can print debug lines to stdout; the fake does too.
 FAKE_GH = """#!/bin/sh
 echo '* Request at 2026-10-27 15:46:00 +0900 JST'
+if [ "$1 $2" = "pr list" ]; then
+  if [ "$FAKE_GH_TITLES_FAIL" = "1" ]; then
+    echo 'history unavailable' >&2
+    exit 1
+  fi
+  [ "$3 $5 $6 $7 $8" = "--repo --state all --limit 5" ] || exit 2
+  printf '"fix(%s): recent title"\\n' "$4"
+  printf '%s\\n' '"docs: second"' '"feat: third"' '"fix: fourth"' '"chore: fifth"'
+  exit 0
+fi
 case "$2" in
   user) echo Eotel ;;
   user/orgs) echo acme ;;
@@ -107,6 +117,10 @@ class PrTemplateTests(unittest.TestCase):
         self.clone_of("git@github.com:acme/api.git")
         status, out, _ = self.run_main("pick")
         self.assertEqual((status, json.loads(out)["kind"]), (0, "review-first"))
+        result = json.loads(out)
+        self.assertEqual(result["target_repository"], "acme/api")
+        self.assertEqual(len(result["recent_pr_titles"]), 5)
+        self.assertEqual(result["recent_pr_titles"][0], "fix(acme/api): recent title")
 
         subprocess.run(
             ["git", "remote", "set-url", "origin", "https://github.com/someone/oss"],
@@ -128,6 +142,21 @@ class PrTemplateTests(unittest.TestCase):
         with patch.dict(os.environ, {"FAKE_GH_PARENT": "someone/oss"}):
             status, out, _ = self.run_main("pick")
         self.assertEqual((status, json.loads(out)["kind"]), (0, "show-me"))
+        self.assertEqual(json.loads(out)["recent_pr_titles"][0], "fix(someone/oss): recent title")
+
+    def test_local_template_keeps_destination_titles_and_survives_history_failure(self) -> None:
+        self.clone_of("https://github.com/Eotel/skills.git")
+        (self.repo / "pull_request_template.md").write_text("## Summary\n", encoding="utf-8")
+        status, out, _ = self.run_main("pick")
+        result = json.loads(out)
+        self.assertEqual((status, result["kind"]), (0, "repo"))
+        self.assertEqual(result["recent_pr_titles"][0], "fix(Eotel/skills): recent title")
+
+        with patch.dict(os.environ, {"FAKE_GH_TITLES_FAIL": "1"}):
+            status, out, _ = self.run_main("pick")
+        result = json.loads(out)
+        self.assertEqual((status, result["kind"], result["recent_pr_titles"]), (0, "repo", []))
+        self.assertIn("history unavailable", result["recent_pr_titles_error"])
 
     def test_check_rejects_the_upstream_shape_in_an_owned_repository(self) -> None:
         self.clone_of("https://github.com/Eotel/skills.git")
