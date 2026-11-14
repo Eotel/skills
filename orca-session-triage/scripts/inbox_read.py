@@ -428,7 +428,7 @@ def inbox_entries(inbox: Path) -> list[dict]:
 
 
 def answer_records(path: Path) -> dict[str, dict]:
-    """The first answer record of each id (an ask, or `<ask id>:<n>`), in the order they were recorded."""
+    """The first delivered answer per id, else its first mark; a later delivery can supply a note-only mark's answer."""
     if not path.exists():
         return {}
     found: dict[str, dict] = {}
@@ -438,7 +438,10 @@ def answer_records(path: Path) -> dict[str, dict]:
         except ValueError:
             continue
         if isinstance(record, dict) and isinstance(record.get("id"), str):
-            found.setdefault(record["id"], record)
+            previous = found.get(record["id"])
+            if previous is None or (previous.get("how") not in ("send", "send --decision")
+                                    and record.get("how") in ("send", "send --decision")):
+                found[record["id"]] = record
     return found
 
 
@@ -585,10 +588,10 @@ def reissues(ask_id: str, entries: list[dict]) -> list[Reissue]:
     return [reissue for _, reissue in sorted(found, key=itemgetter(0))]
 
 
-def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None:
+def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None) -> None:
     """Append one line per answered id; triage-notify's lock keeps concurrent writers' lines whole."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    stamp = at or datetime.now().astimezone().isoformat(timespec="seconds")
     lines = "".join(json.dumps({"id": answer, "ts": stamp, "how": how, **({"note": note} if note else {})},
                                ensure_ascii=False) + "\n" for answer in ids)
     with path.open("a", encoding="utf-8") as stream:
@@ -876,6 +879,11 @@ def main(argv: list[str] | None = None) -> int:
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
     answered.add_argument("--before", help="instead, every open ask asked before this ISO time")
     answered.add_argument("--note", default="", help="why, kept with the record")
+    answered.add_argument("--decision", action="append", default=[], metavar="KEY=ANSWER",
+                          help="answer each decision of a keyed handoff explicitly; repeat per key")
+    answered.add_argument("--state-file", type=Path, default=Path("~/.cache/orca-session-triage/hourly-state.json"))
+    answered.add_argument("--handed-off-file", type=Path, default=Path("~/.cache/orca-session-triage/handed-off.jsonl"))
+    answered.add_argument("--handoffs-dir", type=Path, default=Path("~/.cache/orca-session-triage/handoffs"))
     answer_evidence.add_arguments(answered)
     claim = actions.add_parser("claim", help="record that a worktree is asking the user these asks now, before "
                                              "it asks: open-asks marks them 伺い中, watch stops reminding of "
@@ -955,7 +963,24 @@ def main(argv: list[str] | None = None) -> int:
                     ids = [ask.report["id"] for ask in earlier
                            if answer_evidence.answers_to(ask.report, found, ask.open_questions, shared)]
                     refused = [ask for ask in earlier if ask.report["id"] not in ids]
-                record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
+                import answer_sync
+                decisions = {}
+                for value in args.decision:
+                    key, sep, text = value.partition("=")
+                    if not sep or not key.strip() or not text.strip() or key.strip() in decisions:
+                        raise ValueError("--decision requires one nonempty KEY=ANSWER per key")
+                    decisions[key.strip()] = text.strip()
+                required = answer_sync.handoff_keys(ids, entries, args.handed_off_file.expanduser(),
+                                                    args.handoffs_dir.expanduser())
+                if required - decisions.keys():
+                    raise ValueError("keyed handoff requires --decision KEY=ANSWER for each key: "
+                                     + ", ".join(sorted(required)))
+                if decisions:
+                    answer_sync.record(ids, args.note, "inbox_read.py answered", decisions=decisions,
+                                       state_file=args.state_file, decisions_file=args.decisions_file,
+                                       handed_off_file=args.handed_off_file)
+                else:
+                    record_answers(answers_path(), ids, "inbox_read.py answered", args.note)
                 print(f"answered: {len(ids)}")
                 for ask in refused:
                     print(f"not marked, no answer after it names this ask or each open question: "

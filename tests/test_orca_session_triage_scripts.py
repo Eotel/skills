@@ -4882,9 +4882,9 @@ class LeadDecisionProposalTests(unittest.TestCase):
                                   "text": "two", "questions": [{"question": "A?"}, {"question": "B?"}]}])
         write_jsonl(self.handed, [{"decision": "whole", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask2"},
                                   {"decision": "one", "handed_off_at": "2026-10-01T01:00:00Z", "ask_id": "ask3:1"}])
-        write_jsonl(self.answers, [{"id": "ask2:1", "at": "2026-10-01T02:00:00Z", "how": "reply", "note": "A"},
-                                   {"id": "ask2:2", "at": "2026-10-01T02:01:00Z", "how": "reply", "note": "B"},
-                                   {"id": "ask3", "at": "2026-10-01T02:02:00Z", "how": "reply", "note": "all"}])
+        write_jsonl(self.answers, [{"id": "ask2:1", "at": "2026-10-01T02:00:00Z", "how": "send", "note": "A"},
+                                   {"id": "ask2:2", "at": "2026-10-01T02:01:00Z", "how": "send", "note": "B"},
+                                   {"id": "ask3", "at": "2026-10-01T02:02:00Z", "how": "send", "note": "all"}])
 
         code, shown = self.call("unanswered", "--handed-off-file", str(self.handed))
 
@@ -4898,7 +4898,7 @@ class LeadDecisionProposalTests(unittest.TestCase):
                                   {"decision": "bound", "handed_off_at": "2026-10-01T02:00:00Z"},
                                   {"decision": "old", "handed_off_at": "2026-10-01T01:00:00Z"},
                                   {"decision": "direct", "handed_off_at": "2026-10-01T01:00:00Z"}])
-        answer = {"id": "ask1", "at": "2026-10-01T02:00:00Z", "how": "reply", "note": "go ahead"}
+        answer = {"id": "ask1", "at": "2026-10-01T02:00:00Z", "how": "send", "note": "go ahead"}
         self.answers.write_text("not JSON\n" + json.dumps(answer))
         decision = self.lead.Decision("d", "direct", "wait", "2026-10-01T02:00:00Z")
         self.lead.append(self.log, decision)
@@ -6156,7 +6156,7 @@ class HourlyStateTests(unittest.TestCase):
         scan_json = self.root / "scan.json"
         scan_json.write_text(json.dumps([{"path": "/w/lane", "class": "stalled", "repo": "app",
                                          "git": {"github": "acme/app"}, "pr": {"number": 10, "state": "OPEN"},
-                                         "verdict": {"class": "blocked", "waits_on": "三浦さんの判断"},
+                                         "verdict": {"class": "blocked", "waits_on": "三浦さんの判断", "needs_user": "判断"},
                                          "claude": {"final_text": "Waiting.", "final_at": "2026-10-28T01:00:00Z"}}]))
         write_jsonl(self.root / "inbox.jsonl", [{"id": "abcd1234-0000", "kind": "ask", "worktree": "lane",
                                                "text": "Deploy?", "ts": "2026-10-28T01:00:00Z"}])
