@@ -1377,6 +1377,30 @@ class ClassifyTests(unittest.TestCase):
         for path in ("/w/limited", "/w/reworded", "/w/wrapped"):
             self.assertEqual((rows[path]["class"], rows[path]["stop"]["kind"]), ("stalled", "usage_limit"))
 
+    def test_a_past_connection_error_does_not_stall_a_tab_showing_a_new_reply_and_running_line(self) -> None:
+        error = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+        progress = "✽ Transmuting… (14m 25s · ↓ 2.7k tokens · thinking with xhigh effort)"
+        screens = {
+            "resumed": [error, "⏺ 検査を続けています。", progress],
+            "scrolled": ["⏺ 検査を続けています。", progress],
+            "stopped": ["⏺ 前の検査です。", progress, error, "❯"],
+            "finished": [error, "⏺ 検査を続けています。", "✻ Cooked for 4m 14s · done 14:04", "❯"]}
+        for name in screens:
+            self.claude_says(f"/w/{name}", user("go"), {**assistant(text(error)), "isApiErrorMessage": True,
+                                                      "error": "server_error"})
+        rows = {row["path"]: row for row in scan.build_inventory(
+            [worktree(f"/w/{name}", "done") for name in screens],
+            [terminal(f"/w/{name}", "claude", f"term_{name}") for name in screens], self.projects, {},
+            "要判断", now=NOW, judge=lambda message: verdict(),
+            screens={(None, f"term_{name}"): {"source": "screen", "tail": lines} for name, lines in screens.items()})}
+        for name in ("resumed", "scrolled"):
+            self.assertEqual(rows[f"/w/{name}"]["class"], "working")
+            self.assertIsNone(rows[f"/w/{name}"]["stop"])
+            self.assertIsNone(rows[f"/w/{name}"]["claude"]["api_error"])
+        for name in ("stopped", "finished"):
+            self.assertEqual(rows[f"/w/{name}"]["class"], "stalled")
+            self.assertEqual(rows[f"/w/{name}"]["stop"]["kind"], "connection")
+
     def test_a_local_codex_tab_without_a_recent_rollout_is_judged_from_its_screen(self) -> None:
         # 2026-11-11: four uv-migration Codex lanes were "unstarted" while their tabs showed them waiting on a secret.
         reply = "CI は Ruff 成功、残る3 job は引き続き CORELIB_PAT 設定待ちです。"
@@ -5119,6 +5143,27 @@ class HandoffProposalTests(unittest.TestCase):
                                                "notes": {"Merge?": "CI の後で"}}])
         self.assertEqual(result["transcript"], str(self.projects / "-w-lead" / "lead.jsonl"))
         self.assertEqual(result["user_messages"], [{"at": "2026-11-09T01:30:00Z", "text": "続けて"}])
+
+    def test_lead_state_clears_only_a_connection_error_followed_by_a_new_reply_and_running_line(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                          "lead": {"worktree": "/w/lead"}}))
+        error = "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+        progress = "✽ Transmuting… (14m 25s · ↓ 2.7k tokens · thinking with xhigh effort)"
+        write_jsonl(self.projects / "-w-lead" / "lead.jsonl", [
+            assistant(text("前の発言")), {**assistant(text(error)), "isApiErrorMessage": True, "error": "server_error"}])
+        replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
+                   ("terminal", "list"): {"terminals": [terminal("/w/lead", "claude", "term_lead")]}}
+        for lines, recovered in [([error, "⏺ 検査を続けています。", progress], True),
+                                  (["⏺ 前の発言", progress, error, "❯"], False)]:
+            with self.subTest(recovered=recovered), patch("subprocess.run", side_effect=lambda args, **kwargs:
+                    subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):
+                replies[("terminal", "read", "--terminal", "term_lead", "--screen")] = {
+                    "terminal": {"source": "screen", "tail": lines}}
+                code, shown, err = self.call("lead-state")
+            self.assertEqual(code, 0, err)
+            result = json.loads(shown)
+            self.assertEqual(result["api_error"], None if recovered else error)
+            self.assertEqual(result["final"]["text"], "検査を続けています。" if recovered else "前の発言")
 
     def test_lead_state_searches_speech_questions_and_text_tool_results_with_times(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},

@@ -265,6 +265,12 @@ literal word, ignoring case. `--since` applies to the search; `user_messages`
 still starts at the newest handoff. HH:MM means its most recent occurrence in
 local time. Search reads the current transcript.
 
+The scan and lead-state treat a connection error as past when the rendered
+Claude screen shows a later reply/tool call (⏺) and a running status line,
+with no tab still ending at the error. The old notice may have scrolled off.
+Then `api_error` is null and `final` comes from the screen, with an unknown
+time (`at: null`). A usage limit also accepts a completed later turn.
+
 Pending questions answered through shared hourly state or delivered answers in ask-answers carry
 `answered_elsewhere` (the answer time) and `answer_source`. A call whose every
 question is answered also carries the last answer time and `close_selector`

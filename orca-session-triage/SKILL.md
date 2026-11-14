@@ -64,6 +64,9 @@ board's done cards; close what the user approves.
   line, and no Claude tab shows the notice as its last word: the screen's
   reply becomes the final message and the row gets no `stop` (a lane resumed
   in another account writes its transcript elsewhere).
+  A connection error is past under the same screen check when a ⏺ after its
+  notice (or after it scrolled off) is followed by a running status line.
+  `handoff.py lead-state` uses the same evidence to clear `api_error`.
   It also reads the tabs of worktrees with a done or waiting agent, the agent
   tabs of worktrees Orca keeps no agent for, and another Mac's shell tabs Orca
   lists without output: a permission selector or an AskUserQuestion selector

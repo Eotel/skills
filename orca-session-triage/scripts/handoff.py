@@ -34,6 +34,8 @@ current transcript path and timestamped user_messages since that handoff (exclud
 lead and user speech, AskUserQuestion calls, and tool results (literal WORD, case ignored).
 Pending questions answered in hourly state or ask-answers carry answered_elsewhere (the answer's time).
 A fully answered selector visible on a tab gets a heading-checked close-selector command; this read sends nothing.
+Like the scan, lead-state clears a past connection error when the rendered Claude screen shows a later
+reply/tool call and running status line; a usage limit also accepts a completed later turn.
 Both commands
 default to the lead appointed in the shared hourly state when --lead-worktree is omitted.
 `send` ends the text with the run's signature, <session name>（HH:MM の定時）: the name ListAgents
@@ -286,7 +288,7 @@ def transcript_events(entries: list[dict]) -> list[dict]:
 
 
 def question_text(value: str) -> str:
-    """Compare a recorded question without the choice list hourly `asked` appends."""
+    """Compare a recorded question without its trailing choice list."""
     return " ".join(re.split(r"選択肢[:：]|\n\s*- ", value, maxsplit=1)[0].split())
 
 
@@ -349,12 +351,19 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
         raise LookupError(f"lead worktree is missing from Orca: {worktree}")
     terminals = scan_sessions.orca_payload(orca, ["terminal", "list"])["terminals"]
     tabs = []
+    screens: scan_sessions.Screens = {}
     for term in terminals:
         if term.get("worktreeId") != row["worktreeId"] or not term.get("handle"):
             continue
         result = scan_sessions.orca_payload(orca, ["terminal", "read", "--terminal", term["handle"], "--screen"])
-        tabs.append({"handle": term["handle"], "screen_tail": scan_sessions.screen_tail(result.get("terminal") or result)})
+        screen = result.get("terminal") or result
+        screens[(None, term["handle"])] = screen
+        tabs.append({"handle": term["handle"], "screen_tail": scan_sessions.screen_tail(screen)})
     claude = lead_claude(projects, worktree)
+    resumed = scan_sessions.resumed_after_error({"claude": claude, "codex": []},
+                                               scan_sessions.agent_screens(terminals, screens, None, "claude"))
+    if resumed and claude:
+        claude.update(api_error=None, api_error_kind=None)
     final: dict[str, str | None] = {"at": None, "text": None}
     questions = {}
     queued = []
@@ -365,6 +374,8 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
         entries = scan_sessions.load_jsonl(transcript)
         events = transcript_events(entries)
         final = last_said(entries)
+        if resumed and resumed.text:
+            final = {"at": None, "text": resumed.text}
         # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
         last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
         for entry in entries[last + 1:]:
@@ -511,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
         "lead-state", parents=[kept, lead],
         description="JSON keys: worktree (path), agents (type, state, state_started_at, stopped_at, main_agent), "
                     "final (at, text: the lead's newest message of its own, past a running turn or an API error), "
-                    "api_error (the error text that ended the last turn, or null), "
+                    "api_error (an unrecovered turn error, or null after the rendered screen proves recovery), "
                     "transcript (current transcript path, or null), "
                     "user_messages (at, text: user speech since the newest kept handoff, no task notifications), "
                     "pending_questions (id, asked_at, questions with choices; answered_elsewhere is the answer time, "
