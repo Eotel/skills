@@ -80,6 +80,9 @@ board's done cards; close what the user approves.
   checkout nested in it, such as a worktree under its `.claude/worktrees`), even
   when the session started or moved its cwd elsewhere; among those it takes the
   transcript with the newest entry.
+  A live Claude whose tab is absent also exposes `claude_sessions`: `pid`,
+  `ORCA_TERMINAL_HANDLE`, `status`, and `waitingFor` from its process and session
+  record, in `--row` and `--rows`.
   It also reads the worktree's processes by `rm_check.py`'s rule whose job a
   `sleep` or a shell running a command line or script started (a wait loop, a
   timed wait, an agent's background job; not an MCP server, or a dev server or
@@ -121,7 +124,11 @@ board's done cards; close what the user approves.
   `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
   commands). `--rm-specs --row NAME` (repeatable) prints only the named rows,
-  a finished one also while its tabs remain; a row it leaves out is named on
+  a finished one also while its tabs remain. An explicit removal approval in
+  `removal_decision` also permits a check; retain or defer answers keep the row.
+  `rm-check-batch --from` checks the same decision in a preview and before removal,
+  closes approved idle tabs through `close_tabs.py`, and keeps all process and
+  post-scan activity checks. A row it leaves out is named on
   stderr with why (another Mac's with its `rm-check-batch --host` command), and
   the exit status is 1. `--only NAME` scans one worktree and queues it in `--review-out` even
   when it would not need a careful read. Read rows through these rather than parsing the
@@ -177,19 +184,23 @@ board's done cards; close what the user approves.
   tabs, it matches the stopped transcript's session record to the live
   process's `ORCA_TERMINAL_HANDLE`. A usage-limit row shows the latest
   `wake:<row>::*` answer and time when that answer says 「起こさない」.
-- **Review queue**: run the scan with
-  `--review-out ~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}/review-queue.json`.
+- **Review queue**: `scripts/hourly_read.py` writes
+  `~/.cache/orca-session-triage/reads/<run>/review-queue.json` and prints its path,
+  row count, and classification command. For a separate scan, use `--review-out`
+  in that run's directory.
   When every GitHub query or every Jev call failed to connect, the scan prints
   only a line starting with 「ネットワーク断」, writes no queue, and exits 3:
   scan again once the connection is back. It queues every row Jev judged from a final message (`unsure`, `stalled`,
   `waiting`) and every `stalled` row whose own PR merged, unless a careful read
   already classed that same final message. Then invoke the `orca-row-classify`
-  skill with `~/.cache/orca-session-triage/${CLAUDE_SESSION_ID}`: it reads the
+  skill with the directory printed by `hourly_read.py` (or the parent of the
+  separate scan's `--review-out`): it reads the
   queue in a fresh Sonnet context and writes `review-result.json` there. Act on
   its verdicts, not on Jev's class: `waiting` is a question (`question`,
   `needs_user`), `blocked` is reported with `waits_on`, `in_progress` wakes the
   lane with `next_step`, `done_unmerged` is a review-or-merge choice, and
-  `finished` goes to `cleanup.md`. The next scan keeps each verdict in
+  `finished` goes to `cleanup.md`. Both the next scan and `--from` read matching
+  queues and results in `reads/<run>/` and session directories. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
   `verdict` until its final message, PR, latest review or comment from a person other than
   the PR author, tree, permission prompt, Orca comment, or newest `done` or `ask` in the
@@ -207,7 +218,9 @@ board's done cards; close what the user approves.
   `orca-row-classify` in this session with that directory.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted". `--confirm-gone` confirms a removal
-  finished.
+  finished. Both scanning and removal retain workspaces an Orca automation
+  references with `workspaceMode: existing`, including disabled automations,
+  and name the automation in the reason.
 - `scripts/close_tabs.py --from SCAN_JSON HANDLE ...` (or `--row NAME`, repeatable, for a
   row's `closable`, `meaningful_tabs`, and done-card handles): closes tabs the saved
   scan listed, and keeps each one whose worktree's transcripts, triage inbox

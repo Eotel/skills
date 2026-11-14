@@ -122,8 +122,12 @@ def main(argv: list[str] | None = None) -> int:
         for result in results:
             print(f"{result['name']}: exit {result['exit_code']}"
                   + (f" | {result['error']}" if result.get("error") else ""))
+        if scan["exit_code"] == 0:
+            queue_path = directory / "review-queue.json"
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            print(f"review queue: {queue_path}（{len(queue['rows'])} 行）／分類: orca-row-classify {directory}")
         return int(any(result["exit_code"] != 0 for result in results))
-    except OSError as error:
+    except (OSError, ValueError) as error:
         print(f"hourly read: {error}", file=sys.stderr)
         return 1
 
