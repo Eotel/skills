@@ -4928,6 +4928,26 @@ class HandoffProposalTests(unittest.TestCase):
         self.assertEqual([(item.decision, item.ask_id) for item in handoff.lead_decisions.handed_off(self.handed)],
                          [("keep:/w/a", "ask1"), ("keep:/w/b", None)])
 
+    def test_send_exempts_only_answers_delivered_by_this_worktree_and_conversation(self) -> None:
+        ask_id = "f439c015-aaaa-bbbb-cccc-000000000001"
+        write_jsonl(self.inbox, [{"id": ask_id, "ts": "2026-11-14T00:00:00Z", "kind": "ask",
+                                  "worktree": "lane", "text": "Publish?"}])
+        self.body.write_text("ask f439c015 は答えを届けた")
+        with patch.dict(os.environ, {"ORCA_WORKTREE_ID": "repo::/w/triage", "CLAUDE_CODE_SESSION_ID": "run-1",
+                                      "CODEX_THREAD_ID": "", "CLAUDE_SESSION_ID": ""}):
+            inbox_read.record_answers(self.root / "answers.jsonl", [ask_id], "send --decision", "Publish")
+        for worktree_path, session, allowed in [("/w/triage", "run-1", True), ("/w/triage", "run-2", False),
+                                                  ("/w/other", "run-1", False), ("/w/triage", "", False)]:
+            with self.subTest(worktree=worktree_path, session=session), \
+                    patch.dict(os.environ, {"ORCA_WORKTREE_ID": f"repo::{worktree_path}",
+                                             "CLAUDE_CODE_SESSION_ID": session, "CODEX_THREAD_ID": "",
+                                             "CLAUDE_SESSION_ID": "", "CLAUDE_PID": ""}), \
+                    patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)):
+                code, output, error = self.send()
+                self.assertEqual(code, 0 if allowed else 1, error)
+                self.assertEqual("この回の送信" in error, allowed)
+                self.assertEqual("NEXT_OFFSET=" in output, allowed)
+
     def test_lead_state_reads_agents_questions_and_screen_from_the_appointed_worktree(self) -> None:
         self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
                                           "lead": {"worktree": "/w/lead"}}))

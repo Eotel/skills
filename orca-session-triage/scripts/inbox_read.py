@@ -23,6 +23,8 @@ already has a lane for, and `questions` prints their structured questions
 `answered --before` marks only the asks an answer proves answered, every open question
 of them (answer_evidence.py: the lead's decisions, AskUserQuestion answers, delivered
 answers), and names the rest with the related answers to check, without marking them.
+Each new answer record includes sender.worktree (the source path) and sender.session
+(the conversation ID, or null when unknown), for both send and `answered`.
 
 Being asked is a third state. `claim <id>[:<n>] --by <worktree>` records, before the
 worktree asks the user, that it is asking those asks (or questions) now, in
@@ -585,11 +587,32 @@ def reissues(ask_id: str, entries: list[dict]) -> list[Reissue]:
     return [reissue for _, reissue in sorted(found, key=itemgetter(0))]
 
 
+def answer_sender() -> dict[str, str | None]:
+    """The answering worktree and conversation; unknown sessions never identify this run's own records."""
+    worktree = os.environ.get("ORCA_WORKTREE_ID") or os.environ.get("ORCA_WORKTREE_PATH")
+    path = Path(worktree.split("::", 1)[-1]).expanduser().absolute() if worktree else Path.cwd()
+    session = (os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+               or os.environ.get("CLAUDE_SESSION_ID"))
+    if not session and (pid := os.environ.get("CLAUDE_PID")):
+        config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
+        try:
+            recorded = json.loads((config / "sessions" / f"{pid}.json").read_text(encoding="utf-8"))
+            session = recorded.get("sessionId") if isinstance(recorded, dict) else None
+        except (OSError, ValueError):
+            pass
+    return {"worktree": str(path), "session": session if isinstance(session, str) and session else None}
+
+
 def record_answers(path: Path, ids: list[str], how: str, note: str = "") -> None:
-    """Append one line per answered id; triage-notify's lock keeps concurrent writers' lines whole."""
+    """Append one line per answered id with its source worktree/session; lock concurrent writers' lines whole.
+
+    Both send and `answered` use this writer, so handoff can identify this run's own delivered answers.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    lines = "".join(json.dumps({"id": answer, "ts": stamp, "how": how, **({"note": note} if note else {})},
+    sender = answer_sender()
+    lines = "".join(json.dumps({"id": answer, "ts": stamp, "how": how, "sender": sender,
+                               **({"note": note} if note else {})},
                                ensure_ascii=False) + "\n" for answer in ids)
     with path.open("a", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)

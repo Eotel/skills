@@ -295,8 +295,12 @@ from another tab of this workspace (a parallel scheduled run) or an answer to an
 ask the body names reached the inbox or the answer records after `--since`:
 fix the body from them, then pass `--seen ID` (repeat per id: a report's id or
 an answered ask's, or their first 8 or more characters) for each one the body
-now reflects. It also refuses while a later scheduled run began or was skipped
-for this run, as `read` prints it. `--force` sends past every check as
+now reflects. A delivered answer whose recorded sender worktree and session
+both match this run is labelled 「（この回の送信）」 and needs no `--seen`.
+Answer records from `send` and `inbox_read.py answered` now include that source;
+an older record or an unknown session keeps the usual check. It also refuses
+while a later scheduled run began or was skipped for this run, as `read`
+prints it. `--force` sends past every check as
 written, so use `--seen` for what the body already holds. Before writing the handoff, run `lead_decisions.py
 unanswered` without arguments: it prints `{"unanswered": [...], "settled": [...]}`.
 Each unanswered key includes `first_handed_off_at`, `handed_off_at`, and

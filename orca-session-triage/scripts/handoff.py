@@ -19,6 +19,9 @@ and fix the body, then pass --seen ID for each one the body now reflects (a repo
 their first 8 characters or more). It does not send either while a scheduled run of this workspace due after this
 tab's run began, or the precheck skipped one because this run was still working, and prints that run's time and
 pane: the later run owns the read position and the handoff. --force sends past every check as written.
+An answer delivered by this same source worktree and session is labelled 「（この回の送信）」 and needs no --seen.
+The shared answer writer records that source for send and inbox_read.py answered; older records or an unknown
+session still need --seen, and an administrative answered mark is not a delivery.
 `search WORD...` prints each kept handoff whose text or decision keys hold any of the words (case ignored): its
 time, kind, and file, then the matching lines and keys.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
@@ -159,6 +162,7 @@ class Reason(NamedTuple):
     """Something `send` will not send past: the id `--seen` names it by, and the line it prints."""
     id: str
     line: str
+    own: bool = False
 
 
 def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_read.Sender, handle: str,
@@ -176,17 +180,22 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
         records = answers.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         records = []
+    source = inbox_read.answer_sender()
     for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
         if ask in named and (read_at is None or at is None or at > read_at):
+            own = bool(source["session"] and record.get("sender") == source
+                       and record.get("how") in answer_evidence.DELIVERED)
             found.append(Reason(str(record["id"]), f"- answered {record['id']} at {record.get('ts') or '-'} "
-                                f"({record.get('how') or '-'})  {excerpt(record.get('note'))}"))
+                                f"({record.get('how') or '-'})" + ("（この回の送信）" if own else "")
+                                + f"  {excerpt(record.get('note'))}", own))
     return found
 
 
 def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
     """The lines of the reasons no --seen value names (inbox_read.names: an exact id or an 8+ character prefix)."""
-    return [reason.line for reason in reasons if not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
+    return [reason.line for reason in reasons if not reason.own
+            and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
 
 
 def search(directory: Path, words: list[str], since: datetime | None) -> int:
@@ -447,6 +456,8 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
         return 1
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
+    if own := [reason.line for reason in found if reason.own]:
+        print("handoff: this run's deliveries need no --seen:", *own, sep="\n", file=sys.stderr)
     if not args.force and (left := unseen(found, args.seen)):
         print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
               "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; then pass --seen ID "
