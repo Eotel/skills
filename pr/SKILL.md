@@ -27,6 +27,8 @@ It prints the kind, the template file, and its headings:
   [references/show-me.md](references/show-me.md), the upstream template, and write in the
   project's language.
 
+Match the title style of the destination's five recent PR titles printed by `pick`; if their history is unavailable, it reports the error alongside the template.
+
 Exit 2 means it could not tell (no GitHub origin, `gh` not signed in). Decide by the same
 rules and pass `--kind` to `check`.
 
