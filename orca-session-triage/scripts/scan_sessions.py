@@ -270,7 +270,8 @@ def session_transcript(session_id: str, cwd: str, roots: Sequence[Path]) -> Path
 def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequence[Path], projects_root: str | Path,
                                processes: dict[int, tuple[int, str]],
                                cwds: Callable[[list[int]], dict[int, str]], tabs: Mapping[str, str] | None = None,
-                               tab_of: Callable[[list[int]], dict[int, TabProcess]] = tab_processes
+                               tab_of: Callable[[list[int]], dict[int, TabProcess]] = tab_processes,
+                               session_details: dict[str, list[dict]] | None = None
                                ) -> dict[str, list[Path]]:
     """The transcripts of running Claude sessions by the worktree each runs under.
 
@@ -281,8 +282,11 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
     such a tab with no session file is known by the session its --resume or --session-id names. Otherwise its
     worktree is the first of the process and its ancestors whose cwd, from its session file or else from lsof,
     is inside one.
+    `session_details`, when supplied, also receives live session records whose tab is absent,
+    even when no transcript was found for them.
     """
     live = {}
+    records = {}
     for directory in session_dirs:
         for path in directory.glob("*.json"):
             try:
@@ -295,8 +299,9 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
             if (isinstance(pid, int) and "claude" in processes.get(pid, (0, ""))[1] and isinstance(cwd, str)
                     and isinstance(session_id, str) and re.fullmatch(r"[\w-]+", session_id)):
                 live[pid] = (session_id, cwd, directory.parent / "projects")
+                records[pid] = record
     tab_paths: Mapping[str, str] = tabs or {}
-    claude = [pid for pid, (_, command) in processes.items() if "claude" in command] if tab_paths else []
+    claude = [pid for pid, (_, command) in processes.items() if "claude" in command] if tab_paths or session_details is not None else []
     in_tab = tab_of(sorted({member for pid in claude for member in ancestry(pid, processes)})) if claude else {}
 
     def tab_worktree(pid: int) -> str | None:
@@ -332,6 +337,12 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
                                                           *(profiles if pid in named else [])])
         if worktree and transcript:
             found.setdefault(worktree, set()).add(transcript)
+        handle = next((tab.handle for member in chains[pid] if (tab := in_tab.get(member)) and tab.handle), None)
+        if worktree and session_details is not None and pid in records and handle not in tab_paths:
+            record = records[pid]
+            session_details.setdefault(worktree, []).append({
+                "pid": pid, "ORCA_TERMINAL_HANDLE": handle,
+                "status": record.get("status"), "waitingFor": record.get("waitingFor")})
     return {worktree: sorted(paths) for worktree, paths in found.items()}
 
 
@@ -1521,7 +1532,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     shell_idle_minutes: float = 30, judge: Callable[[str], dict | None] = lambda message: None,
                     mail: dict | None = None, screens: Screens | None = None,
                     live_transcripts: dict[str, list[Path]] | None = None,
-                    processes: dict[str, list[WorktreeProcess]] | None = None) -> list[dict]:
+                    processes: dict[str, list[WorktreeProcess]] | None = None,
+                    live_sessions: dict[str, list[dict]] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1584,6 +1596,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
+        if not remote and (sessions := (live_sessions or {}).get(w["path"])):
+            row["claude_sessions"] = sessions
         row["queued_input"] = (queued_input(Path(row["claude"]["transcript"]),
                                             datetime.fromtimestamp(now, timezone.utc)) if row["claude"] else [])
         if row["prompt_waiting"] and "target" not in row["prompt_waiting"] and row["claude"]:
@@ -2351,10 +2365,33 @@ def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
             if item.get("delivered_at") is None and item.get("to") in names]
 
 
+def with_automation_workspaces(rows: list[dict], orca: str) -> list[dict]:
+    """Read automation ownership once per Orca environment and retain each referenced workspace."""
+    import hourly_runtime
+    inventories = {}
+    errors = {}
+    for environment in {row.get("environment") for row in rows}:
+        try:
+            inventories[environment] = hourly_runtime.existing_workspace_automations(orca, environment)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+            inventories[environment] = {}
+            errors[environment] = f"自動実行の作業場を確認できない: {error}"
+    for row in rows:
+        names = inventories[row.get("environment")].get(os.path.realpath(row["path"]), [])
+        row["automation_workspaces"] = names
+        row["automation_blocker"] = errors.get(row.get("environment")) or "; ".join(
+            f"自動実行『{name}』の作業場" for name in names)
+    return rows
+
+
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path) -> list[dict]:
     import lead_decisions
     decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
     for row in rows:
+        if blocker := row.get("automation_blocker"):
+            row.update(closable=[], open_pr_cleanup=False)
+            if blocker not in row.get("reasons", []):
+                row["reasons"] = [*row.get("reasons", []), blocker]
         promises = pending_handoffs(row, state_file)
         if promises:
             row.update(pending_handoffs=promises, closable=[], open_pr_cleanup=False)
@@ -2444,6 +2481,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
         return current_verdict(row, verdicts) is None
 
     return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             **{key: row[key] for key in ("claude_sessions", "automation_workspaces", "automation_blocker") if row.get(key)},
              **({"inbox": row["inbox"], "newest_report": newest_report(row)} if row.get("inbox") else {}),
              **({"open_pr_cleanup": True} if row.get("open_pr_cleanup") else {}),
              **({"identity": row_identity(row)} if row.get("environment") else {}),
@@ -2877,15 +2915,17 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        if not row.get("removal_decision") or removal_approved(row):
+        if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
             print("    " + rm_check_command(row, scan_file))
     open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
-        if not row.get("removal_decision") or removal_approved(row):
+        if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
             print("    " + rm_check_command(row, scan_file, remove_ok=True))
     for row in rows:
+        if blocker := row.get("automation_blocker"):
+            print(f"{row_name(row)}: {blocker}")
         if answer := row.get("removal_decision"):
             print(f"removal decision: {row_name(row)} {answer['decided_at']} {answer['answer']}")
     hooks = [(row, error) for row in rows for error in row.get("hook_errors") or []]
@@ -2981,7 +3021,8 @@ MERGE = re.compile(r"(?<![A-Za-z])merge(?![A-Za-z])|マージ", re.IGNORECASE)
 ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class", "scan_class", "reasons",
             "question", "merge_question", "review", "stop", "waits_on", "next_step", "verdict", "final",
             "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "processes",
-            "tabs", "done_cards", "closable", "meaningful_tabs", "open_pr_cleanup")
+            "tabs", "done_cards", "closable", "meaningful_tabs", "open_pr_cleanup", "claude_sessions",
+            "automation_workspaces", "automation_blocker")
 
 
 class ReviewResult(TypedDict):
@@ -3068,6 +3109,9 @@ def row_view(row: dict) -> dict:
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
         "prompt_waiting": row.get("prompt_waiting"), "queued_input": row.get("queued_input") or [],
         "processes": row.get("processes") or [],
+        "claude_sessions": row.get("claude_sessions") or [],
+        "automation_workspaces": row.get("automation_workspaces") or [],
+        "automation_blocker": row.get("automation_blocker") or "",
         "tabs": [{"handle": t.get("handle") or "", "agent": t.get("agent") or "", "title": t.get("title") or ""}
                  for t in row.get("terminals") or []],
         # Whole, unlike --cards: the prompt and last message are what a reader came for.
@@ -3098,8 +3142,12 @@ def row_line(view: dict) -> str:
     git = view["git"] or {}
     dirty = json.dumps(git.get("dirty"))
     unpushed = json.dumps(git.get("unpushed"))
+    sessions = "; ".join(" ".join(f"{key}={session.get(key) if session.get(key) is not None else '-'}"
+                                  for key in ("pid", "ORCA_TERMINAL_HANDLE", "status", "waitingFor"))
+                         for session in view.get("claude_sessions") or [])
     return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
-            f" | reasons {reasons} | git.dirty {dirty} | git.unpushed {unpushed}")
+            f" | reasons {reasons} | git.dirty {dirty} | git.unpushed {unpushed}"
+            + (f" | Claude sessions {sessions}" if sessions else ""))
 
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
@@ -3157,7 +3205,8 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     if scan_file and row.get("closable"):
         lines.append(f"{lead} | close: " + shlex.join([str(CLOSE_TABS), "--from", str(scan_file),
                                                       *row["closable"]]))
-    if row.get("open_pr_cleanup") or ((row.get("verdict") or {}).get("class") or row["class"]) == "finished":
+    if not row.get("automation_blocker") and (row.get("open_pr_cleanup") or (
+            (row.get("verdict") or {}).get("class") or row["class"]) == "finished"):
         lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
     return lines
 
@@ -3233,16 +3282,18 @@ def main(argv: list[str] | None = None) -> int:
     processes = {} if args.ps_json else worktree_processes(
         [w["path"] for w in worktrees if not w.get("_environment")], Path(PROCESS_CPU).expanduser(), time.time())
     local = {w.get("worktreeId"): w["path"] for w in worktrees if not w.get("_environment")}
+    live_sessions: dict[str, list[dict]] = {}
     live = {} if args.ps_json else running_claude_transcripts(
         list(local.values()), claude_session_dirs(), claude_root, process_table(), process_cwds,
         tabs={t["handle"]: local[t.get("worktreeId")] for t in terminals
-              if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local})
+              if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local},
+        session_details=live_sessions)
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
-                                               processes=processes),
+                                               processes=processes, live_sessions=live_sessions),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts)
     if down := reach.down():
@@ -3252,6 +3303,8 @@ def main(argv: list[str] | None = None) -> int:
         return NETWORK_DOWN_EXIT
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
+    if not args.ps_json:
+        rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
     rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser())
     if args.review_out:
@@ -3344,7 +3397,9 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
     # A row named twice (by name and by path) is printed once.
     for row in {id(row): row for row in selected}.values():
         shown = (row.get("verdict") or {}).get("class") or row["class"]
-        if row.get("pending_handoffs"):
+        if blocker := row.get("automation_blocker"):
+            why = blocker
+        elif row.get("pending_handoffs"):
             why = "未配信の約束の送り先"
         elif (answer := row.get("removal_decision")) and not removal_approved(row):
             why = f"removal decision {answer['decided_at']} {answer['answer']}"
@@ -3376,6 +3431,9 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         remote = 0
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
+            if blocker := row.get("automation_blocker"):
+                print(f"{row_name(row)}: {blocker}", file=sys.stderr)
+                continue
             if row.get("pending_handoffs"):
                 continue
             if row.get("removal_decision") and not removal_approved(row):

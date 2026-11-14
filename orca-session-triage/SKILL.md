@@ -84,6 +84,9 @@ board's done cards; close what the user approves.
   checkout nested in it, such as a worktree under its `.claude/worktrees`), even
   when the session started or moved its cwd elsewhere; among those it takes the
   transcript with the newest entry.
+  A live Claude whose tab is absent also exposes `claude_sessions`: `pid`,
+  `ORCA_TERMINAL_HANDLE`, `status`, and `waitingFor` from its process and session
+  record, in `--row` and `--rows`.
   It also reads the worktree's processes by `rm_check.py`'s rule whose job a
   `sleep` or a shell running a command line or script started (a wait loop, a
   timed wait, an agent's background job; not an MCP server, or a dev server or
@@ -219,7 +222,9 @@ board's done cards; close what the user approves.
   `orca-row-classify` in this session with that directory.
 - `scripts/rm_check.py`: preflight before closing a worktree. Its verdict beats
   an agent's own "done" or "uncommitted". `--confirm-gone` confirms a removal
-  finished.
+  finished. Both scanning and removal retain workspaces an Orca automation
+  references with `workspaceMode: existing`, including disabled automations,
+  and name the automation in the reason.
 - `scripts/close_tabs.py --from SCAN_JSON HANDLE ...` (or `--row NAME`, repeatable, for a
   row's `closable`, `meaningful_tabs`, and done-card handles): closes tabs the saved
   scan listed, and keeps each one whose worktree's transcripts, triage inbox

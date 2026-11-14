@@ -21,6 +21,7 @@ from typing import NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 import lead_decisions
+import hourly_runtime
 from worktree_notes import NotesUnavailable, OrcaNotes, WorktreeNotes, keep_note
 
 # A path counts as regenerable when a tool writes it again from tracked files or installed
@@ -1553,6 +1554,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    automation_blockers = []
+    try:
+        automations = hourly_runtime.existing_workspace_automations(args.orca).get(worktree, [])
+        automation_blockers = [f"自動実行『{name}』の作業場" for name in automations]
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
+        automation_blockers = [f"自動実行の作業場を確認できない: {error}"]
+    decided.extend(automation_blockers)
     try:
         projects = [] if args.no_docker else compose_projects()
     except subprocess.TimeoutExpired:
@@ -1654,6 +1662,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("docker compose unavailable: containers not checked")
     if notes:
         result["notes"] = notes
+    if automation_blockers:
+        result["automation_blocker"] = "; ".join(automation_blockers)
     json.dump({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),
                **result}, sys.stdout, ensure_ascii=False, indent=2)
     print()
