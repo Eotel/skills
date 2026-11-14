@@ -175,7 +175,10 @@ SCAN_JSON --out FILE` publish complete JSON atomically without stdout.
 `open-asks --out` implies JSON. `stale-asks --summary` is a separate text mode.
 
 `cleanup_hourly_tabs.py` checks Orca's run, terminal and agent records before closing previous
-scheduled tabs. It keeps a tab if its turn or background work is active, a
+scheduled tabs. Each per-tab `keep` or `closed` line includes the run's scheduled
+and start times in local time (`scheduled`, `started`; `-` when unknown).
+Workspace tabs without a matching run stay open with `keep: …: run の記録に無い`.
+It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
 latest conversation has an unanswered AskUserQuestion or no final message, its
 transcript is missing or active within five minutes, or its rendered screen
