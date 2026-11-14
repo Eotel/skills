@@ -1384,6 +1384,7 @@ class ClassifyTests(unittest.TestCase):
             "resumed": [error, "⏺ 検査を続けています。", progress],
             "scrolled": ["⏺ 検査を続けています。", progress],
             "stopped": ["⏺ 前の検査です。", progress, error, "❯"],
+            "new_error": [error, "⏺ 検査を続けています。", progress, "⎿  API Error: Can't reach the API server", "❯"],
             "finished": [error, "⏺ 検査を続けています。", "✻ Cooked for 4m 14s · done 14:04", "❯"]}
         for name in screens:
             self.claude_says(f"/w/{name}", user("go"), {**assistant(text(error)), "isApiErrorMessage": True,
@@ -1397,7 +1398,7 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(rows[f"/w/{name}"]["class"], "working")
             self.assertIsNone(rows[f"/w/{name}"]["stop"])
             self.assertIsNone(rows[f"/w/{name}"]["claude"]["api_error"])
-        for name in ("stopped", "finished"):
+        for name in ("stopped", "new_error", "finished"):
             self.assertEqual(rows[f"/w/{name}"]["class"], "stalled")
             self.assertEqual(rows[f"/w/{name}"]["stop"]["kind"], "connection")
 
@@ -5154,6 +5155,8 @@ class HandoffProposalTests(unittest.TestCase):
         replies = {("worktree", "ps"): {"worktrees": [worktree("/w/lead")]},
                    ("terminal", "list"): {"terminals": [terminal("/w/lead", "claude", "term_lead")]}}
         for lines, recovered in [([error, "⏺ 検査を続けています。", progress], True),
+                                  ([error, "⏺ 検査を続けています。", progress,
+                                    "⎿  API Error: Can't reach the API server", "❯"], False),
                                   (["⏺ 前の発言", progress, error, "❯"], False)]:
             with self.subTest(recovered=recovered), patch("subprocess.run", side_effect=lambda args, **kwargs:
                     subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args[1:-1])]}))):

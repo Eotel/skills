@@ -1167,7 +1167,7 @@ def error_notices(lines: list[str], error: str) -> list[int]:
     head = error.strip().splitlines()[0][:ERROR_HEAD] if error.strip() else ""
 
     def shows(text: str) -> bool:
-        return bool(USAGE_LIMIT.search(text) or head and head in text)
+        return bool(USAGE_LIMIT.search(text) or API_ENDED.match(text.lstrip("⎿■ ")) or head and head in text)
 
     return [index for index, line in enumerate(lines)
             if shows(line) or index and not shows(lines[index - 1])
