@@ -101,6 +101,16 @@ or an AskUserQuestion answer (in the transcripts of the current directory's
 worktree and each `--asked-in` worktree) that names the ask's id or quotes each
 open question, or a delivered answer. It names the rest with the answers that
 mention only the lane or its PR numbers: confirm each one, then mark it by id.
+When `send --ask` delivers an answer, it records the same answer and time in
+each hourly question whose `covers` names that ask and each known
+`answer:<lane>::<ask id>` decision key. Numbered answers settle only the
+questions they cover; a whole-ask question waits for every part.
+For a handoff with decision keys, `inbox_read.py answered` requires
+`--decision KEY=ANSWER` for every key and writes those answers to
+`lead_decisions.py`. Missing answers write nothing and print the keys.
+A note alone remains a candidate in `lead_decisions.py unanswered`; it does
+not settle a decision. Use `--handed-off-file`, `--handoffs-dir`, and
+`--state-file` when working with isolated records.
 A report pulled late from another Mac is still shown even
 if its original timestamp is old. The watch and notification services each
 keep their own cursor. The watch's output is in
@@ -114,8 +124,16 @@ After these checks permit the turn to end, the same hook queues this hourly
 session's transcript. The external retrospective service skips a session the
 run's own forked retrospective already recorded and reviews one it did not.
 See `references/retro.md` for both and for reviewing their proposals.
-Before AskUserQuestion in the hourly workspace, a PreToolUse hook in the same
-script refuses the call when any question's text, options and descriptions hold
+The chezmoi-managed Claude Code settings register `scripts/stop_check.py` as
+an AskUserQuestion PreToolUse hook. It applies in the hourly workspace and the
+appointed lead's workspace even when this skill is not active. It matches inbox
+question headers and the recorded questions' `covers` keys. An answered ask,
+another workspace's claim, or another tab's unanswered hourly question blocks
+the call, naming the question, workspace, and time. Its own claim and the current
+tab's question record permit the call. Keep the appointed lead current with
+`hourly_state.py appoint-lead`.
+
+Before AskUserQuestion in the hourly workspace, the same hook refuses the call when any question's text, options and descriptions hold
 no kana or kanji. While another tab is appointed lead (`hourly_state.py
 appoint-lead`), it also refuses a question asked before this run sent its
 handoff (`handoff.py last` older than the run's start): a question stops the
