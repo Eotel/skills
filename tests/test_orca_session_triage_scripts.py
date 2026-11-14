@@ -624,6 +624,25 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([row["claude"]["final_text"] for row in rows], ["今日の報告", "今日のメモ"])
 
+    def test_a_running_claude_without_an_orca_tab_exposes_its_session_state(self) -> None:
+        sessions = Path(self.tmp.name) / "profile/sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "73.json").write_text(json.dumps({"pid": 73, "sessionId": "active", "cwd": "/w/orphan",
+                                                     "status": "waiting", "waitingFor": "user"}))
+        details: dict[str, list[dict]] = {}
+        live = scan.running_claude_transcripts(["/w/orphan"], [sessions], self.projects, {73: (1, "claude")},
+            lambda pids: {}, tab_of=lambda pids: {73: scan.TabProcess("term_missing", None)}, session_details=details)
+        [row] = scan.build_inventory([worktree("/w/orphan")], [], self.projects, {}, "要判断",
+                                     live_transcripts=live, live_sessions=details)
+        saved = Path(self.tmp.name) / "orphan.json"
+        saved.write_text(json.dumps([row]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rows"]), 0)
+        for word in ("tabs 0", "pid=73", "ORCA_TERMINAL_HANDLE=term_missing", "status=waiting", "waitingFor=user"):
+            self.assertIn(word, out.getvalue())
+        self.assertEqual(row["claude_sessions"], [{"pid": 73, "ORCA_TERMINAL_HANDLE": "term_missing",
+                                                    "status": "waiting", "waitingFor": "user"}])
+
     def test_a_restart_that_dropped_background_waits_is_a_reason(self) -> None:
         line = "3 background shell command tasks didn't finish before the previous session ended"
         tree: dict = {**worktree("/w/lost"), "agents": [done_agent("claude", "tab1:leaf1")]}
@@ -2719,6 +2738,51 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines()[0],
                          "classes: stalled=0 (scan: 1), unsure=1, waiting=2 (scan: 1), working=1")
 
+    def test_automation_workspaces_are_left_out_even_with_removal_approval(self) -> None:
+        rows = [{"path": "/w/app/scheduled", "repo": "app", "class": "finished", "open_pr_cleanup": True,
+                 "terminals": [], "meaningful_tabs": [], "removal_decision": {
+                     "answer": "消してよい", "decided_at": "2026-11-14T00:00:00Z"}}]
+        payload = {"automations": [
+            {"name": "Daily review", "workspaceMode": "existing", "enabled": False,
+             "workspaceId": "repo-id::/w/app/scheduled"},
+            {"name": "New workspace", "workspaceMode": "new_per_run", "workspaceId": "repo-id::/w/app/scheduled"}]}
+        with patch.object(hourly_runtime, "orca_result", return_value=payload):
+            rows = scan.with_automation_workspaces(rows, "orca")
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps(rows))
+        for named in ([], ["--row=scheduled"]):
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(saved), "--rm-specs", *named])
+            self.assertEqual(code, int(bool(named)))
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("自動実行『Daily review』の作業場", err.getvalue())
+            self.assertNotIn("New workspace", err.getvalue())
+
+    def test_removal_specs_honor_approval_but_keep_retained_rows_and_print_scan_values(self) -> None:
+        saved = self.dir / "scan.json"
+        decisions = self.dir / "decisions.jsonl"
+        names = ("approved", "keep", "defer", "conditional", "negated", "not-ready", "after", "unknown")
+        rows = [{"path": f"/w/app/{name}", "repo": "app", "class": "unsure", "meaningful_tabs": ["term_idle"]}
+                for name in names]
+        saved.write_text(json.dumps(rows))
+        write_jsonl(decisions, [{"id": name, "decision": f"remove:local::/w/app/{name}", "answer": answer,
+                                "decided_at": "2026-11-14T00:00:00Z"}
+                               for name, answer in (("approved", "指揮: rm_check が ok なら作業場を消してよい"),
+                                                    ("keep", "結果が出るまで残す。その後に消す"),
+                                                    ("defer", "保留。使っている人が終えたら消してよい"),
+                                                    ("conditional", "PR が merge されたら消す"),
+                                                    ("negated", "削除するな"),
+                                                    ("not-ready", "not ready to remove"),
+                                                    ("after", "remove it after the experiment finishes"))])
+        for named in ([], [f"--row={name}" for name in names]):
+            with self.subTest(named=bool(named)), redirect_stdout(io.StringIO()) as out, \
+                    redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(saved), "--decisions-file", str(decisions), "--rm-specs", *named])
+            self.assertEqual(code, int(bool(named)))
+            self.assertEqual(out.getvalue(), "/w/app/approved -\n")
+            for expected in ("class=unsure", "open_pr_cleanup=False", "removal_decision=", "結果が出るまで残す", "保留"):
+                self.assertIn(expected, err.getvalue())
+
     def test_scan_includes_paired_mac_and_keeps_local_rows_if_it_is_unreachable(self) -> None:
         local = {"worktrees": [worktree("/local/w", "done")],
                  "hostScope": {"omittedHostSelectors": [
@@ -3162,6 +3226,15 @@ class FakeWorktreeNotes:
 class RmCheckTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        binary = Path(self.tmp.name) / "orca-bin/orca"
+        binary.parent.mkdir()
+        binary.write_text('#!/bin/sh\nif [ "$1 $2" = "automations list" ]; then\n'
+                          '  echo \'{"ok":true,"result":{"automations":[]}}\'\nelse\n'
+                          '  echo \'{"ok":false,"error":{"code":"selector_not_found"}}\'\n  exit 1\nfi\n')
+        binary.chmod(0o755)
+        cli = patch.dict(os.environ, {"PATH": f"{binary.parent}:{os.environ.get('PATH', '')}"})
+        cli.start()
+        self.addCleanup(cli.stop)
         self.main = Path(self.tmp.name) / "main"
         self.main.mkdir()
         git(self.main, "init", "-q", "-b", "main")
@@ -3176,12 +3249,30 @@ class RmCheckTests(unittest.TestCase):
         recheck = patch.object(rmcheck, "PROCESS_RECHECK_SECONDS", 0)
         recheck.start()
         self.addCleanup(recheck.stop)
+        automations = patch.object(hourly_runtime, "orca_result", return_value={"automations": []})
+        automations.start()
+        self.addCleanup(automations.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def check(self, **kwargs: object) -> dict:
         return rmcheck.check(self.wt, self.main, base="main", compose_projects=[], **kwargs)
+
+    def test_an_automation_workspace_blocks_archival_and_removal(self) -> None:
+        (self.main / ".git/info/exclude").write_text(".tmp/\n")
+        source = self.wt / ".tmp/notes.md"
+        source.parent.mkdir()
+        source.write_text("keep for the automation\n")
+        payload = {"automations": [{"name": "Daily review", "workspaceMode": "existing", "enabled": False,
+                                    "workspaceId": "repo-id::" + str(self.wt.resolve())}]}
+        with patch.object(hourly_runtime, "orca_result", return_value=payload):
+            code, result = self.run_main("--archive-path", ".tmp", "--archive-dir", str(self.main / "archive"))
+        self.assertEqual(code, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("自動実行『Daily review』の作業場", result["reasons"])
+        self.assertEqual(source.read_text(), "keep for the automation\n")
+        self.assertEqual(result["archived"], [])
 
     def test_clean_worktree_contained_in_base_is_ok(self) -> None:
         result = self.check()
@@ -3296,14 +3387,9 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(len(result["processes"]), 1)
 
     def test_check_does_not_count_itself_or_its_shell(self) -> None:
-        binary = Path(self.tmp.name) / "bin/orca"
-        binary.parent.mkdir()
-        binary.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"ok":false,"error":{"code":"selector_not_found"}}\'\nexit 1\n')
-        binary.chmod(0o755)
         command = (f'{sys.executable} {rmcheck.__file__} --worktree {self.wt} '
                    '--base main --no-docker; :')
-        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True,
-                                   env={**os.environ, "PATH": f"{binary.parent}:{os.environ.get('PATH', '')}"})
+        completed = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         result = json.loads(completed.stdout)
@@ -6743,6 +6829,8 @@ class HourlyReadTests(unittest.TestCase):
                     Path(args[1]).write_text("[]")
                 else:
                     stdout.write("[]\n")
+                if "--review-out" in args:
+                    Path(args[args.index("--review-out") + 1]).write_text(json.dumps({"rows": [{"path": "/w/a"}]}))
                 return subprocess.CompletedProcess(args, 0)
             with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()) as out:
                 code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
@@ -6760,6 +6848,8 @@ class HourlyReadTests(unittest.TestCase):
             self.assertIn("topic unavailable", (run_dir / "topic-check.stderr").read_text())
             self.assertIn("topic-check: exit 7", out.getvalue())
             self.assertIn(str(run_dir), out.getvalue())
+            self.assertIn(f"review queue: {run_dir.resolve() / 'review-queue.json'}（1 行）／分類: orca-row-classify {run_dir.resolve()}",
+                          out.getvalue())
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
@@ -8489,6 +8579,14 @@ class BashTimeoutHookTests(unittest.TestCase):
         self.assertEqual(self.hook_output(100.0, call), "")
         self.assertEqual(self.hook_output(390.0, {**call, "timeout": 600000}), "")
 
+    def test_worktree_removal_gets_ten_minutes_even_at_low_load(self) -> None:
+        command = "~/.cache/orca-briefs/bin/rm-check-batch --remove-ok --summary '/w/done -'"
+        call = {"command": command, "timeout": 120000}
+        self.assertEqual(json.loads(self.hook_output(1.0, call))["hookSpecificOutput"]["updatedInput"],
+                         {**call, "timeout": 600000})
+        self.assertEqual(self.hook_output(1.0, {"command": command.replace("--remove-ok", "")}), "")
+        self.assertEqual(self.hook_output(1.0, {**call, "run_in_background": True}), "")
+
     def test_a_call_started_in_the_background_keeps_its_input(self) -> None:
         # Its timeout would set how long it may run in the background, not keep it in the foreground.
         self.assertEqual(self.hook_output(390.0, {"command": "ls", "run_in_background": True}), "")
@@ -8637,6 +8735,22 @@ class VerdictStoreTests(unittest.TestCase):
                                     "/w/a": {"class": "blocked", "read": "ka", "queued_at": "g1"},
                                     "/w/c": {"class": "finished", "read": "kc", "queued_at": "g2"}})
         self.assertEqual(json.loads(self.store.read_text()), verdicts)
+
+    def test_hourly_read_verdicts_feed_saved_rows_and_removal_specs_before_the_next_scan(self) -> None:
+        row = {**self.row("/w/app/done", cls="unsure"), "repo": "app", "meaningful_tabs": []}
+        queued = scan.review_queue([row])
+        (self.root / "reads").mkdir()
+        self.write_session("reads/run", "2026-11-14T00:00:00Z", queued, "2026-11-14T00:00:00Z",
+                           [{"path": row["path"], "class": "finished"}])
+        saved = self.root / "reads/run/scan.json"
+        saved.write_text(json.dumps([row]))
+        for options, expected in ((["--rows"], "finished (scan: unsure)"),
+                                  (["--rm-specs"], "/w/app/done -")):
+            with self.subTest(options=options), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--verdicts", str(self.store), *options]), 0)
+            self.assertIn(expected, out.getvalue())
+        self.assertFalse(self.store.exists(), "--from must not write the verdict store")
+        self.assertEqual(scan.absorb_verdicts(self.store)[row["path"]]["class"], "finished")
 
     def test_an_older_session_s_read_does_not_replace_a_newer_one_in_the_store(self) -> None:
         self.write_session("old", "2026-10-08T12:34:54+00:00", [{"path": "/w/a", "read": "k-old"}],

@@ -31,6 +31,16 @@ def hourly_automations(orca: str) -> list[dict[str, Any]]:
             if (automation.get("prompt") or "").startswith(HOURLY_PROMPT)]
 
 
+def existing_workspace_automations(orca: str, environment: str | None = None) -> dict[str, list[str]]:
+    """Automation names by existing workspace, including disabled automations that still refer to it."""
+    found: dict[str, list[str]] = {}
+    payload = orca_result(orca, "automations", "list", *(["--environment", environment] if environment else []))
+    for automation in payload["automations"]:
+        if automation.get("workspaceMode") == "existing" and (path := workspace_path(automation.get("workspaceId"))):
+            found.setdefault(path, []).append(automation["name"])
+    return found
+
+
 def scheduled_runs(orca: str, workspace: str) -> list[dict[str, Any]]:
     """Newest first; skip unrelated automations and manually triggered runs."""
     here = os.path.realpath(workspace)
