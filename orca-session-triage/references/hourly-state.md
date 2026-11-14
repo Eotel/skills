@@ -165,6 +165,18 @@ parent's last message when reporting its waiting time.
   from this read when every check passes. Its record remains available for
   inspection and explicit closure with `user-wait-close`.
 
+`asked` and `asked-many` publish the row and its decision keys as `asking`, with
+the asking workspace and time. Include `--header` (or `header` in JSONL) to
+identify the AskUserQuestion before it opens. `asking --summary`, the lead's
+watch, `stale-asks`, and `lead_decisions.py unanswered` show these as 伺い中.
+Do not ask a question another tab is already putting to the user.
+
+A blocked row counts as waiting on Miura only when its verdict has nonempty
+`needs_user` and `waits_on` names Miura. Each stale item includes the verdict's
+`waits_on` and `next_step`. If the named worker sent `info` or `done` after the
+row's final message, `waiting_reports` gives its report id, timestamp, and text;
+the summary says 待ち先から届いた. Read that report before continuing the wait.
+
 An `unanswered` or `stopped_after_answer` item, and a row's shared unanswered
 question, carries `reissued` when a later ask of the same lane withdrew its ask
 or one of its questions (each such ask's `id`, `ts`, `withdrew`); `--summary`
