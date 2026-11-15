@@ -8001,6 +8001,11 @@ class InboxReadTests(unittest.TestCase):
                 del os.environ["TRIAGE_READ_OFFSET"]
                 self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
             self.assertIn("TRIAGE_READ_OFFSET", shared.getvalue())
+            cursor.write_text(str(inbox.stat().st_size + 1))
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as shorter:
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+            self.assertIn("shorter", shorter.getvalue())
             cursor.write_text("0")
 
             def watch() -> list[str]:

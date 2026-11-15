@@ -256,15 +256,19 @@ def complete_end(data: bytes) -> int:
     return data.rfind(b"\n") + 1
 
 
-def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
-    start = int(cursor.read_text().strip()) if cursor.exists() else 0
+def bytes_after(inbox: Path, start: int) -> bytes:
     with inbox.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         if start > size:
             raise ValueError("inbox is shorter than the saved read position")
         stream.seek(start)
-        data = stream.read()
+        return stream.read()
+
+
+def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
+    start = int(cursor.read_text().strip()) if cursor.exists() else 0
+    data = bytes_after(inbox, start)
     return start, data, complete_end(data)
 
 
@@ -940,9 +944,7 @@ def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> No
         batch: list[str] = []
         batch_started = 0.0
         while True:
-            with inbox.open("rb") as stream:
-                stream.seek(position)
-                data = stream.read()
+            data = bytes_after(inbox, position)
             complete = complete_end(data)
             lines = new_lines(inbox, position, data[:complete], me) if complete else []
             position += complete
