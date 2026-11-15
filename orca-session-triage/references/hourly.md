@@ -60,13 +60,23 @@ from other lanes to the lead in one handoff. It does not reforward its own
 handoff entry. The lead checks inbox IDs and shared hourly state
 before answering so a later hourly handoff cannot repeat an answered question.
 The lead may read `info` and `done` for context but leaves the scheduled sweep
-to the hourly run. The lead watches new reports with a Monitor running
-`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch`,
-a cursor of its own that `initialize` starts once (watch refuses a missing one,
-and refuses to run without `TRIAGE_READ_OFFSET`, so it never skips `info` on the
-scheduled run's cursor).
-It prints every new `ask` and `done`, whatever its source, as a summary line,
-and `unanswered <n> min: <line>` once per ask left unanswered for 15 minutes.
+to the hourly run. The lead watches new reports with a background Bash command
+(`run_in_background`) running
+`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch --exit-on-event`,
+and starts it again each time it ends, after reading the output file its
+completion notice names (the notice carries no output). A Monitor stops after
+30 minutes at most, `persistent` included; in a local session a background
+command has no deadline and wakes the tab when it exits. One watch reads the
+cursor at a time: a second one is refused while the first runs. The cursor is
+the lead's own, which `initialize` starts once (watch
+refuses a missing one, and refuses to run without `TRIAGE_READ_OFFSET`, so it
+never skips `info` on the scheduled run's cursor).
+It prints every new `ask` and `done`, whatever its source, as a summary line;
+each `info` the lead waits on, with why: from a lane held until the lead's release
+signal (`send --hold-until signal:<the lead's handle>`), or a lane's first report
+since the lead sent to it; and `unanswered <n> min: <line>` once per ask left
+unanswered for 15 minutes. The lines that come within 30 seconds go out as one
+line, and the command ends there.
 Being read is not being answered. `send --decision <answer> --ask <id>[:<n>]`
 records the ask (or one of its questions) answered once the send lands (the
 id's first 8 or more characters will do, as for `read --id`). When a later ask

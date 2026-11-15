@@ -10,8 +10,13 @@ holding WORD. Every read marks an ask, or one of its questions, the answer recor
 scheduled run of the workspace due after this one that began, or that the precheck skipped because this run
 was still working: the later run owns the cursor and the handoff. `initialize` starts a new cursor at the
 current end only after the lead has handled all existing inbox entries.
-`watch` is the lead's Monitor: it prints every new ask and done, advances its own
-cursor, and names each ask left unanswered for 15 minutes.
+`watch` is the lead's watch: it prints every new ask and done, and each info the lead's tab
+($ORCA_TERMINAL_HANDLE) waits on: from a lane on hold until its release signal (send's hold
+records), or a lane's first report since the tab sent to it (send's records in orca-board's
+event log). It names each ask left unanswered for 15 minutes, once, gathers the lines of 30
+seconds into one line, and advances its own cursor once that line is out. `--exit-on-event`
+ends it there, for a background command started again each time it ends. One watch reads a
+cursor at a time.
 
 Being read and being answered differ. `answered` records an ask (or one of its
 questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
@@ -38,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -49,6 +55,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -65,6 +72,9 @@ WATCHED_KINDS = frozenset(("ask", "done"))
 ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
 CLAIMS = Path.home() / ".cache/orca-briefs/ask-claims.jsonl"
 REMIND_AFTER_MINUTES = 15
+# send's hold records and its send records (orca-board's event log), for the info this tab waits on.
+HOLDS = Path.home() / ".cache/orca-briefs/holds.sqlite"
+EVENTS = Path.home() / ".local/share/orca-board/events.jsonl"
 ID_PREFIX_MIN = 8
 # AskUserQuestion takes one to four questions per call.
 QUESTIONS_PER_BATCH = 4
@@ -84,6 +94,15 @@ class OpenAsk:
     # Numbers of the questions still unanswered; empty for an ask without structured questions.
     open_questions: tuple[int, ...]
     at: datetime | None
+
+
+@dataclass(frozen=True)
+class WatchOptions:
+    once: bool = False
+    exit_on_event: bool = False
+    interval: float = 10
+    batch_seconds: float = 30
+    remind_after: int = REMIND_AFTER_MINUTES
 
 
 @dataclass(frozen=True)
@@ -237,15 +256,19 @@ def complete_end(data: bytes) -> int:
     return data.rfind(b"\n") + 1
 
 
-def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
-    start = int(cursor.read_text().strip()) if cursor.exists() else 0
+def bytes_after(inbox: Path, start: int) -> bytes:
     with inbox.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         if start > size:
             raise ValueError("inbox is shorter than the saved read position")
         stream.seek(start)
-        data = stream.read()
+        return stream.read()
+
+
+def pending_bytes(inbox: Path, cursor: Path) -> tuple[int, bytes, int]:
+    start = int(cursor.read_text().strip()) if cursor.exists() else 0
+    data = bytes_after(inbox, start)
     return start, data, complete_end(data)
 
 
@@ -795,41 +818,164 @@ def save(cursor: Path, position: int, exclusive: bool = False) -> None:
         temporary.replace(cursor)
 
 
-def watch(inbox: Path, cursor: Path, answers: Path, once: bool, interval: float, remind_after: int) -> None:
-    """Print each new ask and done, whatever its source, then each ask unanswered `remind_after` minutes,
-    once per ask while this watch runs; advance the cursor past every entry printed or not."""
+def holds_path() -> Path:
+    return Path(os.environ.get("TRIAGE_HOLDS") or HOLDS)
+
+
+def events_path() -> Path:
+    return Path(os.environ.get("ORCA_BOARD_EVENTS") or EVENTS).expanduser()
+
+
+def held_until_signal(me: str, holds: Path) -> dict[str, str]:
+    """The lanes on hold until this tab signals their release (`send --hold-until signal:<this tab>`):
+    hold id by the held lane's handle."""
+    if not holds.exists():
+        return {}
+    with closing(sqlite3.connect(f"{holds.resolve().as_uri()}?mode=ro", uri=True, timeout=10)) as db:
+        rows = db.execute("SELECT id, handle FROM holds WHERE condition_kind = 'signal' AND condition_value = ? "
+                          "AND status IN ('staged', 'active')", (me,)).fetchall()
+    return {str(handle): str(hold_id) for hold_id, handle in rows}
+
+
+def sends_to(me: str, handles: set[str], events: Path) -> dict[str, list[datetime]]:
+    """When this tab sent to each of `handles`, from the send records in orca-board's event log."""
+    found: dict[str, list[datetime]] = {handle: [] for handle in handles}
+    if not events.exists():
+        return found
+    mine = json.dumps(me).encode()
+    with events.open("rb") as stream:
+        for raw in stream:
+            if mine not in raw:
+                continue
+            item = entry(raw)
+            if (item and item.get("type") == "send" and item.get("from") == me and item.get("to") in found
+                    and (sent := asked_at(item))):
+                found[item["to"]].append(sent)
+    return found
+
+
+def last_reports(inbox: Path, end: int) -> dict[str, dict]:
+    """Each lane's last report before byte `end`, by handle."""
+    with inbox.open("rb") as stream:
+        data = stream.read(end)
+    return {str(item["handle"]): item for item in map(entry, data.splitlines()) if item and item.get("handle")}
+
+
+def waited_reasons(items: list[dict], previous: dict[str, dict], me: str) -> list[str | None]:
+    """Why this tab waits on each info of `items` (None for the rest): the lane is on hold until this tab's release
+    signal, or the info is the lane's first report since this tab last sent to it. `previous` holds each lane's
+    report before `items`."""
+    held = held_until_signal(me, holds_path())
+    sends = sends_to(me, {str(item["handle"]) for item in items if item.get("handle")}, events_path())
+    reasons: list[str | None] = []
+    for item in items:
+        handle, reason = str(item.get("handle") or ""), None
+        if handle and item.get("kind") == "info":
+            reported, since = asked_at(item), previous.get(handle)
+            since_at = asked_at(since) if since else None
+            replied = [sent for sent in sends.get(handle, [])
+                       if (reported is None or sent <= reported) and (since_at is None or sent > since_at)]
+            if handle in held:
+                reason = f"待機 {held[handle]} の解除待ち"
+            elif replied:
+                reason = f"{max(replied).astimezone():%H:%M} の send への返事"
+        if handle:
+            previous[handle] = item
+        reasons.append(reason)
+    return reasons
+
+
+def new_lines(inbox: Path, start: int, data: bytes, me: str | None) -> list[str]:
+    """A summary line per new ask and done, and per info this tab waits on (`waited_reasons`) with its reason."""
+    items = [item for item in map(entry, data.splitlines()) if item]
+    waits_on = me and any(item.get("kind") == "info" for item in items)
+    reasons = waited_reasons(items, last_reports(inbox, start), me) if waits_on else [None] * len(items)
+    return [summary_line(item) + (f"  [{reason}]" if reason else "")
+            for item, reason in zip(items, reasons) if item.get("kind") in WATCHED_KINDS or reason]
+
+
+def batch_line(lines: list[str]) -> str:
+    """One notice: the line itself, or 「<n> 件:」 and the lines joined by ' ｜ '."""
+    return lines[0] if len(lines) == 1 else f"{len(lines)} 件: " + " ｜ ".join(lines)
+
+
+def watch_state(cursor: Path) -> Path:
+    return cursor.with_name(cursor.name + ".watch.json")
+
+
+def load_watch_state(cursor: Path) -> tuple[set[str], set[tuple[str, str, str]]]:
+    """The asks already reminded of and the claims already shown, so a restarted watch does not repeat them."""
+    try:
+        state = json.loads(watch_state(cursor).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set(), set()
+    return set(state["reminded"]), {tuple(key) for key in state["announced"]}
+
+
+def save_watch_state(cursor: Path, reminded: set[str], announced: set[tuple[str, str, str]],
+                     open_ids: set[str]) -> None:
+    temporary = watch_state(cursor).with_name(watch_state(cursor).name + ".tmp")
+    temporary.write_text(json.dumps({"reminded": sorted(reminded & open_ids),
+                                     "announced": sorted(key for key in announced if key[0] in open_ids)},
+                                    ensure_ascii=False), encoding="utf-8")
+    temporary.replace(watch_state(cursor))
+
+
+def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> None:
+    """Print each new ask and done, and each info this tab waits on, whatever its source, then each ask unanswered
+    `remind_after` minutes, once per ask; the lines that come within `batch_seconds` go out as one line.
+    The cursor and the reminded asks are saved only once that line is out, so a watch stopped earlier misses
+    nothing; with `exit_on_event` the watch then ends."""
     if not cursor.exists():
         raise ValueError(f"watch reads only after an initialized cursor: run initialize with "
                          f"TRIAGE_READ_OFFSET={cursor} first")
-    reminded: set[str] = set()
-    announced: set[tuple[str, str, str]] = set()
-    while True:
-        start, data, complete = pending_bytes(inbox, cursor)
-        for raw in data[:complete].splitlines():
-            try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(item, dict) and item.get("kind") in WATCHED_KINDS:
-                print(summary_line(item), flush=True)
-        if complete:
-            save(cursor, start + complete)
-        now = datetime.now().astimezone()
-        claims = read_claims(claims_path())
-        for ask in open_asks(inbox_entries(inbox), answered_ids(answers)):
-            claim = ask_claim(ask, claims)
-            if claim:
-                if (key := (ask.report["id"], claim.by, claim.at)) not in announced:
-                    announced.add(key)
-                    print(f"伺い中 {claim.by}: {summary_line(ask.report)}", flush=True)
-                continue
-            age = minutes_since(ask.at, now)
-            if age is not None and age >= remind_after and ask.report["id"] not in reminded:
-                reminded.add(ask.report["id"])
-                print(f"unanswered {age} min: {summary_line(ask.report)}", flush=True)
-        if once:
-            return
-        time.sleep(interval)
+    # The tab starts the watch again each time it ends; a second one would print every line twice.
+    with cursor.with_name(cursor.name + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(f"another watch reads {cursor}: stop it before starting this one") from None
+        me = os.environ.get("ORCA_TERMINAL_HANDLE")
+        if not me:
+            print("watch: ORCA_TERMINAL_HANDLE が無いため、待っている info を選べない（ask・done だけを出す）",
+                  file=sys.stderr)
+        reminded, announced = load_watch_state(cursor)
+        position = saved = int(cursor.read_text().strip())
+        batch: list[str] = []
+        batch_started = 0.0
+        while True:
+            data = bytes_after(inbox, position)
+            complete = complete_end(data)
+            lines = new_lines(inbox, position, data[:complete], me) if complete else []
+            position += complete
+            now = datetime.now().astimezone()
+            claims = read_claims(claims_path())
+            asks = open_asks(inbox_entries(inbox), answered_ids(answers))
+            for ask in asks:
+                claim = ask_claim(ask, claims)
+                if claim:
+                    if (key := (ask.report["id"], claim.by, claim.at)) not in announced:
+                        announced.add(key)
+                        lines.append(f"伺い中 {claim.by}: {summary_line(ask.report)}")
+                    continue
+                age = minutes_since(ask.at, now)
+                if age is not None and age >= options.remind_after and ask.report["id"] not in reminded:
+                    reminded.add(ask.report["id"])
+                    lines.append(f"unanswered {age} min: {summary_line(ask.report)}")
+            if lines and not batch:
+                batch_started = time.monotonic()
+            batch.extend(lines)
+            if options.once or not batch or time.monotonic() - batch_started >= options.batch_seconds:
+                if batch:
+                    print(batch_line(batch), flush=True)
+                if batch or position != saved:
+                    save(cursor, position)
+                    save_watch_state(cursor, reminded, announced, {ask.report["id"] for ask in asks})
+                    saved = position
+                if options.once or batch and options.exit_on_event:
+                    return
+                batch = []
+            time.sleep(options.interval)
 
 
 def owner_line(run: dict) -> str:
@@ -878,12 +1024,21 @@ def main(argv: list[str] | None = None) -> int:
                              "the cursor stands: print each match's header (id, time, source; acknowledged ones "
                              "marked 既読) and the lines holding WORD")
     watch_command = actions.add_parser(
-        "watch", help="the lead's Monitor: print every new ask and done as a summary line, advance the cursor, "
-                      "and print `unanswered <n> min: <line>` once per ask left unanswered --remind-after minutes")
+        "watch", help="the lead's watch: print a summary line per new ask and done, and per info this tab "
+                      "($ORCA_TERMINAL_HANDLE) waits on: from a lane on hold until its release signal "
+                      "(send --hold-until signal:<this tab>), or a lane's first report since this tab sent to it; "
+                      "print `unanswered <n> min: <line>` once per ask left unanswered --remind-after minutes; "
+                      "the lines within --batch-seconds go out as one line, and the cursor moves only then")
     watch_command.add_argument("--interval", type=float, default=10, help="seconds between reads (default: 10)")
+    watch_command.add_argument("--batch-seconds", type=float, default=30,
+                               help="seconds to gather lines into one line (default: %(default)s)")
     watch_command.add_argument("--remind-after", type=int, default=REMIND_AFTER_MINUTES,
                                help="minutes before an unanswered ask is named (default: %(default)s)")
-    watch_command.add_argument("--once", action="store_true", help="read once and exit")
+    ending = watch_command.add_mutually_exclusive_group()
+    ending.add_argument("--once", action="store_true", help="read once and exit")
+    ending.add_argument("--exit-on-event", action="store_true",
+                        help="exit after the first line: run it as a background command, which has no deadline "
+                             "in a local session and wakes the tab when it exits, and start it again then")
     open_command = actions.add_parser("open-asks", help="list asks not answered yet, oldest first, one summary "
                                                         "line each after `unanswered <n> min:`; first record "
                                                         "answered each adoption notice whose proposals have a lane "
@@ -953,7 +1108,9 @@ def main(argv: list[str] | None = None) -> int:
             (read_ids if args.ids else read_text if args.text is not None else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":
-            watch(inbox, cursor, answers_path(), args.once, args.interval, args.remind_after)
+            watch(inbox, cursor, answers_path(), WatchOptions(
+                once=args.once, exit_on_event=args.exit_on_event, interval=args.interval,
+                batch_seconds=args.batch_seconds, remind_after=args.remind_after))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)
@@ -1043,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
         save(cursor, args.position)
         print(f"acknowledged through {args.position}")
         return 0
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, sqlite3.Error) as exc:
         print(f"inbox-read: {exc}", file=sys.stderr)
         return 1
 

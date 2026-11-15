@@ -7,9 +7,10 @@ from email.message import Message
 from types import ModuleType
 from typing import Literal, NotRequired, TextIO, TypedDict, Unpack
 
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from functools import partial
+import fcntl
 import hashlib
 import importlib.util
 import http.client
@@ -19,10 +20,11 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
-from threading import Barrier, Event
+from threading import Barrier, Event, Thread
 import time
 import unittest
 from unittest.mock import patch
@@ -7999,6 +8001,11 @@ class InboxReadTests(unittest.TestCase):
                 del os.environ["TRIAGE_READ_OFFSET"]
                 self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
             self.assertIn("TRIAGE_READ_OFFSET", shared.getvalue())
+            cursor.write_text(str(inbox.stat().st_size + 1))
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()) as shorter:
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+            self.assertIn("shorter", shorter.getvalue())
             cursor.write_text("0")
 
             def watch() -> list[str]:
@@ -8014,10 +8021,82 @@ class InboxReadTests(unittest.TestCase):
                                          "text": "次の完了"}, ensure_ascii=False) + "\n")
             second = watch()
 
-        self.assertEqual([line.split("  ")[0] for line in first], [
+        self.assertEqual(len(first), 1)
+        self.assertEqual([part.split("  ")[0] for part in first[0].removeprefix("4 件: ").split(" ｜ ")], [
             f"{old} ask h epm/x id=a1", f"{now} ask h cvm/y id=a2", f"{now} done h cvm/y id=d1",
             f"unanswered 30 min: {old} ask h epm/x id=a1"])
         self.assertEqual([line.split("  ")[0] for line in second], [f"{now} done h z id=d2"])
+
+    def test_watch_shows_the_info_the_lead_waits_on(self) -> None:
+        # 11/15 15:52–16:49: the C3・P4 facts the lead waited on came as info, and its watch showed only ask and done.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = Path(root) / "inbox.jsonl", Path(root) / "watch.offset"
+            holds, events = Path(root) / "holds.sqlite", Path(root) / "events.jsonl"
+            base = datetime.now().astimezone() - timedelta(hours=1)
+
+            def at(minutes: int) -> str:
+                return (base + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+            def info(handle: str, minutes: int, text: str) -> dict:
+                return {"id": text, "ts": at(minutes), "kind": "info", "host": "h", "worktree": handle,
+                        "handle": handle, "text": text}
+
+            write_jsonl(inbox, [info("term_asked", 0, "着手")])
+            cursor.write_text(str(inbox.stat().st_size))
+            with inbox.open("a") as stream:
+                for row in (info("term_held", 12, "問い 3 の調べ"), info("term_asked", 14, "問い 4 の調べ"),
+                            info("term_asked", 15, "問い 4 の補足"), info("term_other", 16, "経過"),
+                            info("term_peer", 17, "相手待ちの経過")):
+                    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            with closing(sqlite3.connect(holds)) as db, db:
+                db.execute("CREATE TABLE holds (id TEXT, handle TEXT, condition_kind TEXT, condition_value TEXT, "
+                           "status TEXT)")
+                db.executemany("INSERT INTO holds VALUES (?, ?, 'signal', ?, ?)", [
+                    ("h1", "term_held", "term_lead", "active"), ("h2", "term_peer", "term_other", "active"),
+                    ("h3", "term_other", "term_lead", "released")])
+            sent = base + timedelta(minutes=10)
+            write_jsonl(events, [
+                {"type": "send", "ts": sent.strftime("%Y-%m-%dT%H:%M:%S%z"), "from": "term_lead",
+                 "to": "term_asked", "text": "問い 4 を調べて info で返してください"},
+                {"type": "send", "ts": sent.strftime("%Y-%m-%dT%H:%M:%S%z"), "from": "term_peer",
+                 "to": "term_other", "text": "相手の send"}])
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl"), "TRIAGE_HOLDS": str(holds),
+                           "ORCA_BOARD_EVENTS": str(events), "ORCA_TERMINAL_HANDLE": "term_lead"}
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 0)
+
+        self.assertEqual(out.getvalue().splitlines(), [
+            f"2 件: {at(12)} info h term_held id=問い 3 の調べ  問い 3 の調べ  [待機 h1 の解除待ち]"
+            f" ｜ {at(14)} info h term_asked id=問い 4 の調べ  問い 4 の調べ  [{sent:%H:%M} の send への返事]"])
+
+    def test_watch_can_end_at_its_first_notice_without_repeating_a_reminder(self) -> None:
+        # A background command has no deadline in a local session and wakes the tab when it ends.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = Path(root) / "inbox.jsonl", Path(root) / "watch.offset"
+            old = (datetime.now().astimezone() - timedelta(minutes=30)).isoformat(timespec="seconds")
+            write_jsonl(inbox, [{"id": "a1", "ts": old, "kind": "ask", "host": "h", "worktree": "x", "text": "質問"}])
+            cursor.write_text(str(inbox.stat().st_size))
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
+            ended: list[int] = []
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as first:
+                watcher = Thread(daemon=True, target=lambda: ended.append(inbox_read.main(
+                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0"])))
+                watcher.start()
+                watcher.join(10)
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as again:
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 0)
+
+            with cursor.with_name(cursor.name + ".lock").open("a") as lock, patch.dict(os.environ, environment), \
+                    redirect_stderr(io.StringIO()) as second:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.assertEqual(inbox_read.main(["watch", "--once"]), 1)
+
+        self.assertEqual(ended, [0])
+        self.assertTrue(first.getvalue().startswith(f"unanswered 30 min: {old} ask h x id=a1"))
+        self.assertEqual(again.getvalue(), "")
+        self.assertIn("another watch", second.getvalue())
 
     def test_a_claimed_ask_shows_as_being_asked_without_a_reminder_or_a_second_asking(self) -> None:
         # 11/04 16:00: the hourly tab and the lead both asked TOUGOU_KAIKEI-799 and #172.
@@ -8063,7 +8142,8 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual(batch["questions"], [])
         self.assertEqual([(item["id"], item["by"]) for item in batch["claimed"]],
                          [("a1:1", "triage-hourly"), ("a1:2", "triage-hourly")])
-        self.assertEqual([line.split("  ")[0] for line in watched],
+        self.assertEqual(len(watched), 1)
+        self.assertEqual([part.split("  ")[0] for part in watched[0].removeprefix("2 件: ").split(" ｜ ")],
                          [f"伺い中 triage-hourly: {old} ask h x id=a1", f"unanswered 30 min: {old} ask h y id=a2"])
 
     def test_taking_over_an_ask_takes_the_questions_claimed_one_by_one(self) -> None:
