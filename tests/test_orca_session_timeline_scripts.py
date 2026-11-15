@@ -122,9 +122,10 @@ class TimelineTests(unittest.TestCase):
                 {"type": "tool_use", "id": use_id, "name": "Bash",
                  "input": {"command": command, "run_in_background": background}}]}}
 
-        def result(ts: str, use_id: str, failed: bool) -> dict:
+        def result(ts: str, use_id: str, failed: bool, out: str = "out") -> dict:
             return {"type": "user", "timestamp": ts, "cwd": str(lane), "message": {"content": [
-                {"type": "tool_result", "tool_use_id": use_id, "is_error": failed, "content": "out"}]}}
+                {"type": "tool_result", "tool_use_id": use_id, "is_error": failed,
+                 "content": [{"type": "text", "text": out}]}]}}
 
         self.append(str(project.relative_to(self.home) / "session.jsonl"),
                     call("2026-11-15T09:00:00Z", "view", "gh pr view 12 -R Eotel/skills"),
@@ -143,7 +144,11 @@ class TimelineTests(unittest.TestCase):
                     result("2026-11-15T09:08:00Z", "later", False),
                     call("2026-11-15T09:09:00Z", "thread", "gh api graphql -f query='query { threads }' | jq . ; "
                          "gh api graphql -f query='mutation { resolveReviewThread }'"),
-                    result("2026-11-15T09:09:01Z", "thread", False))
+                    result("2026-11-15T09:09:01Z", "thread", False),
+                    call("2026-11-15T09:10:00Z", "preview", "gh pr create --dry-run --title x"),
+                    result("2026-11-15T09:10:01Z", "preview", False),
+                    call("2026-11-15T09:11:00Z", "hidden", "gh pr merge 15 --squash 2>&1 | tail -1"),
+                    result("2026-11-15T09:11:02Z", "hidden", False, "GraphQL: Head branch was modified."))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
 
@@ -151,7 +156,8 @@ class TimelineTests(unittest.TestCase):
             ("2026-11-15T18:05:04+09:00", "adopt-x", "merge した"),
             ("2026-11-15T18:07:03+09:00", "adopt-x", "投稿した"),
             ("2026-11-15T18:07:03+09:00", "adopt-x", "自動 merge を予約した"),
-            ("2026-11-15T18:09:01+09:00", "adopt-x", "書いた")])
+            ("2026-11-15T18:09:01+09:00", "adopt-x", "書いた"),
+            ("2026-11-15T18:11:02+09:00", "adopt-x", "merge した（失敗の表示あり）")])
 
     def test_holds_answers_decisions_starts_and_adoptions_join_the_timeline(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",

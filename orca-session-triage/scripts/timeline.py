@@ -17,8 +17,10 @@ person the adoption ledger names), to whom, what happened, a summary, and the re
 - claude, codex: this Mac's agent transcripts, for calls that finished writing outside the workspace: a
   `gh` command that merges, comments, reviews, creates, edits or sends a write to the API, and an MCP tool
   not marked read-only (Codex) or named for a write (Claude). `gh pr merge --auto` reads as a scheduled
-  merge. Text in a heredoc or quotes is not a command, and a call that failed, ran in the background, or
-  follows `||` is left out. Its time is when it finished, so it reads against the sends around it.
+  merge. Text in a heredoc or quotes is not a command, and a call that failed, ran in the background,
+  follows `||`, or only previews (`--dry-run`, `--web`) is left out. When a later call's status hides
+  whether a `gh` call failed, a gh error in the output marks the row 失敗の表示あり. Its time is when it
+  finished, so it reads against the sends around it.
 
 A send's time is when `send` finished checking the delivery, some seconds after the lane got the text.
 The session host (Orca today) names the workspace behind a tab's handle or a directory and lists the
@@ -57,7 +59,11 @@ SHELL_BREAK = re.compile(r"([;\n()]|&&|\|\|?|(?<![<>])&|\bthen\b|\bdo\b)")
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)(\w+)\1")
 QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", re.DOTALL)
 HIDDEN = re.compile("\x1f(\\d+)\x1f")
-HELP = re.compile(r"(?:^|\s)(?:--help|-h)(?=\s|$)")
+# With these flags gh prints help or a preview, or opens the browser, and writes nothing.
+NO_WRITE = re.compile(r"(?:^|\s)(?:--help|-h|--web|-w|--dry-run)(?=\s|$)")
+# A command's status is that of its last call unless calls are joined by && (or grouped).
+PASSES_STATUS = {"&&", "(", ")"}
+GH_FAILED = re.compile(r"GraphQL: |\bHTTP [45]\d\d\b|is not mergeable")
 GH_CALL = re.compile(r"\s*(?:\w+=\S*\s+)*gh\s+(\S+)\s*(\S*)(.*)", re.DOTALL)
 GH_POSTS = {("pr", "comment"), ("pr", "create"), ("pr", "review"), ("issue", "comment"), ("issue", "create")}
 GH_EDITS = {"edit", "close", "reopen", "ready", "delete", "lock", "transfer"}
@@ -81,6 +87,18 @@ class Event:
 
     def row(self) -> dict[str, str | None]:
         return {**asdict(self), "at": self.at.isoformat(timespec="seconds")}
+
+
+@dataclass(frozen=True)
+class Write:
+    kind: str
+    call: str
+    # A later call's status hid this call's own, so gh's error lines in the output are what tell a failure.
+    masked: bool = False
+
+    def against(self, output: str) -> tuple[str, str]:
+        failed = self.masked and GH_FAILED.search(output)
+        return (f"{self.kind}（失敗の表示あり）" if failed else self.kind), self.call
 
 
 @dataclass(frozen=True)
@@ -340,13 +358,16 @@ def adoptions(events: Path, imports: Path, window: Window) -> Iterator[Event]:
             yield Event(at, str(item.get("actor") or "?"), kind, f"{proposal} {item.get('result') or ''}", "adoption", ref)
 
 
-def gh_writes(command: str) -> list[tuple[str, str]]:
+def gh_writes(command: str) -> list[Write]:
     """What each `gh` call of a shell command wrote, with the call (its quoted text emptied)."""
     text, quoted = executed(command)
     parts = SHELL_BREAK.split(text)
+    segments, operators = parts[::2], parts[1::2]
+    last = max((index for index, segment in enumerate(segments) if segment.strip()), default=0)
     # A call after || runs only when the one before it failed, which a successful command cannot show.
-    segments = [segment for index, segment in enumerate(parts[::2]) if index == 0 or parts[2 * index - 1] != "||"]
-    return [wrote for segment in segments if (wrote := gh_write(segment, quoted))]
+    return [Write(*wrote, masked=any(operator not in PASSES_STATUS for operator in operators[index:last]))
+            for index, segment in enumerate(segments)
+            if (index == 0 or operators[index - 1] != "||") and (wrote := gh_write(segment, quoted))]
 
 
 def executed(command: str) -> tuple[str, list[str]]:
@@ -377,7 +398,7 @@ def gh_write(segment: str, quoted: list[str]) -> tuple[str, str] | None:
         return None
     group, verb, rest = found.groups()
     call = HIDDEN.sub("", segment.strip())
-    if HELP.search(f"{verb} {rest}"):
+    if NO_WRITE.search(f"{verb} {rest}"):
         return None
     if group == "pr" and verb == "merge":
         auto = re.search(r"(?:^|\s)--(disable-auto|auto)\b", rest)
@@ -457,12 +478,13 @@ def codex_writes(transcript: Path, window: Window, host: SessionHost) -> Iterato
             yield Event(at, lane, tool_write(tool), summary, "codex", str(item.get("id")))
         elif item.get("exit_code") == 0:
             writes = gh_writes(" ".join(map(str, (item.get("command") or [])[-1:])))
-            for number, (kind, call) in enumerate(writes, 1):
+            for number, write in enumerate(writes, 1):
+                kind, call = write.against(str(item.get("aggregated_output") or ""))
                 yield Event(at, lane, kind, call, "codex", reference(str(item.get("id")), number, len(writes)))
 
 
 def claude_writes(transcript: Path, window: Window, host: SessionHost) -> Iterator[Event]:
-    pending: dict[str, tuple[str, list[tuple[str, str]]]] = {}  # tool_use id -> (lane, [(kind, call)])
+    pending: dict[str, tuple[str, list[Write]]] = {}  # tool_use id -> (lane, writes)
     for raw in window_lines(transcript, window.start - CALL_SLACK):
         if b'"tool_use"' in raw and (b"gh " in raw or b"mcp__" in raw):
             line = parse(raw) or {}
@@ -477,7 +499,8 @@ def claude_writes(transcript: Path, window: Window, host: SessionHost) -> Iterat
                 if part.get("type") == "tool_result" and use in pending:
                     lane, writes = pending.pop(use)
                     if not part.get("is_error") and (at := window.at(line.get("timestamp"))):
-                        for number, (kind, call) in enumerate(writes, 1):
+                        for number, write in enumerate(writes, 1):
+                            kind, call = write.against(output(part))
                             yield Event(at, lane, kind, call, "claude", reference(use, number, len(writes)))
 
 
@@ -486,14 +509,21 @@ def content(line: dict) -> list[dict]:
     return [part for part in parts if isinstance(part, dict)] if isinstance(parts, list) else []
 
 
-def claude_calls(part: dict) -> list[tuple[str, str]]:
+def output(result: dict) -> str:
+    body = result.get("content")
+    if isinstance(body, list):
+        return "\n".join(str(block.get("text") or "") for block in body if isinstance(block, dict))
+    return str(body or "")
+
+
+def claude_calls(part: dict) -> list[Write]:
     name = str(part.get("name") or "")
     arguments = part.get("input") or {}
     if name == "Bash":
         # A background call's result only says it started; whether it wrote comes later, if ever.
         return [] if arguments.get("run_in_background") else gh_writes(str(arguments.get("command") or ""))
     if name.startswith("mcp__") and WRITE_NAME.search(tool := name.split("__")[-1]):
-        return [(tool_write(tool), f"{name.split('__')[1]} {tool} {target(arguments)}")]
+        return [Write(tool_write(tool), f"{name.split('__')[1]} {tool} {target(arguments)}")]
     return []
 
 
