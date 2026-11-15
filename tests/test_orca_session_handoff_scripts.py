@@ -133,9 +133,17 @@ class HandoffTests(unittest.TestCase):
                 self.handed_off.unlink()
 
     def test_lead_state_marks_only_notifications_whose_every_report_was_read_or_answered(self) -> None:
-        ids = [f"aaaaaaaa-0000-0000-0000-{number:012d}" for number in range(5)]
-        self.inbox.write_text("".join(json.dumps({"id": ident, "kind": "ask", "text": "Proceed?",
-                                               "ts": "2026-11-14T00:00:00Z"}) + "\n" for ident in ids))
+        ids = [f"aaaaaaaa-0000-0000-0000-{number:012d}" for number in range(8)]
+        reports: list[dict] = [{"id": ident, "kind": "ask", "text": "Proceed?", "ts": "2026-11-14T00:00:00Z"}
+                               for ident in ids]
+        reports[0]["questions"] = [{"question": "Release now?", "context": "The report will be public.",
+                                    "recommended": "Wait", "options": [
+                                        {"label": "Wait", "description": "Keep it private"}]}]
+        reports[5]["text"] = "Long report " * 30
+        reports[6]["questions"] = [{"question": "Publish the complete report?", "header": "Publication",
+                                    "recommended": "Wait", "options": [
+                                        {"label": "Wait", "description": "Keep it private"}]}]
+        self.inbox.write_text("".join(json.dumps(report) + "\n" for report in reports))
         (self.root / "ask-answers.jsonl").write_text("".join(json.dumps(item) + "\n" for item in [
             {"id": ids[1], "ts": "2026-11-14T00:03:00Z", "how": "send", "note": "Proceed"},
             {"id": ids[2], "ts": "2026-11-14T00:03:00Z", "how": "answered", "note": "administrative mark"}]))
@@ -146,13 +154,17 @@ class HandoffTests(unittest.TestCase):
             {"type": "tool_result", "tool_use_id": "old", "content": ids[3]}]}},
             *({"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-14T00:01:00Z",
                "content": notification(named)} for named in ([ids[0]], [ids[1]], [ids[2]], [ids[3]],
-                                                            [ids[4]], [ids[0], ids[2]])),
+                                                            [ids[4]], [ids[0], ids[2]], [ids[5]], [ids[6]], [ids[7]])),
             {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-14T00:01:00Z",
              "content": f"User instruction mentioning {ids[0]}"},
             {"type": "user", "timestamp": "2026-11-14T00:02:00Z", "message": {"content": [
                 {"type": "tool_result", "tool_use_id": "read", "content": [
-                    {"type": "text", "text": f"id={ids[0]}\nProceed?"}]},
-                {"type": "tool_result", "tool_use_id": "failed", "is_error": True, "content": ids[4]}]}}]
+                    {"type": "text", "text": f"id={ids[0]}\nProceed?\nThe report will be public.\n"
+                     "Release now?（推奨: Wait）\n  - Wait: Keep it private"}]},
+                {"type": "tool_result", "tool_use_id": "failed", "is_error": True, "content": ids[4]},
+                {"type": "tool_result", "tool_use_id": "summary", "content":
+                    f"id={ids[5]}  {reports[5]['text'][:160]}…\nid={ids[6]} Proceed? [質問 1 件: Publication]"},
+                {"type": "tool_result", "tool_use_id": "unrelated", "content": f"Recorded id={ids[7]}"}]}}]
         transcript = self.projects / "-w-lead/s.jsonl"
         transcript.parent.mkdir(parents=True)
         transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -170,7 +182,7 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(shown.returncode, 0, shown.stderr)
         queued = json.loads(shown.stdout)["queued_input"]
         self.assertEqual([item.get("handled_at") for item in queued],
-                         ["2026-11-14T00:02:00Z", "2026-11-14T00:03:00+00:00", None, None, None, None, None])
+                         ["2026-11-14T00:02:00Z", "2026-11-14T00:03:00+00:00", *([None] * 8)])
         self.body.write_text("handoff")
         sent = self.run_tool("--since", str(self.inbox.stat().st_size), "--lead-worktree", "/w/lead",
                              env={"TRIAGE_INBOX": str(self.inbox)})

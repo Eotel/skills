@@ -35,9 +35,9 @@ current transcript path and timestamped user_messages since that handoff (exclud
 `lead-state --grep WORD [--since HH:MM|ISO]` adds matching timestamped transcript events in `matches`:
 lead and user speech, AskUserQuestion calls, and tool results (literal WORD, case ignored).
 Pending questions answered in hourly state or ask-answers carry answered_elsewhere (the answer's time).
-Queued task notifications carry handled_at when every inbox id they name was read in a later successful
-tool result or answered through ask-answers. Exclude those items when judging whether the lead is stalled;
-send leaves them out of its undelivered instructions.
+Queued task notifications carry handled_at when every report they name, including its questions and choices,
+was read in full in a later successful tool result or answered through ask-answers. Exclude those items when
+judging whether the lead is stalled; send leaves them out of its undelivered instructions.
 A fully answered selector visible on a tab gets a heading-checked close-selector command; this read sends nothing.
 Like the scan, lead-state clears a past connection error when the rendered Claude screen shows a later
 reply/tool call and running status line; a usage limit also accepts a completed later turn.
@@ -305,6 +305,20 @@ def transcript_events(entries: list[dict]) -> list[dict]:
     return events
 
 
+def full_report_in(result: str, report: dict) -> bool:
+    """An id alone appears in summaries and commands; require the substantive report, questions and choices."""
+    parts = [str(report.get("text") or "")]
+    for question in inbox_read.questions_of(report):
+        if not isinstance(question, dict):
+            continue
+        parts.extend(str(question.get(key) or "") for key in ("question", "context", "recommended", "issue"))
+        parts.extend(str(option.get(key) or "") for option in question.get("options") or []
+                     if isinstance(option, dict) for key in ("label", "description"))
+    content = " ".join(result.split())
+    return (answer_evidence.names_id(result, str(report["id"])) and any(part.strip() for part in parts)
+            and all(" ".join(part.split()) in content for part in parts))
+
+
 def queued_instructions(transcript: Path) -> list[dict]:
     """Keep the queue history visible, annotating notifications whose inbox reports the lead handled."""
     queued: list[dict] = [dict(item) for item in scan_sessions.queued_input(transcript)]
@@ -328,7 +342,7 @@ def queued_instructions(transcript: Path) -> list[dict]:
             evidence = [(answered[-1].at, answered[-1].at.isoformat())] if answered else []
             evidence.extend((at, event["at"]) for event in results
                             if (at := scan_sessions.parse_time(event["at"])) is not None and at > enqueued
-                            and answer_evidence.names_id(event["text"], ident))
+                            and full_report_in(event["text"], reports[ident]))
             if not evidence:
                 break
             handled.append(min(evidence))
