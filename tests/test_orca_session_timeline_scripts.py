@@ -115,9 +115,10 @@ class TimelineTests(unittest.TestCase):
         lane = self.workspaces / "skills" / "adopt-x"
         project = self.home / ".claude" / "projects" / "-x-orca-workspaces-skills-adopt-x"
 
-        def call(ts: str, use_id: str, command: str) -> dict:
+        def call(ts: str, use_id: str, command: str, background: bool = False) -> dict:
             return {"type": "assistant", "timestamp": ts, "cwd": str(lane), "message": {"content": [
-                {"type": "tool_use", "id": use_id, "name": "Bash", "input": {"command": command}}]}}
+                {"type": "tool_use", "id": use_id, "name": "Bash",
+                 "input": {"command": command, "run_in_background": background}}]}}
 
         def result(ts: str, use_id: str, failed: bool) -> dict:
             return {"type": "user", "timestamp": ts, "cwd": str(lane), "message": {"content": [
@@ -131,12 +132,20 @@ class TimelineTests(unittest.TestCase):
                     call("2026-11-15T09:01:00Z", "early", "gh pr merge 12 -R Eotel/skills --squash"),
                     result("2026-11-15T09:01:02Z", "early", True),
                     call("2026-11-15T09:05:00Z", "merge", "cd /tmp && gh pr merge 12 -R Eotel/skills --squash"),
-                    result("2026-11-15T09:05:04Z", "merge", False))
+                    result("2026-11-15T09:05:04Z", "merge", False),
+                    call("2026-11-15T09:06:00Z", "body", "cat > body.md <<'EOF'\ngh pr merge 12 --squash\nEOF"),
+                    result("2026-11-15T09:06:01Z", "body", False),
+                    call("2026-11-15T09:07:00Z", "pair", 'gh pr comment 13 --body "ok && go" && gh pr merge 13 --auto'),
+                    result("2026-11-15T09:07:03Z", "pair", False),
+                    call("2026-11-15T09:08:00Z", "later", "gh pr merge 14 --squash", background=True),
+                    result("2026-11-15T09:08:00Z", "later", False))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
 
-        self.assertEqual([(row["at"], row["lane"], row["kind"]) for row in rows],
-                         [("2026-11-15T18:05:04+09:00", "adopt-x", "merge した")])
+        self.assertEqual([(row["at"], row["lane"], row["kind"]) for row in rows], [
+            ("2026-11-15T18:05:04+09:00", "adopt-x", "merge した"),
+            ("2026-11-15T18:07:03+09:00", "adopt-x", "投稿した"),
+            ("2026-11-15T18:07:03+09:00", "adopt-x", "自動 merge を予約した")])
 
     def test_holds_answers_decisions_starts_and_adoptions_join_the_timeline(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",

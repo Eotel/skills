@@ -16,8 +16,9 @@ person the adoption ledger names), to whom, what happened, a summary, and the re
   `ADOPTION_TRIAGE_EVENTS` and the other Macs' copies in `ADOPTION_TRIAGE_IMPORTS`;
 - claude, codex: this Mac's agent transcripts, for calls that finished writing outside the workspace: a
   `gh` command that merges, comments, reviews, creates, edits or sends a write to the API, and an MCP tool
-  not marked read-only (Codex) or named for a write (Claude). A call that failed is left out. Its time is
-  when it finished, so it reads against the sends around it.
+  not marked read-only (Codex) or named for a write (Claude). `gh pr merge --auto` reads as a scheduled
+  merge. Text in a heredoc or quotes is not a command, and a call that failed, ran in the background, or
+  follows `||` is left out. Its time is when it finished, so it reads against the sends around it.
 
 A send's time is when `send` finished checking the delivery, some seconds after the lane got the text.
 The session host (Orca today) names the workspace behind a tab's handle or a directory and lists the
@@ -51,7 +52,9 @@ ADOPTION_DECIDED = {"adopt": "案を採用した", "reject": "案を却下した
 ADOPTION_DONE = {"handed_off": "案を渡した", "applied": "案を入れた"}
 WRITE_NAME = re.compile(r"(?:^|[._])(?:add|create|update|edit|merge|delete|remove|post|comment|submit|send|"
                         r"reply|approve)(?:$|[._])")
-SHELL_BREAK = re.compile(r"[;\n()]|&&|\|\|?|(?<![<>])&|\bthen\b|\bdo\b")
+SHELL_BREAK = re.compile(r"([;\n()]|&&|\|\|?|(?<![<>])&|\bthen\b|\bdo\b)")
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)(\w+)\1")
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", re.DOTALL)
 HELP = re.compile(r"(?:^|\s)(?:--help|-h)(?=\s|$)")
 GH_CALL = re.compile(r"\s*(?:\w+=\S*\s+)*gh\s+(\S+)\s*(\S*)(.*)", re.DOTALL)
 GH_POSTS = {("pr", "comment"), ("pr", "create"), ("pr", "review"), ("issue", "comment"), ("issue", "create")}
@@ -144,7 +147,10 @@ class OrcaHost:
         codex = [home / ".codex", *self.support.glob("codex-accounts/*/home"), self.support / "codex-runtime-home/home"]
         found = [*(Transcript("claude", path) for root in claude for path in root.glob("projects/*/*.jsonl")),
                  *(Transcript("codex", path) for root in codex for path in root.glob("sessions/*/*/*/rollout-*.jsonl"))]
-        return [transcript for transcript in found if modified(transcript.path) >= since.timestamp()]
+        # One session's transcript shows under several homes, linked or copied; its file name carries the session id.
+        newest = sorted(found, key=lambda transcript: modified(transcript.path))
+        unique = {(transcript.agent, transcript.path.name): transcript for transcript in newest}
+        return [transcript for transcript in unique.values() if modified(transcript.path) >= since.timestamp()]
 
 
 def modified(path: Path) -> float:
@@ -298,11 +304,18 @@ def holds(path: Path, window: Window, lanes: Names) -> Iterator[Event]:
 
 def undelivered(directory: Path, window: Window, lanes: Names) -> Iterator[Event]:
     for path in sorted(directory.glob("*.json")):
-        item = parse(path.read_bytes()) or {}
+        # watch-inbox removes a record once its resend lands, possibly between the glob and these reads.
+        item = parse(read_or_empty(path)) or {}
         if (at := window.at(item.get("at"))):
-            body = path.with_suffix(".txt")
-            text = body.read_text(encoding="utf-8") if body.exists() else str(item.get("target"))
+            text = read_or_empty(path.with_suffix(".txt")) or str(item.get("target"))
             yield Event(at, lanes.of(item.get("handle")), "未配信", text, "undelivered", path.stem)
+
+
+def read_or_empty(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def adoptions(events: Path, imports: Path, window: Window) -> Iterator[Event]:
@@ -325,29 +338,51 @@ def adoptions(events: Path, imports: Path, window: Window) -> Iterator[Event]:
             yield Event(at, str(item.get("actor") or "?"), kind, f"{proposal} {item.get('result') or ''}", "adoption", ref)
 
 
-def gh_write(command: str) -> tuple[str, str] | None:
-    """What a shell command's `gh` call wrote, and the call; None when it only read."""
-    for segment in SHELL_BREAK.split(command):
-        found = GH_CALL.match(segment)
-        if found is None:
+def gh_writes(command: str) -> list[tuple[str, str]]:
+    """What each `gh` call of a shell command wrote, with the call (its quoted text emptied)."""
+    parts = SHELL_BREAK.split(executed(command))
+    # A call after || runs only when the one before it failed, which a successful command cannot show.
+    segments = [segment for index, segment in enumerate(parts[::2]) if index == 0 or parts[2 * index - 1] != "||"]
+    return [wrote for segment in segments if (wrote := gh_write(segment))]
+
+
+def executed(command: str) -> str:
+    """The command without its heredoc bodies and quoted text, which the shell passes on instead of running."""
+    kept: list[str] = []
+    ends: list[str] = []
+    for line in command.split("\n"):
+        if ends:
+            if line.strip() == ends[0]:
+                ends.pop(0)
             continue
-        group, verb, rest = found.groups()
-        if HELP.search(f"{verb} {rest}"):
-            continue
-        call = segment.strip()
-        if group == "pr" and verb == "merge":
-            return "merge した", call
-        if (group, verb) in GH_POSTS:
-            return "投稿した", call
-        if group in ("pr", "issue") and verb in GH_EDITS:
+        ends.extend(found[2] for found in HEREDOC.finditer(line))
+        kept.append(line)
+    return QUOTED.sub(lambda found: found[0][0] * 2, "\n".join(kept))
+
+
+def gh_write(segment: str) -> tuple[str, str] | None:
+    found = GH_CALL.match(segment)
+    if found is None:
+        return None
+    group, verb, rest = found.groups()
+    call = segment.strip()
+    if HELP.search(f"{verb} {rest}"):
+        return None
+    if group == "pr" and verb == "merge":
+        auto = re.search(r"(?:^|\s)--(disable-auto|auto)\b", rest)
+        return {"auto": "自動 merge を予約した", "disable-auto": "自動 merge を取り消した"}.get(
+            auto[1] if auto else "", "merge した"), call
+    if (group, verb) in GH_POSTS:
+        return "投稿した", call
+    if group in ("pr", "issue") and verb in GH_EDITS:
+        return "書いた", call
+    if group == "api":
+        arguments = f"{verb}{rest}"
+        method = re.search(r"(?:-X|--method)[ =]?(\w+)", arguments)
+        fields = re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b", arguments)
+        query = verb == "graphql" and "mutation" not in arguments
+        if method and method[1].upper() != "GET" or not method and fields and not query:
             return "書いた", call
-        if group == "api":
-            arguments = f"{verb}{rest}"
-            method = re.search(r"(?:-X|--method)[ =]?(\w+)", arguments)
-            fields = re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b", arguments)
-            query = verb == "graphql" and "mutation" not in arguments
-            if method and method[1].upper() != "GET" or not method and fields and not query:
-                return "書いた", call
     return None
 
 
@@ -409,27 +444,30 @@ def codex_writes(transcript: Path, window: Window, host: SessionHost) -> Iterato
                 continue
             summary = f"{item.get('appName') or item.get('server')} {tool.split('.')[-1]} {target(item.get('arguments') or {})}"
             yield Event(at, lane, tool_write(tool), summary, "codex", str(item.get("id")))
-        elif item.get("exit_code") == 0 and (wrote := gh_write(" ".join(map(str, (item.get("command") or [])[-1:])))):
-            yield Event(at, lane, wrote[0], wrote[1], "codex", str(item.get("id")))
+        elif item.get("exit_code") == 0:
+            writes = gh_writes(" ".join(map(str, (item.get("command") or [])[-1:])))
+            for number, (kind, call) in enumerate(writes, 1):
+                yield Event(at, lane, kind, call, "codex", reference(str(item.get("id")), number, len(writes)))
 
 
 def claude_writes(transcript: Path, window: Window, host: SessionHost) -> Iterator[Event]:
-    pending: dict[str, tuple[str, str, str]] = {}  # tool_use id -> (lane, kind, call)
+    pending: dict[str, tuple[str, list[tuple[str, str]]]] = {}  # tool_use id -> (lane, [(kind, call)])
     for raw in window_lines(transcript, window.start - CALL_SLACK):
         if b'"tool_use"' in raw and (b"gh " in raw or b"mcp__" in raw):
             line = parse(raw) or {}
             lane = host.workspace_name(Path(str(line.get("cwd") or "?")))
             for part in content(line):
-                if part.get("type") == "tool_use" and (wrote := claude_call(part)):
-                    pending[str(part.get("id"))] = (lane, *wrote)
+                if part.get("type") == "tool_use" and (writes := claude_calls(part)):
+                    pending[str(part.get("id"))] = (lane, writes)
         elif pending and b'"tool_result"' in raw and any(use.encode() in raw for use in pending):
             line = parse(raw) or {}
             for part in content(line):
                 use = str(part.get("tool_use_id"))
                 if part.get("type") == "tool_result" and use in pending:
-                    lane, kind, call = pending.pop(use)
+                    lane, writes = pending.pop(use)
                     if not part.get("is_error") and (at := window.at(line.get("timestamp"))):
-                        yield Event(at, lane, kind, call, "claude", use)
+                        for number, (kind, call) in enumerate(writes, 1):
+                            yield Event(at, lane, kind, call, "claude", reference(use, number, len(writes)))
 
 
 def content(line: dict) -> list[dict]:
@@ -437,14 +475,19 @@ def content(line: dict) -> list[dict]:
     return [part for part in parts if isinstance(part, dict)] if isinstance(parts, list) else []
 
 
-def claude_call(part: dict) -> tuple[str, str] | None:
+def claude_calls(part: dict) -> list[tuple[str, str]]:
     name = str(part.get("name") or "")
     arguments = part.get("input") or {}
     if name == "Bash":
-        return gh_write(str(arguments.get("command") or ""))
+        # A background call's result only says it started; whether it wrote comes later, if ever.
+        return [] if arguments.get("run_in_background") else gh_writes(str(arguments.get("command") or ""))
     if name.startswith("mcp__") and WRITE_NAME.search(tool := name.split("__")[-1]):
-        return tool_write(tool), f"{name.split('__')[1]} {tool} {target(arguments)}"
-    return None
+        return [(tool_write(tool), f"{name.split('__')[1]} {tool} {target(arguments)}")]
+    return []
+
+
+def reference(call: str, number: int, writes: int) -> str:
+    return call if writes == 1 else f"{call}:{number}"
 
 
 def transcript_writes(host: SessionHost, window: Window) -> Iterator[Event]:
@@ -463,9 +506,7 @@ def timeline(records: Records, host: SessionHost, window: Window) -> list[Event]
         *board_events(board, window, lanes), *holds(records.briefs / "holds.sqlite", window, lanes),
         *undelivered(records.briefs / "undelivered", window, lanes),
         *adoptions(records.adoption, records.adoption_imports, window), *transcript_writes(host, window)]
-    # A forked Codex session repeats its parent's calls under the same ids.
-    unique = {(event.source, event.ref, event.kind, event.at): event for event in found}
-    return sorted(unique.values(), key=lambda event: event.at)
+    return sorted(found, key=lambda event: event.at)
 
 
 def moment(value: str) -> datetime:
