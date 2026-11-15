@@ -34,6 +34,10 @@ one line in its place.
 
 ## Capture
 
+- For a public repository's PR, capture the screen with fictional data, such as seed data.
+- Before attaching any PNG captured in production or a copy of production, inspect the whole image,
+  including the cropped and full-screen versions, for customer and personal names. If any appear,
+  recapture with fictional data before uploading.
 - Take each PNG on the real screen with headless Playwright, with the same data, viewport, and
   role for before and after. Claude in Chrome's `screenshot` saves a JPEG of the viewport, not a
   PNG.
