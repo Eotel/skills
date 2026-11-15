@@ -110,6 +110,8 @@ class TimelineTests(unittest.TestCase):
             ("送った", "merge の伺いは明朝"), ("完了が届いた", "PR #102 を開きま"),
             ("送った", "【至急・方針の変更】今晩"), ("送った", "方針の再変更: #102")])
         self.assertEqual({row["to"] for row in rows if row["kind"] == "送った"}, {"fix-orders"})
+        # The lane's tab is gone from Orca; its handle still names it through the records.
+        self.assertEqual(json.loads(self.run_tool("--since", "2026-11-15T18:00", "--lane", OTHER, "--json").stdout), rows)
 
     def test_only_completed_writes_from_a_claude_transcript_count(self) -> None:
         lane = self.workspaces / "skills" / "adopt-x"
@@ -138,14 +140,17 @@ class TimelineTests(unittest.TestCase):
                     call("2026-11-15T09:07:00Z", "pair", 'gh pr comment 13 --body "ok && go" && gh pr merge 13 --auto'),
                     result("2026-11-15T09:07:03Z", "pair", False),
                     call("2026-11-15T09:08:00Z", "later", "gh pr merge 14 --squash", background=True),
-                    result("2026-11-15T09:08:00Z", "later", False))
+                    result("2026-11-15T09:08:00Z", "later", False),
+                    call("2026-11-15T09:09:00Z", "thread", "gh api graphql -f query='mutation { resolveReviewThread }'"),
+                    result("2026-11-15T09:09:01Z", "thread", False))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
 
         self.assertEqual([(row["at"], row["lane"], row["kind"]) for row in rows], [
             ("2026-11-15T18:05:04+09:00", "adopt-x", "merge した"),
             ("2026-11-15T18:07:03+09:00", "adopt-x", "投稿した"),
-            ("2026-11-15T18:07:03+09:00", "adopt-x", "自動 merge を予約した")])
+            ("2026-11-15T18:07:03+09:00", "adopt-x", "自動 merge を予約した"),
+            ("2026-11-15T18:09:01+09:00", "adopt-x", "書いた")])
 
     def test_holds_answers_decisions_starts_and_adoptions_join_the_timeline(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",

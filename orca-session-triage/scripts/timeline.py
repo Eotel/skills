@@ -42,8 +42,9 @@ from typing import BinaryIO, Literal, Protocol
 
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
-# Transcripts only grow, so reading starts this far before --since: a call may finish well after it began.
-CALL_SLACK = timedelta(minutes=30)
+# Transcripts only grow, so reading starts this far before --since: a call may finish well after it began, and
+# Claude Code lets a foreground Bash call run for up to two hours.
+CALL_SLACK = timedelta(hours=2)
 CHUNK = 4 << 20
 STAMP = re.compile(rb'"timestamp":\s*"([^"]+)"')
 REPORTED = {"ask": "質問が届いた", "done": "完了が届いた", "info": "経過が届いた"}
@@ -343,7 +344,9 @@ def gh_writes(command: str) -> list[tuple[str, str]]:
     parts = SHELL_BREAK.split(executed(command))
     # A call after || runs only when the one before it failed, which a successful command cannot show.
     segments = [segment for index, segment in enumerate(parts[::2]) if index == 0 or parts[2 * index - 1] != "||"]
-    return [wrote for segment in segments if (wrote := gh_write(segment))]
+    # A GraphQL query is quoted, so whether it mutates is read from the command as written.
+    mutation = "mutation" in command
+    return [wrote for segment in segments if (wrote := gh_write(segment, mutation))]
 
 
 def executed(command: str) -> str:
@@ -360,7 +363,7 @@ def executed(command: str) -> str:
     return QUOTED.sub(lambda found: found[0][0] * 2, "\n".join(kept))
 
 
-def gh_write(segment: str) -> tuple[str, str] | None:
+def gh_write(segment: str, mutation: bool) -> tuple[str, str] | None:
     found = GH_CALL.match(segment)
     if found is None:
         return None
@@ -380,7 +383,7 @@ def gh_write(segment: str) -> tuple[str, str] | None:
         arguments = f"{verb}{rest}"
         method = re.search(r"(?:-X|--method)[ =]?(\w+)", arguments)
         fields = re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b", arguments)
-        query = verb == "graphql" and "mutation" not in arguments
+        query = verb == "graphql" and not mutation
         if method and method[1].upper() != "GET" or not method and fields and not query:
             return "書いた", call
     return None
@@ -497,7 +500,8 @@ def transcript_writes(host: SessionHost, window: Window) -> Iterator[Event]:
         yield from readers[transcript.agent](transcript.path, window, host)
 
 
-def timeline(records: Records, host: SessionHost, window: Window) -> list[Event]:
+def timeline(records: Records, host: SessionHost, window: Window, lane: str | None = None) -> list[Event]:
+    """The window's events in time order; with `lane` (a workspace's name, path, or a tab's handle), its own."""
     inbox = entries(records.inbox)
     board = entries(records.board)
     lanes = names(inbox, board, host)
@@ -506,7 +510,9 @@ def timeline(records: Records, host: SessionHost, window: Window) -> list[Event]
         *board_events(board, window, lanes), *holds(records.briefs / "holds.sqlite", window, lanes),
         *undelivered(records.briefs / "undelivered", window, lanes),
         *adoptions(records.adoption, records.adoption_imports, window), *transcript_writes(host, window)]
-    return sorted(found, key=lambda event: event.at)
+    wanted = lanes.of(lane) if lane and lane.startswith("term_") else Path(lane).name if lane else None
+    return sorted((event for event in found if wanted is None or wanted in (event.lane, event.to)),
+                  key=lambda event: event.at)
 
 
 def moment(value: str) -> datetime:
@@ -534,12 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     host = OrcaHost.from_environment(args.orca)
-    events = timeline(Records.from_environment(), host, Window(args.since, args.until))
-    if args.lane:
-        wanted = args.lane if args.lane.startswith("term_") else Path(args.lane).name
-        if wanted.startswith("term_"):
-            wanted = Names(host.tab_workspaces()).of(wanted)
-        events = [event for event in events if wanted in (event.lane, event.to)]
+    events = timeline(Records.from_environment(), host, Window(args.since, args.until), args.lane)
     if args.match:
         events = [event for event in events if args.match.casefold() in event.text.casefold()]
     if args.json:
