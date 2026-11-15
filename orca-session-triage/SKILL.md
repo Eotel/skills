@@ -229,6 +229,14 @@ board's done cards; close what the user approves.
   scan listed, and keeps each one whose worktree's transcripts, triage inbox
   reports, or agent states in Orca, other than the calling session's own,
   changed after the scan started. Close tabs through it.
+- `scripts/timeline.py --since TIME [--until TIME] [--lane WORKSPACE] [--match TEXT] [--json]`:
+  one timeline of what the lead and the lanes did (time, who to whom, what happened, a
+  summary, the record's id), merged from the triage inbox, ask answers, the lead's
+  decisions, the board's log of `send`, `spawn-lane`, and `backlog-post`, holds, undelivered
+  sends, the adoption ledger, and the comments, PRs, and merges this Mac's Claude and Codex
+  transcripts finished. Read a lane's line before cancelling or changing an instruction it
+  already has, and search it (`--match`) for a fact a lane reported. Its `--help` names each
+  record; Orca sits behind its `SessionHost`.
 - `references/delivery.md`: batching questions, sending answers, giving
   lanes work, and handing them meeting or review feedback.
 - `references/next-step.md`: what each `stalled` worktree needs next.
