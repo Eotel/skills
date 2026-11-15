@@ -148,7 +148,9 @@ class TimelineTests(unittest.TestCase):
                     call("2026-11-15T09:10:00Z", "preview", "gh pr create --dry-run --title x"),
                     result("2026-11-15T09:10:01Z", "preview", False),
                     call("2026-11-15T09:11:00Z", "hidden", "gh pr merge 15 --squash 2>&1 | tail -1"),
-                    result("2026-11-15T09:11:02Z", "hidden", False, "GraphQL: Head branch was modified."))
+                    result("2026-11-15T09:11:02Z", "hidden", False, "GraphQL: Head branch was modified."),
+                    call("2026-11-15T09:12:00Z", "read", "gh api graphql -X POST -f query='query { viewer { login } }'"),
+                    result("2026-11-15T09:12:01Z", "read", False))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
 
@@ -162,8 +164,10 @@ class TimelineTests(unittest.TestCase):
     def test_holds_answers_decisions_starts_and_adoptions_join_the_timeline(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",
                     self.report("2026-11-14T10:00:00+0900", OTHER, "fix-orders", "info", "前日の経過"),
-                    self.report("2026-11-15T15:09:25+0900", LANE, "fix-checklist", "ask",
-                                "資料の最新版の場所を教えてください。", "43cc0f6c-1111-2222-3333-444444444444"))
+                    {**self.report("2026-11-15T15:09:25+0900", LANE, "fix-checklist", "ask", "伺い直します。",
+                                   "43cc0f6c-1111-2222-3333-444444444444"),
+                     "questions": [{"header": "資料", "question": "どの版の資料を使いますか？", "recommended": "最新版",
+                                    "issue": "example-org/app#103"}]})
         self.append(".cache/orca-briefs/ask-answers.jsonl",
                     {"id": "43cc0f6c-1111-2222-3333-444444444444", "ts": "2026-11-15T15:20:00+09:00", "how": "send",
                      "sender": {"worktree": str(self.workspaces / "orca" / "triage-lead")}, "note": "最新版は #100 です。"})
@@ -207,6 +211,9 @@ class TimelineTests(unittest.TestCase):
             ("未配信", "fix-orders", None),
             ("保留を解いた", "fix-orders", None),
         ])
+        asked = next(row["text"] for row in rows if row["kind"] == "質問が届いた")
+        self.assertIn("どの版の資料を使いますか？", asked)
+        self.assertIn("example-org/app#103", asked)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,8 @@ import subprocess
 import sys
 from typing import BinaryIO, Literal, Protocol
 
+import inbox_read
+
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
 # Transcripts only grow, so reading starts this far before --since: a call may finish well after it began, and
@@ -255,7 +257,7 @@ def names(inbox: list[dict], board: list[dict], host: SessionHost) -> Names:
 def reports(inbox: list[dict], window: Window) -> Iterator[Event]:
     for item in inbox:
         if (at := window.at(item.get("ts"))):
-            text = item.get("text") or "; ".join(str(question.get("question")) for question in item.get("questions") or [])
+            text = inbox_read.full_text(item).strip()
             kind = REPORTED.get(str(item.get("kind")), f"{item.get('kind')}が届いた")
             yield Event(at, str(item.get("worktree") or "?"), kind, text, "inbox", str(item.get("id")))
 
@@ -408,12 +410,15 @@ def gh_write(segment: str, quoted: list[str]) -> tuple[str, str] | None:
         return "投稿した", call
     if group in ("pr", "issue") and verb in GH_EDITS:
         return "書いた", call
+    if group == "api" and verb == "graphql":
+        # GraphQL goes by POST whether it reads or writes, so only a mutation in the call's own query writes.
+        own = [rest, *(quoted[int(mark)] for mark in HIDDEN.findall(rest))]
+        return ("書いた", call) if any("mutation" in piece for piece in own) else None
     if group == "api":
         arguments = f"{verb}{rest}"
         method = re.search(r"(?:-X|--method)[ =]?(\w+)", arguments)
         fields = re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b", arguments)
-        query = verb == "graphql" and not any("mutation" in quoted[int(mark)] for mark in HIDDEN.findall(rest))
-        if method and method[1].upper() != "GET" or not method and fields and not query:
+        if method and method[1].upper() != "GET" or not method and fields:
             return "書いた", call
     return None
 
