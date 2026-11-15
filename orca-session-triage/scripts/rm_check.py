@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -936,7 +937,7 @@ def moved_since(worktree: Path, since: datetime) -> list[str]:
 
 
 def check(worktree: str | Path, main: str | Path, base: str | None, compose_projects: Sequence[ComposeProject], pr: dict | None = None, pr_head: str | None = None, head_ahead_of_pr: int | None = None,
-          *, decided: tuple[str, ...] = (), since: datetime | None = None) -> dict:
+          *, decided: tuple[str, ...] = (), since: datetime | None = None, scan_file: Path | None = None) -> dict:
     """Return the removal verdict, including containers and processes using `worktree`.
 
     `decided` are blockers main found before the check: an Orca comment to keep it, an unanswered docker.
@@ -1013,11 +1014,12 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                             "起動に使った zsh のラッパーではなく、node などの本体の PID を止めてください。"
                             % "、".join(outside))
         if busy:
-            closes = sorted({"%s --from SCAN_JSON %s" % (CLOSE_TABS, item["tab"])
+            closes = sorted({shlex.join([str(CLOSE_TABS), "--from", str(scan_file) if scan_file else "SCAN_JSON", item["tab"]])
                              for item in busy if item["tab"]})
             unknown = [str(item["pid"]) for item in busy if not item["tab"]]
             blockers.append("Orca のタブで作業場を使うプロセスがあります。scan の closable にあるタブなら、保存した走査の "
-                            "JSON を SCAN_JSON に渡して閉じてから（走査の後に動いたタブは閉じません）、"
+                            + ("JSON を SCAN_JSON に渡して" if scan_file is None else "JSON を使って")
+                            + "閉じてから（走査の後に動いたタブは閉じません）、"
                             "rm_check をやり直してください: " + "; ".join(closes)
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
@@ -1265,6 +1267,23 @@ def holds_only_records(result: dict, movable: tuple[str, ...]) -> bool:
     others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
               and not blocker.startswith(NESTED_READY)]
     return not others and all(any(within(rel, named) for named in movable) for rel in result["uncommitted"])
+
+
+def archive_obstacles(worktree: Path, result: dict, movable: tuple[str, ...]) -> list[str]:
+    """Paths outside the archive scope, including siblings inside an ignored parent directory."""
+    paths = [*result["uncommitted"], *(entry.rpartition(" (")[0] for entry in result["review"])]
+    outside: set[str] = set()
+    for rel in paths:
+        if any(within(rel, named) for named in movable):
+            continue
+        holder = worktree / rel
+        if holder.is_dir() and not holder.is_symlink() and any(within(named, rel) for named in movable):
+            outside.update(str(child.relative_to(worktree)) for child in holder.rglob("*")
+                           if (child.is_symlink() or not child.is_dir())
+                           and not any(within(str(child.relative_to(worktree)), named) for named in movable))
+        else:
+            outside.add(rel)
+    return sorted(outside)
 
 
 def reasons(result: dict) -> list[str]:
@@ -1573,7 +1592,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                          % DOCKER_TIMEOUT)
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                      decided=tuple(decided), since=since)
+                      decided=tuple(decided), since=since,
+                      scan_file=args.from_file.expanduser().absolute() if args.from_file else None)
     result = recheck()
 
     def movable_now(result: dict) -> tuple[str, ...]:
@@ -1617,7 +1637,18 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         elif any((Path(worktree) / name).exists() for name in movable):
             options = " and ".join(name for name, given in (("--archive-scratch", args.archive_scratch),
                                                             ("--archive-path", bool(named))) if given)
-            notes.append("%s moved nothing: the worktree is kept for other blockers or paths to review" % options)
+            obstacles = archive_obstacles(Path(worktree), result, movable_now(result))
+            other_blockers = [item for item in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", item)]
+            note = "%s moved nothing: the worktree is kept for other blockers or paths to review" % options
+            if obstacles:
+                note += "; paths outside archive scope: " + ", ".join(obstacles)
+            if other_blockers:
+                note += "; " + "; ".join(other_blockers)
+            scratch = (*movable, *SCRATCH_DIRS, *(item["path"].rstrip("/") for item in result["records"]),
+                       *untracked_exec_plans(Path(worktree), base, pr))
+            if not args.archive_scratch and archive_movers(Path(worktree), result, scratch):
+                note += "。%s も止めている。--archive-scratch を足す" % "、".join(obstacles)
+            notes.append(note)
         result["archived"] = archived
         if args.archive_scratch:
             result["copied_to_main"] = copied

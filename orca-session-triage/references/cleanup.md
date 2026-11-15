@@ -22,7 +22,8 @@ in a tab. To check worktrees of several repositories in one call, give
 `rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory:
 `scan_sessions.py --from SCAN_JSON --rm-specs --row NAME …` prints those specs
 for the rows you name, finished ones whose tabs remain included, instead of
-building them by hand.
+building them by hand. Specs remain on stdout; after them, stderr gives the complete
+`rm-check-batch --from` command with `--remove-ok --summary` for the selected rows.
 Its `--archive-scratch` passes that option to each `rm_check.py`, and
 `--remove-ok` runs steps 3 and 4 below for each worktree whose check is `ok`
 with no `containers`, putting the result in that worktree's line as `removal`

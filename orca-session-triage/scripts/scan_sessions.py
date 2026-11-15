@@ -2856,7 +2856,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "rows without meaningful tabs, for rm-check-batch; another Mac's rows are counted on "
                             "stderr, and --summary prints their rm-check-batch --host commands. With --row NAME "
                             "(repeatable), only the named rows, a finished one also while its tabs remain; a row "
-                            "left out is named on stderr with why, and the exit status is 1")
+                            "left out is named on stderr with why, and the exit status is 1. After the specs, "
+                            "stderr prints the full rm-check-batch --from command with --remove-ok --summary")
     views.add_argument("--wake", action="store_true",
                        help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
@@ -3403,6 +3404,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         print(error, file=sys.stderr)
         return 1
     left_out = 0
+    specs = []
     # A row named twice (by name and by path) is printed once.
     for row in {id(row): row for row in selected}.values():
         shown = (row.get("verdict") or {}).get("class") or row["class"]
@@ -3417,11 +3419,22 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         elif row.get("environment"):
             why = "on another Mac: " + rm_check_command(row, scan_file)
         else:
-            print(f"{row['path']} {pr_number(row) or '-'}")
+            specs.append(f"{row['path']} {pr_number(row) or '-'}")
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
+    print_rm_specs(specs, scan_file)
     return 1 if left_out else 0
+
+
+def print_rm_specs(specs: list[str], scan_file: Path) -> None:
+    """Keep stdout usable as specs; give the executable next command on stderr after them."""
+    for spec in specs:
+        print(spec)
+    if specs:
+        sys.stdout.flush()
+        print(shlex.join([str(RM_CHECK_BATCH), "--from", str(scan_file), "--remove-ok", "--summary", *specs]),
+              file=sys.stderr)
 
 
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
@@ -3438,6 +3451,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
                 print(row_line(row_view(row)))
     elif args.rm_specs:
         remote = 0
+        specs = []
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
             if blocker := row.get("automation_blocker"):
@@ -3452,7 +3466,8 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
                 if row.get("environment"):
                     remote += 1
                 else:
-                    print(f"{row['path']} {pr_number(row) or '-'}")
+                    specs.append(f"{row['path']} {pr_number(row) or '-'}")
+        print_rm_specs(specs, Path(args.from_file).expanduser().absolute())
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
                   file=sys.stderr)

@@ -2747,7 +2747,9 @@ class ScanCommandTests(unittest.TestCase):
                 code = scan.main(["--from", str(saved), "--rm-specs", *(f"--row={name}" for name in names)])
             return code, out.getvalue(), err.getvalue()
 
-        self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", ""))
+        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
+                               "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
+        self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", expected))
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
@@ -2762,6 +2764,20 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
         self.assertEqual(out.getvalue().splitlines()[0],
                          "classes: stalled=0 (scan: 1), unsure=1, waiting=2 (scan: 1), working=1")
+
+    def test_rm_specs_command_quotes_the_saved_scan_and_each_selected_spec(self) -> None:
+        saved = self.dir / "saved scan's.json"
+        saved.write_text(json.dumps([
+            {"path": "/w/app/one", "repo": "app", "class": "finished", "meaningful_tabs": [], "pr": {"number": 7}},
+            {"path": "/w/app/two", "repo": "app", "class": "finished", "meaningful_tabs": []},
+            {"path": "/w/app/busy", "repo": "app", "class": "working", "meaningful_tabs": []}]))
+        for named in ([], ["--row=one", "--row=two"]):
+            with self.subTest(named=named), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", *named]), 0)
+            specs = out.getvalue().splitlines()
+            self.assertEqual(specs, ["/w/app/one 7", "/w/app/two -"])
+            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
+                                                         "--remove-ok", "--summary", *specs])
 
     def test_automation_workspaces_are_left_out_even_with_removal_approval(self) -> None:
         rows = [{"path": "/w/app/scheduled", "repo": "app", "class": "finished", "open_pr_cleanup": True,
@@ -3809,11 +3825,33 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main(*args)
 
         self.assertEqual((kept_code, kept["archived"]), (1, []))
+        note = next(note for note in kept["notes"] if "moved nothing" in note)
+        self.assertIn(".tmp/scratch.txt", note)
+        self.assertNotIn("--archive-scratch を足す", note)
         self.assertEqual((code, result["ok"], result["review"]), (0, True, []))
         [moved] = result["archived"]
         self.assertRegex(Path(moved["to"]).name, r"^wt-pr-descriptions-\d{8}$")
         self.assertEqual((Path(moved["to"]) / "917.md").read_text(), "PR 本文の写し\n")
         self.assertFalse(named.exists())
+
+    def test_named_archive_explains_scratch_without_moving_it_implicitly(self) -> None:
+        (self.main / ".git/info/exclude").write_text(".tmp/\n.yomiyasu/\n")
+        for rel in (".tmp/body.md", ".yomiyasu/inputs/draft.md"):
+            path = self.wt / rel
+            path.parent.mkdir(parents=True)
+            path.write_text("keep this record\n")
+        archive = Path(self.tmp.name) / "archive"
+        args = ("--archive-path", ".tmp", "--archive-dir", str(archive))
+
+        code, result = self.run_main(*args)
+
+        self.assertEqual((code, result["archived"]), (1, []))
+        note = next(note for note in result["notes"] if "moved nothing" in note)
+        self.assertIn(".yomiyasu/ も止めている。--archive-scratch を足す", note)
+        self.assertTrue((self.wt / ".tmp/body.md").exists())
+        self.assertTrue((self.wt / ".yomiyasu/inputs/draft.md").exists())
+        code, result = self.run_main(*args, "--archive-scratch")
+        self.assertEqual((code, result["ok"]), (0, True))
 
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")
@@ -4182,6 +4220,19 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(f"{SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
         self.assertIn("PID 40（node server.js、cwd %s）" % wt, result["blockers"][0])
         self.assertEqual((idle_only["ok"], idle_only["blockers"]), (True, []))
+
+    def test_tab_close_command_uses_the_scan_given_to_main(self) -> None:
+        saved = Path(self.tmp.name) / "saved scan's.json"
+        saved.write_text("[]")
+        process = {"pid": 123, "command": "codex", "cwd": str(self.wt), "in_orca_tab": True,
+                   "idle_tab": False, "tab": "term_busy"}
+        with patch.object(rmcheck, "processes_in", return_value=[process]), \
+                patch.object(rmcheck, "without_ended", side_effect=lambda processes: processes):
+            code, result = self.run_main("--from", str(saved))
+        self.assertEqual(code, 1)
+        reason = next(reason for reason in result["reasons"] if "close_tabs.py" in reason)
+        self.assertIn(shlex.join([str(SCRIPTS / "close_tabs.py"), "--from", str(saved.absolute()), "term_busy"]), reason)
+        self.assertNotIn("SCAN_JSON", reason)
 
     def test_a_failed_pr_lookup_names_the_command_for_a_mac_where_gh_works(self) -> None:
         git(self.main, "remote", "add", "origin", "git@github.com:acme/app.git")
