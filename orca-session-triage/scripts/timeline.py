@@ -14,7 +14,8 @@ person the adoption ledger names), to whom, what happened, a summary, and the re
 - undelivered: sends kept for a resend because the lane's screen was unreadable, under `ORCA_BRIEFS_ROOT`;
 - adoption: the adoption ledger's proposals, decisions, hand-offs and applications,
   `ADOPTION_TRIAGE_EVENTS` and the other Macs' copies in `ADOPTION_TRIAGE_IMPORTS`;
-- claude, codex: this Mac's agent transcripts, for calls that finished writing outside the workspace: a
+- claude, codex: the transcripts of this Mac's sessions that started in a workspace (not other sessions on
+  the Mac), for calls that finished writing outside the workspace: a
   `gh` command that merges, comments, reviews, creates, edits or sends a write to the API, and an MCP tool
   not marked read-only (Codex) or named for a write (Claude). `gh pr merge --auto` reads as a scheduled
   merge. Text in a heredoc or quotes is not a command, and a call that failed, ran in the background,
@@ -132,7 +133,8 @@ class SessionHost(Protocol):
         ...
 
     def transcripts(self, since: datetime) -> list[Transcript]:
-        """This Mac's agent transcripts written to since `since`."""
+        """This Mac's transcripts written to since `since` by the sessions that started in a workspace (the lead's and
+        the lanes'), not by other sessions on the Mac."""
         ...
 
 
@@ -172,7 +174,15 @@ class OrcaHost:
         # One session's transcript shows under several homes, linked or copied; its file name carries the session id.
         newest = sorted(found, key=lambda transcript: modified(transcript.path))
         unique = {(transcript.agent, transcript.path.name): transcript for transcript in newest}
-        return [transcript for transcript in unique.values() if modified(transcript.path) >= since.timestamp()]
+        return [transcript for transcript in unique.values()
+                if modified(transcript.path) >= since.timestamp() and self.started_in_workspace(transcript)]
+
+    def started_in_workspace(self, transcript: Transcript) -> bool:
+        if transcript.agent == "claude":
+            # Claude Code names a session's folder after the directory it started in, each non-alphanumeric as "-".
+            return transcript.path.parent.name.startswith(re.sub(r"[^A-Za-z0-9]", "-", f"{self.workspaces}/"))
+        start = session_directory(transcript.path)
+        return start is not None and start.is_relative_to(self.workspaces)
 
 
 def modified(path: Path) -> float:
@@ -459,13 +469,19 @@ def window_offset(stream: BinaryIO, start: datetime) -> int:
     return 0
 
 
-def codex_writes(transcript: Path, window: Window, host: SessionHost) -> Iterator[Event]:
+def session_directory(rollout: Path) -> Path | None:
+    """The directory a Codex session started in, from its rollout's first (session_meta) line."""
     try:
-        with transcript.open("rb") as stream:
+        with rollout.open("rb") as stream:
             meta = parse(stream.readline()) or {}
     except OSError:
-        return
-    lane = host.workspace_name(Path(str((meta.get("payload") or {}).get("cwd") or "?")))
+        return None
+    cwd = (meta.get("payload") or {}).get("cwd")
+    return Path(str(cwd)) if cwd else None
+
+
+def codex_writes(transcript: Path, window: Window, host: SessionHost) -> Iterator[Event]:
+    lane = host.workspace_name(session_directory(transcript) or Path("?"))
     for raw in window_lines(transcript, window.start - CALL_SLACK):
         if b'"item_completed"' not in raw or (b"McpToolCall" not in raw and b"CommandExecution" not in raw):
             continue

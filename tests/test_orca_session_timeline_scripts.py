@@ -115,7 +115,8 @@ class TimelineTests(unittest.TestCase):
 
     def test_only_completed_writes_from_a_claude_transcript_count(self) -> None:
         lane = self.workspaces / "skills" / "adopt-x"
-        project = self.home / ".claude" / "projects" / "-x-orca-workspaces-skills-adopt-x"
+        project = self.home / ".claude" / "projects" / "".join(c if c.isalnum() else "-" for c in str(lane))
+        elsewhere = self.home / ".claude" / "projects" / "-elsewhere"
 
         def call(ts: str, use_id: str, command: str, background: bool = False) -> dict:
             return {"type": "assistant", "timestamp": ts, "cwd": str(lane), "message": {"content": [
@@ -151,6 +152,9 @@ class TimelineTests(unittest.TestCase):
                     result("2026-11-15T09:11:02Z", "hidden", False, "GraphQL: Head branch was modified."),
                     call("2026-11-15T09:12:00Z", "read", "gh api graphql -X POST -f query='query { viewer { login } }'"),
                     result("2026-11-15T09:12:01Z", "read", False))
+        self.append(str(elsewhere.relative_to(self.home) / "other.jsonl"),
+                    call("2026-11-15T09:13:00Z", "other", "gh pr comment 30 --body x"),
+                    result("2026-11-15T09:13:01Z", "other", False))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
 
