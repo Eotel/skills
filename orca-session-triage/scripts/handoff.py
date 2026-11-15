@@ -22,6 +22,8 @@ pane: the later run owns the read position and the handoff. --force sends past e
 An answer delivered by this same source worktree and session is labelled 「（この回の送信）」 and needs no --seen.
 The shared answer writer records that source for send and inbox_read.py answered; older records or an unknown
 session still need --seen, and an administrative answered mark is not a delivery.
+An ask or info received after --since from a worktree named by --decision remove:PATH (also
+remove:ENVIRONMENT::PATH) likewise needs --seen before recommending its removal.
 `search WORD...` prints each kept handoff whose text or decision keys hold any of the words (case ignored): its
 time, kind, and file, then the matching lines and keys.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
@@ -33,6 +35,9 @@ current transcript path and timestamped user_messages since that handoff (exclud
 `lead-state --grep WORD [--since HH:MM|ISO]` adds matching timestamped transcript events in `matches`:
 lead and user speech, AskUserQuestion calls, and tool results (literal WORD, case ignored).
 Pending questions answered in hourly state or ask-answers carry answered_elsewhere (the answer's time).
+Queued task notifications carry handled_at when every inbox id they name was read in a later successful
+tool result or answered through ask-answers. Exclude those items when judging whether the lead is stalled;
+send leaves them out of its undelivered instructions.
 A fully answered selector visible on a tab gets a heading-checked close-selector command; this read sends nothing.
 Like the scan, lead-state clears a past connection error when the rendered Claude screen shows a later
 reply/tool call and running status line; a usage limit also accepts a completed later turn.
@@ -200,6 +205,18 @@ def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
             and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
 
 
+def removal_reports(keys: list[str], reports: list[dict]) -> list[Reason]:
+    """A target's new report can change the recommendation even when its id is absent from the body.
+
+    Inbox reports name the worktree by its leaf, so same-name worktrees on other hosts also require review.
+    """
+    targets = {Path(key.removeprefix("remove:").split("::", 1)[-1]).name
+               for key in keys if key.startswith("remove:")}
+    return [Reason(str(item.get("id") or ""),
+                   f"{report_head(item)} (removal target reported)  {excerpt(item.get('text'))}")
+            for item in reports if item.get("kind") in ("ask", "info") and item.get("worktree") in targets]
+
+
 def search(directory: Path, words: list[str], since: datetime | None) -> int:
     """Print each kept handoff sent at or after `since` whose text or decision keys hold a word, oldest first."""
     folded = [word.casefold() for word in words]
@@ -236,11 +253,11 @@ def lead_state(projects: Path, worktree: str) -> str:
     if claude is None:
         return f"指揮（{name}）の会話記録が見つかりません。"
     said = " ".join((claude.get("final_text") or "").split())
-    queued = scan_sessions.queued_input(Path(claude["transcript"]))
+    queued = queued_instructions(Path(claude["transcript"]))
     return (f"指揮の今（{name}）: 未回答の質問 {len(claude['pending_questions'])} 件。"
             f"最後の発言 {claude.get('final_at') or '-'}: {said[:200]}" + ("…" if len(said) > 200 else "")
             + "".join(f"\n未配信の指示（{item['enqueued_at'] or '-'}、{item['minutes']} 分経過）: {item['text']}"
-                      for item in queued))
+                      for item in queued if not item.get("handled_at")))
 
 
 def last_said(entries: list[dict]) -> dict[str, str | None]:
@@ -283,8 +300,41 @@ def transcript_events(entries: list[dict]) -> list[dict]:
                 text = result if isinstance(result, str) else "\n".join(
                     part["text"] for part in result or []
                     if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str))
-                events.append({"at": at, "kind": "tool_result", "id": block.get("tool_use_id"), "text": text})
+                events.append({"at": at, "kind": "tool_result", "id": block.get("tool_use_id"), "text": text,
+                               **({"is_error": True} if block.get("is_error") else {})})
     return events
+
+
+def queued_instructions(transcript: Path) -> list[dict]:
+    """Keep the queue history visible, annotating notifications whose inbox reports the lead handled."""
+    queued: list[dict] = [dict(item) for item in scan_sessions.queued_input(transcript)]
+    notifications = [item for item in queued if item["text"].lstrip().startswith("<task-notification>")]
+    if not notifications:
+        return queued
+    reports = {str(item["id"]): item for item in hourly_state.inbox_entries() if item.get("id")}
+    answers = list(answer_evidence.delivered(inbox_read.answers_path()))
+    shared = answer_evidence.shared_questions(reports.values())
+    results = [event for event in transcript_events(scan_sessions.load_jsonl(transcript))
+               if event["kind"] == "tool_result" and not event.get("is_error")
+               and scan_sessions.parse_time(event["at"]) is not None]
+    for item in notifications:
+        ids = set(re.findall(r"(?<![\w-])id=([\w-]+)", item["text"]))
+        enqueued = scan_sessions.parse_time(item["enqueued_at"])
+        if not ids or not ids <= reports.keys() or enqueued is None:
+            continue
+        handled = []
+        for ident in ids:
+            answered = answer_evidence.answers_to(reports[ident], answers, shared=shared)
+            evidence = [(answered[-1].at, answered[-1].at.isoformat())] if answered else []
+            evidence.extend((at, event["at"]) for event in results
+                            if (at := scan_sessions.parse_time(event["at"])) is not None and at > enqueued
+                            and answer_evidence.names_id(event["text"], ident))
+            if not evidence:
+                break
+            handled.append(min(evidence))
+        else:
+            item["handled_at"] = max(handled)[1]
+    return queued
 
 
 def question_text(value: str) -> str:
@@ -390,7 +440,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
                                                                  (block.get("input") or {}).get("questions", [])]}
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
-        queued = scan_sessions.queued_input(transcript)
+        queued = queued_instructions(transcript)
     # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
     transcripts = list(dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
                                       *([Path(claude["transcript"])] if claude else [])]))
@@ -469,11 +519,13 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
         return 1
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
+    found.extend(removal_reports(keys, after))
     if own := [reason.line for reason in found if reason.own]:
         print("handoff: this run's deliveries need no --seen:", *own, sep="\n", file=sys.stderr)
     if not args.force and (left := unseen(found, args.seen)):
         print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
-              "was answered. Read each one in full (inbox_read.py read --id ID) and fix the body; then pass --seen ID "
+              "was answered, or a removal target sent an ask/info. Read each one in full "
+              "(inbox_read.py read --id ID) and fix the body; then pass --seen ID "
               "for each one the body reflects, or --force to send it as written:",
               *left, sep="\n", file=sys.stderr)
         return 1
@@ -531,7 +583,8 @@ def main(argv: list[str] | None = None) -> int:
                     "answers by question, notes by question), "
                     "rejected (questions closed unanswered since the newest kept handoff, with ask/close times), "
                     "terminals (handle, screen_tail: 画面の末尾の行の配列（文字列ではない）), "
-                    "queued_input (undelivered instructions and enqueue times). "
+                    "queued_input (instructions and enqueue times; handled_at marks notifications already read "
+                    "or answered, excluded from stall judgment and send's undelivered list). "
                     "With --grep: matches (at, kind, text, optional tool id), filtered by --since.",
         help="print the appointed lead's current state as JSON, with the questions answered (answered) and closed "
              "unanswered (rejected) since the newest kept handoff")
@@ -557,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
                                    "characters, taken off the reasons not to send; repeat per id")
     send_command.add_argument("--force", action="store_true",
                               help="send past every check: a later scheduled run, another tab's reports, and "
-                                   "answers to the asks the body names")
+                                   "answers to the asks the body names, and removal targets' new reports")
     send_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                               help="Orca CLI executable that lists the later scheduled runs (default: %(default)s)")
     send_command.add_argument("--kind", choices=("ask", "info"), default="ask",

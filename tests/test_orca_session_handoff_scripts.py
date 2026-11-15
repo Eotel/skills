@@ -45,6 +45,7 @@ class HandoffTests(unittest.TestCase):
     def run_tool(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "send", "--inbox", str(self.inbox),
                                "--decisions-file", str(self.decisions), "--handed-off-file", str(self.handed_off),
+                               "--state-file", str(self.root / "hourly-state.json"),
                                "--claude-projects", str(self.projects), "--handoffs-dir", str(self.handoffs),
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True,
@@ -106,6 +107,79 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("消してよい", result.stderr)
         self.assertFalse(self.sent.exists())
         self.assertFalse(self.handed_off.exists())
+
+    def test_removal_waits_for_each_late_ask_and_info_to_be_seen(self) -> None:
+        previous = json.dumps({"id": "old", "kind": "ask", "worktree": "lane", "text": "before"}) + "\n"
+        reports = [{"id": "aaaaaaaa-1111", "kind": "ask", "worktree": "lane", "text": "keep working"},
+                   {"id": "bbbbbbbb-2222", "kind": "info", "worktree": "lane", "text": "new work"},
+                   {"id": "other", "kind": "ask", "worktree": "other", "text": "unrelated"}]
+        self.inbox.write_text(previous + "".join(json.dumps(item) + "\n" for item in reports))
+        for key in ("remove:/w/lane", "remove:remote::/w/lane"):
+            with self.subTest(key=key):
+                args = ("--since", str(len(previous.encode())), "--decision", key)
+                refused = self.run_tool(*args)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn("aaaaaaaa-1111", refused.stderr)
+                self.assertIn("bbbbbbbb-2222", refused.stderr)
+                self.assertNotIn("id=other", refused.stderr)
+                self.assertFalse(self.sent.exists())
+                self.assertFalse(self.handed_off.exists())
+                one = self.run_tool(*args, "--seen", "aaaaaaaa")
+                self.assertEqual(one.returncode, 1, one.stderr)
+                self.assertNotIn("id=aaaaaaaa-1111", one.stderr)
+                both = self.run_tool(*args, "--seen", "aaaaaaaa", "--seen", "bbbbbbbb")
+                self.assertEqual(both.returncode, 0, both.stderr)
+                self.sent.unlink()
+                self.handed_off.unlink()
+
+    def test_lead_state_marks_only_notifications_whose_every_report_was_read_or_answered(self) -> None:
+        ids = [f"aaaaaaaa-0000-0000-0000-{number:012d}" for number in range(5)]
+        self.inbox.write_text("".join(json.dumps({"id": ident, "kind": "ask", "text": "Proceed?",
+                                               "ts": "2026-11-14T00:00:00Z"}) + "\n" for ident in ids))
+        (self.root / "ask-answers.jsonl").write_text("".join(json.dumps(item) + "\n" for item in [
+            {"id": ids[1], "ts": "2026-11-14T00:03:00Z", "how": "send", "note": "Proceed"},
+            {"id": ids[2], "ts": "2026-11-14T00:03:00Z", "how": "answered", "note": "administrative mark"}]))
+        def notification(named: list[str]) -> str:
+            return "<task-notification>\n<event>" + "\n".join(
+                f"ask app/lane id={ident} Proceed?" for ident in named) + "</event>\n</task-notification>"
+        rows = [{"type": "user", "timestamp": "2026-11-14T00:00:30Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "old", "content": ids[3]}]}},
+            *({"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-14T00:01:00Z",
+               "content": notification(named)} for named in ([ids[0]], [ids[1]], [ids[2]], [ids[3]],
+                                                            [ids[4]], [ids[0], ids[2]])),
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-14T00:01:00Z",
+             "content": f"User instruction mentioning {ids[0]}"},
+            {"type": "user", "timestamp": "2026-11-14T00:02:00Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "read", "content": [
+                    {"type": "text", "text": f"id={ids[0]}\nProceed?"}]},
+                {"type": "tool_result", "tool_use_id": "failed", "is_error": True, "content": ids[4]}]}}]
+        transcript = self.projects / "-w-lead/s.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        orca = self.root / "orca"
+        orca.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                        "result = {'worktrees': [{'path': '/w/lead', 'worktreeId': 'lead', 'agents': []}]} "
+                        "if sys.argv[1:3] == ['worktree', 'ps'] else {'terminals': []}\n"
+                        "print(json.dumps({'result': result}))\n")
+        orca.chmod(0o755)
+        shown = subprocess.run([sys.executable, str(SCRIPT), "lead-state", "--lead-worktree", "/w/lead",
+                                "--orca", str(orca), "--claude-projects", str(self.projects),
+                                "--handoffs-dir", str(self.handoffs)], text=True, capture_output=True,
+                               env={**os.environ, "TRIAGE_INBOX": str(self.inbox),
+                                    "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl")})
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        queued = json.loads(shown.stdout)["queued_input"]
+        self.assertEqual([item.get("handled_at") for item in queued],
+                         ["2026-11-14T00:02:00Z", "2026-11-14T00:03:00+00:00", None, None, None, None, None])
+        self.body.write_text("handoff")
+        sent = self.run_tool("--since", str(self.inbox.stat().st_size), "--lead-worktree", "/w/lead",
+                             env={"TRIAGE_INBOX": str(self.inbox)})
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        body = json.loads(self.sent.read_text())[-1]
+        self.assertNotIn(notification([ids[0]]), body)
+        self.assertNotIn(notification([ids[1]]), body)
+        self.assertIn(notification([ids[2]]), body)
+        self.assertIn("User instruction", body)
 
     def test_refuses_while_another_tab_of_this_workspace_reported_after_the_scan(self) -> None:
         # 11/10 09:08: the 07:00 tab handed off 4 asks as open after the 02:00 tab of the same workspace
