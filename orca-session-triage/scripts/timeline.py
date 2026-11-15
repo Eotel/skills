@@ -56,6 +56,7 @@ WRITE_NAME = re.compile(r"(?:^|[._])(?:add|create|update|edit|merge|delete|remov
 SHELL_BREAK = re.compile(r"([;\n()]|&&|\|\|?|(?<![<>])&|\bthen\b|\bdo\b)")
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)(\w+)\1")
 QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", re.DOTALL)
+HIDDEN = re.compile("\x1f(\\d+)\x1f")
 HELP = re.compile(r"(?:^|\s)(?:--help|-h)(?=\s|$)")
 GH_CALL = re.compile(r"\s*(?:\w+=\S*\s+)*gh\s+(\S+)\s*(\S*)(.*)", re.DOTALL)
 GH_POSTS = {("pr", "comment"), ("pr", "create"), ("pr", "review"), ("issue", "comment"), ("issue", "create")}
@@ -341,16 +342,17 @@ def adoptions(events: Path, imports: Path, window: Window) -> Iterator[Event]:
 
 def gh_writes(command: str) -> list[tuple[str, str]]:
     """What each `gh` call of a shell command wrote, with the call (its quoted text emptied)."""
-    parts = SHELL_BREAK.split(executed(command))
+    text, quoted = executed(command)
+    parts = SHELL_BREAK.split(text)
     # A call after || runs only when the one before it failed, which a successful command cannot show.
     segments = [segment for index, segment in enumerate(parts[::2]) if index == 0 or parts[2 * index - 1] != "||"]
-    # A GraphQL query is quoted, so whether it mutates is read from the command as written.
-    mutation = "mutation" in command
-    return [wrote for segment in segments if (wrote := gh_write(segment, mutation))]
+    return [wrote for segment in segments if (wrote := gh_write(segment, quoted))]
 
 
-def executed(command: str) -> str:
-    """The command without its heredoc bodies and quoted text, which the shell passes on instead of running."""
+def executed(command: str) -> tuple[str, list[str]]:
+    """The command without its heredoc bodies, and its quoted texts each held out behind a numbered mark.
+
+    The shell passes those on instead of running them; a call's own quoted text still tells what it sends."""
     kept: list[str] = []
     ends: list[str] = []
     for line in command.split("\n"):
@@ -360,15 +362,21 @@ def executed(command: str) -> str:
             continue
         ends.extend(found[2] for found in HEREDOC.finditer(line))
         kept.append(line)
-    return QUOTED.sub(lambda found: found[0][0] * 2, "\n".join(kept))
+    quoted: list[str] = []
+
+    def hide(found: re.Match[str]) -> str:
+        quoted.append(found[0])
+        return f"{found[0][0]}\x1f{len(quoted) - 1}\x1f{found[0][0]}"
+
+    return QUOTED.sub(hide, "\n".join(kept)), quoted
 
 
-def gh_write(segment: str, mutation: bool) -> tuple[str, str] | None:
+def gh_write(segment: str, quoted: list[str]) -> tuple[str, str] | None:
     found = GH_CALL.match(segment)
     if found is None:
         return None
     group, verb, rest = found.groups()
-    call = segment.strip()
+    call = HIDDEN.sub("", segment.strip())
     if HELP.search(f"{verb} {rest}"):
         return None
     if group == "pr" and verb == "merge":
@@ -383,7 +391,7 @@ def gh_write(segment: str, mutation: bool) -> tuple[str, str] | None:
         arguments = f"{verb}{rest}"
         method = re.search(r"(?:-X|--method)[ =]?(\w+)", arguments)
         fields = re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)\b", arguments)
-        query = verb == "graphql" and not mutation
+        query = verb == "graphql" and not any("mutation" in quoted[int(mark)] for mark in HIDDEN.findall(rest))
         if method and method[1].upper() != "GET" or not method and fields and not query:
             return "書いた", call
     return None

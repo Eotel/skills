@@ -141,7 +141,8 @@ class TimelineTests(unittest.TestCase):
                     result("2026-11-15T09:07:03Z", "pair", False),
                     call("2026-11-15T09:08:00Z", "later", "gh pr merge 14 --squash", background=True),
                     result("2026-11-15T09:08:00Z", "later", False),
-                    call("2026-11-15T09:09:00Z", "thread", "gh api graphql -f query='mutation { resolveReviewThread }'"),
+                    call("2026-11-15T09:09:00Z", "thread", "gh api graphql -f query='query { threads }' | jq . ; "
+                         "gh api graphql -f query='mutation { resolveReviewThread }'"),
                     result("2026-11-15T09:09:01Z", "thread", False))
 
         rows = json.loads(self.run_tool("--since", "2026-11-15T17:00", "--json").stdout)
