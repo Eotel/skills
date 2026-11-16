@@ -1651,6 +1651,30 @@ class NextStepFactTests(unittest.TestCase):
                                              "spin-dd/taihei-coresys-masters#731, spin-dd/taihei-coresys-masters#732, "
                                              "spin-dd/taihei-masters-ui#125, spin-dd/taihei-masters-ui#126"])
 
+    def test_a_saved_verdict_is_read_again_once_the_ledger_decided_the_proposals_it_waits_on(self) -> None:
+        # adopt-inbox-timer waited on the lead to record 2 proposals the ledger already had as adopted and applied.
+        row = {"path": "/w/timer", "repo": "skills", "class": "stalled", "linked_pr": None,
+               "jev": {"asks": 0.1}, "claude": {"final_at": "t1", "final_text": "採用の記録を待ちます"},
+               "codex": [], "reasons": []}
+        first, second = "f1183067-0000-4000-8000-000000000001", "1f3dd4a6-0000-4000-8000-000000000002"
+        verdicts = {"/w/timer": {"read": scan.read_key(scan.add_next_step_facts([row], git_lookup=lambda _: None)[0]),
+                                 "class": "blocked", "waits_on": "指揮 (案 f1183067・1f3dd4a6 の採用を記録する)",
+                                 "next_step": "記録が届いたら done を送り直す（commit 4e50b6f7）"}}
+
+        def facts(ledger: dict[str, bool]) -> dict:
+            return scan.add_next_step_facts([row], git_lookup=lambda _: None, verdicts=verdicts,
+                                            proposals=lambda: ledger)[0]
+
+        waiting, decided = facts({first: True, second: False}), facts({first: True, second: True})
+
+        self.assertEqual(scan.current_verdict(waiting, verdicts)["class"], "blocked")
+        self.assertIsNone(scan.current_verdict(decided, verdicts))
+        self.assertEqual(decided["reasons"], ["待っていた案が台帳で決まった: f1183067, 1f3dd4a6"])
+        # The re-read may name the same proposals again; its verdict then holds instead of being read every scan.
+        verdicts["/w/timer"] = {**verdicts["/w/timer"], "read": scan.read_key(decided), "class": "in_progress",
+                                "next_step": "--applied f1183067,1f3dd4a6 で done を送り直す"}
+        self.assertEqual(scan.current_verdict(facts({first: True, second: True}), verdicts)["class"], "in_progress")
+
     def test_summarizes_review_merge_and_check_state_of_a_pr(self) -> None:
         data = {"number": 11263, "state": "OPEN", "reviewDecision": "APPROVED",
                 "reviewRequests": [{"login": "k-mizokami"}, {"name": "backend"}],
@@ -5546,6 +5570,27 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(by_name["reasked"]["state"], "unanswered")
         self.assertEqual(by_name["progress"]["state"], "unanswered")
         self.assertEqual(by_name["prompt"]["since"], "2026-11-09T02:00:00Z")
+
+    def test_stale_asks_lists_a_consolidation_row_only_while_a_proposal_it_names_is_undecided(self) -> None:
+        saved = self.root / "scan.json"
+        (self.root / "inbox.jsonl").write_text("")
+        saved.write_text(json.dumps([{"path": "/w/adoption-consolidate-20261116-104047-14ed", "repo": "skills",
+            "class": "waiting", "claude": {"final_at": "2026-11-16T01:50:00Z", "final_text":
+                "新しい案 967d4e60・74aeb54e の採否をボードで決めてください（8e86662d をまとめた）"}}]))
+        adopted, pending = "967d4e60-1765-46ae-9792-d25c0dd87164", "74aeb54e-b223-4b25-827f-c1d56f7149c4"
+        for ledger, expected in (({adopted: True, pending: False}, [(["74aeb54e"], 1)]),
+                                 ({adopted: True, pending: True}, [])):
+            with self.subTest(ledger=ledger), \
+                    patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value=ledger):
+                code, result = self.call("stale-asks", "--from", str(saved))
+            self.assertEqual((code, [(item["undecided_proposals"], item["undecided_count"]) for item in result]),
+                             (0, expected))
+        asking = json.loads(saved.read_text())
+        asking[0]["prompt_waiting"] = {"tab": "t", "question": "残りの案 2ead92cc を採用しますか？", "choices": ["1. 採用"]}
+        saved.write_text(json.dumps(asking))
+        with patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value={adopted: True, pending: True}):
+            code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual((code, [item["row"] for item in result]), (0, [scan.row_identity(asking[0])]))
 
     def test_in_progress_without_a_question_is_not_an_unanswered_user_question(self) -> None:
         saved = self.root / "scan.json"
