@@ -201,6 +201,16 @@ class MorningLanesTests(unittest.TestCase):
 
         self.assertEqual(stall.judge(lane, verdict, kept, NOW, FakeProbe(), live=False), [])
 
+    def test_a_codex_request_answered_later_in_chat_does_not_explain_the_quiet(self) -> None:
+        lanes, records = morning()
+        lane, _ = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-elsewhere"))
+        lane = {**lane, "claude": None,
+                "codex": [{**codex("2026-11-14T07:34:16Z")[0],
+                           "pending_requests": [{"answered_in_chat_later": True}]}]}
+
+        self.assertEqual([item.signal for item in stall.judge(lane, None, records, NOW, FakeProbe(), live=False)],
+                         ["idle_after_report"])
+
     def test_a_forge_wait_signals_once_the_forge_answers(self) -> None:
         probe = FakeProbe(origins={"/w/app/forge-wait": "https://git.example.org/me/app.git"}, reachable=True)
 

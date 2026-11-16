@@ -448,10 +448,11 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
 
 
 def waits_explained(row: Mapping, verdict: Mapping | None, records: Records, now: float) -> bool:
-    claude, codex = row.get("claude") or {}, (row.get("codex") or [{}])[-1]
+    claude = row.get("claude") or {}
     asking = ((verdict or {}).get("class") == "waiting" or row.get("prompt_waiting")
               or DECISION_MARKER in (row.get("comment") or "") or claude.get("pending_questions")
-              or codex.get("pending_requests"))
+              or any(not request.get("answered_in_chat_later") for session in row.get("codex") or []
+                     for request in session.get("pending_requests") or []))
     ends = {process["parent"] for process in row.get("processes") or []}
     live_job = any(not scan.stopped(process, now) for process in row.get("processes") or []
                    if process["pid"] not in ends)
