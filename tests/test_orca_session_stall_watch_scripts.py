@@ -318,6 +318,18 @@ class RunTests(unittest.TestCase):
         self.assertEqual({(item["signal"], item["status"], item["inbox_id"]) for item in checks},
                          {("answer_undelivered", "open", asks[0]["id"]), ("idle_after_report", "open", asks[0]["id"])})
 
+    def test_a_verdict_read_before_the_lane_spoke_again_does_not_explain_its_quiet(self) -> None:
+        saved = json.loads(self.scan.read_text())[0]
+        (self.dir / "verdicts.json").write_text(json.dumps(
+            {saved["path"]: {"class": "waiting", "read": stall.scan.read_key(saved)}}))
+        spoke_again = [{**saved, "claude": claude("2026-11-15T20:10:00+09:00")}]
+
+        with patch.object(stall, "refreshed", lambda rows, now: spoke_again):
+            self.assertEqual(self.run_watch(NOW), 0)
+
+        checks = json.loads((self.dir / "work-checks.json").read_text())
+        self.assertIn("idle_after_report", {item["signal"] for item in checks})
+
 
 if __name__ == "__main__":
     unittest.main()

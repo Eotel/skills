@@ -723,7 +723,7 @@ def run(args: argparse.Namespace) -> int:
     cache = {item["watcher_pr"]: "MERGED" for item in checks if item.get("watcher_pr")}
     probe = LiveProbe(cache)
     seen = {key_of(item) for item in checks}
-    found = [item for row, saved in zip(fresh, rows) for item in judge(row, verdict_of(saved, verdicts), records, now, probe)]
+    found = [item for row in fresh for item in judge(row, verdict_of(row, verdicts), records, now, probe)]
     new = [item for item in found if key_of(asdict(item)) not in seen]
     if args.dry_run:
         print(ask_text(new) if new else "新しい合図はありません", f"(scan: {source})", sep="\n")
