@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta
 import importlib.util
 import io
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 from types import ModuleType
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -89,7 +91,7 @@ LOOP = ("/bin/zsh -c until s=$(gh pr checks 3690 --json name,bucket | grep -v '^
         "do sleep 30; done")
 
 
-def morning() -> tuple[list[tuple[dict, dict | None]], object]:
+def morning() -> tuple[list[tuple[dict, dict | None]], Any]:
     """The shapes of the lanes found stopped on the morning of 2026-11-16, renamed."""
     lanes: list[tuple[dict, dict | None]] = [
         (row("watch-loop", claude=claude("2026-11-11T03:29:38Z"), processes=[
@@ -191,6 +193,13 @@ class MorningLanesTests(unittest.TestCase):
             "dated-wait": {"wait_resolved"},
             "api-error": {"api_error_turn", "idle_after_report"},
         })
+
+    def test_an_open_handoff_naming_the_lane_by_its_worktree_name_keeps_its_promise(self) -> None:
+        lanes, records = morning()
+        lane, verdict = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/morning-info"))
+        kept = replace(records, open_handoff_names=frozenset({"morning-info"}))
+
+        self.assertEqual(stall.judge(lane, verdict, kept, NOW, FakeProbe(), live=False), [])
 
     def test_a_forge_wait_signals_once_the_forge_answers(self) -> None:
         probe = FakeProbe(origins={"/w/app/forge-wait": "https://git.example.org/me/app.git"}, reachable=True)

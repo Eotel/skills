@@ -142,7 +142,7 @@ class Records:
     answers_by_ask: Mapping[str, tuple[Answer, ...]] = field(default_factory=dict)
     sends_by_handle: Mapping[str, tuple[datetime, ...]] = field(default_factory=dict)
     held_handles: frozenset[str] = frozenset()
-    handoff_paths: frozenset[str] = frozenset()
+    open_handoff_names: frozenset[str] = frozenset()
     due_worktrees: frozenset[str] = frozenset()
     done_at_by_worktree: Mapping[str, datetime] = field(default_factory=dict)
     reached_environments: frozenset[str] = frozenset()
@@ -353,7 +353,7 @@ def promise_due(text: str, said: datetime) -> datetime | None:
 def kept_elsewhere(row: Mapping, records: Records) -> bool:
     """A hold, an open handoff, a work_due, an Orca automation, or a one-shot schedule keeps the lane's next step."""
     claude = row.get("claude") or {}
-    return bool(handles(row) & records.held_handles or row["path"] in records.handoff_paths
+    return bool(handles(row) & records.held_handles or scan.handoff_names(row) & records.open_handoff_names
                 or Path(row["path"]).name in records.due_worktrees or row.get("automation_workspaces")
                 or claude.get("one_shot_schedules"))
 
@@ -533,9 +533,9 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     state = scan.read_json_file(hourly_state) if hourly_state.is_file() else {}
     state = state if isinstance(state, dict) else {}
     handoffs = state.get("handoffs") or {}
-    open_paths = {path for item in (handoffs.values() if isinstance(handoffs, dict) else handoffs)
-                  if isinstance(item, dict) and not item.get("delivered_at") for path in (item.get("to"), item.get("from"))
-                  if path}
+    open_names = {name for item in (handoffs.values() if isinstance(handoffs, dict) else handoffs)
+                  if isinstance(item, dict) and not item.get("delivered_at") for name in (item.get("to"), item.get("from"))
+                  if name}
     remote = scan.read_json_file(remotes) if remotes.is_file() else {}
     hosts = remote.get("hosts") if isinstance(remote, dict) else None
     aliases = {}
@@ -547,7 +547,7 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
         reports_by_worktree={name: tuple(sorted(items, key=lambda report: report.at)) for name, items in reports.items()},
         answers_by_ask={key: tuple(items) for key, items in given.items()},
         sends_by_handle={key: tuple(items) for key, items in sends.items()}, held_handles=frozenset(held),
-        handoff_paths=frozenset(open_paths), due_worktrees=frozenset(due), done_at_by_worktree=agent_done,
+        open_handoff_names=frozenset(open_names), due_worktrees=frozenset(due), done_at_by_worktree=agent_done,
         reached_environments=frozenset(row["environment"] for row in rows if row.get("environment")),
         environment_by_alias=aliases, lead_path=((state.get("lead") or {}).get("worktree")))
 

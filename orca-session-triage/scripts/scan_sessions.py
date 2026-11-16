@@ -2487,7 +2487,7 @@ def read_key(row: dict) -> str | None:
                        *([{"decided": row["waits_decided"]}] if row.get("waits_decided") else [])])
 
 
-def row_identity(row: dict) -> str:
+def row_identity(row: Mapping) -> str:
     """Keep equal paths on different Orca servers distinct in the verdict store."""
     return f"{row['environment']}::{row['path']}" if row.get("environment") else row["path"]
 
@@ -2497,12 +2497,17 @@ def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
     if not state_file.exists():
         return []
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    names = {row_identity(row), row_name(row), row["path"],
-             f"{row.get('repo')}/{Path(row['path']).name}"}
-    if not row.get("environment"):
-        names.add(Path(row["path"]).name)
+    names = handoff_names(row)
     return [item for item in data.get("handoffs", {}).values()
             if item.get("delivered_at") is None and item.get("to") in names]
+
+
+def handoff_names(row: Mapping) -> set[str]:
+    """Every name a handoff's from or to may give this row: its identity, path, repo/name, or a local row's name."""
+    names = {row_identity(row), row_name(row), row["path"], f"{row.get('repo')}/{Path(row['path']).name}"}
+    if not row.get("environment"):
+        names.add(Path(row["path"]).name)
+    return names
 
 
 def with_automation_workspaces(rows: list[dict], orca: str) -> list[dict]:
@@ -3078,7 +3083,7 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
         print(f"  {error['host']} {error['path']} ({row_name(row)} {error.get('tab') or '-'})")
 
 
-def row_name(row: dict) -> str:
+def row_name(row: Mapping) -> str:
     name = Path(row["path"]).name
     return f"{row['environment']}::{name}" if row.get("environment") else name
 
