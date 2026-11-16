@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -183,10 +183,28 @@ def is_real_user_message(entry: dict) -> bool:
 # Claude Code keeps <config dir>/sessions/<pid>.json for each running session, with its sessionId and current
 # cwd; Orca runs Claude under one config dir per profile.
 CLAUDE_SESSION_DIRS = (".claude/sessions", "Library/Application Support/orca/claude-profiles/*/home/sessions")
+CLAUDE_PROJECT_DIRS = (".claude/projects", "Library/Application Support/orca/claude-profiles/*/home/projects")
 
 
 def claude_session_dirs() -> list[Path]:
     return [path for pattern in CLAUDE_SESSION_DIRS for path in Path.home().glob(pattern) if path.is_dir()]
+
+
+def claude_project_roots() -> list[Path]:
+    """Every Claude account's projects directory, once each: an Orca profile may link its own to ~/.claude/projects."""
+    found = [path for pattern in CLAUDE_PROJECT_DIRS for path in Path.home().glob(pattern) if path.is_dir()]
+    return list({path.resolve(): path for path in found}.values())
+
+
+def newest_copy(paths: Iterable[Path]) -> Path | None:
+    """The copy whose newest timestamped entry is latest: a session resumed in another account keeps writing only there,
+    while its first account's copy stays behind."""
+    def entry_at(path: Path) -> tuple[datetime, float]:
+        try:
+            return last_entry_at(path) or EPOCH, path.stat().st_mtime
+        except OSError:
+            return EPOCH, 0.0
+    return max({path.resolve(): path for path in paths}.values(), key=entry_at, default=None)
 
 
 def process_table() -> dict[int, tuple[int, str]]:
@@ -260,12 +278,12 @@ def ancestry(pid: int, processes: dict[int, tuple[int, str]]) -> list[int]:
 
 
 def session_transcript(session_id: str, cwd: str, roots: Sequence[Path]) -> Path | None:
-    """The transcript of a session under its cwd's project directory, or under any one after its cwd moved."""
+    """The newest copy of a session's transcript under its cwd's project directory, or under any one after its cwd
+    moved."""
     name = session_id + ".jsonl"
     roots = list(dict.fromkeys(roots))
-    exact = (path for root in roots if (path := find_claude_dir(root, cwd) / name).is_file())
-    moved = (path for root in roots if root.is_dir() for path in root.glob("*/" + name))
-    return next(exact, None) or next(moved, None)
+    exact = [path for root in roots if (path := find_claude_dir(root, cwd) / name).is_file()]
+    return newest_copy(exact) or newest_copy(path for root in roots if root.is_dir() for path in root.glob("*/" + name))
 
 
 def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequence[Path], projects_root: str | Path,
@@ -399,12 +417,15 @@ def one_shot_schedules(rows: list[dict]) -> list[dict]:
 def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
     """Summarize the newest Claude transcript for a worktree, or None when there is none.
 
-    `running` adds transcripts of Claude sessions running under it that live in other project directories.
+    `running` adds transcripts of Claude sessions running under it that live in other project directories. Every
+    account's projects directory is searched, since one session can leave a copy in each account it ran in.
     """
-    candidates = list(find_claude_dir(projects_root, worktree_path).glob("*.jsonl"))
-    if not candidates and not running:
+    roots = {root.resolve(): root for root in (Path(projects_root), *claude_project_roots())}.values()
+    newest = [max(found, key=lambda p: p.stat().st_mtime) for root in roots
+              if (found := list(find_claude_dir(root, worktree_path).glob("*.jsonl")))]
+    if not newest and not running:
         return None
-    path = max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+    path = newest_copy(newest)
     if running:
         # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
         path = max(dict.fromkeys([*running, *([path] if path else [])]),

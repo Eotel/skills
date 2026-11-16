@@ -239,6 +239,25 @@ class ClaudeTranscriptTests(unittest.TestCase):
     def test_returns_none_without_a_transcript(self) -> None:
         self.assertIsNone(scan.read_claude(self.projects, "/nowhere"))
 
+    def test_the_newest_copy_of_a_transcript_is_read_from_another_profile(self) -> None:
+        old = self.transcript([user("go"), {**assistant(text("waiting for review")), "timestamp": "2026-11-13T00:01:38Z"}])
+        profile = Path(self.tmp.name) / "profile" / "projects"
+        error = "API Error: getaddrinfo ENOTFOUND api.anthropic.com"
+        stopped = {**assistant(text(error)),
+                   "timestamp": "2026-11-15T11:43:27Z", "isApiErrorMessage": True, "error": "server_error"}
+        newer = scan.claude_project_dir(profile, self.worktree) / old.name
+        write_jsonl(newer, [user("go"), {**assistant(text("waiting for review")), "timestamp": "2026-11-13T00:01:38Z"},
+                            user("keep watching"), stopped])
+        os.utime(old, (time.time(), time.time()))
+        os.utime(newer, (time.time() - 3600, time.time() - 3600))
+
+        with patch.object(scan, "claude_project_roots", return_value=[self.projects, profile]):
+            result = scan.read_claude(self.projects, self.worktree)
+            running = scan.session_transcript(old.stem, self.worktree, [self.projects, profile])
+
+        self.assertEqual((result["transcript"], result["api_error"]), (str(newer), error))
+        self.assertEqual(running, newer)
+
     def test_queued_input_replays_all_operations_and_reaches_the_scan_row(self) -> None:
         stamp = "2026-10-01T01:00:00Z"
         operations = [("dequeue", None), ("enqueue", "cleared"), ("popAll", None),
