@@ -579,8 +579,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     the item's ask, or the recorded question's (withdrawn_by): the question to put or relay may be the old one. An unanswered item's `ask.claimed` names the tab that
     claimed it with `inbox_read.py claim` and is asking the user now: `claimed` holds, by ask id, the claim on each
     open ask itself or on every one of its open questions (inbox_read.ask_claim).
+    A row whose question is only its Orca comment's summary carries `question_sources`, the lane's ask and info
+    reports naming its question label (scan_sessions.question_sources).
     A consolidation lane's row (`adoption-consolidate-*`) is left out once `proposals` (the adoption ledger) has
-    every proposal its final message, waits_on or next_step names decided; while one is not, its item carries
+    every proposal its final message, waits_on or next_step names decided, unless it still asks a question of its
+    own (a screen question, an unanswered ask); while one is not, its item carries
     `undecided_proposals` (their 8-character IDs) and `undecided_count`.
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
@@ -652,6 +655,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         view.update(waits_on=verdict.get("waits_on"), next_step=verdict.get("next_step"))
         view["waiting_reports"] = received
+        if sources := scan_sessions.question_sources(row, entries):
+            view["question_sources"] = sources
         view["asking"] = ask_state.for_row(state, identity, latest_decisions)
         if undecided:
             view.update(undecided_proposals=undecided, undecided_count=len(undecided))

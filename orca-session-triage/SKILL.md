@@ -51,7 +51,10 @@ board's done cards; close what the user approves.
   same way (its tab is read even while Orca shows it working): a reply under
   its turn-end line is the row's `orca_message` (`from: screen`, `at` from
   the line's `• HH:MM` on the day of the tab's last output; the newest such
-  reply across the worktree's Codex tabs), so Jev and the review queue read it instead of
+  reply across the worktree's Codex tabs). A tab that redraws on a later day
+  moves that day, so when the lane sent a `done` or `info` within five minutes
+  before the clock time on an earlier day, `at` is that report's `ts`
+  (`screen_at` keeps the screen's reading, `at_from` names the report). Jev and the review queue read it instead of
   calling the row `unstarted`; it is the row's final message also over an
   older Claude transcript (a lane Codex took over).
   A Claude tab whose screen ends on the status line of a running turn
@@ -117,7 +120,10 @@ board's done cards; close what the user approves.
   row's final time in `--rows` and `--sort final` follows it), its `done_cards`
   with whole `prompt` and `last_message`, `github` as
   owner/repo from origin for `gh -R`, the agents' `transcripts` (`--transcripts`
-  prints them as `claude <path>` or `codex <path>` lines instead), and the PR's
+  prints them as `claude <path>` or `codex <path>` lines instead, or on stderr
+  what the scan looked for when there are none), `question_sources` (the
+  lane's ask and info behind a question known only from its Orca comment's
+  summary, as in `references/hourly-state.md`), and the PR's
   completed independent review (`review`: head, verdict, path, and whether it
   asks for changes on the current head) beside `merge_question`. NAME is
   repo/name as `--summary` prints it, the name (a unique one on another Mac

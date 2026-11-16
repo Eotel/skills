@@ -1651,6 +1651,25 @@ class NextStepFactTests(unittest.TestCase):
                                              "spin-dd/taihei-coresys-masters#731, spin-dd/taihei-coresys-masters#732, "
                                              "spin-dd/taihei-masters-ui#125, spin-dd/taihei-masters-ui#126"])
 
+    def test_a_codex_screen_reply_takes_the_time_of_the_report_sent_just_before_its_turn_ended(self) -> None:
+        # A Codex tab redrew on later days, so its 11:53 turn end was read on 11/14 and 11/15; its lane sent done
+        # d7e1f0f4 at 11:52 on 11/13.
+        done = {"id": "d7e1f0f4-aaaa", "kind": "done", "worktree": "cutover", "repo": "app",
+                "ts": "2026-11-13T11:52:26+09:00", "text": "切替手順へ反映しました"}
+
+        def shown(at: str, entries: list[dict]) -> dict:
+            row = {"path": "/w/app/cutover", "repo": "app", "class": "stalled",
+                   "orca_message": {"text": "triageへ done d7e1f0f4 で報告済みです。", "at": at, "from": "screen"}}
+            return scan.with_reported_times([row], entries)[0]["orca_message"]
+
+        moved = [shown(at, [done]) for at in ("2026-11-14T02:53:59Z", "2026-11-15T02:53:59Z")]
+        same_day = shown("2026-11-15T02:53:59Z", [done, {**done, "id": "later", "ts": "2026-11-15T11:52:00+09:00"}])
+
+        self.assertEqual({message["at"] for message in moved}, {"2026-11-13T11:52:26+09:00"})
+        self.assertEqual(moved[1]["screen_at"], "2026-11-15T02:53:59Z")
+        self.assertEqual(moved[1]["at_from"], {"kind": "done", "id": "d7e1f0f4-aaaa"})
+        self.assertEqual(same_day["at"], "2026-11-15T02:53:59Z")
+
     def test_a_saved_verdict_is_read_again_once_the_ledger_decided_the_proposals_it_waits_on(self) -> None:
         # adopt-inbox-timer waited on the lead to record 2 proposals the ledger already had as adopted and applied.
         row = {"path": "/w/timer", "repo": "skills", "class": "stalled", "linked_pr": None,
@@ -2270,6 +2289,36 @@ class ScanCommandTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
+        # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
+        saved, inbox = self.dir / "scan.json", self.dir / "inbox.jsonl"
+        saved.write_text(json.dumps([{
+            "path": "/w/app/budget-import", "repo": "app", "environment": None, "class": "waiting", "reasons": [],
+            "comment": "要判断: Q4 小計だけにある予算額の取込方法。",
+            "marker_question": "Q4 小計だけにある予算額の取込方法。", "terminals": [],
+            "claude": None, "codex": [],
+            "orca_message": {"text": "Q4 の回答待ちです。", "at": "2026-11-13T06:33:59Z", "from": "screen"}}]))
+        write_jsonl(inbox, [
+            {"id": "f5b656e0", "kind": "info", "worktree": "budget-import", "repo": "app",
+             "ts": "2026-11-13T14:25:05+09:00",
+             "text": "決定済みの 2 点を反映しました。\n\n現在は Q4「予算額 1,000 万円を一式で取り込むか」の回答待ちです。"},
+            {"id": "progress", "kind": "info", "worktree": "budget-import", "repo": "app",
+             "ts": "2026-11-13T15:00:00+09:00", "text": "照合を進めています。"},
+            {"id": "a5ca8714", "kind": "info", "worktree": "budget-import", "repo": "app",
+             "ts": "2026-11-13T15:32:44+09:00", "text": "再照合しました。設計は Q4（小計だけにある予算額）の回答待ちです。"}])
+
+        with redirect_stdout(io.StringIO()) as out:
+            scan.main(["--from", str(saved), "--inbox", str(inbox), "--row", "budget-import"])
+        with redirect_stdout(io.StringIO()) as listed, redirect_stderr(io.StringIO()) as why:
+            code = scan.main(["--from", str(saved), "--inbox", str(inbox), "--row", "budget-import", "--transcripts"])
+
+        sources = json.loads(out.getvalue())["question_sources"]
+        self.assertEqual([source["id"] for source in sources], ["f5b656e0", "a5ca8714"])
+        self.assertEqual(sources[0]["text"], "現在は Q4「予算額 1,000 万円を一式で取り込むか」の回答待ちです。")
+        self.assertEqual((code, listed.getvalue()), (0, ""))
+        self.assertIn("no transcript", why.getvalue())
+        self.assertIn("screen", why.getvalue())
 
     def test_expand_roots_accepts_absolute_patterns_with_spaces(self) -> None:
         accounts = self.dir / "Application Support" / "accounts"
@@ -5601,6 +5650,18 @@ class HourlyStateTests(unittest.TestCase):
         code, result = self.call("stale-asks", "--from", str(saved))
         self.assertEqual(code, 0)
         self.assertEqual(result, [])
+
+    def test_stale_asks_shows_the_inbox_question_behind_a_comment_summary(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/budget-import", "repo": "app", "class": "waiting",
+            "claude": None, "codex": [], "comment": "要判断: Q4 予算額の取込方法。",
+            "marker_question": "Q4 予算額の取込方法。",
+            "orca_message": {"text": "Q4 の回答待ちです。", "at": "2026-11-13T06:33:59Z", "from": "screen"}}]))
+        write_jsonl(self.root / "inbox.jsonl", [{"id": "f5b656e0", "kind": "info", "worktree": "budget-import",
+            "repo": "app", "ts": "2026-11-13T14:25:05+09:00",
+            "text": "現在は Q4「予算額 1,000 万円を一式で取り込むか」の回答待ちです。"}])
+        code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual((code, [source["id"] for source in result[0]["question_sources"]]), (0, ["f5b656e0"]))
 
     def test_stale_asks_reports_pr_state_head_and_update_for_an_unasked_row(self) -> None:
         saved = self.root / "scan.json"
