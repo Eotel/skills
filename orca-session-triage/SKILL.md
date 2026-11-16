@@ -218,7 +218,11 @@ board's done cards; close what the user approves.
   its `waits_on` names closed (reason 「everything the saved verdict waits on
   closed: …」; read in the same GraphQL query: `repo#N` is the repository of the
   row's organization named so or the only known one ending in `-repo`, and a
-  bare `#N` the one named before it or the row's own);
+  bare `#N` the one named before it or the row's own), or until the adoption
+  ledger has every proposal its `waits_on` or `next_step` names (full ID or the
+  8-character prefix) adopted, rejected, held, or applied (reason
+  「待っていた案が台帳で決まった: …」; the row is read again once, and a new
+  verdict naming the same proposals holds);
   act on it the same way in every run. Each queued row carries those inbox
   reports and which report came last, since the Orca comment has no time; an
   answered ask carries `answered` (`at`, `note`) from `ask-answers.jsonl`. A Stop

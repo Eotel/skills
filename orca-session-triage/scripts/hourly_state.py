@@ -17,7 +17,7 @@ open, `answered` and `withdraw` take a settled one off, and `comment --result TE
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -501,6 +501,10 @@ def row_question(row: dict, final: dict) -> str:
                                       {"tail": card.get("screen_tail") or []}))), "")
 
 
+# The worktrees of adoption-triage's consolidation sessions; their questions are proposals put to the board.
+CONSOLIDATE_PREFIX = "adoption-consolidate-"
+
+
 def blocked_by_user(row: dict) -> bool:
     verdict = row.get("verdict") or {}
     return verdict.get("class") == "blocked" and bool(verdict.get("needs_user")) and bool(re.search(
@@ -554,7 +558,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                handed: list[lead_decisions.HandOff],
                claimed: dict[str, inbox_read.Claim] | None = None,
                decided: dict[str, list[lead_decisions.Decision]] | None = None,
-               rejected: list[dict] | None = None) -> list[dict]:
+               rejected: list[dict] | None = None,
+               proposals: Mapping[str, bool] | None = None) -> list[dict]:
     """Waiting rows, rows blocked on the user, and rows an unanswered handoff key names, longest waiting first.
     The lane's asks that count are
     those still open and those it sent in its last turn:
@@ -576,6 +581,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     open ask itself or on every one of its open questions (inbox_read.ask_claim).
     A row whose question is only its Orca comment's summary carries `question_sources`, the lane's ask and info
     reports naming its question label (scan_sessions.question_sources).
+    A consolidation lane's row (`adoption-consolidate-*`) is left out once `proposals` (the adoption ledger) has
+    every proposal its final message, waits_on or next_step names decided, unless it still asks a question of its
+    own (a screen question, an unanswered ask); while one is not, its item carries
+    `undecided_proposals` (their 8-character IDs) and `undecided_count`.
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
@@ -600,6 +609,14 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                                    "state": "lost_schedule", "since": since.isoformat(),
                                    "question": f"予約が消えた: {job['cron']} {job['prompt'][:100]}",
                                    "schedule": job, "ask": None, "answer": None}))
+        undecided: list[str] = []
+        settled = False
+        if proposals and name.startswith(CONSOLIDATE_PREFIX):
+            verdict = row.get("verdict") or {}
+            named = scan_sessions.named_proposals("\n".join(str(value or "") for value in (
+                verdict.get("waits_on"), verdict.get("next_step"), final["text"])), proposals)
+            undecided = [proposal[:8] for proposal in named if not proposals[proposal]]
+            settled = bool(named) and not undecided
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
@@ -616,6 +633,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        # The ledger settles only the proposals the lane waited on, not a question it is asking now.
+        if settled and not (row.get("prompt_waiting") or (row.get("claude") or {}).get("pending_questions")
+                            or shared_pending or any(not proof or keys.get(item["id"]) for _, item, proof in counted)):
+            continue
         verdict = row.get("verdict") or {}
         received = [{**report_view(item), "worktree": item.get("worktree"), "repo": item.get("repo")}
                     for item in entries if item.get("kind") in ("info", "done")
@@ -637,6 +658,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if sources := scan_sessions.question_sources(row, entries):
             view["question_sources"] = sources
         view["asking"] = ask_state.for_row(state, identity, latest_decisions)
+        if undecided:
+            view.update(undecided_proposals=undecided, undecided_count=len(undecided))
         if blocked_by_user(row):
             proven = [answer for _, _, proof in counted for answer in proof]
             if proven:
@@ -1659,7 +1682,9 @@ def main(argv: list[str] | None = None) -> int:
                                 datetime.now(timezone.utc), state=data, handed=handed,
                                 claimed={ask.report["id"]: claim for ask in asks
                                          if (claim := inbox_read.ask_claim(ask, claims))},
-                                decided=decided, rejected=rejected)
+                                decided=decided, rejected=rejected,
+                                proposals=scan_sessions.ledger_proposals() if any(
+                                    Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc))],
                             key=lambda item: -item["age_minutes"])
             identities = {item["row"] for item in result if item.get("row")}

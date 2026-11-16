@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hourly_runtime
 import inbox_read
+import retro_ledger
 import rm_check
 from worktree_notes import keep_note
 
@@ -2124,8 +2125,38 @@ def waited_items(waits_on: str, slug: str, names: set[str],
     return list(dict.fromkeys(items))
 
 
+# A proposal of the adoption ledger, named by its full ID or by the first 8 characters people write.
+PROPOSAL_REF = re.compile(r"(?<![0-9A-Za-z-])[0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?"
+                          r"(?![0-9A-Za-z-])")
+DECIDED_STATUSES = ("adopted", "rejected", "held")
+
+
+def ledger_proposals() -> dict[str, bool] | None:
+    """Each adoption-ledger proposal ID and whether the board decided it (adopted, rejected or held) or it was
+    applied; None, with the reason on stderr, when the ledger cannot be read."""
+    try:
+        items = retro_ledger.LedgerClient().list()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
+        print(f"adoption ledger unreadable: {error}", file=sys.stderr)
+        return None
+    return {item["proposal_id"]: item.get("status") in DECIDED_STATUSES or bool(item.get("implemented_at"))
+            for item in items if isinstance(item.get("proposal_id"), str)}
+
+
+def named_proposals(text: str, proposals: Mapping[str, bool]) -> list[str]:
+    """The ledger proposals `text` names: by full ID, or by an 8-character prefix only one proposal has.
+    Other hex words (commit SHAs, event IDs) name none."""
+    named = []
+    for token in PROPOSAL_REF.findall(text):
+        matches = [proposal for proposal in proposals if proposal.startswith(token)]
+        if len(matches) == 1:
+            named.append(matches[0])
+    return list(dict.fromkeys(named))
+
+
 def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | None] = git_state,
-                        pr_lookup: PrLookup = gh_prs, verdicts: dict | None = None) -> list[dict]:
+                        pr_lookup: PrLookup = gh_prs, verdicts: dict | None = None,
+                        proposals: Callable[[], Mapping[str, bool] | None] | None = None) -> list[dict]:
     """Add git and PR facts to rows needing review or completed rows with no current agent.
 
     `pr_lookup(slug, refs)` reads every PR one repository's rows need at once
@@ -2133,6 +2164,9 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
     The issues and PRs each row's saved verdict waits on (`verdicts`) are read in the
     same queries; once every one is closed, the row's `waits_closed` names them and
     the verdict no longer holds (current_verdict), so the row is read again.
+    Once `proposals()` (the adoption ledger, read only when a saved verdict's waits_on or next_step holds a
+    proposal-like ID) has every proposal they name decided, `waits_decided` names them; read_key includes it, so
+    the verdict is read again once, and a re-read that names the same proposals holds.
     `pr.head_matches` is False when the PR found (a branch name can be reused)
     does not point at the checkout's HEAD. A stalled row whose final message
     waited on someone else finishes once its PR merged after that message.
@@ -2153,6 +2187,11 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             org = git["github"].partition("/")[0]
             names = repo_names | {slug.partition("/")[2] for slug in known if slug.partition("/")[0] == org}
             waits_by_row[id(row)] = waited_items(verdict["waits_on"], git["github"], names)
+    # The re-read replaces waits_on and next_step, so a decided proposal drops a verdict only once.
+    wait_texts = {id(row): "\n".join(str(verdict.get(key) or "") for key in ("waits_on", "next_step"))
+                  for row in fact_rows if isinstance(verdict := (verdicts or {}).get(row_identity(row)), dict)}
+    ledger = (proposals() if proposals and any(PROPOSAL_REF.search(text) for text in wait_texts.values())
+              else None) or {}
     refs_by_repo: dict[str, list[PrRef]] = {}
     for row in rows:
         if id(row) not in fact_row_ids:
@@ -2187,7 +2226,7 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
         if id(row) not in fact_row_ids:
             result.append(row)
             continue
-        git, waits = git_by_row[id(row)], waits_by_row.get(id(row), [])
+        git, waits, wait_text = git_by_row[id(row)], waits_by_row.get(id(row), []), wait_texts.get(id(row), "")
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
         if pr is not None and git is not None:
@@ -2220,6 +2259,11 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             row = {**row, "waits_closed": closed,
                    "reasons": [*row.get("reasons", []), "everything the saved verdict waits on closed: "
                                + ", ".join(closed)]}
+        named = named_proposals(wait_text, ledger)
+        if named and all(ledger[proposal] for proposal in named):
+            decided = [proposal[:8] for proposal in named]
+            row = {**row, "waits_decided": decided,
+                   "reasons": [*row.get("reasons", []), "待っていた案が台帳で決まった: " + ", ".join(decided)]}
         result.append(row)
     return result
 
@@ -2372,8 +2416,8 @@ def newest_report(row: dict) -> dict | None:
 
 
 def read_key(row: dict) -> str | None:
-    """What a careful read saw: final message, PR, human activity, tree, inbox reports, permission prompt, and
-    Orca comment. None without a message.
+    """What a careful read saw: final message, PR, human activity, tree, inbox reports, permission prompt,
+    Orca comment, and the decided proposals its verdict waits on (`waits_decided`). None without a message.
 
     A timeless message uses a text digest. An inbox answer changes the key,
     and a verdict holds only while the key is unchanged.
@@ -2390,7 +2434,8 @@ def read_key(row: dict) -> str | None:
     return json.dumps([final_at, pr.get("state"), pr.get("number"), pr.get("head_oid"),
                        pr.get("latest_human_review"), pr.get("latest_human_activity"), git.get("dirty"),
                        *([inbox] if inbox else []), *([row["prompt_waiting"]] if row.get("prompt_waiting") else []),
-                       *([{"comment": row["comment"]}] if row.get("comment") else [])])
+                       *([{"comment": row["comment"]}] if row.get("comment") else []),
+                       *([{"decided": row["waits_decided"]}] if row.get("waits_decided") else [])])
 
 
 def row_identity(row: dict) -> str:
@@ -3398,7 +3443,7 @@ def main(argv: list[str] | None = None) -> int:
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
                                                processes=processes, live_sessions=live_sessions),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
-                               verdicts=verdicts)
+                               verdicts=verdicts, proposals=ledger_proposals)
     if down := reach.down():
         line = f"ネットワーク断: {'。'.join(down)}。接続が戻ってから走査し直してください（--review-out は書いていません）"
         print(line)
