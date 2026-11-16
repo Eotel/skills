@@ -7170,6 +7170,23 @@ class HourlyReadTests(unittest.TestCase):
             self.assertIn(str(run_dir), out.getvalue())
             self.assertIn(f"review queue: {run_dir.resolve() / 'review-queue.json'}（1 行）／分類: orca-row-classify {run_dir.resolve()}",
                           out.getvalue())
+            self.assertEqual(out.getvalue().splitlines()[-1],
+                             f"results: {run_dir.resolve() / 'results.json'}（命令ごとの記録の配列。各記録の鍵: "
+                             "name・command・exit_code・stdout・stderr・result・error）")
+
+    def test_a_skipped_stale_asks_record_has_every_key_of_a_run_record(self) -> None:
+        hourly_read = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
+                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(args, 3 if "--review-out" in args else 0)
+            with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()):
+                hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
+            [run_dir] = Path(root).iterdir()
+            result = json.loads((run_dir / "results.json").read_text())
+            self.assertEqual({tuple(item) for item in result},
+                             {("name", "command", "exit_code", "stdout", "stderr", "result", "error")})
+            self.assertEqual(result[-1]["error"], "skipped: scan failed")
 
 
 class HourlyTabCleanupTests(unittest.TestCase):

@@ -172,8 +172,12 @@ It runs cleanup, lead-state, open-asks, unanswered decisions, pending hourly
 state, the last handoff, scan, backlog-watch, Asana status, and topic checks in
 parallel. After a successful scan it runs stale-asks against that scan. Each
 invocation prints its unique directory under `~/.cache/orca-session-triage/reads`
-and writes `results.json` there with every command, exit code, stdout, stderr,
-and successful JSON result path. Read the files directly, including when the
+and writes `results.json` there; its last line prints that path and shape.
+`results.json` is a JSON array (not an object) with one record per command,
+each with the keys `name`, `command`, `exit_code`, `stdout` and `stderr` (paths
+of the command's output files), `result` (the path of its JSON result, or
+null) and `error` (or null). The `<name>: exit N` lines printed before it list
+the same exit codes. Read the files directly, including when the
 command ran in the background; terminal completion messages are not JSON.
 An error or timeout in one command leaves the other reads available. A failed
 scan skips stale-asks. Inspect every nonzero or skipped exit status before

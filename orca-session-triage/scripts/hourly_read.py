@@ -1,10 +1,14 @@
 #!/usr/bin/env -S uv run --no-project --no-config --python 3.12
 """Run the hourly triage reads in parallel and keep each result outside terminal output.
 
-Each invocation creates a unique directory under --output-root. results.json lists
-every exit code and output path. Failed commands keep their stdout and stderr;
-only successful, parseable JSON is published as a .json result. Cleanup can close
-previous completed scheduled tabs under its existing safety checks.
+Each invocation creates a unique directory under --output-root and ends by printing
+the path of its results.json: a JSON array with one record per command, each with
+the keys name, command, exit_code, stdout and stderr (the paths of the command's
+output files), result (the path of its .json result, or null) and error (or null).
+The lines `<name>: exit N` before it list the same exit codes. Failed commands keep
+their stdout and stderr; only successful, parseable JSON is published as a .json
+result. Cleanup can close previous completed scheduled tabs under its existing
+safety checks.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +25,8 @@ import tempfile
 import hourly_runtime
 import hourly_state
 import json_output
+
+RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error")
 
 
 @dataclass(frozen=True)
@@ -117,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--orca", args.orca, "--out", str(stale_file)], True, stale_file)
             results.append(read_task(stale, directory, args.timeout))
         else:
-            results.append({"name": "stale-asks", "exit_code": None, "error": "skipped: scan failed"})
+            results.append({**dict.fromkeys(RECORD_KEYS), "name": "stale-asks", "error": "skipped: scan failed"})
         json_output.emit(results, directory / "results.json")
         for result in results:
             print(f"{result['name']}: exit {result['exit_code']}"
@@ -126,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             queue_path = directory / "review-queue.json"
             queue = json.loads(queue_path.read_text(encoding="utf-8"))
             print(f"review queue: {queue_path}（{len(queue['rows'])} 行）／分類: orca-row-classify {directory}")
+        print(f"results: {directory / 'results.json'}（命令ごとの記録の配列。各記録の鍵: {'・'.join(RECORD_KEYS)}）")
         return int(any(result["exit_code"] != 0 for result in results))
     except (OSError, ValueError) as error:
         print(f"hourly read: {error}", file=sys.stderr)
