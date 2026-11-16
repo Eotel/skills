@@ -89,6 +89,7 @@ def tasks_for(args: argparse.Namespace, directory: Path) -> list[ReadTask]:
         ReadTask("backlog-watch", [str(tools / "backlog-watch")]),
         ReadTask("asana99-status", [str(tools / "asana99_status.py"), str(asana_file), "--diff"], True, asana_file),
         ReadTask("topic-check", [str(tools / "topic"), "check", "--all"]),
+        ReadTask("tracker-gaps", [str(tools / "project-status"), "--gaps", "--json"], True),
     ]
 
 
@@ -102,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-file", type=Path, default=Path(hourly_state.DEFAULT_STATE))
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"))
     parser.add_argument("--bin-dir", type=Path, default=Path("~/.cache/orca-briefs/bin"),
-                        help="installed backlog-watch, asana99_status.py and topic commands")
+                        help="installed backlog-watch, asana99_status.py, topic and project-status commands")
     parser.add_argument("--timeout", type=float, default=600, help="seconds per command (default: %(default)s)")
     args = parser.parse_args(argv)
     if not args.workspace or args.timeout <= 0:
