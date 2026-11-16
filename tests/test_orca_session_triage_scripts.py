@@ -1698,8 +1698,12 @@ class NextStepFactTests(unittest.TestCase):
     def test_an_adopted_proposal_handed_to_the_lane_is_its_own_work_not_a_wait(self) -> None:
         # A lane handed an adopted proposal waited on its forge; its next step named the proposal it ships.
         proposal = "c8c0b479-0000-4000-8000-000000000003"
+        # Adopted again after a revoke: the lane given the earlier adoption no longer holds it.
         item = {"proposal_id": proposal, "status": "adopted", "implemented_at": None,
-                "executions": [{"actor": "deploy-prepush", "outcome": "handed_off"}]}
+                "decisions": [{"id": "d1", "decision": "adopt"}, {"id": "d2", "decision": "revoke"},
+                              {"id": "d3", "decision": "adopt"}],
+                "executions": [{"actor": "deploy-old", "outcome": "handed_off", "decision_id": "d1"},
+                               {"actor": "deploy-prepush", "outcome": "handed_off", "decision_id": "d3"}]}
         row = {"path": "/w/app/deploy-prepush", "repo": "app", "class": "stalled", "linked_pr": None,
                "jev": {"asks": 0.1}, "claude": {"final_at": "t1", "final_text": "forge の復旧を待ちます"},
                "codex": [], "reasons": []}
@@ -1710,6 +1714,7 @@ class NextStepFactTests(unittest.TestCase):
         with patch.object(scan.retro_ledger.LedgerClient, "list", return_value=[item]):
             facts = scan.add_next_step_facts([row], git_lookup=lambda _: None, verdicts=verdicts,
                                              proposals=scan.ledger_proposals)[0]
+            self.assertEqual(scan.ledger_proposals()[proposal].holders, {"deploy-prepush"})
 
         self.assertEqual((scan.current_verdict(facts, verdicts) or {}).get("class"), "blocked")
         self.assertEqual(facts["reasons"], [])

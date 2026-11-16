@@ -2144,17 +2144,25 @@ class LedgerProposal(NamedTuple):
 
 def ledger_proposals() -> dict[str, LedgerProposal] | None:
     """Each adoption-ledger proposal by ID; None, with the reason on stderr, when the ledger cannot be read.
-    A lane holds a proposal when a handed_off execution names it as the actor."""
+    A lane holds a proposal when a handed_off execution under its last adoption names it as the actor, as
+    adoption-triage's `ledger.py owner` reads it."""
     try:
         items = retro_ledger.LedgerClient().list()
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
         print(f"adoption ledger unreadable: {error}", file=sys.stderr)
         return None
+
+    def holders(item: dict) -> frozenset[str]:
+        if item.get("implemented_at") or item.get("status") != "adopted":
+            return frozenset()
+        adoption = next((decision.get("id") for decision in reversed(item.get("decisions") or [])
+                         if decision.get("decision") == "adopt"), None)
+        return frozenset(str(run["actor"]) for run in item.get("executions") or []
+                         if adoption and run.get("decision_id") == adoption
+                         and run.get("outcome") == "handed_off" and run.get("actor"))
+
     return {item["proposal_id"]: LedgerProposal(
-                item.get("status") in DECIDED_STATUSES or bool(item.get("implemented_at")),
-                frozenset() if item.get("implemented_at") or item.get("status") != "adopted"
-                else frozenset(str(run["actor"]) for run in item.get("executions") or []
-                               if run.get("outcome") == "handed_off" and run.get("actor")))
+                item.get("status") in DECIDED_STATUSES or bool(item.get("implemented_at")), holders(item))
             for item in items if isinstance(item.get("proposal_id"), str)}
 
 
