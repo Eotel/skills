@@ -476,8 +476,9 @@ def idle_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
     if not reports or act.at is None or now - act.at < IDLE_AFTER:
         return []
     last = reports[-1]
-    answered = last.kind == "ask" and bool(covering_answers(last, records))
-    if not (last.kind == "info" or answered) or waits_explained(row, verdict, records, now.timestamp()):
+    asking = [report for report in reports if report.kind == "ask" and report.id
+              and not inbox_read.is_handoff({"text": report.text}) and not covering_answers(report, records)]
+    if asking or last.kind not in ("info", "ask") or waits_explained(row, verdict, records, now.timestamp()):
         return []
     return [base_signal(row, act, records, "idle_after_report", f"{last.id[:8]}@{act.at:%Y%m%dT%H%M}",
                         f"最後の報告は {short(last.at)} の {last.kind}（「{' '.join(last.text.split())[:80]}」）。"

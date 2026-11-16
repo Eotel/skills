@@ -220,6 +220,15 @@ class MorningLanesTests(unittest.TestCase):
 
         self.assertEqual(stall.judge(lane, None, two_questions, NOW, FakeProbe(), live=False), [])
 
+    def test_a_lane_whose_earlier_ask_is_still_open_is_waiting_not_idle(self) -> None:
+        lanes, records = morning()
+        lane, verdict = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-elsewhere"))
+        asked_first = replace(records, reports_by_worktree={**records.reports_by_worktree, "answer-elsewhere": (
+            report("ask-open-0001", "ask", "2026-11-14T16:10:00+09:00", "どちらで進めますか。"),
+            *records.reports_by_worktree["answer-elsewhere"])})
+
+        self.assertEqual(stall.judge(lane, verdict, asked_first, NOW, FakeProbe(), live=False), [])
+
     def test_a_forge_wait_signals_once_the_forge_answers(self) -> None:
         probe = FakeProbe(origins={"/w/app/forge-wait": "https://git.example.org/me/app.git"}, reachable=True)
 
