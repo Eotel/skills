@@ -328,7 +328,7 @@ def promise_due(text: str, said: datetime) -> datetime | None:
         plain = QUOTED.sub("", sentence)
         if plain.lstrip().startswith(">") or not PROMISE_VERB.search(plain) or NOT_PROMISE.search(plain):
             continue
-        dues = []
+        days = []
         for month, day, part in (match.groups() for match in DATED.finditer(plain)
                                  if not DEADLINE.match(plain, match.end())):
             try:
@@ -336,15 +336,15 @@ def promise_due(text: str, said: datetime) -> datetime | None:
                                    second=0, microsecond=0)
             except ValueError:
                 continue
-            dues.append(at.replace(year=at.year + 1) if at < local - PROMISE_HORIZON else at)
+            days.append(at.replace(year=at.year + 1) if at < local - PROMISE_HORIZON else at)
         for match in TOMORROW.finditer(plain):
-            dues.append((local + timedelta(days=1)).replace(hour=DAY_PART.get(match[1] or "", MORNING), minute=0,
-                                                             second=0, microsecond=0))
+            days.append((local + timedelta(days=1)).replace(hour=DAY_PART.get(match[1] or "", MORNING), minute=0,
+                                                            second=0, microsecond=0))
         if TONIGHT.search(plain):
-            dues.append(local.replace(hour=NIGHT, minute=0, second=0, microsecond=0))
-        for hour, minute in CLOCK.findall(plain):
-            if int(hour) < 24 and int(minute) < 60:
-                dues.append(local.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0))
+            days.append(local.replace(hour=NIGHT, minute=0, second=0, microsecond=0))
+        clocks = [(int(hour), int(minute)) for hour, minute in CLOCK.findall(plain) if int(hour) < 24 and int(minute) < 60]
+        dues = ([at.replace(hour=hour, minute=minute) for at in days or [local.replace(second=0, microsecond=0)] for hour, minute in clocks]
+                if clocks else days)
         if dues := [at for at in dues if ahead_of_saying(at, local)]:
             promised.append(max(dues))
     return min(promised, default=None)

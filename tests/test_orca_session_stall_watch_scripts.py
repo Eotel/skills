@@ -235,6 +235,8 @@ class PromiseTests(unittest.TestCase):
                          at("2026-11-16T09:00:00+09:00"))
         self.assertEqual(stall.promise_due("差が小さいので、18:30 に登録します。", said),
                          at("2026-11-15T18:30:00+09:00"))
+        self.assertEqual(stall.promise_due("明日 18:30 に確認します。", said), at("2026-11-16T18:30:00+09:00"))
+        self.assertEqual(stall.promise_due("11/16 7:30 から流します。", said), at("2026-11-16T07:30:00+09:00"))
 
 
 class LiveProbeTests(unittest.TestCase):
