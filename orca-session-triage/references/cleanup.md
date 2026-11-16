@@ -75,7 +75,10 @@ Run these per worktree, in order.
      base under another hash (a PR rebased before it merged) does not block; it
      is listed in `merged_by_patch`, so name it in the report. A merge commit
      outside the base still blocks, and a patch that the base later reverted
-     still counts as in the base.
+     still counts as in the base. One exception: when every commit past a
+     merged PR's head is a merge and HEAD's tree equals the base's (the base
+     merged in after the PR merged), nothing blocks and `notes` say so; an own
+     commit or any tree difference still blocks as ahead of the PR head.
      An Orca comment containing 「消さない」 or 「残す」 also blocks, naming the
      key `remove:<path>`: hand the question to the lead, and once
      `lead_decisions.py` holds an answer for that key, the blocker clears and

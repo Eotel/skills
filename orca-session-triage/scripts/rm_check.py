@@ -629,6 +629,21 @@ def patches_in_base(worktree: str | Path, head: str, base: str) -> list[str] | N
     return [line[2:] for line in lines]
 
 
+def only_base_merged_after(worktree: str | Path, head: str, pr_head: str, base: str) -> bool:
+    """Whether every commit past the merged PR head merges base in and HEAD's tree is base's.
+
+    Both are asked: an own commit counts as work even when its patch reached base, and the tree
+    check keeps an edit made while merging. False when git cannot tell (the PR head object is absent).
+    """
+    past = git(worktree, "rev-list", head, "^" + pr_head, "^" + base)
+    own = git(worktree, "rev-list", "--no-merges", head, "^" + pr_head, "^" + base)
+    trees = git(worktree, "rev-parse", head + "^{tree}", base + "^{tree}")
+    if any(done.returncode != 0 for done in (past, own, trees)):
+        return False
+    head_tree, base_tree = trees.stdout.split()
+    return bool(past.stdout.strip()) and not own.stdout.strip() and head_tree == base_tree
+
+
 def pr_head_relation(worktree: str | Path, head: str, pr_head: str, head_ahead_of_pr: int | None) -> str:
     """Whether HEAD is in the merged PR head's history; trust compare only if that object is absent."""
     if git(worktree, "cat-file", "-e", pr_head + "^{commit}").returncode != 0:
@@ -965,6 +980,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
     merged_by_patch = []
+    merge_notes = []
     open_pr_at_head = (pr or {}).get("state") == "OPEN" and (pr or {}).get("headRefOid") == head
     if not open_pr_at_head and (base is None or git(worktree, "merge-base", "--is-ancestor", head, base).returncode != 0):
         merged_head = pr_head or ((pr or {}).get("headRefOid") if (pr or {}).get("state") == "MERGED" else None)
@@ -972,7 +988,11 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
         # Do not let an equivalent patch hide work committed after the PR head.
         if relation == "ahead":
             assert merged_head is not None
-            blockers.append("HEAD %s is ahead of merged PR head %s" % (head[:8], merged_head[:8]))
+            if base and only_base_merged_after(worktree, head, merged_head, base):
+                merge_notes.append("HEAD %s is merged PR head %s plus merges of %s, and its tree equals %s"
+                                   % (head[:8], merged_head[:8], base, base))
+            else:
+                blockers.append("HEAD %s is ahead of merged PR head %s" % (head[:8], merged_head[:8]))
         elif relation != "contained":
             # A commit rebased before its PR merged has its patch in base under another hash.
             merged_by_patch = (patches_in_base(worktree, head, base) or []) if base else []
@@ -993,6 +1013,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
     review, regenerable, nested, notes, lock_holders, records, held_files = ignored_paths(worktree, main)
     notes.extend(clone_notes)
+    notes.extend(merge_notes)
     nested = [nested_check(copy) for copy in nested]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
