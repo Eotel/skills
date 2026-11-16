@@ -7282,7 +7282,7 @@ class HourlyReadTests(unittest.TestCase):
         hourly_read = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            initial = Barrier(10, timeout=5)
+            initial = Barrier(11, timeout=5)
             seen = []
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
                     text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -7309,14 +7309,15 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual(code, 1)
             [run_dir] = directory.iterdir()
             result = json.loads((run_dir / "results.json").read_text())
-            self.assertEqual(len(seen), 11)
+            self.assertEqual(len(seen), 12)
             self.assertEqual({item["name"]: item["exit_code"] for item in result}, {
                 "cleanup-hourly-tabs": 0, "lead-state": 0, "open-asks": 0, "unanswered": 0,
                 "pending": 0, "handoff-last": 0, "scan": 0, "backlog-watch": 124,
-                "asana99-status": 0, "topic-check": 7, "stale-asks": 0})
+                "asana99-status": 0, "topic-check": 7, "tracker-gaps": 0, "stale-asks": 0})
             self.assertEqual(json.loads((run_dir / "scan.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "lead-state.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "asana99-status.json").read_text()), [])
+            self.assertEqual(json.loads((run_dir / "tracker-gaps.json").read_text()), [])
             self.assertIn("topic unavailable", (run_dir / "topic-check.stderr").read_text())
             self.assertIn("topic-check: exit 7", out.getvalue())
             self.assertIn(str(run_dir), out.getvalue())

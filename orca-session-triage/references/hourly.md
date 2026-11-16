@@ -180,8 +180,8 @@ by hand.
 At the start, run
 `~/.claude/skills/orca-session-triage/scripts/hourly_read.py`.
 It runs cleanup, lead-state, open-asks, unanswered decisions, pending hourly
-state, the last handoff, scan, backlog-watch, Asana status, and topic checks in
-parallel. After a successful scan it runs stale-asks against that scan. Each
+state, the last handoff, scan, backlog-watch, Asana status, topic checks, and
+tracker gaps in parallel. After a successful scan it runs stale-asks against that scan. Each
 invocation prints its unique directory under `~/.cache/orca-session-triage/reads`
 and writes `results.json` there; its last line prints that path and shape.
 `results.json` is a JSON array (not an object) with one record per command,
@@ -249,6 +249,17 @@ In every hourly run on a Mac that has `~/.cache/orca-briefs/bin/topic`, run
 workspace that should fix it (its newest writer that still exists, with live
 agents). The writer fixes its own drift: never route a row to the user. A row
 without a live writer goes to the lead.
+
+In every hourly run, read `tracker-gaps.json` (`project-status --gaps --json`).
+Each row in `gaps` is an item of a registered project assigned to the user (a
+Backlog issue, a GitHub issue, an Asana task) that a workspace started but left
+未対応, or left without the fields the shared rule asks for at start and finish
+(`missing`: start date, due date, estimated or actual hours, or the issue's
+「予定」 and assignee). `workspace` and `host` name the workspace that worked on
+it; `fix` is the command that fills it. The workspace fixes its own item,
+counting the user's own time as the shared rule says: never route a row to the
+user. A row whose `workspace` is null, or whose send fails because the
+workspace has no agent, goes to the lead.
 
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
@@ -416,6 +427,9 @@ until the lead observes that its recorded symptom is gone. Then:
 - Send each `topic check --all` drift row to a live agent of the workspace it
   names with `send`, quoting the row and the fix it prints. When another lead
   is appointed, put the rows in the handoff instead.
+- Send the `tracker-gaps` rows to their `workspace` with `send` (on its
+  `host`), one message per workspace quoting each row's `text` and `fix`. When
+  another lead is appointed, put the rows in the handoff instead.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
   For 「レビューの番」, run the row's `review-pr ... --if-needed` command in this
