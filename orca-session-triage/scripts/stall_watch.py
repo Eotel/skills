@@ -56,6 +56,7 @@ import time
 from typing import Literal, Protocol
 from urllib.parse import urlparse
 
+import inbox_read
 import scan_sessions as scan
 
 HOME = Path.home()
@@ -122,6 +123,7 @@ class Report:
     at: datetime
     text: str
     handle: str
+    questions: int = 0
 
 
 @dataclass(frozen=True)
@@ -296,14 +298,23 @@ def watcher_signals(row: Mapping, act: Activity, records: Records, now: datetime
     return found
 
 
+def covering_answers(ask: Report, records: Records) -> list[Answer]:
+    """The answers that settle the ask: its own, or one for every structured question (inbox_read.open_asks's rule)."""
+    keys = ([ask.id] if ask.id in records.answers_by_ask
+            else [f"{ask.id}:{number}" for number in range(1, ask.questions + 1)])
+    return ([answer for key in keys for answer in records.answers_by_ask[key]]
+            if keys and all(key in records.answers_by_ask for key in keys) else [])
+
+
 def answer_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     found = []
     for ask in (report for report in lane_reports(row, records) if report.kind == "ask"):
         answers = [answer for key, given in records.answers_by_ask.items()
                    if key == ask.id or key.startswith(ask.id + ":") for answer in given]
-        if not answers or any(answer.how in DELIVERED or answer.how == WITHDRAWN for answer in answers):
+        covering = covering_answers(ask, records)
+        if not covering or any(answer.how in DELIVERED or answer.how == WITHDRAWN for answer in answers):
             continue
-        answered = min(answer.at for answer in answers)
+        answered = max(answer.at for answer in covering)
         sent = [at for handle in {ask.handle, *handles(row)} for at in records.sends_by_handle.get(handle, ()) if at > ask.at]
         if sent or now - answered < GRACE or moved_since(act, answered):
             continue
@@ -465,7 +476,7 @@ def idle_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
     if not reports or act.at is None or now - act.at < IDLE_AFTER:
         return []
     last = reports[-1]
-    answered = last.kind == "ask" and any(key == last.id or key.startswith(last.id + ":") for key in records.answers_by_ask)
+    answered = last.kind == "ask" and bool(covering_answers(last, records))
     if not (last.kind == "info" or answered) or waits_explained(row, verdict, records, now.timestamp()):
         return []
     return [base_signal(row, act, records, "idle_after_report", f"{last.id[:8]}@{act.at:%Y%m%dT%H%M}",
@@ -506,7 +517,7 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
         if at and at <= now and item.get("worktree") and item.get("kind") in ("ask", "done", "info"):
             reports.setdefault(item["worktree"], []).append(
                 Report(str(item.get("id") or ""), item["kind"], at, str(item.get("text") or ""),
-                       str(item.get("handle") or "")))
+                       str(item.get("handle") or ""), len(inbox_read.questions_of(item))))
     given: dict[str, list[Answer]] = {}
     for item in read_jsonl(answers):
         at = parse(item.get("ts"))

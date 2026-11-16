@@ -211,6 +211,15 @@ class MorningLanesTests(unittest.TestCase):
         self.assertEqual([item.signal for item in stall.judge(lane, None, records, NOW, FakeProbe(), live=False)],
                          ["idle_after_report"])
 
+    def test_an_ask_with_a_question_still_unanswered_is_still_waiting(self) -> None:
+        lanes, records = morning()
+        lane, _ = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-left"))
+        two_questions = replace(records, reports_by_worktree={
+            "answer-left": (replace(records.reports_by_worktree["answer-left"][0], questions=2),)},
+            answers_by_ask={"ask-left-0001:1": records.answers_by_ask["ask-left-0001"]})
+
+        self.assertEqual(stall.judge(lane, None, two_questions, NOW, FakeProbe(), live=False), [])
+
     def test_a_forge_wait_signals_once_the_forge_answers(self) -> None:
         probe = FakeProbe(origins={"/w/app/forge-wait": "https://git.example.org/me/app.git"}, reachable=True)
 
