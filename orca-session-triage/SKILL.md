@@ -85,7 +85,9 @@ board's done cards; close what the user approves.
   the process and its ancestors whose cwd is inside the worktree and not in a
   checkout nested in it, such as a worktree under its `.claude/worktrees`), even
   when the session started or moved its cwd elsewhere; among those it takes the
-  transcript with the newest entry.
+  transcript with the newest entry. Every Claude account's projects directory
+  (`~/.claude/projects` and each Orca profile's) is searched, and of a session
+  with a copy in several accounts the newest copy is read.
   A live Claude whose tab is absent also exposes `claude_sessions`: `pid`,
   `ORCA_TERMINAL_HANDLE`, `status`, and `waitingFor` from its process and session
   record, in `--row` and `--rows`.
@@ -240,6 +242,19 @@ board's done cards; close what the user approves.
   scan listed, and keeps each one whose worktree's transcripts, triage inbox
   reports, or agent states in Orca, other than the calling session's own,
   changed after the scan started. Close tabs through it.
+- `scripts/stall_watch.py run`: judges the newest saved scan, with this Mac's
+  transcripts, rollouts, and background jobs read again, by six fixed rules
+  (its `--help`): a wait loop
+  outliving the PR it names, an answer recorded but never sent to the lane, a
+  time the lane promised that passed with nothing keeping it, a verdict's
+  outside wait that now holds, a turn an API error ended, and a lane left idle
+  after its last report. New signals reach the lead as one `ask` from
+  `stall-watch`; each is kept in `~/.cache/orca-session-triage/work-checks.json`
+  and, when the board offers `orca_board_commitments.py check`, in its
+  work_check table, and is never sent twice. The lead wakes
+  the lane (`send … --ask <id>`) or closes or keeps the signal
+  (`inbox_read.py answered <id> --note …`). `stopped-at PATH…` prints when an
+  agent last did anything, as `lanes-idle` measures it.
 - `scripts/timeline.py --since TIME [--until TIME] [--lane WORKSPACE] [--match TEXT] [--json]`:
   one timeline of what the lead and the lanes did (time, who to whom, what happened, a
   summary, the record's id), merged from the triage inbox, ask answers, the lead's

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -183,10 +183,28 @@ def is_real_user_message(entry: dict) -> bool:
 # Claude Code keeps <config dir>/sessions/<pid>.json for each running session, with its sessionId and current
 # cwd; Orca runs Claude under one config dir per profile.
 CLAUDE_SESSION_DIRS = (".claude/sessions", "Library/Application Support/orca/claude-profiles/*/home/sessions")
+CLAUDE_PROJECT_DIRS = (".claude/projects", "Library/Application Support/orca/claude-profiles/*/home/projects")
 
 
 def claude_session_dirs() -> list[Path]:
     return [path for pattern in CLAUDE_SESSION_DIRS for path in Path.home().glob(pattern) if path.is_dir()]
+
+
+def claude_project_roots() -> list[Path]:
+    """Every Claude account's projects directory, once each: an Orca profile may link its own to ~/.claude/projects."""
+    found = [path for pattern in CLAUDE_PROJECT_DIRS for path in Path.home().glob(pattern) if path.is_dir()]
+    return list({path.resolve(): path for path in found}.values())
+
+
+def newest_copy(paths: Iterable[Path]) -> Path | None:
+    """The copy whose newest timestamped entry is latest: a session resumed in another account keeps writing only there,
+    while its first account's copy stays behind."""
+    def entry_at(path: Path) -> tuple[datetime, float]:
+        try:
+            return last_entry_at(path) or EPOCH, path.stat().st_mtime
+        except OSError:
+            return EPOCH, 0.0
+    return max({path.resolve(): path for path in paths}.values(), key=entry_at, default=None)
 
 
 def process_table() -> dict[int, tuple[int, str]]:
@@ -260,12 +278,12 @@ def ancestry(pid: int, processes: dict[int, tuple[int, str]]) -> list[int]:
 
 
 def session_transcript(session_id: str, cwd: str, roots: Sequence[Path]) -> Path | None:
-    """The transcript of a session under its cwd's project directory, or under any one after its cwd moved."""
+    """The newest copy of a session's transcript under its cwd's project directory, or under any one after its cwd
+    moved."""
     name = session_id + ".jsonl"
     roots = list(dict.fromkeys(roots))
-    exact = (path for root in roots if (path := find_claude_dir(root, cwd) / name).is_file())
-    moved = (path for root in roots if root.is_dir() for path in root.glob("*/" + name))
-    return next(exact, None) or next(moved, None)
+    exact = [path for root in roots if (path := find_claude_dir(root, cwd) / name).is_file()]
+    return newest_copy(exact) or newest_copy(path for root in roots if root.is_dir() for path in root.glob("*/" + name))
 
 
 def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequence[Path], projects_root: str | Path,
@@ -396,20 +414,28 @@ def one_shot_schedules(rows: list[dict]) -> list[dict]:
     return list(jobs.values())
 
 
-def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
-    """Summarize the newest Claude transcript for a worktree, or None when there is none.
-
-    `running` adds transcripts of Claude sessions running under it that live in other project directories.
-    """
-    candidates = list(find_claude_dir(projects_root, worktree_path).glob("*.jsonl"))
-    if not candidates and not running:
-        return None
-    path = max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+def newest_claude_transcript(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> Path | None:
+    """The worktree's newest Claude transcript across every account, preferring by last entry a running session's."""
+    roots = {root.resolve(): root for root in (Path(projects_root), *claude_project_roots())}.values()
+    newest = [max(found, key=lambda p: p.stat().st_mtime) for root in roots
+              if (found := list(find_claude_dir(root, worktree_path).glob("*.jsonl")))]
+    path = newest_copy(newest)
     if running:
         # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
         path = max(dict.fromkeys([*running, *([path] if path else [])]),
                    key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
-    assert path is not None
+    return path
+
+
+def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
+    """Summarize the newest Claude transcript for a worktree, or None when there is none.
+
+    `running` adds transcripts of Claude sessions running under it that live in other project directories. Every
+    account's projects directory is searched, since one session can leave a copy in each account it ran in.
+    """
+    path = newest_claude_transcript(projects_root, worktree_path, running)
+    if path is None:
+        return None
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None
@@ -2461,7 +2487,7 @@ def read_key(row: dict) -> str | None:
                        *([{"decided": row["waits_decided"]}] if row.get("waits_decided") else [])])
 
 
-def row_identity(row: dict) -> str:
+def row_identity(row: Mapping) -> str:
     """Keep equal paths on different Orca servers distinct in the verdict store."""
     return f"{row['environment']}::{row['path']}" if row.get("environment") else row["path"]
 
@@ -2471,12 +2497,17 @@ def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
     if not state_file.exists():
         return []
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    names = {row_identity(row), row_name(row), row["path"],
-             f"{row.get('repo')}/{Path(row['path']).name}"}
-    if not row.get("environment"):
-        names.add(Path(row["path"]).name)
+    names = handoff_names(row)
     return [item for item in data.get("handoffs", {}).values()
             if item.get("delivered_at") is None and item.get("to") in names]
+
+
+def handoff_names(row: Mapping) -> set[str]:
+    """Every name a handoff's from or to may give this row: its identity, path, repo/name, or a local row's name."""
+    names = {row_identity(row), row_name(row), row["path"], f"{row.get('repo')}/{Path(row['path']).name}"}
+    if not row.get("environment"):
+        names.add(Path(row["path"]).name)
+    return names
 
 
 def with_automation_workspaces(rows: list[dict], orca: str) -> list[dict]:
@@ -3052,7 +3083,7 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
         print(f"  {error['host']} {error['path']} ({row_name(row)} {error.get('tab') or '-'})")
 
 
-def row_name(row: dict) -> str:
+def row_name(row: Mapping) -> str:
     name = Path(row["path"]).name
     return f"{row['environment']}::{name}" if row.get("environment") else name
 
