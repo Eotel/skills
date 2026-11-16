@@ -5585,6 +5585,12 @@ class HourlyStateTests(unittest.TestCase):
                 code, result = self.call("stale-asks", "--from", str(saved))
             self.assertEqual((code, [(item["undecided_proposals"], item["undecided_count"]) for item in result]),
                              (0, expected))
+        asking = json.loads(saved.read_text())
+        asking[0]["prompt_waiting"] = {"tab": "t", "question": "残りの案 2ead92cc を採用しますか？", "choices": ["1. 採用"]}
+        saved.write_text(json.dumps(asking))
+        with patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value={adopted: True, pending: True}):
+            code, result = self.call("stale-asks", "--from", str(saved))
+        self.assertEqual((code, [item["row"] for item in result]), (0, [scan.row_identity(asking[0])]))
 
     def test_in_progress_without_a_question_is_not_an_unanswered_user_question(self) -> None:
         saved = self.root / "scan.json"

@@ -607,13 +607,13 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                                    "question": f"予約が消えた: {job['cron']} {job['prompt'][:100]}",
                                    "schedule": job, "ask": None, "answer": None}))
         undecided: list[str] = []
+        settled = False
         if proposals and name.startswith(CONSOLIDATE_PREFIX):
             verdict = row.get("verdict") or {}
             named = scan_sessions.named_proposals("\n".join(str(value or "") for value in (
                 verdict.get("waits_on"), verdict.get("next_step"), final["text"])), proposals)
             undecided = [proposal[:8] for proposal in named if not proposals[proposal]]
-            if named and not undecided:
-                continue
+            settled = bool(named) and not undecided
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
@@ -630,6 +630,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
+        # The ledger settles only the proposals the lane waited on, not a question it is asking now.
+        if settled and not (row.get("prompt_waiting") or (row.get("claude") or {}).get("pending_questions")
+                            or shared_pending or any(not proof or keys.get(item["id"]) for _, item, proof in counted)):
+            continue
         verdict = row.get("verdict") or {}
         received = [{**report_view(item), "worktree": item.get("worktree"), "repo": item.get("repo")}
                     for item in entries if item.get("kind") in ("info", "done")

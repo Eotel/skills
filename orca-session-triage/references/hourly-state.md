@@ -141,7 +141,8 @@ state), and `related_issues_closed`, true when every one is closed or merged;
 check that before putting it to the user. A consolidation lane's row
 (`adoption-consolidate-*`) is left out once the adoption ledger has every
 proposal its final message, `waits_on`, or `next_step` names adopted, rejected,
-held, or applied; while some are not, its item carries `undecided_proposals`
+held, or applied, unless it still asks something of its own (a question on its
+screen, an unanswered ask); while some are not, its item carries `undecided_proposals`
 (their 8-character IDs) and `undecided_count`: report only those as waiting on
 the board. A screen question's `asked_at`,
 from the live session's transcript including a fork, takes priority over the
