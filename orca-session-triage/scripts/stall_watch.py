@@ -30,6 +30,10 @@ Signals:
                        fifteen minutes or more ago
   idle_after_report    the lane's last report is an info or an answered ask, its agent has done nothing for two
                        hours, and no open question, active hold, live background job, or Orca automation explains it
+  busy_without_progress  the lane's agent has called tools without a break of 30 minutes, at 30 calls an hour or more,
+                       for 90 minutes since its last report, successful commit, push, PR or issue write, or user
+                       message (Claude's transcript or Codex's rollout, read from the end); a lane with an open ask
+                       or an Orca automation is left out
 
 When the agent last did anything: Claude's newest transcript entry (the newest copy across Claude accounts), Codex's
 newest assistant message in its rollout, else the board's done time for the agent, else the lane's last report;
@@ -41,7 +45,7 @@ Exit status: 0 the check finished, 1 a record could not be read or the inbox wri
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
@@ -82,9 +86,15 @@ SIGNALS = {
     "wait_resolved": "外の待ち先が解けた",
     "api_error_turn": "エラーで終わった turn",
     "idle_after_report": "報告の後の放置",
+    "busy_without_progress": "動き続けて進まない",
 }
 WATCHER_AFTER = timedelta(hours=1)
 IDLE_AFTER = timedelta(hours=2)
+BUSY_AFTER = timedelta(minutes=90)
+BUSY_GAP = timedelta(minutes=30)
+BUSY_CALLS_PER_HOUR = 30
+TAIL_CHUNK = 1 << 20
+TAIL_LIMIT = 64 << 20
 GRACE = timedelta(minutes=15)
 PROMISE_HORIZON = timedelta(days=60)
 CODEX_SINCE = timedelta(days=2)
@@ -110,6 +120,9 @@ DEADLINE = re.compile(r"\s*(?:まで|より前|の?前|以前)")
 CLOCK = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])\s*(?:に|から|以降|ごろ|頃)")
 WAIT_DATE = re.compile(r"(?<![\d/])(?:(\d{4})[-/])?(\d{1,2})[/-](\d{1,2})(?![\d/])|(\d{1,2})月(\d{1,2})日")
 FORGE_WORDS = ("forge", "forgejo", "gitea")
+PROGRESS_COMMAND = re.compile(r"\bgit\s+(?:-[Cc]\s+\S+\s+)*(?:commit|push)\b"
+                              r"|\bgh\s+(?:pr|issue)\s+(?:create|merge|comment|review|edit|close)\b|triage-notify")
+EXIT_CODE = re.compile(r'\\*"exit_code\\*"\s*:\s*(\d+)')
 
 
 MeasuredBy = Literal["transcript", "rollout", "agent_state", "report"]
@@ -487,6 +500,133 @@ def idle_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
                         f"{short(act.at)} から動いておらず、待ち・hold・裏の作業・定期実行のどれも無い")]
 
 
+@dataclass(frozen=True)
+class Run:
+    """The lane's current stretch of tool calls since its last progress, or since it started working without a break."""
+    since: datetime
+    calls: int
+    source: str
+    whole: bool
+
+
+def lines_backwards(path: Path) -> Iterator[bytes]:
+    """The file's lines from the newest, reading at most TAIL_LIMIT bytes; the last item is b"" when it stopped early."""
+    with path.open("rb") as handle:
+        size = end = handle.seek(0, os.SEEK_END)
+        rest = b""
+        while end > 0:
+            if size - end >= TAIL_LIMIT:
+                yield b""
+                return
+            start = max(0, end - TAIL_CHUNK)
+            handle.seek(start)
+            lines = (handle.read(end - start) + rest).split(b"\n")
+            end = start
+            rest = lines.pop(0) if start else b""
+            yield from (line for line in reversed(lines) if line.strip())
+
+
+def claude_steps(entry: Mapping, done: dict[str, datetime]) -> Iterator[tuple[str, datetime]]:
+    """Steps of one transcript entry, read newest first: a tool result is seen before the call that made it."""
+    at = parse(entry.get("timestamp"))
+    content = (entry.get("message") or {}).get("content")
+    blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+    if at is None or entry.get("isSidechain"):
+        return
+    if entry.get("type") == "user":
+        if scan.is_real_user_message(dict(entry)):
+            yield "progress", at
+        done.update({str(block.get("tool_use_id")): at for block in blocks
+                     if block.get("type") == "tool_result" and not block.get("is_error")})
+    elif entry.get("type") == "assistant":
+        yield "turn", at
+        for block in (block for block in blocks if block.get("type") == "tool_use"):
+            yield "call", at
+            command = str((block.get("input") or {}).get("command") or "")
+            if (finished := done.get(str(block.get("id")))) and PROGRESS_COMMAND.search(command):
+                yield "progress", finished
+
+
+def codex_steps(entry: Mapping, done: dict[str, datetime]) -> Iterator[tuple[str, datetime]]:
+    payload = entry.get("payload")
+    at = parse(entry.get("timestamp"))
+    if at is None or entry.get("type") != "response_item" or not isinstance(payload, dict):
+        return
+    kind = payload.get("type")
+    if kind in ("function_call_output", "custom_tool_call_output"):
+        codes = EXIT_CODE.findall(str(payload.get("output") or ""))
+        if codes and all(code == "0" for code in codes):
+            done[str(payload.get("call_id"))] = at
+    elif kind in ("function_call", "custom_tool_call"):
+        yield "turn", at
+        yield "call", at
+        command = str(payload.get("input") or payload.get("arguments") or "")
+        if (finished := done.get(str(payload.get("call_id")))) and PROGRESS_COMMAND.search(command):
+            yield "progress", finished
+    elif kind == "message" and payload.get("role") == "assistant":
+        yield "turn", at
+    elif kind == "message" and payload.get("role") == "user":
+        text = " ".join(str(part.get("text") or "") for part in payload.get("content") or [] if isinstance(part, dict))
+        if text.strip() and not text.lstrip().startswith("<"):
+            yield "progress", at
+
+
+def current_run(path: Path, agent: str, now: datetime, floor: datetime | None) -> Run | None:
+    """Walk back from the newest entry to the last progress, a break longer than BUSY_GAP, or `floor` (a report)."""
+    steps = claude_steps if agent == "claude" else codex_steps
+    done: dict[str, datetime] = {}
+    calls, newest, oldest = 0, None, None
+    try:
+        for line in lines_backwards(path):
+            if not line:
+                return Run(oldest, calls, path.stem[-8:], False) if oldest else None
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or (at := parse(entry.get("timestamp"))) is None or at > now:
+                continue
+            for step, when in steps(entry, done):
+                if step == "progress" or (floor and when <= floor):
+                    return Run(max(when, floor or when), calls, path.stem[-8:], True) if newest else None
+                if step == "turn":
+                    if newest is None and now - when > GRACE:
+                        return None
+                    if oldest and oldest - when > BUSY_GAP:
+                        return Run(oldest, calls, path.stem[-8:], True)
+                    newest, oldest = newest or when, when
+                elif step == "call":
+                    calls += 1
+    except OSError:
+        return None
+    return Run(oldest, calls, path.stem[-8:], True) if oldest else None
+
+
+def busy_signals(row: Mapping, act: Activity, records: Records, now: datetime, live: bool) -> list[Signal]:
+    reports = [report for report in lane_reports(row, records) if report.at <= now]
+    asking = [report for report in reports if report.kind == "ask" and report.id
+              and not inbox_read.is_handoff({"text": report.text}) and not covering_answers(report, records)]
+    if asking or row.get("automation_workspaces") or (live and (act.at is None or now - act.at > GRACE)):
+        return []
+    claude = row.get("claude") or {}
+    rollouts = sorted((item for item in row.get("codex") or [] if item.get("rollout")),
+                      key=lambda item: parse(item.get("last_assistant_at")) or datetime.min.replace(tzinfo=timezone.utc))
+    sources = [(Path(claude["transcript"]), "claude")] if claude.get("transcript") else []
+    sources += [(Path(rollouts[-1]["rollout"]), "codex")] if rollouts else []
+    floor = reports[-1].at if reports else None
+    runs = [run for path, agent in sources if path.is_file() and (run := current_run(path, agent, now, floor))]
+    run = max(runs, key=lambda item: item.calls, default=None)
+    if run is None or now - run.since < BUSY_AFTER:
+        return []
+    minutes = (now - run.since) / timedelta(minutes=1)
+    if run.calls < BUSY_CALLS_PER_HOUR * minutes / 60:
+        return []
+    since = f"{run.since.astimezone():%Y%m%dT%H%M}" if run.whole else "tail"
+    return [base_signal(row, act, records, "busy_without_progress", f"{run.source}@{since}",
+                        f"{short(run.since)} から {minutes:.0f} 分、tool を {run.calls} 回使い続けているが、報告・commit・"
+                        "push・PR・人の入力が無い。担当に聞かず画面を読み、空回りなら止めるか立て直す")]
+
+
 def judge(row: Mapping, verdict: Mapping | None, records: Records, now: datetime, probe: Probe,
           live: bool = True) -> list[Signal]:
     if records.lead_path and row["path"] == records.lead_path:
@@ -494,7 +634,8 @@ def judge(row: Mapping, verdict: Mapping | None, records: Records, now: datetime
     act = activity(row, records, live)
     return [*watcher_signals(row, act, records, now, probe), *answer_signals(row, act, records, now),
             *promise_signals(row, act, records, now), *wait_signals(row, verdict, act, records, now, probe),
-            *error_signals(row, act, records, now), *idle_signals(row, verdict, act, records, now)]
+            *error_signals(row, act, records, now), *idle_signals(row, verdict, act, records, now),
+            *busy_signals(row, act, records, now, live)]
 
 
 def read_jsonl(path: Path) -> list[dict]:

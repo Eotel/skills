@@ -265,6 +265,87 @@ class PromiseTests(unittest.TestCase):
         self.assertEqual(stall.promise_due("11/16 7:30 から流します。", said), at("2026-11-16T07:30:00+09:00"))
 
 
+def utc(minutes_before_now: int) -> str:
+    return (NOW - timedelta(minutes=minutes_before_now)).astimezone(stall.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def claude_call(minutes_before_now: int, command: str = "sed -n 1,80p app/view.py", failed: bool = False) -> list[dict]:
+    use = f"toolu_{minutes_before_now}_{abs(hash(command)) % 1000}"
+    return [{"type": "assistant", "timestamp": utc(minutes_before_now), "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": use, "name": "Bash", "input": {"command": command}}]}},
+            {"type": "user", "timestamp": utc(minutes_before_now), "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": use, "content": "…", "is_error": failed}]}}]
+
+
+def codex_call(minutes_before_now: int, command: str = "sed -n 1,80p app/view.py", exit_code: int = 0) -> list[dict]:
+    call = f"call_{minutes_before_now}_{abs(hash(command)) % 1000}"
+    return [{"timestamp": utc(minutes_before_now), "type": "response_item", "payload": {
+                "type": "custom_tool_call", "call_id": call, "name": "exec",
+                "input": f"text(await tools.exec_command({{cmd:{json.dumps(command)}}}));"}},
+            {"timestamp": utc(minutes_before_now), "type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": call,
+                "output": f'[{{"type":"input_text","text":"{{\\"exit_code\\":{exit_code},\\"output\\":\\"…\\"}}"}}]'}}]
+
+
+class BusyWithoutProgressTests(unittest.TestCase):
+    """A lane that keeps calling tools with no report, commit, push, PR, or word from anyone (pstack's orchestrate)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def lane(self, agent: str, entries: list[dict]) -> dict:
+        path = self.dir / f"{agent}.jsonl"
+        in_order = sorted(entries, key=lambda entry: entry["timestamp"])
+        path.write_text("".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in in_order), encoding="utf-8")
+        if agent == "claude":
+            return row("busy", claude=claude(utc(1), "", transcript=str(path)))
+        return row("busy", codex=[{"rollout": str(path), "last_assistant_at": utc(1), "last_assistant": "",
+                                   "last_role": "assistant"}])
+
+    def signals(self, lane: dict, records: object = None, now: datetime = NOW) -> list[tuple[str, str]]:
+        return [(item.signal, item.fingerprint)
+                for item in stall.judge(lane, None, records or stall.Records(), now, FakeProbe(), live=False)]
+
+    def test_a_lane_calling_tools_for_ninety_minutes_with_nothing_to_show_wakes_the_lead_once(self) -> None:
+        for agent, call in (("claude", claude_call), ("codex", codex_call)):
+            with self.subTest(agent):
+                busy = [entry for minutes in range(104, 0, -1) for entry in call(minutes)]
+                first = self.signals(self.lane(agent, busy))
+                later = self.signals(self.lane(agent, busy + [e for m in range(-1, -15, -1) for e in call(m)]),
+                                     now=NOW + timedelta(minutes=15))
+
+                self.assertEqual([signal for signal, _ in first], ["busy_without_progress"])
+                self.assertEqual(later, first)
+
+    def test_a_commit_push_report_or_typed_word_within_the_ninety_minutes_is_progress(self) -> None:
+        busy = [entry for minutes in range(104, 0, -1) for entry in claude_call(minutes)]
+        codex_busy = [entry for minutes in range(104, 0, -1) for entry in codex_call(minutes)]
+        typed = {"type": "user", "timestamp": utc(45), "message": {"role": "user", "content": "その方針で進めてください"}}
+        reported = stall.Records(reports_by_worktree={
+            "busy": (report("r1", "info", (NOW - timedelta(minutes=45)).isoformat()),)})
+        for name, agent, entries, records in (
+                ("commit in another repo", "claude", busy + claude_call(45, "git -C ../tools commit -m 'fix: retry'"), None),
+                ("codex push", "codex", codex_busy + codex_call(45, "git push"), None),
+                ("report", "claude", busy, reported),
+                ("typed word", "claude", busy + [typed], None)):
+            with self.subTest(name):
+                self.assertEqual(self.signals(self.lane(agent, entries), records), [])
+        for name, agent, entries in (("failed push", "claude", busy + claude_call(45, "git push", failed=True)),
+                                     ("failed codex push", "codex", codex_busy + codex_call(45, "git push", 1))):
+            with self.subTest(name):
+                self.assertEqual([signal for signal, _ in self.signals(self.lane(agent, entries))],
+                                 ["busy_without_progress"])
+
+    def test_a_lane_waking_every_twenty_minutes_to_check_its_pr_is_waiting_not_busy(self) -> None:
+        polling = [entry for minutes in range(185, 0, -20) for entry in claude_call(minutes, "watch_prs.py --once 52")]
+
+        self.assertEqual(self.signals(self.lane("claude", polling)), [])
+
+
 class LiveProbeTests(unittest.TestCase):
     def test_a_forge_that_does_not_answer_is_asked_once_per_run(self) -> None:
         probe = stall.LiveProbe({})
