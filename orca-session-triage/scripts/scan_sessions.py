@@ -2131,19 +2131,42 @@ PROPOSAL_REF = re.compile(r"(?<![0-9A-Za-z-])[0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]
 DECIDED_STATUSES = ("adopted", "rejected", "held")
 
 
-def ledger_proposals() -> dict[str, bool] | None:
-    """Each adoption-ledger proposal ID and whether the board decided it (adopted, rejected or held) or it was
-    applied; None, with the reason on stderr, when the ledger cannot be read."""
+class LedgerProposal(NamedTuple):
+    """An adoption-ledger proposal as a lane's wait sees it."""
+    decided: bool  # the board adopted, rejected or held it, or it was applied
+    holders: frozenset[str] = frozenset()  # the lanes it was handed to while adopted and not yet applied
+
+    def settles(self, worktree: str) -> bool:
+        """Whether a wait of `worktree` that names this proposal is over. A lane holding the proposal names it as
+        the work it ships (`--applied <id>`), not as something it waits on, until it is applied."""
+        return self.decided and worktree not in self.holders
+
+
+def ledger_proposals() -> dict[str, LedgerProposal] | None:
+    """Each adoption-ledger proposal by ID; None, with the reason on stderr, when the ledger cannot be read.
+    A lane holds a proposal when a handed_off execution under its last adoption names it as the actor, as
+    adoption-triage's `ledger.py owner` reads it."""
     try:
         items = retro_ledger.LedgerClient().list()
     except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
         print(f"adoption ledger unreadable: {error}", file=sys.stderr)
         return None
-    return {item["proposal_id"]: item.get("status") in DECIDED_STATUSES or bool(item.get("implemented_at"))
+
+    def holders(item: dict) -> frozenset[str]:
+        if item.get("implemented_at") or item.get("status") != "adopted":
+            return frozenset()
+        adoption = next((decision.get("id") for decision in reversed(item.get("decisions") or [])
+                         if decision.get("decision") == "adopt"), None)
+        return frozenset(str(run["actor"]) for run in item.get("executions") or []
+                         if adoption and run.get("decision_id") == adoption
+                         and run.get("outcome") == "handed_off" and run.get("actor"))
+
+    return {item["proposal_id"]: LedgerProposal(
+                item.get("status") in DECIDED_STATUSES or bool(item.get("implemented_at")), holders(item))
             for item in items if isinstance(item.get("proposal_id"), str)}
 
 
-def named_proposals(text: str, proposals: Mapping[str, bool]) -> list[str]:
+def named_proposals(text: str, proposals: Mapping[str, LedgerProposal]) -> list[str]:
     """The ledger proposals `text` names: by full ID, or by an 8-character prefix only one proposal has.
     Other hex words (commit SHAs, event IDs) name none."""
     named = []
@@ -2156,7 +2179,7 @@ def named_proposals(text: str, proposals: Mapping[str, bool]) -> list[str]:
 
 def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | None] = git_state,
                         pr_lookup: PrLookup = gh_prs, verdicts: dict | None = None,
-                        proposals: Callable[[], Mapping[str, bool] | None] | None = None) -> list[dict]:
+                        proposals: Callable[[], Mapping[str, LedgerProposal] | None] | None = None) -> list[dict]:
     """Add git and PR facts to rows needing review or completed rows with no current agent.
 
     `pr_lookup(slug, refs)` reads every PR one repository's rows need at once
@@ -2260,7 +2283,7 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
                    "reasons": [*row.get("reasons", []), "everything the saved verdict waits on closed: "
                                + ", ".join(closed)]}
         named = named_proposals(wait_text, ledger)
-        if named and all(ledger[proposal] for proposal in named):
+        if named and all(ledger[proposal].settles(Path(row["path"]).name) for proposal in named):
             decided = [proposal[:8] for proposal in named]
             row = {**row, "waits_decided": decided,
                    "reasons": [*row.get("reasons", []), "待っていた案が台帳で決まった: " + ", ".join(decided)]}

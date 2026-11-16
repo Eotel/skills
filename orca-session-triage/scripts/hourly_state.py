@@ -559,7 +559,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                claimed: dict[str, inbox_read.Claim] | None = None,
                decided: dict[str, list[lead_decisions.Decision]] | None = None,
                rejected: list[dict] | None = None,
-               proposals: Mapping[str, bool] | None = None) -> list[dict]:
+               proposals: Mapping[str, scan_sessions.LedgerProposal] | None = None) -> list[dict]:
     """Waiting rows, rows blocked on the user, and rows an unanswered handoff key names, longest waiting first.
     The lane's asks that count are
     those still open and those it sent in its last turn:
@@ -615,7 +615,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             verdict = row.get("verdict") or {}
             named = scan_sessions.named_proposals("\n".join(str(value or "") for value in (
                 verdict.get("waits_on"), verdict.get("next_step"), final["text"])), proposals)
-            undecided = [proposal[:8] for proposal in named if not proposals[proposal]]
+            undecided = [proposal[:8] for proposal in named if not proposals[proposal].settles(name)]
             settled = bool(named) and not undecided
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and item.get("repo") in (None, "", row.get("repo"))
