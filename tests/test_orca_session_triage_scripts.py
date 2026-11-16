@@ -72,6 +72,7 @@ hourly_runs = load_script("hourly_runs")
 inbox_alert = load_script("inbox_alert")
 close_tabs = importlib.import_module("close_tabs")
 handoff = importlib.import_module("handoff")
+lead_compact = load_script("lead_compact")
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -9385,6 +9386,60 @@ class VerdictStoreTests(unittest.TestCase):
 
         self.assertEqual(verdicts, {"/w/a": {"class": "blocked", "read": "ka", "queued_at": "g1"}})
         self.assertEqual((self.root / "verdicts.json.bad").read_text(), "[1, 2")
+
+
+class LeadCompactTests(unittest.TestCase):
+    """The appointed lead keeps its open commitments through a summary; other sessions are left alone."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.lead = self.root / "triage-lead"
+        self.lead.mkdir()
+        state = self.root / "hourly-state.json"
+        state.write_text(json.dumps({"lead": {"worktree": str(self.lead)}}))
+        self.calls = self.root / "calls.jsonl"
+        self.board = self.root / "board.py"
+        self.write_board(0)
+        environment = patch.dict(os.environ, {"TRIAGE_HOURLY_STATE": str(state),
+                                              "ORCA_BOARD_COMMITMENTS": str(self.board)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("ORCA_WORKTREE_ID", None)
+        os.environ.pop("ORCA_WORKTREE_PATH", None)
+
+    def write_board(self, code: int) -> None:
+        self.board.write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            f"open({str(self.calls)!r}, 'a').write(json.dumps([sys.argv[1:], sys.stdin.read()]) + '\\n')\n"
+            "print('答え待ちの伺い\\nask:1 担当 a')\n"
+            f"sys.exit({code})\n")
+        self.board.chmod(0o755)
+
+    def run_hook(self, event: str, cwd: Path, **fields: str) -> str:
+        out = io.StringIO()
+        payload = json.dumps({"session_id": "s1", "cwd": str(cwd), **fields})
+        self.assertEqual(lead_compact.main([event], io.StringIO(payload), out), 0)
+        return out.getvalue()
+
+    def board_calls(self) -> list[list]:
+        return [json.loads(line) for line in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def test_lead_gets_the_digest_and_summary_instructions_and_other_sessions_get_nothing(self) -> None:
+        self.assertIn("ask:1 担当 a", self.run_hook("session-start", self.lead))
+        self.assertIn("id", self.run_hook("pre-compact", self.lead))
+        other = self.root / "lane"
+        other.mkdir()
+        for event in ("session-start", "pre-compact", "post-compact"):
+            self.assertEqual(self.run_hook(event, other, compact_summary="要約"), "")
+        self.assertEqual([call[0][0] for call in self.board_calls()], ["digest"])
+
+    def test_summary_is_saved_to_the_board_under_its_session(self) -> None:
+        self.run_hook("post-compact", self.lead, compact_summary="要約の本文")
+        self.assertEqual(self.board_calls(), [[["save-summary", "--session", "s1"], "要約の本文"]])
+
+    def test_lead_is_told_how_to_read_the_digest_when_the_board_fails(self) -> None:
+        self.write_board(1)
+        self.assertIn(f"{self.board} digest", self.run_hook("session-start", self.lead))
 
 if __name__ == "__main__":
     unittest.main()
