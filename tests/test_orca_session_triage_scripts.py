@@ -1680,11 +1680,12 @@ class NextStepFactTests(unittest.TestCase):
                                  "class": "blocked", "waits_on": "指揮 (案 f1183067・1f3dd4a6 の採用を記録する)",
                                  "next_step": "記録が届いたら done を送り直す（commit 4e50b6f7）"}}
 
-        def facts(ledger: dict[str, bool]) -> dict:
+        def facts(ledger: dict[str, scan.LedgerProposal]) -> dict:
             return scan.add_next_step_facts([row], git_lookup=lambda _: None, verdicts=verdicts,
                                             proposals=lambda: ledger)[0]
 
-        waiting, decided = facts({first: True, second: False}), facts({first: True, second: True})
+        done, pending = scan.LedgerProposal(True), scan.LedgerProposal(False)
+        waiting, decided = facts({first: done, second: pending}), facts({first: done, second: done})
 
         self.assertEqual(scan.current_verdict(waiting, verdicts)["class"], "blocked")
         self.assertIsNone(scan.current_verdict(decided, verdicts))
@@ -1692,7 +1693,26 @@ class NextStepFactTests(unittest.TestCase):
         # The re-read may name the same proposals again; its verdict then holds instead of being read every scan.
         verdicts["/w/timer"] = {**verdicts["/w/timer"], "read": scan.read_key(decided), "class": "in_progress",
                                 "next_step": "--applied f1183067,1f3dd4a6 で done を送り直す"}
-        self.assertEqual(scan.current_verdict(facts({first: True, second: True}), verdicts)["class"], "in_progress")
+        self.assertEqual(scan.current_verdict(facts({first: done, second: done}), verdicts)["class"], "in_progress")
+
+    def test_an_adopted_proposal_handed_to_the_lane_is_its_own_work_not_a_wait(self) -> None:
+        # A lane handed an adopted proposal waited on its forge; its next step named the proposal it ships.
+        proposal = "c8c0b479-0000-4000-8000-000000000003"
+        item = {"proposal_id": proposal, "status": "adopted", "implemented_at": None,
+                "executions": [{"actor": "deploy-prepush", "outcome": "handed_off"}]}
+        row = {"path": "/w/app/deploy-prepush", "repo": "app", "class": "stalled", "linked_pr": None,
+               "jev": {"asks": 0.1}, "claude": {"final_at": "t1", "final_text": "forge の復旧を待ちます"},
+               "codex": [], "reasons": []}
+        verdicts = {row["path"]: {"read": scan.read_key(scan.add_next_step_facts([row], git_lookup=lambda _: None)[0]),
+                                  "class": "blocked", "waits_on": "forge の復旧",
+                                  "next_step": "forge が戻ったら PR を出し、--applied c8c0b479 を記録する"}}
+
+        with patch.object(scan.retro_ledger.LedgerClient, "list", return_value=[item]):
+            facts = scan.add_next_step_facts([row], git_lookup=lambda _: None, verdicts=verdicts,
+                                             proposals=scan.ledger_proposals)[0]
+
+        self.assertEqual((scan.current_verdict(facts, verdicts) or {}).get("class"), "blocked")
+        self.assertEqual(facts["reasons"], [])
 
     def test_summarizes_review_merge_and_check_state_of_a_pr(self) -> None:
         data = {"number": 11263, "state": "OPEN", "reviewDecision": "APPROVED",
@@ -5627,8 +5647,9 @@ class HourlyStateTests(unittest.TestCase):
             "class": "waiting", "claude": {"final_at": "2026-11-16T01:50:00Z", "final_text":
                 "新しい案 967d4e60・74aeb54e の採否をボードで決めてください（8e86662d をまとめた）"}}]))
         adopted, pending = "967d4e60-1765-46ae-9792-d25c0dd87164", "74aeb54e-b223-4b25-827f-c1d56f7149c4"
-        for ledger, expected in (({adopted: True, pending: False}, [(["74aeb54e"], 1)]),
-                                 ({adopted: True, pending: True}, [])):
+        done, open_ = scan.LedgerProposal(True), scan.LedgerProposal(False)
+        for ledger, expected in (({adopted: done, pending: open_}, [(["74aeb54e"], 1)]),
+                                 ({adopted: done, pending: done}, [])):
             with self.subTest(ledger=ledger), \
                     patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value=ledger):
                 code, result = self.call("stale-asks", "--from", str(saved))
@@ -5637,7 +5658,7 @@ class HourlyStateTests(unittest.TestCase):
         asking = json.loads(saved.read_text())
         asking[0]["prompt_waiting"] = {"tab": "t", "question": "残りの案 2ead92cc を採用しますか？", "choices": ["1. 採用"]}
         saved.write_text(json.dumps(asking))
-        with patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value={adopted: True, pending: True}):
+        with patch.object(hourly_state.scan_sessions, "ledger_proposals", return_value={adopted: done, pending: done}):
             code, result = self.call("stale-asks", "--from", str(saved))
         self.assertEqual((code, [item["row"] for item in result]), (0, [scan.row_identity(asking[0])]))
 
