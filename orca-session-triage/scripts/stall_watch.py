@@ -602,11 +602,11 @@ def current_run(path: Path, agent: str, now: datetime, floor: datetime | None) -
     return Run(oldest, calls, path.stem[-8:], True) if oldest else None
 
 
-def busy_signals(row: Mapping, act: Activity, records: Records, now: datetime, live: bool) -> list[Signal]:
+def busy_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     reports = [report for report in lane_reports(row, records) if report.at <= now]
     asking = [report for report in reports if report.kind == "ask" and report.id
               and not inbox_read.is_handoff({"text": report.text}) and not covering_answers(report, records)]
-    if asking or row.get("automation_workspaces") or (live and (act.at is None or now - act.at > GRACE)):
+    if asking or row.get("automation_workspaces"):
         return []
     claude = row.get("claude") or {}
     rollouts = sorted((item for item in row.get("codex") or [] if item.get("rollout")),
@@ -635,7 +635,7 @@ def judge(row: Mapping, verdict: Mapping | None, records: Records, now: datetime
     return [*watcher_signals(row, act, records, now, probe), *answer_signals(row, act, records, now),
             *promise_signals(row, act, records, now), *wait_signals(row, verdict, act, records, now, probe),
             *error_signals(row, act, records, now), *idle_signals(row, verdict, act, records, now),
-            *busy_signals(row, act, records, now, live)]
+            *busy_signals(row, act, records, now)]
 
 
 def read_jsonl(path: Path) -> list[dict]:

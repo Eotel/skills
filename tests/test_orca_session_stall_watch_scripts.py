@@ -340,6 +340,13 @@ class BusyWithoutProgressTests(unittest.TestCase):
                 self.assertEqual([signal for signal, _ in self.signals(self.lane(agent, entries))],
                                  ["busy_without_progress"])
 
+    def test_a_codex_lane_calling_tools_without_a_word_for_forty_minutes_is_judged_in_a_live_run(self) -> None:
+        lane = self.lane("codex", [entry for minutes in range(104, 0, -1) for entry in codex_call(minutes)])
+        silent = {**lane, "codex": [{**lane["codex"][0], "last_assistant_at": utc(40)}]}
+
+        self.assertEqual([item.signal for item in stall.judge(silent, None, stall.Records(), NOW, FakeProbe())],
+                         ["busy_without_progress"])
+
     def test_a_lane_waking_every_twenty_minutes_to_check_its_pr_is_waiting_not_busy(self) -> None:
         polling = [entry for minutes in range(185, 0, -20) for entry in claude_call(minutes, "watch_prs.py --once 52")]
 
