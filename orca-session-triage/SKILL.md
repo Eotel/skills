@@ -243,12 +243,13 @@ board's done cards; close what the user approves.
   reports, or agent states in Orca, other than the calling session's own,
   changed after the scan started. Close tabs through it.
 - `scripts/stall_watch.py run`: judges the newest saved scan, with this Mac's
-  transcripts, rollouts, and background jobs read again, by six fixed rules
+  transcripts, rollouts, and background jobs read again, by seven fixed rules
   (its `--help`): a wait loop
   outliving the PR it names, an answer recorded but never sent to the lane, a
   time the lane promised that passed with nothing keeping it, a verdict's
-  outside wait that now holds, a turn an API error ended, and a lane left idle
-  after its last report. New signals reach the lead as one `ask` from
+  outside wait that now holds, a turn an API error ended, a lane left idle
+  after its last report, and a lane calling tools for 90 minutes with no
+  report, commit, push, PR, or word from anyone. New signals reach the lead as one `ask` from
   `stall-watch`; each is kept in `~/.cache/orca-session-triage/work-checks.json`
   and, when the board offers `orca_board_commitments.py check`, in its
   work_check table, and is never sent twice. The lead wakes
