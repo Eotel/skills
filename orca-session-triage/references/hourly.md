@@ -427,9 +427,9 @@ until the lead observes that its recorded symptom is gone. Then:
 - Send each `topic check --all` drift row to a live agent of the workspace it
   names with `send`, quoting the row and the fix it prints. When another lead
   is appointed, put the rows in the handoff instead.
-- Send each `tracker-gaps` row to its `workspace` with `send` (on its `host`),
-  quoting the row's `text` and `fix`. When another lead is appointed, put the
-  rows in the handoff instead.
+- Send the `tracker-gaps` rows to their `workspace` with `send` (on its
+  `host`), one message per workspace quoting each row's `text` and `fix`. When
+  another lead is appointed, put the rows in the handoff instead.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
   asana-pr-review skill, even when its value differences were already judged.
   For 「レビューの番」, run the row's `review-pr ... --if-needed` command in this
