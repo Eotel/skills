@@ -138,7 +138,12 @@ also carries `related_issues`, each 「関わる issue」 its questions name (`r
 `state`, `updatedAt`, read in one batch per repository; a Backlog key has no
 state), and `related_issues_closed`, true when every one is closed or merged;
 `--summary` then adds 関わる issue が閉じた. Its question may no longer stand:
-check that before putting it to the user. A screen question's `asked_at`,
+check that before putting it to the user. A consolidation lane's row
+(`adoption-consolidate-*`) is left out once the adoption ledger has every
+proposal its final message, `waits_on`, or `next_step` names adopted, rejected,
+held, or applied; while some are not, its item carries `undecided_proposals`
+(their 8-character IDs) and `undecided_count`: report only those as waiting on
+the board. A screen question's `asked_at`,
 from the live session's transcript including a fork, takes priority over the
 parent's last message when reporting its waiting time.
 
