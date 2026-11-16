@@ -2323,6 +2323,43 @@ def with_inbox(rows: list[dict], reports: InboxReports) -> list[dict]:
     return [{**row, "inbox": inbox} if (inbox := newest(row)) else row for row in rows]
 
 
+# How long before a turn's end its lane sends the done or info about it; measured on transcript rows, half of
+# such reports come within a minute of the final message.
+REPORT_BEFORE_TURN_END = timedelta(minutes=5)
+
+
+def with_reported_times(rows: list[dict], entries: Sequence[dict]) -> list[dict]:
+    """Rows whose Codex reply was read from a tab's screen take the time of the done or info the lane sent just
+    before that turn ended, when it was sent on an earlier day than the screen's reading.
+
+    The screen gives only the turn end's clock, read on the day of the tab's last output (codex_tab_message), so a
+    tab that redraws days later moves the reply to that day. The newest report of the worktree sent within
+    REPORT_BEFORE_TURN_END of that clock time sets the day: on an earlier day, the reply's `at` becomes the report's
+    `ts`, `screen_at` keeps the screen's reading, and `at_from` names the report; on the reading's own day, it stays.
+    """
+    sent: dict[str, list[tuple[datetime, dict]]] = {}
+    for item in entries:
+        if item.get("kind") in ("done", "info") and item.get("worktree") and (at := parse_time(item.get("ts"))):
+            sent.setdefault(item["worktree"], []).append((at, item))
+
+    def reported(row: dict) -> dict:
+        message = row.get("orca_message") or {}
+        shown = parse_time(message.get("at"))
+        if message.get("from") != "screen" or shown is None:
+            return row
+        reports = sorted(((at, item) for at, item in sent.get(Path(row["path"]).name, [])
+                          if at <= shown and (item.get("repo") or "") in ("", row.get("repo") or "")),
+                         key=lambda pair: pair[0], reverse=True)
+        for at, item in reports:
+            if (shown - at) % timedelta(days=1) <= REPORT_BEFORE_TURN_END:
+                if shown - at < timedelta(days=1):
+                    return row
+                return {**row, "orca_message": {**message, "at": item["ts"], "screen_at": message["at"],
+                                                "at_from": {"kind": item["kind"], "id": item.get("id")}}}
+        return row
+    return [reported(row) for row in rows]
+
+
 def newest_report(row: dict) -> dict | None:
     """Which came last of the final message and the inbox reports; the Orca comment has no time."""
     said = [("final_message", row_final_at(row)),
@@ -2847,7 +2884,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="print one row as JSON with fixed keys: " + ", ".join(ROW_KEYS) + ". "
                              "Strings are never null, `final` is the newest "
                              "final message of Claude, Codex, or Orca, `transcripts` is "
-                             '{"claude": [path…], "codex": [path…]}, and `github` is owner/repo from origin; '
+                             '{"claude": [path…], "codex": [path…]} (--transcripts prints them, or on stderr why '
+                             'there are none), `question_sources` the lane\'s ask and info naming the question '
+                             'label (Q4) of an Orca comment summary the row shows without a transcript, and `github` '
+                             'is owner/repo from origin; '
                              "NAME is repo/name, the last path segment (with optional ENVIRONMENT:: on another "
                              "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
                              "or " + REVIEW_DIR + ". With --rm-specs, repeatable: the spec of each named row")
@@ -3032,7 +3072,7 @@ ROW_KEYS = ("identity", "name", "path", "repo", "environment", "github", "class"
             "question", "merge_question", "review", "stop", "waits_on", "next_step", "verdict", "final",
             "last_user", "transcripts", "comment", "pr", "git", "prompt_waiting", "queued_input", "processes",
             "tabs", "done_cards", "closable", "meaningful_tabs", "open_pr_cleanup", "claude_sessions",
-            "automation_workspaces", "automation_blocker")
+            "automation_workspaces", "automation_blocker", "question_sources")
 
 
 class ReviewResult(TypedDict):
@@ -3093,7 +3133,53 @@ def row_question(row: dict) -> str:
                                         verdict.get("question"), final_message(row)["text"]) if text), "")
 
 
-def row_view(row: dict) -> dict:
+QUESTION_LABEL = re.compile(r"(?<![A-Za-z0-9])Q\d+(?![0-9])")
+QUESTION_SOURCES = 3  # labels such as Q1 come back in later rounds of a lane's questions
+
+
+def question_sources(row: dict, entries: Sequence[dict]) -> list[dict]:
+    """The lane's ask and info reports behind a question this Mac knows only from its Orca comment's summary.
+
+    Without a transcript here, the 要判断 line is all the row shows. Each report of the worktree naming a question
+    label the summary names (Q4) is a source: the newest QUESTION_SOURCES, oldest first, with id, kind, ts, and
+    the paragraphs naming the label.
+    """
+    summary = str(row.get("marker_question") or "")
+    labels = set(QUESTION_LABEL.findall(summary))
+    if (not labels or row_question(row) != summary or (row.get("claude") or {}).get("transcript")
+            or row.get("codex")):
+        return []
+    name, repo = Path(row["path"]).name, row.get("repo") or ""
+    found = []
+    for item in entries:
+        if (item.get("kind") not in ("ask", "info") or item.get("worktree") != name
+                or (item.get("repo") or "") not in ("", repo) or (at := parse_time(item.get("ts"))) is None):
+            continue
+        asked = [str(item.get("text") or ""), *(str(question.get("question") or "")
+                                               for question in inbox_read.questions_of(item)
+                                               if isinstance(question, dict))]
+        paragraphs = [part.strip() for text in asked for part in re.split(r"\n\s*\n", text)
+                      if labels & set(QUESTION_LABEL.findall(part))]
+        if paragraphs:
+            found.append((at, {"id": item.get("id"), "kind": item["kind"], "ts": item["ts"],
+                               "text": "\n\n".join(paragraphs)}))
+    found.sort(key=lambda pair: pair[0])
+    return [source for _, source in found[-QUESTION_SOURCES:]]
+
+
+def missing_transcripts(row: dict) -> str:
+    """Why --transcripts lists nothing for a row: what the scan looked for, and where the shown reply came from."""
+    if row.get("environment"):
+        return f"{row_name(row)}: no transcript on this Mac; the worktree is on {row['environment']}"
+    source = final_message(row)["source"]
+    said = ("the tab's screen" if source == "orca" and (row.get("orca_message") or {}).get("from") == "screen"
+            else {"card": "Orca's done card", "orca": "Orca", "": "nowhere"}.get(source, source))
+    return (f"{row_name(row)}: no transcript. The scan found no Claude transcript for {row['path']} under the Claude "
+            f"projects directory and no Codex rollout with that cwd modified within --since-hours; the final "
+            f"message shown was read from {said}")
+
+
+def row_view(row: dict, entries: Sequence[dict] = ()) -> dict:
     """One row with fixed keys and no null strings, so a reader never has to know the scan's raw shapes."""
     verdict = row.get("verdict") or {}
     final = final_message(row)
@@ -3133,6 +3219,7 @@ def row_view(row: dict) -> dict:
                        for card in row.get("done_cards") or []],
         "closable": row.get("closable") or [], "meaningful_tabs": row.get("meaningful_tabs") or [],
         "open_pr_cleanup": bool(row.get("open_pr_cleanup")),
+        "question_sources": question_sources(row, entries),
     }
 
 
@@ -3228,17 +3315,23 @@ def saved_rows(path: str) -> list[dict]:
     return rows
 
 
-def print_row(rows: list[dict], key: str, transcripts: bool = False) -> int:
+def print_row(rows: list[dict], key: str, transcripts: bool = False, inbox: Path | None = None) -> int:
     try:
         row = select_row(rows, key)
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
-    view = row_view(row)
+    try:
+        entries = inbox_read.inbox_entries(inbox) if inbox and row.get("marker_question") else []
+    except OSError:
+        entries = []
+    view = row_view(row, entries)
     if transcripts:
         for agent, paths in view["transcripts"].items():
             for path in paths:
                 print(f"{agent} {path}")
+        if not any(view["transcripts"].values()):
+            print(missing_transcripts(row), file=sys.stderr)
         return 0
     json.dump(view, sys.stdout, ensure_ascii=False, indent=2)
     print()
@@ -3313,6 +3406,10 @@ def main(argv: list[str] | None = None) -> int:
         return NETWORK_DOWN_EXIT
     rows = [{**row, "scanned_at": scanned_at}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
+    try:
+        rows = with_reported_times(rows, inbox_read.inbox_entries(Path(args.inbox).expanduser()))
+    except OSError:
+        pass
     if not args.ps_json:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
@@ -3441,7 +3538,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
     if args.row and args.rm_specs:
         return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute())
     if args.row:
-        return print_row(rows, args.row[0], args.transcripts)
+        return print_row(rows, args.row[0], args.transcripts, Path(args.inbox).expanduser())
     if args.rows:
         if args.sort == "final":
             rows = sorted(rows, key=lambda row: parse_time(row_final_at(row)) or

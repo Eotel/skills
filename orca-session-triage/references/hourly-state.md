@@ -184,6 +184,13 @@ A blocked row counts as waiting on Miura only when its verdict has nonempty
 row's final message, `waiting_reports` gives its report id, timestamp, and text;
 the summary says 待ち先から届いた. Read that report before continuing the wait.
 
+A row with no transcript on this Mac (a Codex lane, or a lane on another Mac)
+whose question is only its Orca comment's summary carries `question_sources`:
+the lane's `ask` and `info` reports naming a question label of the summary
+(Q4), the newest three oldest first, each with `id`, `kind`, `ts`, and the
+paragraphs naming the label. `scan_sessions.py --row` shows the same. Put the
+question to the user from these, not from the summary.
+
 An `unanswered` or `stopped_after_answer` item, and a row's shared unanswered
 question, carries `reissued` when a later ask of the same lane withdrew its ask
 or one of its questions (each such ask's `id`, `ts`, `withdrew`); `--summary`

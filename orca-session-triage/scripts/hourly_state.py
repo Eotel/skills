@@ -574,6 +574,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     the item's ask, or the recorded question's (withdrawn_by): the question to put or relay may be the old one. An unanswered item's `ask.claimed` names the tab that
     claimed it with `inbox_read.py claim` and is asking the user now: `claimed` holds, by ask id, the claim on each
     open ask itself or on every one of its open questions (inbox_read.ask_claim).
+    A row whose question is only its Orca comment's summary carries `question_sources`, the lane's ask and info
+    reports naming its question label (scan_sessions.question_sources).
     """
     found: list[tuple[datetime, dict[str, Any]]] = []
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
@@ -632,6 +634,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         view.update(waits_on=verdict.get("waits_on"), next_step=verdict.get("next_step"))
         view["waiting_reports"] = received
+        if sources := scan_sessions.question_sources(row, entries):
+            view["question_sources"] = sources
         view["asking"] = ask_state.for_row(state, identity, latest_decisions)
         if blocked_by_user(row):
             proven = [answer for _, _, proof in counted for answer in proof]
