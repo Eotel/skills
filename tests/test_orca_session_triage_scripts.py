@@ -4589,6 +4589,44 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ahead of merged PR head", " ".join(result["blockers"]))
 
+    def squash_merge_then_move_base(self) -> str:
+        """Commit the PR head here, then land it in main after another commit; return the PR head."""
+        (self.wt / "app.txt").write_text("merged change\n")
+        git(self.wt, "commit", "-q", "-am", "merged change")
+        pr_head = git(self.wt, "rev-parse", "HEAD")
+        (self.main / "base.txt").write_text("base moved separately\n")
+        git(self.main, "add", "base.txt")
+        git(self.main, "commit", "-q", "-m", "base moved separately")
+        git(self.main, "cherry-pick", pr_head)
+        return pr_head
+
+    def test_merging_the_base_after_the_merged_pr_head_does_not_block(self) -> None:
+        pr_head = self.squash_merge_then_move_base()
+        git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "main")
+
+        result = self.check(pr_head=pr_head)
+
+        self.assertEqual(result["blockers"], [])
+        self.assertIn("merges of main", " ".join(result["notes"]))
+
+    def test_work_past_the_merged_pr_head_besides_merging_the_base_blocks(self) -> None:
+        pr_head = self.squash_merge_then_move_base()
+        git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "main")
+        (self.wt / "base.txt").write_text("base moved separately\nhand edit\n")
+        git(self.wt, "commit", "-q", "--amend", "-a", "--no-edit")
+        edited_merge = self.check(pr_head=pr_head)
+
+        git(self.wt, "reset", "-q", "--hard", pr_head)
+        (self.wt / "draft.txt").write_text("own commit\n")
+        git(self.wt, "add", "draft.txt")
+        git(self.wt, "commit", "-q", "-m", "own commit")
+        git(self.main, "cherry-pick", git(self.wt, "rev-parse", "HEAD"))
+        git(self.wt, "merge", "-q", "--no-ff", "--no-edit", "main")
+        own_commit = self.check(pr_head=pr_head)
+
+        self.assertIn("ahead of merged PR head", " ".join(edited_merge["blockers"]))
+        self.assertIn("ahead of merged PR head", " ".join(own_commit["blockers"]))
+
     def test_command_uses_compare_when_the_pr_head_object_is_missing(self) -> None:
         (self.wt / "app.txt").write_text("older PR commit\n")
         git(self.wt, "commit", "-q", "-am", "older PR commit")
