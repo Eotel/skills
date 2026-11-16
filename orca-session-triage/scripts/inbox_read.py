@@ -15,8 +15,9 @@ current end only after the lead has handled all existing inbox entries.
 records), or a lane's first report since the tab sent to it (send's records in orca-board's
 event log). It names each ask left unanswered for 15 minutes, once, gathers the lines of 30
 seconds into one line, and advances its own cursor once that line is out. `--exit-on-event`
-ends it there, for a background command started again each time it ends. One watch reads a
-cursor at a time.
+ends it there, for a background command started again each time it ends. `--hold-seconds`
+keeps the lines other than a new ask (done, a waited info, reminders, 伺い中) up to that long
+before the line goes out; a new ask sends them along at once. One watch reads a cursor at a time.
 
 Being read and being answered differ. `answered` records an ask (or one of its
 questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
@@ -102,6 +103,7 @@ class WatchOptions:
     exit_on_event: bool = False
     interval: float = 10
     batch_seconds: float = 30
+    hold_seconds: float = 0
     remind_after: int = REMIND_AFTER_MINUTES
 
 
@@ -885,12 +887,13 @@ def waited_reasons(items: list[dict], previous: dict[str, dict], me: str) -> lis
     return reasons
 
 
-def new_lines(inbox: Path, start: int, data: bytes, me: str | None) -> list[str]:
-    """A summary line per new ask and done, and per info this tab waits on (`waited_reasons`) with its reason."""
+def new_lines(inbox: Path, start: int, data: bytes, me: str | None) -> list[tuple[str, bool]]:
+    """A summary line per new ask and done, and per info this tab waits on (`waited_reasons`) with its reason,
+    each with whether it is an ask."""
     items = [item for item in map(entry, data.splitlines()) if item]
     waits_on = me and any(item.get("kind") == "info" for item in items)
     reasons = waited_reasons(items, last_reports(inbox, start), me) if waits_on else [None] * len(items)
-    return [summary_line(item) + (f"  [{reason}]" if reason else "")
+    return [(summary_line(item) + (f"  [{reason}]" if reason else ""), item.get("kind") == "ask")
             for item, reason in zip(items, reasons) if item.get("kind") in WATCHED_KINDS or reason]
 
 
@@ -923,7 +926,8 @@ def save_watch_state(cursor: Path, reminded: set[str], announced: set[tuple[str,
 
 def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> None:
     """Print each new ask and done, and each info this tab waits on, whatever its source, then each ask unanswered
-    `remind_after` minutes, once per ask; the lines that come within `batch_seconds` go out as one line.
+    `remind_after` minutes, once per ask; the lines that come within `batch_seconds` go out as one line, or within
+    `hold_seconds` while none of them is a new ask.
     The cursor and the reminded asks are saved only once that line is out, so a watch stopped earlier misses
     nothing; with `exit_on_event` the watch then ends."""
     if not cursor.exists():
@@ -942,11 +946,14 @@ def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> No
         reminded, announced = load_watch_state(cursor)
         position = saved = int(cursor.read_text().strip())
         batch: list[str] = []
+        urgent = False
         batch_started = 0.0
         while True:
             data = bytes_after(inbox, position)
             complete = complete_end(data)
-            lines = new_lines(inbox, position, data[:complete], me) if complete else []
+            tagged = new_lines(inbox, position, data[:complete], me) if complete else []
+            lines = [line for line, _ in tagged]
+            urgent = urgent or any(ask for _, ask in tagged)
             position += complete
             now = datetime.now().astimezone()
             claims = read_claims(claims_path())
@@ -965,7 +972,8 @@ def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> No
             if lines and not batch:
                 batch_started = time.monotonic()
             batch.extend(lines)
-            if options.once or not batch or time.monotonic() - batch_started >= options.batch_seconds:
+            gather = options.batch_seconds if urgent else max(options.batch_seconds, options.hold_seconds)
+            if options.once or not batch or time.monotonic() - batch_started >= gather:
                 if batch:
                     print(batch_line(batch), flush=True)
                 if batch or position != saved:
@@ -975,6 +983,7 @@ def watch(inbox: Path, cursor: Path, answers: Path, options: WatchOptions) -> No
                 if options.once or batch and options.exit_on_event:
                     return
                 batch = []
+                urgent = False
             time.sleep(options.interval)
 
 
@@ -1032,6 +1041,9 @@ def main(argv: list[str] | None = None) -> int:
     watch_command.add_argument("--interval", type=float, default=10, help="seconds between reads (default: 10)")
     watch_command.add_argument("--batch-seconds", type=float, default=30,
                                help="seconds to gather lines into one line (default: %(default)s)")
+    watch_command.add_argument("--hold-seconds", type=float, default=0,
+                               help="seconds to keep lines other than a new ask before they go out; a new ask "
+                                    "sends them at once (default: %(default)s, the --batch-seconds behavior)")
     watch_command.add_argument("--remind-after", type=int, default=REMIND_AFTER_MINUTES,
                                help="minutes before an unanswered ask is named (default: %(default)s)")
     ending = watch_command.add_mutually_exclusive_group()
@@ -1110,7 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "watch":
             watch(inbox, cursor, answers_path(), WatchOptions(
                 once=args.once, exit_on_event=args.exit_on_event, interval=args.interval,
-                batch_seconds=args.batch_seconds, remind_after=args.remind_after))
+                batch_seconds=args.batch_seconds, hold_seconds=args.hold_seconds, remind_after=args.remind_after))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)

@@ -8285,6 +8285,49 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual(again.getvalue(), "")
         self.assertIn("another watch", second.getvalue())
 
+    def test_watch_holds_notices_other_than_an_ask_until_an_ask_comes_or_the_hold_ends(self) -> None:
+        # 2026-11-16: the lead woke about 112 times a day on notices; a done can wait, an ask cannot.
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = Path(root) / "inbox.jsonl", Path(root) / "watch.offset"
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            inbox.write_text("")
+            cursor.write_text("0")
+            environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
+                           "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
+
+            def run(hold: str) -> tuple[Thread, list[int]]:
+                ended: list[int] = []
+                watcher = Thread(daemon=True, target=lambda: ended.append(inbox_read.main(
+                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0",
+                     "--hold-seconds", hold])))
+                watcher.start()
+                return watcher, ended
+
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as held:
+                watcher, ended = run("600")
+                write_jsonl(inbox, [{"id": "d1", "ts": now, "kind": "done", "host": "h", "worktree": "x",
+                                     "text": "終えた"}])
+                watcher.join(0.5)
+                still_waiting = watcher.is_alive() and held.getvalue() == ""
+                with inbox.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"id": "a1", "ts": now, "kind": "ask", "host": "h", "worktree": "y",
+                                             "text": "質問"}) + "\n")
+                watcher.join(10)
+            with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as timed:
+                watcher, ended_by_time = run("0.3")
+                with inbox.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"id": "d2", "ts": now, "kind": "done", "host": "h", "worktree": "z",
+                                             "text": "終えた"}) + "\n")
+                watcher.join(10)
+
+        self.assertTrue(still_waiting)
+        self.assertEqual(ended, [0])
+        self.assertTrue(held.getvalue().startswith("2 件: "))
+        self.assertIn("id=d1", held.getvalue())
+        self.assertIn("id=a1", held.getvalue())
+        self.assertEqual(ended_by_time, [0])
+        self.assertIn("id=d2", timed.getvalue())
+
     def test_a_claimed_ask_shows_as_being_asked_without_a_reminder_or_a_second_asking(self) -> None:
         # 11/04 16:00: the hourly tab and the lead both asked TOUGOU_KAIKEI-799 and #172.
         with tempfile.TemporaryDirectory() as root:
