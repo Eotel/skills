@@ -62,11 +62,13 @@ before answering so a later hourly handoff cannot repeat an answered question.
 The lead may read `info` and `done` for context but leaves the scheduled sweep
 to the hourly run. The lead watches new reports with a background Bash command
 (`run_in_background`) running
-`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch --exit-on-event`,
+`TRIAGE_READ_OFFSET="$HOME/.cache/orca-session-triage/lead-watch.offset" scripts/inbox_read.py watch --exit-on-event --hold-seconds 600`,
 and starts it again each time it ends, after reading the output file its
 completion notice names (the notice carries no output). A Monitor stops after
 30 minutes at most, `persistent` included; in a local session a background
-command has no deadline and wakes the tab when it exits. One watch reads the
+command has no deadline and wakes the tab when it exits. `--hold-seconds 600`
+lets a done, a waited info, a reminder or 伺い中 wait up to 10 minutes for the
+next notice, so one wake covers several; a new ask ends the wait at once. One watch reads the
 cursor at a time: a second one is refused while the first runs. The cursor is
 the lead's own, which `initialize` starts once (watch
 refuses a missing one, and refuses to run without `TRIAGE_READ_OFFSET`, so it
