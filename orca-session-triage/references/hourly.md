@@ -145,6 +145,15 @@ the call, naming the question, workspace, and time. Its own claim and the curren
 tab's question record permit the call. Keep the appointed lead current with
 `hourly_state.py appoint-lead`.
 
+The same settings register `scripts/lead_compact.py` for PreCompact,
+SessionStart (startup and compact) and PostCompact, so the appointed lead keeps
+its commitments through a summary. In the lead's session only, PreCompact asks
+the summary to keep what the board records by id and everything else verbatim,
+SessionStart prints `orca_board_commitments.py digest --max-tokens 3000`, and
+PostCompact saves the summary with `orca_board_commitments.py save-summary`.
+Other sessions get nothing. When the board cannot be read, the lead gets one
+line naming the command to run by hand.
+
 Before AskUserQuestion in the hourly workspace, the same hook refuses the call when any question's text, options and descriptions hold
 no kana or kanji. While another tab is appointed lead (`hourly_state.py
 appoint-lead`), it also refuses a question asked before this run sent its
