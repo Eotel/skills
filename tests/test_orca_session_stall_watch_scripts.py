@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 import importlib.util
 import io
@@ -228,6 +228,14 @@ class MorningLanesTests(unittest.TestCase):
             *records.reports_by_worktree["answer-elsewhere"])})
 
         self.assertEqual(stall.judge(lane, verdict, asked_first, NOW, FakeProbe(), live=False), [])
+
+    def test_the_same_lane_name_on_another_mac_is_a_different_work(self) -> None:
+        lanes, records = morning()
+        lane, verdict = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/dated-wait"))
+        here = stall.judge(lane, verdict, records, NOW, FakeProbe(), live=False)
+        there = stall.judge({**lane, "environment": "mac-two"}, verdict, records, NOW, FakeProbe(), live=False)
+
+        self.assertNotEqual({stall.key_of(asdict(item)) for item in here}, {stall.key_of(asdict(item)) for item in there})
 
     def test_a_forge_wait_signals_once_the_forge_answers(self) -> None:
         probe = FakeProbe(origins={"/w/app/forge-wait": "https://git.example.org/me/app.git"}, reachable=True)

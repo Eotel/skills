@@ -203,8 +203,10 @@ def short(at: datetime | None) -> str:
 
 
 def work_name(row: Mapping) -> str:
+    """repo/name, qualified as `<environment>::repo/name` for another Mac's lane, as scan's row_name does."""
     name = Path(row["path"]).name
-    return f"{row['repo']}/{name}" if row.get("repo") else name
+    work = f"{row['repo']}/{name}" if row.get("repo") else name
+    return f"{row['environment']}::{work}" if row.get("environment") else work
 
 
 def lane_reports(row: Mapping, records: Records) -> tuple[Report, ...]:
