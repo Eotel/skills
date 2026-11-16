@@ -414,23 +414,28 @@ def one_shot_schedules(rows: list[dict]) -> list[dict]:
     return list(jobs.values())
 
 
+def newest_claude_transcript(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> Path | None:
+    """The worktree's newest Claude transcript across every account, preferring by last entry a running session's."""
+    roots = {root.resolve(): root for root in (Path(projects_root), *claude_project_roots())}.values()
+    newest = [max(found, key=lambda p: p.stat().st_mtime) for root in roots
+              if (found := list(find_claude_dir(root, worktree_path).glob("*.jsonl")))]
+    path = newest_copy(newest)
+    if running:
+        # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
+        path = max(dict.fromkeys([*running, *([path] if path else [])]),
+                   key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
+    return path
+
+
 def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence[Path] = ()) -> dict | None:
     """Summarize the newest Claude transcript for a worktree, or None when there is none.
 
     `running` adds transcripts of Claude sessions running under it that live in other project directories. Every
     account's projects directory is searched, since one session can leave a copy in each account it ran in.
     """
-    roots = {root.resolve(): root for root in (Path(projects_root), *claude_project_roots())}.values()
-    newest = [max(found, key=lambda p: p.stat().st_mtime) for root in roots
-              if (found := list(find_claude_dir(root, worktree_path).glob("*.jsonl")))]
-    if not newest and not running:
+    path = newest_claude_transcript(projects_root, worktree_path, running)
+    if path is None:
         return None
-    path = newest_copy(newest)
-    if running:
-        # The transcript a session continued from keeps getting untimed lines, which move its mtime alone.
-        path = max(dict.fromkeys([*running, *([path] if path else [])]),
-                   key=lambda p: (last_entry_at(p) or EPOCH, p.stat().st_mtime))
-    assert path is not None
     rows = load_jsonl(path)
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None

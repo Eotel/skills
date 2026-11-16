@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 import importlib.util
 import io
 import json
@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import ModuleType
 import unittest
 from unittest.mock import patch
@@ -32,6 +33,17 @@ def load_script(name: str) -> ModuleType:
 
 stall = load_script("stall_watch")
 NOW = datetime.fromisoformat("2026-11-16T10:45:00+09:00")
+MAC_ZONE = patch.dict(os.environ, {"TZ": "Asia/Tokyo"})
+
+
+def setUpModule() -> None:
+    MAC_ZONE.start()
+    time.tzset()
+
+
+def tearDownModule() -> None:
+    MAC_ZONE.stop()
+    time.tzset()
 
 
 def at(value: str) -> datetime:
@@ -92,7 +104,7 @@ def morning() -> tuple[list[tuple[dict, dict | None]], object]:
          {"class": "blocked", "waits_on": "MBP16 への SSH 到達(ネットワーク)"}),
         (row("morning-info", codex=codex("2026-11-15T09:26:10Z")), {"class": "blocked", "waits_on": "今夜の full run"}),
         (row("morning-screen", claude=claude("2026-11-15T19:11:51+09:00",
-                                             "明朝の確かめは、朝の確かめの README のとおりに進めます。")), None),
+                                             "明朝の確かめは、手順書のとおりに進めます。")), None),
         (row("named-in-readme", claude=claude("2026-11-14T23:50:25+09:00")),
          {"class": "blocked", "waits_on": "取り込みの担当"}),
         (row("done-promise", codex=codex("2026-11-15T07:51:43Z")), None),
@@ -127,17 +139,17 @@ def morning() -> tuple[list[tuple[dict, dict | None]], object]:
             "answer-elsewhere": (report("r3", "info", "2026-11-14T16:19:41+09:00", "記録を直しました。"),),
             "mac-wait": (report("r4", "info", "2026-11-13T08:46:59+09:00", "MBP16 は今回も届かず、未反映です。"),),
             "morning-info": (report("r5", "info", "2026-11-15T18:26:01+09:00",
-                                    "今夜の待機を終了し、full run後の再照合とQ2の2件の補正を11/16の朝に行います。"),),
+                                    "今夜の待機を終え、再照合と 2 件の補正を11/16の朝に行います。"),),
             "morning-screen": (report("r6", "info", "2026-11-15T18:01:27+09:00", "写しを消しました。"),),
             "named-in-readme": (report("r7", "info", "2026-11-14T19:14:59+09:00", "確かめを用意しました。"),),
             "done-promise": (report("r8", "done", "2026-11-15T16:51:43+09:00",
-                                    "追加の変更は、指示どおり明日午前の結果に再び当たった場合に行います。"),),
+                                    "追加の変更は、明日午前の結果に再び当たった場合に行います。"),),
             "dated-wait": (report("r9", "done", "2026-11-10T18:41:43+09:00", "返信を投稿しました。"),),
             "forge-wait": (report("r10", "done", "2026-11-10T21:38:26+09:00", "deploy しました。"),),
             "person-answer": (report("r11", "done", "2026-10-29T14:55:40+09:00", "下書きを直しました。"),),
             "own-question": (report("r12", "info", "2026-11-13T15:32:44+09:00", "Q4 の回答待ちです。"),),
             "automation": (report("r13", "info", "2026-11-15T16:16:58+09:00",
-                                  "18:00以降も未接続なら、triage-notify --kind info を一度送ります。"),),
+                                  "18:00以降もつながらなければ、info を一度送ります。"),),
             "held": (report("r14", "done", "2026-11-14T23:50:07+09:00", "結びました。"),),
             "watching": (report("r15", "info", "2026-11-16T00:04:55+09:00", "まだ review がありません。"),),
             "reviewer-wait": (report("r16", "done", "2026-11-13T15:13:06+09:00", "控えを取り直しました。"),),
@@ -186,6 +198,26 @@ class MorningLanesTests(unittest.TestCase):
         self.assertEqual(self.signals(probe)["forge-wait"], {"wait_resolved"})
 
 
+class PromiseTests(unittest.TestCase):
+    def test_deadlines_references_and_times_already_past_are_not_promises(self) -> None:
+        said = at("2026-11-15T15:09:00+09:00")
+        for sentence in ("書き込みは 14:48 に終え、これから merge します。",
+                         "11/16 までに作り、検証環境で確かめます。",
+                         "直す変更を 11/16 より前に入れ、検証環境で確かめます。",
+                         "11/14 と同じ流し方で確かめを進めます。",
+                         "取込は、手順 3/4 の入れ替えの前に流します。"):
+            with self.subTest(sentence):
+                self.assertIsNone(stall.promise_due(sentence, said))
+
+    def test_a_promised_time_falls_due_in_the_mac_zone(self) -> None:
+        said = at("2026-11-15T18:26:00+09:00")
+
+        self.assertEqual(stall.promise_due("再照合と 2 件の補正を11/16の朝に行います。", said),
+                         at("2026-11-16T09:00:00+09:00"))
+        self.assertEqual(stall.promise_due("差が小さいので、18:30 に登録します。", said),
+                         at("2026-11-15T18:30:00+09:00"))
+
+
 class LiveProbeTests(unittest.TestCase):
     def test_a_forge_that_does_not_answer_is_asked_once_per_run(self) -> None:
         probe = stall.LiveProbe({})
@@ -208,7 +240,8 @@ class RunTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.inbox = self.dir / "triage-inbox.jsonl"
         self.inbox.write_text(json.dumps({"id": "ask-left-0001", "ts": "2026-11-15T19:22:08+09:00",
-                                          "worktree": "answer-left", "kind": "ask", "text": "台帳に記録してください。",
+                                          "worktree": "answer-left", "kind": "ask",
+                                          "text": "明朝の確かめの前に、台帳に記録してください。",
                                           "handle": "term_left"}) + "\n")
         (self.dir / "answers.jsonl").write_text(json.dumps({"id": "ask-left-0001", "ts": "2026-11-15T19:22:52+09:00",
                                                             "how": "inbox_read.py answered"}) + "\n")
@@ -216,6 +249,8 @@ class RunTests(unittest.TestCase):
         self.scan.write_text(json.dumps([row("answer-left", claude=claude("2026-11-15T19:22:23+09:00"))]))
         notify = self.dir / "triage-notify"
         notify.write_text("#!/usr/bin/env python3\nimport json, os, sys, uuid\n"
+                          "if '明朝' in sys.argv[-1] and '--no-follow-up' not in sys.argv:\n"
+                          "    sys.exit('triage-notify: 本文に時刻の約束「明朝」があります（送っていません）')\n"
                           "line = {'id': str(uuid.uuid4()), 'ts': '2026-11-16T10:45:00+09:00', 'kind': 'ask',\n"
                           "        'worktree': os.path.basename(os.getcwd()), 'text': sys.argv[-1],\n"
                           "        'env': os.environ.get('ORCA_WORKTREE_ID', '')}\n"
@@ -235,16 +270,16 @@ class RunTests(unittest.TestCase):
             item.stop()
         self.tmp.cleanup()
 
-    def run_watch(self) -> int:
+    def run_watch(self, now: datetime) -> int:
         with patch.dict(os.environ, {"ORCA_WORKTREE_ID": "repo::/w/orca/triage-lead"}), \
                 patch.object(stall, "datetime", wraps=datetime) as clock, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            clock.now.return_value = NOW
+            clock.now.return_value = now
             return stall.main(["run", "--scan", str(self.scan)])
 
     def test_new_signals_go_out_as_one_ask_from_stall_watch_and_are_not_sent_again(self) -> None:
-        self.assertEqual(self.run_watch(), 0)
-        self.assertEqual(self.run_watch(), 0)
+        self.assertEqual(self.run_watch(NOW), 0)
+        self.assertEqual(self.run_watch(NOW + timedelta(minutes=15)), 0)
 
         asks = [json.loads(line) for line in self.inbox.read_text().splitlines()][1:]
         self.assertEqual([(item["worktree"], item["env"]) for item in asks], [("stall-watch", "")])

@@ -99,12 +99,13 @@ REPO_FLAG = re.compile(r"(?:-R|--repo)[ =]([\w.-]+/[\w.-]+)|github\.com/([\w.-]+
 SENTENCE = re.compile(r"[^。\n]+[。]?")
 QUOTED = re.compile(r"「[^」]*」|『[^』]*』|`[^`]*`")
 PROMISE_VERB = re.compile(r"(?:行い|進め|確かめ|確認し|対応し|流し|再開し|直し|送り|知らせ|伺い|見直し|やり|し)ます(?:。|$)")
-NOT_PROMISE = re.compile(r"ました|でした|予定です|ません|ですか|ますか|お願い|ください|いただ")
+NOT_PROMISE = re.compile(r"ました|でした|予定です|ません|ですか|ますか|お願い|ください|いただ|提案")
 DAY_PART = {"朝": MORNING, "午前": MORNING, "午前中": MORNING, "昼": 12, "午後": AFTERNOON, "夕方": EVENING,
             "夜": NIGHT}
 DATED = re.compile(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])\s*(?:の)?\s*(朝|午前中|午前|昼|午後|夕方|夜)?")
 TOMORROW = re.compile(r"明朝|翌朝|明日\s*の?\s*(朝|午前中|午前|昼|午後|夕方|夜)?")
 TONIGHT = re.compile(r"今夜|今晩")
+DEADLINE = re.compile(r"\s*(?:まで|より前|の?前|以前)")
 CLOCK = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])\s*(?:に|から|以降|ごろ|頃)")
 WAIT_DATE = re.compile(r"(?<![\d/])(?:(\d{4})[-/])?(\d{1,2})[/-](\d{1,2})(?![\d/])|(\d{1,2})月(\d{1,2})日")
 FORGE_WORDS = ("forge", "forgejo", "gitea")
@@ -328,7 +329,8 @@ def promise_due(text: str, said: datetime) -> datetime | None:
         if plain.lstrip().startswith(">") or not PROMISE_VERB.search(plain) or NOT_PROMISE.search(plain):
             continue
         dues = []
-        for month, day, part in DATED.findall(plain):
+        for month, day, part in (match.groups() for match in DATED.finditer(plain)
+                                 if not DEADLINE.match(plain, match.end())):
             try:
                 at = local.replace(month=int(month), day=int(day), hour=DAY_PART.get(part, MORNING), minute=0,
                                    second=0, microsecond=0)
@@ -342,8 +344,7 @@ def promise_due(text: str, said: datetime) -> datetime | None:
             dues.append(local.replace(hour=NIGHT, minute=0, second=0, microsecond=0))
         for hour, minute in CLOCK.findall(plain):
             if int(hour) < 24 and int(minute) < 60:
-                at = local.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-                dues.append(at if at > local else at + timedelta(days=1))
+                dues.append(local.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0))
         if dues := [at for at in dues if ahead_of_saying(at, local)]:
             promised.append(max(dues))
     return min(promised, default=None)
@@ -656,7 +657,7 @@ def ask_text(signals: Sequence[Signal]) -> str:
     for item in signals:
         by_work.setdefault(item.work, []).append(item)
     lines = [f"【止まった作業の合図】{len(by_work)} 件の作業に、手の要りそうな合図が出ました。"
-             "指揮が、起こす・閉じる・待つを決めてください（三浦さんに回す問いではありません）。"]
+             "指揮が、起こす・閉じる・待つを決めてください（ユーザーに回す問いではありません）。"]
     for number, (work, items) in enumerate(by_work.items(), 1):
         names = "・".join(SIGNALS[item.signal] for item in items)
         lines.append(f"{number}. {work}（{names}）")
@@ -670,11 +671,12 @@ def notify(text: str) -> str | None:
     """Append the ask as the worktree stall-watch and return its inbox id."""
     SENDER.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if key not in ("ORCA_WORKTREE_ID", "ORCA_TERMINAL_HANDLE")}
-    result = subprocess.run([str(NOTIFY), "--kind", "ask", text], cwd=SENDER, env=env, capture_output=True,
-                            text=True, timeout=60)
+    before = len(read_jsonl(INBOX))
+    result = subprocess.run([str(NOTIFY), "--kind", "ask", "--no-follow-up", text], cwd=SENDER, env=env,
+                            capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise RuntimeError(f"triage-notify: {(result.stderr or result.stdout).strip()[:300]}")
-    mine = [item for item in read_jsonl(INBOX)[-50:] if item.get("worktree") == SENDER.name and item.get("text") == text]
+    mine = [item for item in read_jsonl(INBOX)[before:] if item.get("worktree") == SENDER.name]
     return str(mine[-1].get("id")) if mine else None
 
 
@@ -749,7 +751,8 @@ def last_activity(paths: Sequence[str], now: datetime) -> dict[str, Activity]:
     live = scan.running_claude_transcripts(paths, scan.claude_session_dirs(), projects, scan.process_table(),
                                            scan.process_cwds)
     codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS), (now - CODEX_SINCE).timestamp())
-    return {path: activity({"path": path, "claude": scan.read_claude(projects, path, live.get(path, [])),
+    transcripts = {path: scan.newest_claude_transcript(projects, path, live.get(path, [])) for path in paths}
+    return {path: activity({"path": path, "claude": {"transcript": str(found)} if (found := transcripts[path]) else None,
                             "codex": codex.get(path, [])}, records, live=True) for path in paths}
 
 
