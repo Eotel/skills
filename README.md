@@ -62,7 +62,7 @@ resolution on older Windows Python versions without following symlinks.
   Eotel maintains the MIT-licensed copy from mattpocock/skills.
 - `django`: refactor Django ORM/query boundaries and DRF-owned policies.
 - `markdown-lint-setup`: configure remark and textlint for repository Markdown.
-- `natural-japanese`: review and revise human-facing Japanese word choices;
+- `natural-japanese`: write and revise human-facing Japanese in the reader's terms;
   flag expressions for contextual review with a Python scanner.
 - `yomiyasu`: revise AI-written Japanese while preserving meaning and facts.
   This copy is the MIT-licensed `nanaism/yomiyasu` v3.0.0 skill
