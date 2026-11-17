@@ -224,5 +224,25 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("example-org/app#103", asked)
 
 
+    def test_review_hold_reads_as_waiting_for_a_review(self) -> None:
+        # 2026-11-17: hold_store gained pr-reviewed:<PR URL>; the timeline read it as a release signal from the URL.
+        root = self.home / ".cache" / "orca-briefs"
+        root.mkdir(parents=True)
+        with sqlite3.connect(root / "holds.sqlite") as db:
+            db.execute("""CREATE TABLE holds (id TEXT PRIMARY KEY, handle TEXT NOT NULL, environment TEXT,
+                condition_kind TEXT NOT NULL, condition_value TEXT NOT NULL, release_by TEXT NOT NULL,
+                may_continue TEXT NOT NULL, instruction TEXT NOT NULL, created_at REAL NOT NULL,
+                alert_after REAL NOT NULL, status TEXT NOT NULL, signalled_at REAL, warned_at REAL,
+                released_at REAL, sending_at REAL, failure TEXT)""")
+            db.execute("INSERT INTO holds VALUES ('h1', ?, NULL, 'pr-reviewed', 'https://github.com/example-org/app/pull/7',"
+                       " 'watch-inbox', '', '承認を待つ', 1794719400, 1794720300, 'active', NULL, NULL, NULL, NULL, NULL)",
+                       (OTHER,))
+
+        rows = json.loads(self.run_tool("--since", "2026-11-15T14:00", "--until", "2026-11-15T23:59", "--json").stdout)
+
+        self.assertEqual([row["text"] for row in rows],
+                         ["https://github.com/example-org/app/pull/7 にレビューが付くまで: 承認を待つ"])
+
+
 if __name__ == "__main__":
     unittest.main()
