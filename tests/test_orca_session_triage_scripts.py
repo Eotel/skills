@@ -7367,7 +7367,11 @@ class HourlyTabCleanupTests(unittest.TestCase):
                   "/usage-credits to finish what you’re working on."]
         composer = ["─" * 40, "❯", "─" * 40, "[Opus 5.5] 📁 triage-hourly"]
         screens = {"limit": [*notice, "✻ Baked for 0s · done 5:00", *composer],
+                   "wrapped": ["⎿  You've hit your weekly li", "mit · resets Nov 19 at 2am (Asia/Tokyo)",
+                               "✻ Worked for 0s · done 6:00", *composer],
                    "resumed": [*notice, "⏺ 再開しました。", "✻ Baked for 2m 3s · done 9:02", *composer],
+                   "mentions": ["⏺ The usage limit is resolved. Should I deploy the fix?", "✻ Baked for 9s · done 9:10",
+                                *composer],
                    "draft": [*notice, "✻ Baked for 0s · done 6:00", "─" * 40, "❯ 次の指示", "─" * 40]}
         terms = [{"worktreeId": "repo::/w/triage", "tabId": name, "leafId": "leaf", "handle": name,
                   "connected": True, "lastOutputAt": (time.time() - 3600) * 1000}
@@ -7395,9 +7399,9 @@ class HourlyTabCleanupTests(unittest.TestCase):
             code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", "/missing/status.json",
                                         "--state-file", str(Path(root) / "no-state.json")])
 
-        self.assertEqual((code, closed), (0, ["limit"]))
+        self.assertEqual((code, closed), (0, ["limit", "wrapped"]))
         self.assertIn("closed: limit", out.getvalue())
-        for kept in ("resumed", "draft", "busy"):
+        for kept in ("resumed", "mentions", "draft", "busy"):
             self.assertIn(f"keep: {kept} (run -, scheduled=-, started=-): run の記録に無い", out.getvalue())
 
     def test_rendered_empty_composer_overrides_an_old_orca_draft(self) -> None:

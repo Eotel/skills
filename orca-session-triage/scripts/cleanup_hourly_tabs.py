@@ -65,6 +65,9 @@ def tab_label(term: dict[str, Any], runs: list[dict[str, Any]]) -> str:
     return f"{term.get('handle') or hourly_runtime.pane_key(term)} ({timings or 'run -, scheduled=-, started=-'})"
 
 
+LIMIT_HEAD = 80
+
+
 def all_done(agents: list[dict[str, Any]]) -> bool:
     return bool(agents) and all(agent.get("state") == "done" and (agent.get("mainAgent") or {}).get("state") == "done"
                                 for agent in agents)
@@ -226,12 +229,22 @@ def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes:
     return problems + screen_blockers(term, screen)
 
 
+def limit_notices(lines: list[str]) -> list[int]:
+    """The indexes of the stripped lines a usage-limit notice ends on. Claude Code prints it as a result line (⎿),
+    which a narrow pane wraps onto the next line mid-word or at a space; a reply (⏺) naming a limit is not one."""
+    def notice(text: str) -> bool:
+        return text.startswith("⎿") and bool(scan_sessions.USAGE_LIMIT.search(text[:LIMIT_HEAD]))
+
+    return [index for index, line in enumerate(lines)
+            if notice(line) or index and not notice(lines[index - 1])
+            and any(notice(lines[index - 1] + glue + line) for glue in ("", " "))]
+
+
 def ended_on_usage_limit(screen: dict) -> bool:
     """Whether the screen's last turn ended on a usage-limit notice: its turn-end line follows the notice with no
     reply or tool call (⏺) between."""
     lines = [line.strip() for line in scan_sessions.screen_lines(screen)]
-    notices = [index for index in scan_sessions.error_notices(lines, "")
-               if scan_sessions.USAGE_LIMIT.search(" ".join(lines[max(index - 1, 0):index + 1]))]
+    notices = limit_notices(lines)
     after = lines[notices[-1] + 1:] if notices else []
     return (bool(notices) and not any(line.startswith("⏺ ") for line in after)
             and any(scan_sessions.CLAUDE_TURN_END.match(line) for line in after))
