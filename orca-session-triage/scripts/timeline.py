@@ -328,7 +328,8 @@ def holds(path: Path, window: Window, lanes: Names) -> Iterator[Event]:
         rows = db.execute("SELECT * FROM holds").fetchall()
     for row in rows:
         kind, value = row["condition_kind"], row["condition_value"]
-        until = {"pr-merged": f"{value} の merge まで", "time": f"{value} まで"}.get(kind, f"{lanes.of(value)} の解除の連絡まで")
+        until = {"pr-merged": f"{value} の merge まで", "pr-reviewed": f"{value} にレビューが付くまで",
+                 "time": f"{value} まで"}.get(kind, f"{lanes.of(value)} の解除の連絡まで")
         lane = lanes.of(row["handle"])
         if (at := window.at(row["created_at"])):
             yield Event(at, lane, "保留を置いた", f"{until}: {row['instruction']}", "hold", row["id"])

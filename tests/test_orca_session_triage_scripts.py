@@ -83,6 +83,15 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
 
 
+def write_agent_status(path: Path, entries: dict[str, dict]) -> Path:
+    """Orca's agent-hooks/last-status.db (stablyai/orca#39995): one `entry\\0<pane key>` row per pane."""
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("CREATE TABLE rows(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, value TEXT NOT NULL)")
+        db.executemany("INSERT INTO rows VALUES (?, ?, ?)",
+                       [(f"entry\0{pane}", seq, json.dumps(entry)) for seq, (pane, entry) in enumerate(entries.items())])
+    return path
+
+
 def user(text: str | list[dict]) -> dict:
     return {"type": "user", "message": {"role": "user", "content": text}}
 
@@ -7731,10 +7740,9 @@ class HourlyCleanupCommandTests(unittest.TestCase):
         self.transcript = self.root / "old-session.jsonl"
         write_jsonl(self.transcript, [{**assistant(text("終了しました")), "timestamp": "2026-10-26T08:00:00Z"}])
         self.state = self.root / "state.json"
-        self.status = self.root / "status.json"
-        self.status.write_text(json.dumps({"entries": {"old:leaf": {
+        self.status = write_agent_status(self.root / "last-status.db", {"old:leaf": {
             "worktreeId": "repo::/w/triage", "providerSession": {
-                "id": "old-session", "transcriptPath": str(self.transcript)}}}}))
+                "id": "old-session", "transcriptPath": str(self.transcript)}}})
         self.ps_failures = 0
         self.sent = []
         self.closed = []
@@ -7901,6 +7909,12 @@ class HourlyReadTests(unittest.TestCase):
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.status = write_agent_status(self.root / "last-status.db", {})
+
     def test_unmatched_workspace_tabs_are_kept_with_a_reason(self) -> None:
         terms = [{"worktreeId": "repo::/w/triage", "tabId": name, "leafId": "leaf",
                   "handle": name, "connected": True, "orphaned": orphaned}
@@ -7910,7 +7924,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
                 patch.object(cleanup_hourly.hourly_runtime, "orca_result", side_effect=[
                     {"terminals": terms}, {"worktrees": [{"path": "/w/triage", "agents": []}]}]) as calls, \
                 redirect_stdout(io.StringIO()) as out:
-            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", "/missing/status.json"])
+            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", str(self.status)])
         self.assertEqual(code, 0)
         lines = out.getvalue().splitlines()
         self.assertEqual(len(lines), 2)
@@ -7919,6 +7933,19 @@ class HourlyTabCleanupTests(unittest.TestCase):
             self.assertIn("run の記録に無い", line)
             self.assertIn("scheduled=-, started=-", line)
         self.assertEqual(calls.call_count, 2)  # no screen read, send, or close without a run
+
+    def test_cleanup_stops_without_orca_agent_status(self) -> None:
+        # Eotel/skills#217: Orca moved the status to last-status.db; the missing JSON read as no sessions.
+        terms = [{"worktreeId": "repo::/w/triage", "tabId": "old", "leafId": "leaf", "handle": "old", "connected": True}]
+        with patch.object(cleanup_hourly.hourly_runtime, "scheduled_runs", return_value=[]), \
+                patch.object(cleanup_hourly.hourly_runtime, "orca_result", side_effect=[
+                    {"terminals": terms}, {"worktrees": [{"path": "/w/triage", "agents": []}]}]) as calls, \
+                redirect_stdout(io.StringIO()) as out:
+            code = cleanup_hourly.main(["--workspace", "/w/triage",
+                                        "--agent-status-file", str(self.root / "last-status.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("keep: could not verify previous tabs: cannot read Orca's agent status", out.getvalue())
+        self.assertEqual(calls.call_count, 2)
 
     def test_an_unrecorded_tab_whose_turn_the_usage_limit_ended_closes(self) -> None:
         notice = ["⎿  You've hit your weekly limit · resets Nov 19 at 2am (Asia/Tokyo)",
@@ -7954,7 +7981,7 @@ class HourlyTabCleanupTests(unittest.TestCase):
                 patch.object(cleanup_hourly.hourly_runtime, "scheduled_runs", return_value=[]), \
                 patch.object(cleanup_hourly.hourly_runtime, "orca_result", side_effect=orca), \
                 redirect_stdout(io.StringIO()) as out:
-            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", "/missing/status.json",
+            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", str(self.status),
                                         "--state-file", str(Path(root) / "no-state.json")])
 
         self.assertEqual((code, closed), (0, ["limit", "wrapped"]))
@@ -7997,11 +8024,10 @@ class HourlyTabCleanupTests(unittest.TestCase):
                              {"worktreeId": "repo::/w/triage", "tabId": "pty:other", "leafId": "pty:other",
                               "recordedPaneKey": "other:leaf", "handle": "other-handle",
                               "connected": True, "orphaned": True}]
-                    status = home / "last-status.json"
-                    status.write_text(json.dumps({"version": 2, "entries": {"old:leaf": {
+                    status = write_agent_status(home / "last-status.db", {"old:leaf": {
                         "worktreeId": "repo::/w/triage", "paneKey": "old:leaf",
                         "providerSession": {"id": "session-1", "transcriptPath": str(transcript)},
-                        "payload": {"state": "done", "mainAgent": {"state": "done"}}}}}))
+                        "payload": {"state": "done", "mainAgent": {"state": "done"}}}})
 
                     def orca(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
                         args = command[1:-1]
