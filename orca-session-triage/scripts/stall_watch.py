@@ -493,9 +493,9 @@ def wait_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
 
 
 def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
-    """When each earlier stop of the work was recovered: its ask answered by a send that reached the lane within a
-    minute, or closed as handed to a new lane (「立て直し: <old worktree> → <new worktree>」), whose stops then count as
-    the same work's."""
+    """When each earlier stop of the work was first recovered (once per stop): its ask answered by a send that reached
+    the lane within a minute, or closed as handed to a new lane (「立て直し: <old worktree> → <new worktree>」), whose
+    stops then count as the same work's."""
     def tabs(name: str) -> set[str]:
         return {report.handle for report in records.reports_by_worktree.get(name, ()) if report.handle}
 
@@ -520,9 +520,10 @@ def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
                 | {tab for stop in records.stops_by_work.get(work, ()) for tab in stop.tabs})
         sends = [at for tab in lane for at in records.sends_by_handle.get(tab, ())]
         for stop in {stop.ask: stop for stop in records.stops_by_work.get(work, ()) if stop.at <= now}.values():
-            found.update(answer.at for answer, _ in handoffs(work, stop))
-            found.update(sent for answer in answered(stop) if answer.how in DELIVERED
-                         and (sent := next((at for at in sends if abs(at - answer.at) <= SEND_LANDS), None)))
+            woke = [sent for answer in answered(stop) if answer.how in DELIVERED
+                    and (sent := next((at for at in sends if abs(at - answer.at) <= SEND_LANDS), None))]
+            if recovered := [*(answer.at for answer, _ in handoffs(work, stop)), *woke]:
+                found.add(min(recovered))
     return sorted(found)
 
 

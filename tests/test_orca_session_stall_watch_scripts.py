@@ -401,14 +401,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn("同じ続きを送る", replanned)
 
     def test_a_work_handed_to_a_new_lane_keeps_its_recoveries_there(self) -> None:
-        # One ask named two lanes, and only cut was handed to a new lane.
+        # One ask named two lanes, and only cut was handed to a new lane; the lead recorded it twice.
         handed = stall.Answer(at("2026-11-15T10:20:00+09:00"), "inbox_read.py answered",
                               "立て直し: cut → cut-2。other は待つ")
+        again = replace(handed, at=at("2026-11-15T10:25:00+09:00"))
         records = stall.Records(
             stops_by_work={"app/cut": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
                            "app/other": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
                            "app/cut-2": (stall.EarlierStop(at("2026-11-15T20:00:00+09:00"), "ask-2"),)},
-            answers_by_ask={"ask-1": (handed,), "ask-2": (stall.Answer(at("2026-11-15T20:05:00+09:00"), "send"),)},
+            answers_by_ask={"ask-1": (handed, again), "ask-2": (stall.Answer(at("2026-11-15T20:05:00+09:00"), "send"),)},
             sends_by_handle={"term_cut2": (at("2026-11-15T20:05:00+09:00"),)})
         lane = {**self.stopped("context_limit"), "path": "/w/app/cut-2", "terminals": [{"handle": "term_cut2"}]}
 

@@ -720,7 +720,8 @@ def cut_off(row: dict) -> str | None:
 
 # The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
 API_ENDED = re.compile(r"(?:API Error:|You['’]ve hit your [\w ]+ limit|Login expired|Not logged in|Please run /login|"
-                       r"Failed to authenticate|(?:■\s*)?stream disconnected before completion)")
+                       r"Failed to authenticate|Prompt is too long|"
+                       r"(?:■\s*)?(?:stream disconnected before completion|Codex ran out of room in the model's context))")
 USAGE_LIMIT = re.compile(r"hit your [\w ]+ limit|usage limit", re.IGNORECASE)
 LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in|Failed to authenticate", re.IGNORECASE)
 # Without Claude Code's tag (Codex, Orca's copy), the text names an error a retry repeats: a safeguard flag, or a

@@ -1550,6 +1550,8 @@ class ClassifyTests(unittest.TestCase):
                               "your session limit resets 2pm (Asia/Tokyo)"), ("usage_limit", "wait", "2pm (Asia/Tokyo)"))
         self.assertEqual(stop("API Error: Connection lost mid-response. The response above may be incomplete."),
                          ("connection", "wake", None))
+        self.assertEqual(stop("■ Codex ran out of room in the model's context window. Start a new thread or clear "
+                              "earlier history before retrying."), ("context_limit", "new_lane", None))
 
     def test_codex_capacity_failure_on_screen_is_stalled_even_with_a_merged_pr(self) -> None:
         failure = "■ Selected model is at capacity"
