@@ -10,6 +10,7 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 |---|---|
 | Reason "turn ended with an API error" | wake it now: send the lane one line saying its last turn was cut off and to continue from where it stopped; report it after |
 | Reason "usage limit; resets …" | wait: send that line once the reset time has passed; until then report when it resets |
+| Reason "context window full" | recover it in a new lane with a smaller scope (Recovering a stopped lane below); report it after |
 | Reason "login expired" | report it: a person runs `/login` in that tab; do not send it work |
 | Reason "turn ended with an API error waking does not fix" | report the error: a person reads it (a safeguard flag, an invalid request) and decides; do not wake it |
 | Reason "N orchestration messages unread since its last turn began" | wake it now: send the lead one line naming the unread reports and `orca orchestration check --run <run>`; report it after. On a `waiting` row, ask the question as usual and send the wake line too |
@@ -48,3 +49,28 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 - Keep the board truthful: `orca worktree set --worktree path:<path>
   --workspace-status in-review` while a reviewer is the blocker, `completed`
   once the work is done.
+
+## Recovering a stopped lane
+
+Recover a lane that stopped mid-work by what stopped it. `stall_watch.py`
+names the step in each signal's 「立て直し」:
+
+| Cause | Recovery |
+|---|---|
+| Lost connection (stop kind `connection`) | the same work continues: one line to go on from where it stopped. `connection_wake.py` sends it once the connection is back; send it yourself when the signal still comes |
+| Full context window (`context_limit`) | a smaller scope in a new lane: `spawn-lane` a brief with only the rest of the work (what is done, what remains, its branch or PR), then stop the old lane's tab |
+| Tool error (`busy_without_progress` with half or more of the run's tool calls failed) | a different model: `spawn-lane` the same work with the other agent (Codex for a Claude lane, Claude for a Codex lane), then stop the old lane |
+| No error (`idle_after_report`, or `busy_without_progress` whose calls succeed) | read its screen, then continue it with one line, close it, or wait |
+
+A work recovered twice is not recovered a third time. When its signal says
+「…に立て直した。3 回目はせず、この作業を外して計画を立て直す」, take the work out
+of the lane (stop its tab and say why in its Orca comment), replan around it
+(split it, change the approach, or leave it for later), and report the new
+plan. A recovery is an earlier `api_error_turn`, `idle_after_report`, or
+`busy_without_progress` signal of the same work (repo/name) in
+`work-checks.json` whose ask you answered with a send (`send … --ask <id>`)
+and whose lane got a send before the work's next such signal; a signal closed
+as waiting is none, even when an answer reached the lane meanwhile. So wake a
+lane for a signal through `--ask`. A connection wake with no signal is not
+counted: a lost connection stops every lane at once and says nothing about
+the work.

@@ -371,6 +371,21 @@ class CodexRolloutTests(unittest.TestCase):
             handle.write(json.dumps(codex_user("2026-11-04T07:00:00Z", "continue")) + "\n")
         self.assertIsNone(scan.stop_reason({"claude": None, "codex": [scan.summarize_rollout(path)[1]]}))
 
+    def test_a_full_context_window_hands_the_rest_to_a_new_lane_instead_of_waking_it(self) -> None:
+        path = self.rollout("rollout-context.jsonl", "/w/cut", [
+            codex_user("2026-11-03T05:40:00Z", "finish the work"),
+            codex_row("2026-11-03T05:51:58Z", "event_msg", {
+                "type": "error", "message": "Codex ran out of room in the model's context window. Start a new "
+                                            "thread or clear earlier history from the current thread."}),
+        ])
+        claude = {"api_error": "Prompt is too long", "api_error_kind": "invalid_request"}
+        for name, row in (("codex", {"claude": None, "codex": [scan.summarize_rollout(path)[1]]}),
+                          ("claude", {"claude": claude, "codex": []})):
+            with self.subTest(name):
+                stop = scan.stop_reason(row)
+                self.assertEqual((stop["kind"], stop["action"]), ("context_limit", "new_lane"))
+                self.assertIn("new lane", scan.stop_line(stop))
+
 
 def worktree(path: str, state: str | None = None, agent: str = "claude", comment: str = "", pr: dict | None = None, main: bool = False, status: str = "in-progress",
              turn: str | None = None) -> dict:

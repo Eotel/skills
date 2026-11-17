@@ -197,7 +197,8 @@ board's done cards; close what the user approves.
   wins even while Orca shows the agent working, and the row's `stop` says
   which: a lost connection (`connection`, wake it), a usage limit
   (`usage_limit`, with the time it `resets`), an expired login (`login`, a
-  person logs in), or another error waking would repeat (`other`, such as a
+  person logs in), a full context window (`context_limit`, a new lane with a
+  smaller scope), or another error waking would repeat (`other`, such as a
   safeguard flag; a person reads it). `--from SCAN_JSON --wake` prints each
   such row with its agent's tab and what it needs. For multiple local Claude
   tabs, it matches the stopped transcript's session record to the live
@@ -261,9 +262,11 @@ board's done cards; close what the user approves.
   report, commit, push, PR, or word from anyone. New signals reach the lead as one `ask` from
   `stall-watch`; each is kept in `~/.cache/orca-session-triage/work-checks.json`
   and, when the board offers `orca_board_commitments.py check`, in its
-  work_check table, and is never sent twice. The lead wakes
-  the lane (`send … --ask <id>`) or closes or keeps the signal
-  (`inbox_read.py answered <id> --note …`). `stopped-at PATH…` prints when an
+  work_check table, and is never sent twice. A stopped lane's signal names its
+  recovery by cause, and a work recovered twice gets replanning instead
+  (`references/next-step.md`, Recovering a stopped lane). The lead recovers
+  the lane as the signal says (`send … --ask <id>` or `spawn-lane`) or closes
+  or keeps the signal (`inbox_read.py answered <id> --note …`). `stopped-at PATH…` prints when an
   agent last did anything, as `lanes-idle` measures it.
 - `scripts/timeline.py --since TIME [--until TIME] [--lane WORKSPACE] [--match TEXT] [--json]`:
   one timeline of what the lead and the lanes did (time, who to whom, what happened, a
@@ -315,6 +318,10 @@ permitted cleanup, and any handoff in `references/hourly.md`.
     that wakes it to continue its own work; a row stopped by a usage limit gets
     it once the reset time has passed, and an expired login or another API
     error is reported.
+  - A lane a full context window stopped goes to a new lane with the rest of
+    its work, and one whose tool calls keep failing to a lane of the other
+    agent (`references/next-step.md`, Recovering a stopped lane); a work
+    recovered twice is replanned instead, and each is reported.
   - A task the user approved as the follow-up of another lane's result ("when
     A settles it, give B the task") goes to B once A reports it.
   - A lane confirmation in the user's standing approvals is answered once it

@@ -484,7 +484,8 @@ def message_text(payload: dict) -> str:
 
 API_FAILURE = re.compile(
     r"(?:Selected model is at capacity|API Error:|rate limit(?:ed| exceeded)?|usage limit|"
-    r"request failed|connection error|stream error|stream disconnected before completion|server error)", re.IGNORECASE)
+    r"request failed|connection error|stream error|stream disconnected before completion|server error|context window)",
+    re.IGNORECASE)
 
 
 def api_failure(text: str | None) -> str | None:
@@ -724,14 +725,16 @@ USAGE_LIMIT = re.compile(r"hit your [\w ]+ limit|usage limit", re.IGNORECASE)
 LOGIN_EXPIRED = re.compile(r"Login expired|Please run /login|not logged in|Failed to authenticate", re.IGNORECASE)
 # Without Claude Code's tag (Codex, Orca's copy), the text names an error a retry repeats: a safeguard flag, or a
 # request the API refused (a 4xx other than a rate limit).
-NOT_RETRYABLE = re.compile(r"safeguards flagged|invalid_request|API Error: 4(?!29)\d\d|prompt is too long|"
-                           r"credit balance", re.IGNORECASE)
+NOT_RETRYABLE = re.compile(r"safeguards flagged|invalid_request|API Error: 4(?!29)\d\d|credit balance", re.IGNORECASE)
+# The conversation outgrew the model's context window: a new lane with a smaller scope continues, not a wake.
+CONTEXT_LIMIT = re.compile(r"prompt is too long|conversation too long|context window|context_length_exceeded",
+                           re.IGNORECASE)
 RESETS = re.compile(r"(?:resets|try again at)\s+(.+?)\.?$")
 
 
 class StopReason(TypedDict):
-    kind: str  # connection, usage_limit, login, or other
-    action: str  # wake, wait (until resets), or human
+    kind: str  # connection, usage_limit, login, context_limit, or other
+    action: str  # wake, wait (until resets), human, or new_lane
     agent: str | None
     error: str
     resets: str | None
@@ -739,8 +742,8 @@ class StopReason(TypedDict):
 
 def stop_reason(row: dict) -> StopReason | None:
     """Why an API failure ended the last turn: a lost connection to wake from, a usage limit to wait out, an
-    expired login a person has to renew, or another error a person reads (a safeguard flag, an invalid request),
-    which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
+    expired login a person has to renew, a full context window a new lane with a smaller scope gets past, or
+    another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
     if not (found := failure(row)):
         return None
@@ -752,6 +755,8 @@ def stop_reason(row: dict) -> StopReason | None:
                 "resets": resets[1] if resets else None}
     if tag == "authentication_failed" or LOGIN_EXPIRED.search(error):
         return {"kind": "login", "action": "human", "agent": agent, "error": error, "resets": None}
+    if CONTEXT_LIMIT.search(error):
+        return {"kind": "context_limit", "action": "new_lane", "agent": agent, "error": error, "resets": None}
     if tag not in (None, "server_error") or tag is None and NOT_RETRYABLE.search(error):
         return {"kind": "other", "action": "human", "agent": agent, "error": error, "resets": None}
     return {"kind": "connection", "action": "wake", "agent": agent, "error": error, "resets": None}
@@ -762,6 +767,8 @@ def stop_line(stop: StopReason) -> str:
         return "usage limit; resets " + stop["resets"] if stop["resets"] else "usage limit: " + stop["error"]
     if stop["kind"] == "login":
         return "login expired; a person has to log in again: " + stop["error"]
+    if stop["kind"] == "context_limit":
+        return "context window full; hand the rest to a new lane with a smaller scope: " + stop["error"]
     if stop["kind"] == "other":
         return "turn ended with an API error waking does not fix: " + stop["error"]
     return "turn ended with an API error: " + stop["error"]
@@ -3100,7 +3107,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     views.add_argument("--wake", action="store_true",
                        help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
-                            "logs in, その他: a person reads it) | the error's first 200 characters")
+                            "logs in, 文脈の上限: a new lane with a smaller scope, その他: a person reads it) | the error's first 200 characters")
     parser.add_argument("--transcripts", action="store_true",
                         help="with --row, print the row's transcript paths instead of JSON, one per line as "
                              "`claude <path>` or `codex <path>`")
@@ -3634,7 +3641,8 @@ def main(argv: list[str] | None = None) -> int:
     return print_rows(args, rows, verdicts)
 
 
-WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する", "other": "その他: 人が読む"}
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する",
+                "context_limit": "文脈の上限: 範囲を小さくして新しい担当に渡す", "other": "その他: 人が読む"}
 
 
 def reset_time(value: str | None, now: datetime, failed_at: datetime | None) -> datetime | None:
