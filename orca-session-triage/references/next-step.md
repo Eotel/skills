@@ -59,7 +59,12 @@ names the step in each signal's 「立て直し」:
 |---|---|
 | Lost connection (stop kind `connection`) | the same work continues: one line to go on from where it stopped. `connection_wake.py` sends it once the connection is back; send it yourself when the signal still comes |
 | Full context window (`context_limit`) | a smaller scope in a new lane: `spawn-lane` a brief with only the rest of the work (what is done, what remains, its branch or PR), then stop the old lane's tab |
-| Tool error (`busy_without_progress` with half or more of the run's tool calls failed) | a different model: `spawn-lane` the same work with the other agent (Codex for a Claude lane, Claude for a Codex lane), then stop the old lane |
+| Tool error (`busy_without_progress` with half or more of the run's tool calls failed) | a different model, once its screen shows the same tool failing again and again (a test run failing while the lane fixes code is not one): `spawn-lane` the same work with the other agent (Codex for a Claude lane, Claude for a Codex lane), then stop the old lane |
+
+After a new lane takes the work, close the signal with
+`inbox_read.py answered <id> --note "立て直し: <old worktree> → <new worktree>"`
+(worktree names; one pair per lane the ask named): the new lane then carries
+the work's recoveries.
 | No error (`idle_after_report`, or `busy_without_progress` whose calls succeed) | read its screen, then continue it with one line, close it, or wait |
 
 A work recovered twice is not recovered a third time. When its signal says
@@ -69,8 +74,8 @@ of the lane (stop its tab and say why in its Orca comment), replan around it
 plan. A recovery is an earlier `api_error_turn`, `idle_after_report`, or
 `busy_without_progress` signal of the same work (repo/name) in
 `work-checks.json` whose ask you answered with a send (`send … --ask <id>`)
-and whose lane got a send before the work's next such signal; a signal closed
-as waiting is none, even when an answer reached the lane meanwhile. So wake a
-lane for a signal through `--ask`. A connection wake with no signal is not
+that reached its lane within a minute, or closed as handed to a new lane as
+above. A signal closed as waiting is none, even when an answer reached the
+lane meanwhile, so wake a lane for a signal through `--ask`. A connection wake with no signal is not
 counted: a lost connection stops every lane at once and says nothing about
 the work.

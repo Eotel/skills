@@ -39,8 +39,9 @@ Recovery: api_error_turn, idle_after_report, and busy_without_progress name the 
 the same work continued, a full context window (stop kind context_limit) a new lane with a smaller scope, and a run whose
 tool calls failed half the time or more a lane of the other agent (Claude for Codex, Codex for Claude). A recovery is an
 earlier one of those signals of the same work in work-checks.json whose ask the lead answered with a send (`send --ask`)
-and whose lane got a send (board send events to its tabs or the tabs its reports came from) before the work's next such
-signal. Once a work has had two, the signal says to take the work out and replan instead of a third recovery.
+that reached the lane's tabs (or the tabs its reports came from) within a minute, or closed with `inbox_read.py answered
+<id> --note "立て直し: <old worktree> → <new worktree>"`; the new worktree's lane carries the work's recoveries on. Once a work has had two,
+the signal says to take the work out and replan instead of a third recovery.
 
 When the agent last did anything: Claude's newest transcript entry (the newest copy across Claude accounts), Codex's
 newest assistant message in its rollout, else the board's done time for the agent, else the lane's last report;
@@ -113,7 +114,10 @@ RECOVERED = ("api_error_turn", "idle_after_report", "busy_without_progress")
 MAX_RECOVERIES = 2
 STEPS = {"connection": "通信断。同じ続きを送る（止まったところから続ける 1 行）",
          "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
-         "tool_error": "道具のエラー。{other} の担当に移す（同じ作業を {other} で spawn-lane し、今の担当は止める）"}
+         "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
+                       " spawn-lane し、今の担当は止める）"}
+HANDED_TO = re.compile(r"立て直し[:：]\s*([\w.-]+)\s*(?:→|->)\s*([\w.-]+)")
+SEND_LANDS = timedelta(minutes=1)
 PERSON_STEPS = {"login": "人がログインし直す（起こしても直らない）", "other": "人がエラーを読む（起こしても同じエラーになる）"}
 DECISION_MARKER = "要判断"
 MORNING, AFTERNOON, EVENING, NIGHT = 9, 13, 17, 21
@@ -156,6 +160,7 @@ class Report:
 class Answer:
     at: datetime
     how: str
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -484,15 +489,34 @@ def wait_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
 
 
 def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
-    """When the lane was woken after each earlier stop signal of its work whose ask the lead answered with a send, before
-    the work's next one; an ask closed as waiting is no recovery, even when an answer reached the lane meanwhile."""
-    stops = sorted((stop for stop in records.stops_by_work.get(work_name(row), ()) if stop.at <= now),
-                   key=lambda stop: stop.at)
-    tabs = handles(row) | {report.handle for report in lane_reports(row, records) if report.handle}
-    sends = sorted(at for tab in tabs for at in records.sends_by_handle.get(tab, ()))
-    woken = [(stop, until) for stop, until in zip(stops, [*[stop.at for stop in stops[1:]], now])
-             if any(answer.how in DELIVERED for answer in records.answers_by_ask.get(stop.ask, ()))]
-    return [sent for stop, until in woken if (sent := next((at for at in sends if stop.at < at <= until), None))]
+    """When each earlier stop of the work was recovered: its ask answered by a send that reached the lane within a
+    minute, or closed as handed to a new lane (「立て直し: <old worktree> → <new worktree>」), whose stops then count as
+    the same work's."""
+    def tabs(name: str) -> set[str]:
+        return {report.handle for report in records.reports_by_worktree.get(name, ()) if report.handle}
+
+    def answered(stop: EarlierStop) -> tuple[Answer, ...]:
+        return tuple(answer for answer in records.answers_by_ask.get(stop.ask, ()) if answer.at <= now)
+
+    def handoffs(work: str, stop: EarlierStop) -> list[tuple[Answer, str]]:
+        return [(answer, new) for answer in answered(stop) if answer.how == "inbox_read.py answered"
+                for old, new in HANDED_TO.findall(answer.note) if old == work.rpartition("/")[2]]
+
+    handed = {new: work for work, stops in records.stops_by_work.items() for stop in stops
+              for _, new in handoffs(work, stop)}
+    chain, name = [work_name(row)], Path(row["path"]).name
+    while (earlier := handed.get(name)) and earlier not in chain:
+        chain.append(earlier)
+        name = earlier.rpartition("/")[2]
+    found = set()
+    for work in chain:
+        lane = tabs(work.rpartition("/")[2]) | (handles(row) if work == chain[0] else set())
+        sends = [at for tab in lane for at in records.sends_by_handle.get(tab, ())]
+        for stop in {stop.ask: stop for stop in records.stops_by_work.get(work, ()) if stop.at <= now}.values():
+            found.update(answer.at for answer, _ in handoffs(work, stop))
+            found.update(sent for answer in answered(stop) if answer.how in DELIVERED
+                         and (sent := next((at for at in sends if abs(at - answer.at) <= SEND_LANDS), None)))
+    return sorted(found)
 
 
 def recovery(row: Mapping, records: Records, now: datetime, step: str | None) -> str:
@@ -723,7 +747,7 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     for item in read_jsonl(answers):
         at = parse(item.get("ts"))
         if at and at <= now and item.get("id"):
-            given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or "")))
+            given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or ""), str(item.get("note") or "")))
     sends: dict[str, list[datetime]] = {}
     held: set[str] = set()
     due: set[str] = set()
@@ -880,9 +904,10 @@ def ask_text(signals: Sequence[Signal]) -> str:
         names = "・".join(SIGNALS[item.signal] for item in items)
         lines.append(f"{number}. {work}（{names}）")
         lines += [f"   - {item.reason}" for item in items]
-    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\" か spawn-lane"
-              "（orca-session-triage の references/next-step.md の Recovering a stopped lane）。閉じる・待つ: inbox_read.py"
-              " answered <この ask の id> --note \"理由\"。", "合図の記録: ~/.cache/orca-session-triage/work-checks.json"]
+    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。新しい担当に渡したら"
+              " inbox_read.py answered <この ask の id> --note \"立て直し: <元の作業場> → <新しい作業場>\"（orca-session-triage の"
+              " references/next-step.md の Recovering a stopped lane）。閉じる・待つ: inbox_read.py answered <この ask の id>"
+              " --note \"理由\"。", "合図の記録: ~/.cache/orca-session-triage/work-checks.json"]
     return "\n".join(lines)
 
 

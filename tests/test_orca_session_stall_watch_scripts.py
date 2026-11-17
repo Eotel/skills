@@ -356,7 +356,8 @@ class BusyWithoutProgressTests(unittest.TestCase):
                                     stall.Records(), NOW, FakeProbe(), live=False)
 
                 self.assertEqual([item.signal for item in found], ["busy_without_progress"])
-                self.assertIn(f"立て直し（1 回目）: 道具のエラー。{other} の担当に移す", found[0].reason)
+                self.assertIn(f"立て直し（1 回目）: 道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す",
+                              found[0].reason)
 
     def test_a_lane_waking_every_twenty_minutes_to_check_its_pr_is_waiting_not_busy(self) -> None:
         polling = [entry for minutes in range(185, 0, -20) for entry in claude_call(minutes, "watch_prs.py --once 52")]
@@ -384,19 +385,35 @@ class RecoveryTests(unittest.TestCase):
         stops = tuple(stall.EarlierStop(at(when), ask) for when, ask in (
             ("2026-11-15T10:00:00+09:00", "ask-1"), ("2026-11-15T15:00:00+09:00", "ask-2"),
             ("2026-11-16T08:00:00+09:00", "ask-3")))
-        sends = {"term_cut": (at("2026-11-15T10:05:00+09:00"), at("2026-11-15T15:10:00+09:00"))}
-        woken = (stall.Answer(at("2026-11-15T10:05:00+09:00"), "send"),)
-        waited = (stall.Answer(at("2026-11-15T15:05:00+09:00"), "inbox_read.py answered"),)
-        # The second stop was closed as waiting, and only an answer reached the lane afterwards.
-        once = stall.Records(stops_by_work={"app/cut": stops}, sends_by_handle=sends,
-                             answers_by_ask={"ask-1": woken, "ask-2": waited, "ask-3": waited})
+        sends = {"term_cut": tuple(at(f"2026-11-{when}+09:00") for when in ("15T10:05:00", "15T15:40:00", "16T08:30:00"))}
+        # The second ask's send woke another lane, and the third stop was closed as waiting: the sends this lane got
+        # afterwards relayed answers.
+        once = stall.Records(stops_by_work={"app/cut": stops}, sends_by_handle=sends, answers_by_ask={
+            "ask-1": (stall.Answer(at("2026-11-15T10:05:00+09:00"), "send"),),
+            "ask-2": (stall.Answer(at("2026-11-15T15:05:00+09:00"), "send"),),
+            "ask-3": (stall.Answer(at("2026-11-16T08:10:00+09:00"), "inbox_read.py answered"),)})
         twice = replace(once, answers_by_ask={**once.answers_by_ask,
-                                              "ask-2": (stall.Answer(at("2026-11-15T15:10:00+09:00"), "send"),)})
+                                              "ask-2": (stall.Answer(at("2026-11-15T15:40:00+09:00"), "send"),)})
 
         self.assertIn("立て直し（2 回目）: 通信断。同じ続きを送る", self.reason(self.stopped("connection"), once))
         replanned = self.reason(self.stopped("connection"), twice)
-        self.assertIn("11/15 10:05・11/15 15:10 に立て直した。3 回目はせず、この作業を外して計画を立て直す", replanned)
+        self.assertIn("11/15 10:05・11/15 15:40 に立て直した。3 回目はせず、この作業を外して計画を立て直す", replanned)
         self.assertNotIn("同じ続きを送る", replanned)
+
+    def test_a_work_handed_to_a_new_lane_keeps_its_recoveries_there(self) -> None:
+        # One ask named two lanes, and only cut was handed to a new lane.
+        handed = stall.Answer(at("2026-11-15T10:20:00+09:00"), "inbox_read.py answered",
+                              "立て直し: cut → cut-2。other は待つ")
+        records = stall.Records(
+            stops_by_work={"app/cut": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
+                           "app/other": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
+                           "app/cut-2": (stall.EarlierStop(at("2026-11-15T20:00:00+09:00"), "ask-2"),)},
+            answers_by_ask={"ask-1": (handed,), "ask-2": (stall.Answer(at("2026-11-15T20:05:00+09:00"), "send"),)},
+            sends_by_handle={"term_cut2": (at("2026-11-15T20:05:00+09:00"),)})
+        lane = {**self.stopped("context_limit"), "path": "/w/app/cut-2", "terminals": [{"handle": "term_cut2"}]}
+
+        self.assertIn("11/15 10:20・11/15 20:05 に立て直した。3 回目はせず", self.reason(lane, records))
+        self.assertIn("立て直し（1 回目）", self.reason({**self.stopped("connection"), "path": "/w/app/other"}, records))
 
 
 class LiveProbeTests(unittest.TestCase):
