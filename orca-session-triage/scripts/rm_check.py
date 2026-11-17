@@ -77,6 +77,8 @@ COMPOSER_MANIFESTS = ("composer.json", "composer.lock")
 VITE_CONFIGS = ":(glob)**/vite.config.*"
 VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
+# More than one outDir (per mode, say) leaves which one builds to the config's code, so such a config is not read.
+VITE_OUT_DIR_ANYWHERE = re.compile(r"""\boutDir['"]?\s*:""")
 # A config that moves Vite's root resolves a relative outDir from there, so beside it only an outDir that is an absolute
 # path from the config's own file is read: fileURLToPath(new URL(…, import.meta.url)) or path.resolve/join(__dirname, …),
 # matched with its string literals removed.
@@ -396,7 +398,7 @@ def composer_vendor_dir(manifest: Path) -> bool:
 
 
 def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | None:
-    """The tracked vite.config.* whose outDir, a directory below the config's own, is `path` or holds it, or None."""
+    """The tracked vite.config.* whose one outDir, a directory below the config's own, is `path` or holds it, or None."""
     for name in git(worktree, "ls-files", "-z", "--", VITE_CONFIGS).stdout.split("\0"):
         config = PurePosixPath(name)
         if config.suffix not in VITE_SUFFIXES:
@@ -406,18 +408,17 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
                                             (worktree / config).read_text(errors="replace"))
         except OSError:
             continue
-        moves_root = VITE_ROOT.search(text) is not None
-        for found in VITE_OUT_DIR.finditer(text):
-            value = found.group(1)
-            parts = [literal for _, literal in JS_STRING.findall(value)]
-            if not parts or any(VITE_UNREAD_LITERAL.search(part) for part in parts) or not VITE_PATH_CALL.fullmatch(
-                    JS_STRING.sub("", value)):
-                continue
-            if moves_root and not VITE_FROM_CONFIG.fullmatch(JS_STRING.sub("", value)):
-                continue
-            out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
-            if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
-                return config
+        if len(VITE_OUT_DIR_ANYWHERE.findall(text)) != 1 or (found := VITE_OUT_DIR.search(text)) is None:
+            continue
+        parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
+        calls = JS_STRING.sub("", found.group(1))
+        if not parts or any(VITE_UNREAD_LITERAL.search(part) for part in parts) or not VITE_PATH_CALL.fullmatch(calls):
+            continue
+        if VITE_ROOT.search(text) and not VITE_FROM_CONFIG.fullmatch(calls):
+            continue
+        out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
+        if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
+            return config
     return None
 
 
