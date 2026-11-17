@@ -35,6 +35,15 @@ Signals:
                        message (Claude's transcript or Codex's rollout, read from the end); a lane with an open ask
                        or an Orca automation is left out
 
+Recovery: api_error_turn, idle_after_report, and busy_without_progress name the step by cause: a lost connection gets
+the same work continued, a full context window (stop kind context_limit) a new lane with a smaller scope, and a run whose
+tool calls failed half the time or more a lane of the other agent (Claude for Codex, Codex for Claude). A recovery is an
+earlier one of those signals of the same work in work-checks.json whose ask the lead answered with a send (`send --ask`)
+that reached the lane's tabs (its terminals, the tabs its reports came from, or the tabs kept with its signals) within a
+minute, or closed with `inbox_read.py answered
+<id> --note "立て直し: <old worktree> → <new worktree>"`; the new worktree's lane carries the work's recoveries on. Once a work has had two,
+the signal says to take the work out and replan instead of a third recovery.
+
 When the agent last did anything: Claude's newest transcript entry (the newest copy across Claude accounts), Codex's
 newest assistant message in its rollout, else the board's done time for the agent, else the lane's last report;
 never Orca's lastOutputAt, which a status line redraws every 30 seconds.
@@ -101,7 +110,16 @@ CODEX_SINCE = timedelta(days=2)
 PROBE_TIMEOUT = 15
 DELIVERED = ("send", "send --decision")
 WITHDRAWN = "triage-notify --withdraws"
-STOP_KINDS = ("connection", "other", "login")
+STOP_KINDS = ("connection", "context_limit", "other", "login")
+RECOVERED = ("api_error_turn", "idle_after_report", "busy_without_progress")
+MAX_RECOVERIES = 2
+STEPS = {"connection": "通信断。同じ続きを送る（止まったところから続ける 1 行）",
+         "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
+         "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
+                       " spawn-lane し、今の担当は止める）"}
+HANDED_TO = re.compile(r"立て直し[:：]\s*([\w.:/-]+)\s*(?:→|->)\s*([\w.:/-]+)")
+SEND_LANDS = timedelta(minutes=1)
+PERSON_STEPS = {"login": "人がログインし直す（起こしても直らない）", "other": "人がエラーを読む（起こしても同じエラーになる）"}
 DECISION_MARKER = "要判断"
 MORNING, AFTERNOON, EVENING, NIGHT = 9, 13, 17, 21
 
@@ -143,6 +161,14 @@ class Report:
 class Answer:
     at: datetime
     how: str
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class EarlierStop:
+    at: datetime
+    ask: str
+    tabs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,6 +186,7 @@ class Records:
     open_handoff_names: frozenset[str] = frozenset()
     due_worktrees: frozenset[str] = frozenset()
     done_at_by_worktree: Mapping[str, datetime] = field(default_factory=dict)
+    stops_by_work: Mapping[str, tuple[EarlierStop, ...]] = field(default_factory=dict)
     reached_environments: frozenset[str] = frozenset()
     environment_by_alias: Mapping[str, str] = field(default_factory=dict)
     lead_path: str | None = None
@@ -191,6 +218,7 @@ class Signal:
     watcher_command: str | None = None
     watcher_started_at: str | None = None
     watcher_pr: str | None = None
+    tabs: tuple[str, ...] = ()
 
     def record(self, checked_at: datetime, inbox_id: str | None) -> dict:
         fields = {key: value for key, value in asdict(self).items() if key != "path"}
@@ -283,7 +311,8 @@ def base_signal(row: Mapping, act: Activity, records: Records, kind: str, finger
                   watcher_pid=watcher.pid if watcher else None,
                   watcher_command=watcher.command if watcher else None,
                   watcher_started_at=iso(watcher.started) if watcher else None,
-                  watcher_pr=watcher.pr if watcher else None)
+                  watcher_pr=watcher.pr if watcher else None,
+                  tabs=tuple(sorted(handles(row) | {report.handle for report in reports if report.handle})))
 
 
 def watcher_signals(row: Mapping, act: Activity, records: Records, now: datetime, probe: Probe) -> list[Signal]:
@@ -463,14 +492,61 @@ def wait_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
             for kind, target, why in found]
 
 
+def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
+    """When each earlier stop of the work was first recovered (once per stop): its ask answered by a send that reached
+    the lane within a minute, or closed as handed to a new lane (「立て直し: <old worktree> → <new worktree>」), whose
+    stops then count as the same work's."""
+    def tabs(name: str) -> set[str]:
+        return {report.handle for report in records.reports_by_worktree.get(name, ()) if report.handle}
+
+    def answered(stop: EarlierStop) -> tuple[Answer, ...]:
+        return tuple(answer for answer in records.answers_by_ask.get(stop.ask, ()) if answer.at <= now)
+
+    def handoffs(work: str, stop: EarlierStop) -> list[tuple[Answer, str]]:
+        """A bare new worktree name is in the old work's repository and on its Mac."""
+        place = work.rpartition("/")[0]
+        return [(answer, new if "/" in new or not place else f"{place}/{new}") for answer in answered(stop)
+                if answer.how == "inbox_read.py answered" for old, new in HANDED_TO.findall(answer.note)
+                if old in (work, work.rpartition("/")[2])]
+
+    handed = {new: work for work, stops in records.stops_by_work.items() for stop in stops
+              for _, new in handoffs(work, stop)}
+    chain = [work_name(row)]
+    while (earlier := handed.get(chain[-1])) and earlier not in chain:
+        chain.append(earlier)
+    found = set()
+    for work in chain:
+        lane = (tabs(work.rpartition("/")[2]) | (handles(row) if work == chain[0] else set())
+                | {tab for stop in records.stops_by_work.get(work, ()) for tab in stop.tabs})
+        sends = [at for tab in lane for at in records.sends_by_handle.get(tab, ())]
+        for stop in {stop.ask: stop for stop in records.stops_by_work.get(work, ()) if stop.at <= now}.values():
+            woke = [sent for answer in answered(stop) if answer.how in DELIVERED
+                    and (sent := next((at for at in sends if abs(at - answer.at) <= SEND_LANDS), None))]
+            if recovered := [*(answer.at for answer, _ in handoffs(work, stop)), *woke]:
+                found.add(min(recovered))
+    return sorted(found)
+
+
+def recovery(row: Mapping, records: Records, now: datetime, step: str | None) -> str:
+    """The step a stop of this cause gets, or replanning once the work has been recovered MAX_RECOVERIES times."""
+    done = recoveries(row, records, now)
+    if len(done) >= MAX_RECOVERIES:
+        return (f"。{'・'.join(short(at) for at in done)} に立て直した。{len(done) + 1} 回目はせず、"
+                "この作業を外して計画を立て直す")
+    return f"。立て直し（{len(done) + 1} 回目）: {step}" if step else ""
+
+
 def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     stop = row.get("stop")
     if not stop or stop.get("kind") not in STOP_KINDS:
         return []
     if act.at is None or now - act.at < GRACE:
         return []
+    then = (f"。{PERSON_STEPS[stop['kind']]}" if stop["kind"] in PERSON_STEPS
+            else recovery(row, records, now, STEPS[stop["kind"]]))
     return [base_signal(row, act, records, "api_error_turn", f"{act.by}@{act.at:%Y%m%dT%H%M%S}",
-                        f"最後の turn が {short(act.at)} に API エラー（{stop['kind']}）で終わった: {stop['error'][:100]}")]
+                        f"最後の turn が {short(act.at)} に API エラー（{stop['kind']}）で終わった: "
+                        f"{stop['error'][:100]}{then}")]
 
 
 def waits_explained(row: Mapping, verdict: Mapping | None, records: Records, now: float) -> bool:
@@ -497,7 +573,8 @@ def idle_signals(row: Mapping, verdict: Mapping | None, act: Activity, records: 
         return []
     return [base_signal(row, act, records, "idle_after_report", f"{last.id[:8]}@{act.at:%Y%m%dT%H%M}",
                         f"最後の報告は {short(last.at)} の {last.kind}（「{' '.join(last.text.split())[:80]}」）。"
-                        f"{short(act.at)} から動いておらず、待ち・hold・裏の作業・定期実行のどれも無い")]
+                        f"{short(act.at)} から動いておらず、待ち・hold・裏の作業・定期実行のどれも無い"
+                        f"{recovery(row, records, now, None)}")]
 
 
 @dataclass(frozen=True)
@@ -507,6 +584,8 @@ class Run:
     calls: int
     source: str
     whole: bool
+    agent: str
+    failed: int
 
 
 def lines_backwards(path: Path) -> Iterator[bytes]:
@@ -536,8 +615,9 @@ def claude_steps(entry: Mapping, done: dict[str, datetime]) -> Iterator[tuple[st
     if entry.get("type") == "user":
         if scan.is_real_user_message(dict(entry)):
             yield "progress", at
-        done.update({str(block.get("tool_use_id")): at for block in blocks
-                     if block.get("type") == "tool_result" and not block.get("is_error")})
+        results = [block for block in blocks if block.get("type") == "tool_result"]
+        done.update({str(block.get("tool_use_id")): at for block in results if not block.get("is_error")})
+        yield from (("failed", at) for block in results if block.get("is_error"))
     elif entry.get("type") == "assistant":
         yield "turn", at
         for block in (block for block in blocks if block.get("type") == "tool_use"):
@@ -557,6 +637,8 @@ def codex_steps(entry: Mapping, done: dict[str, datetime]) -> Iterator[tuple[str
         codes = EXIT_CODE.findall(str(payload.get("output") or ""))
         if codes and all(code == "0" for code in codes):
             done[str(payload.get("call_id"))] = at
+        elif codes:
+            yield "failed", at
     elif kind in ("function_call", "custom_tool_call"):
         yield "turn", at
         yield "call", at
@@ -575,11 +657,11 @@ def current_run(path: Path, agent: str, now: datetime, floor: datetime | None) -
     """Walk back from the newest entry to the last progress, a break longer than BUSY_GAP, or `floor` (a report)."""
     steps = claude_steps if agent == "claude" else codex_steps
     done: dict[str, datetime] = {}
-    calls, newest, oldest = 0, None, None
+    calls, failed, newest, oldest = 0, 0, None, None
     try:
         for line in lines_backwards(path):
             if not line:
-                return Run(oldest, calls, path.stem[-8:], False) if oldest else None
+                return Run(oldest, calls, path.stem[-8:], False, agent, failed) if oldest else None
             try:
                 entry = json.loads(line)
             except ValueError:
@@ -588,18 +670,20 @@ def current_run(path: Path, agent: str, now: datetime, floor: datetime | None) -
                 continue
             for step, when in steps(entry, done):
                 if step == "progress" or (floor and when <= floor):
-                    return Run(max(when, floor or when), calls, path.stem[-8:], True) if newest else None
+                    return Run(max(when, floor or when), calls, path.stem[-8:], True, agent, failed) if newest else None
                 if step == "turn":
                     if newest is None and now - when > GRACE:
                         return None
                     if oldest and oldest - when > BUSY_GAP:
-                        return Run(oldest, calls, path.stem[-8:], True)
+                        return Run(oldest, calls, path.stem[-8:], True, agent, failed)
                     newest, oldest = newest or when, when
                 elif step == "call":
                     calls += 1
+                elif step == "failed":
+                    failed += 1
     except OSError:
         return None
-    return Run(oldest, calls, path.stem[-8:], True) if oldest else None
+    return Run(oldest, calls, path.stem[-8:], True, agent, failed) if oldest else None
 
 
 def busy_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
@@ -622,9 +706,14 @@ def busy_signals(row: Mapping, act: Activity, records: Records, now: datetime) -
     if run.calls < BUSY_CALLS_PER_HOUR * minutes / 60:
         return []
     since = f"{run.since.astimezone():%Y%m%dT%H%M}" if run.whole else "tail"
-    return [base_signal(row, act, records, "busy_without_progress", f"{run.source}@{since}",
-                        f"{short(run.since)} から {minutes:.0f} 分、tool を {run.calls} 回使い続けているが、報告・commit・"
-                        "push・PR・人の入力が無い。担当に聞かず画面を読み、空回りなら止めるか立て直す")]
+    said = (f"{short(run.since)} から {minutes:.0f} 分、tool を {run.calls} 回使い続けているが、報告・commit・push・PR・"
+            "人の入力が無い")
+    if run.failed * 2 >= run.calls:
+        other = "Codex" if run.agent == "claude" else "Claude"
+        reason = f"{said}。うち {run.failed} 回は失敗した{recovery(row, records, now, STEPS['tool_error'].format(other=other))}"
+    else:
+        reason = f"{said}。担当に聞かず画面を読み、空回りなら止めるか立て直す{recovery(row, records, now, None)}"
+    return [base_signal(row, act, records, "busy_without_progress", f"{run.source}@{since}", reason)]
 
 
 def judge(row: Mapping, verdict: Mapping | None, records: Records, now: datetime, probe: Probe,
@@ -666,7 +755,7 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     for item in read_jsonl(answers):
         at = parse(item.get("ts"))
         if at and at <= now and item.get("id"):
-            given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or "")))
+            given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or ""), str(item.get("note") or "")))
     sends: dict[str, list[datetime]] = {}
     held: set[str] = set()
     due: set[str] = set()
@@ -686,6 +775,11 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
             held = {handle for handle, created, released, status in db.execute(
                 "select handle, created_at, released_at, status from holds")
                 if created <= stamp and (status == "active" if released is None else released > stamp)}
+    stops: dict[str, list[EarlierStop]] = {}
+    for item in load_checks():
+        if item.get("signal") in RECOVERED and (at := parse(item.get("checked_at"))) and at <= now:
+            stops.setdefault(str(item.get("work")), []).append(
+                EarlierStop(at, str(item.get("inbox_id") or ""), tuple(map(str, item.get("tabs") or ()))))
     state = scan.read_json_file(hourly_state) if hourly_state.is_file() else {}
     state = state if isinstance(state, dict) else {}
     handoffs = state.get("handoffs") or {}
@@ -704,6 +798,7 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
         answers_by_ask={key: tuple(items) for key, items in given.items()},
         sends_by_handle={key: tuple(items) for key, items in sends.items()}, held_handles=frozenset(held),
         open_handoff_names=frozenset(open_names), due_worktrees=frozenset(due), done_at_by_worktree=agent_done,
+        stops_by_work={work: tuple(items) for work, items in stops.items()},
         reached_environments=frozenset(row["environment"] for row in rows if row.get("environment")),
         environment_by_alias=aliases, lead_path=((state.get("lead") or {}).get("worktree")))
 
@@ -818,7 +913,9 @@ def ask_text(signals: Sequence[Signal]) -> str:
         names = "・".join(SIGNALS[item.signal] for item in items)
         lines.append(f"{number}. {work}（{names}）")
         lines += [f"   - {item.reason}" for item in items]
-    lines += ["起こす: send <作業場> --ask <この ask の id> \"…\"。閉じる・待つ: inbox_read.py answered <この ask の id>"
+    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。新しい担当に渡したら"
+              " inbox_read.py answered <この ask の id> --note \"立て直し: <元の作業場> → <新しい作業場>\"（orca-session-triage の"
+              " references/next-step.md の Recovering a stopped lane）。閉じる・待つ: inbox_read.py answered <この ask の id>"
               " --note \"理由\"。", "合図の記録: ~/.cache/orca-session-triage/work-checks.json"]
     return "\n".join(lines)
 
@@ -841,7 +938,8 @@ def to_board(records: Sequence[dict]) -> str | None:
     if not BOARD_CHECK.is_file():
         return None
     for item in records:
-        result = subprocess.run([str(BOARD_CHECK), "check"], input=json.dumps(item, ensure_ascii=False),
+        known = {key: value for key, value in item.items() if key != "tabs"}
+        result = subprocess.run([str(BOARD_CHECK), "check"], input=json.dumps(known, ensure_ascii=False),
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
             return (result.stderr or result.stdout).strip()[:300]

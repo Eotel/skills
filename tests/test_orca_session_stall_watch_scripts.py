@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -347,10 +348,82 @@ class BusyWithoutProgressTests(unittest.TestCase):
         self.assertEqual([item.signal for item in stall.judge(silent, None, stall.Records(), NOW, FakeProbe())],
                          ["busy_without_progress"])
 
+    def test_a_lane_whose_tool_calls_mostly_fail_is_moved_to_the_other_agent(self) -> None:
+        for agent, call, other in (("claude", lambda m: claude_call(m, failed=m % 3 > 0), "Codex"),
+                                   ("codex", lambda m: codex_call(m, exit_code=int(m % 3 > 0)), "Claude")):
+            with self.subTest(agent):
+                found = stall.judge(self.lane(agent, [e for m in range(104, 0, -1) for e in call(m)]), None,
+                                    stall.Records(), NOW, FakeProbe(), live=False)
+
+                self.assertEqual([item.signal for item in found], ["busy_without_progress"])
+                self.assertIn(f"立て直し（1 回目）: 道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す",
+                              found[0].reason)
+
     def test_a_lane_waking_every_twenty_minutes_to_check_its_pr_is_waiting_not_busy(self) -> None:
         polling = [entry for minutes in range(185, 0, -20) for entry in claude_call(minutes, "watch_prs.py --once 52")]
 
         self.assertEqual(self.signals(self.lane("claude", polling)), [])
+
+
+class RecoveryTests(unittest.TestCase):
+    """A stopped lane is recovered by its cause, and a work recovered twice is replanned (pstack's orchestrate)."""
+
+    def stopped(self, kind: str) -> dict:
+        return row("cut", terminals=[{"handle": "term_cut"}], claude=claude("2026-11-16T09:00:00+09:00"),
+                   stop={"kind": kind, "action": "wake", "agent": "claude", "error": "API Error: …", "resets": None})
+
+    def reason(self, lane: dict, records: object = None) -> str:
+        found = stall.judge(lane, None, records or stall.Records(), NOW, FakeProbe(), live=False)
+        return next(item.reason for item in found if item.signal == "api_error_turn")
+
+    def test_each_cause_names_its_own_recovery(self) -> None:
+        self.assertIn("立て直し（1 回目）: 通信断。同じ続きを送る", self.reason(self.stopped("connection")))
+        self.assertIn("立て直し（1 回目）: 文脈の上限。範囲を小さくして新しい担当に渡す",
+                      self.reason(self.stopped("context_limit")))
+
+    def test_a_work_recovered_twice_is_replanned_instead_of_recovered_a_third_time(self) -> None:
+        stops = tuple(stall.EarlierStop(at(when), ask) for when, ask in (
+            ("2026-11-15T10:00:00+09:00", "ask-1"), ("2026-11-15T15:00:00+09:00", "ask-2"),
+            ("2026-11-16T08:00:00+09:00", "ask-3")))
+        sends = {"term_cut": tuple(at(f"2026-11-{when}+09:00") for when in ("15T10:05:00", "15T15:40:00", "16T08:30:00"))}
+        # The second ask's send woke another lane, and the third stop was closed as waiting: the sends this lane got
+        # afterwards relayed answers.
+        once = stall.Records(stops_by_work={"app/cut": stops}, sends_by_handle=sends, answers_by_ask={
+            "ask-1": (stall.Answer(at("2026-11-15T10:05:00+09:00"), "send"),),
+            "ask-2": (stall.Answer(at("2026-11-15T15:05:00+09:00"), "send"),),
+            "ask-3": (stall.Answer(at("2026-11-16T08:10:00+09:00"), "inbox_read.py answered"),)})
+        twice = replace(once, answers_by_ask={**once.answers_by_ask,
+                                              "ask-2": (stall.Answer(at("2026-11-15T15:40:00+09:00"), "send"),)})
+
+        self.assertIn("立て直し（2 回目）: 通信断。同じ続きを送る", self.reason(self.stopped("connection"), once))
+        replanned = self.reason(self.stopped("connection"), twice)
+        self.assertIn("11/15 10:05・11/15 15:40 に立て直した。3 回目はせず、この作業を外して計画を立て直す", replanned)
+        self.assertNotIn("同じ続きを送る", replanned)
+
+    def test_a_work_handed_to_a_new_lane_keeps_its_recoveries_there(self) -> None:
+        # One ask named two lanes, and only cut was handed to a new lane; the lead recorded it twice.
+        handed = stall.Answer(at("2026-11-15T10:20:00+09:00"), "inbox_read.py answered",
+                              "立て直し: cut → cut-2。other は待つ")
+        again = replace(handed, at=at("2026-11-15T10:25:00+09:00"))
+        records = stall.Records(
+            stops_by_work={"app/cut": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
+                           "app/other": (stall.EarlierStop(at("2026-11-15T10:00:00+09:00"), "ask-1"),),
+                           "app/cut-2": (stall.EarlierStop(at("2026-11-15T20:00:00+09:00"), "ask-2"),)},
+            answers_by_ask={"ask-1": (handed, again), "ask-2": (stall.Answer(at("2026-11-15T20:05:00+09:00"), "send"),)},
+            sends_by_handle={"term_cut2": (at("2026-11-15T20:05:00+09:00"),)})
+        lane = {**self.stopped("context_limit"), "path": "/w/app/cut-2", "terminals": [{"handle": "term_cut2"}]}
+
+        self.assertIn("11/15 10:20・11/15 20:05 に立て直した。3 回目はせず", self.reason(lane, records))
+        self.assertIn("立て直し（1 回目）", self.reason({**self.stopped("connection"), "path": "/w/app/other"}, records))
+        # The old lane never reported, so only its signal remembers the tab its earlier wake reached.
+        woken_first = replace(records, stops_by_work={**records.stops_by_work, "app/cut": (
+            stall.EarlierStop(at("2026-11-15T08:00:00+09:00"), "ask-0", ("term_cut",)),
+            *records.stops_by_work["app/cut"])}, answers_by_ask={
+            **records.answers_by_ask, "ask-0": (stall.Answer(at("2026-11-15T08:05:00+09:00"), "send"),)},
+            sends_by_handle={**records.sends_by_handle, "term_cut": (at("2026-11-15T08:05:00+09:00"),)})
+        self.assertIn("11/15 08:05・11/15 10:20・11/15 20:05 に立て直した", self.reason(lane, woken_first))
+        # A lane of the same name in another repository is another work.
+        self.assertIn("立て直し（1 回目）", self.reason({**lane, "path": "/w/lib/cut-2", "repo": "lib"}, records))
 
 
 class LiveProbeTests(unittest.TestCase):
@@ -413,15 +486,43 @@ class RunTests(unittest.TestCase):
             return stall.main(["run", "--scan", str(self.scan)])
 
     def test_new_signals_go_out_as_one_ask_from_stall_watch_and_are_not_sent_again(self) -> None:
-        self.assertEqual(self.run_watch(NOW), 0)
+        board, taken = self.dir / "board-check", self.dir / "board-records.jsonl"
+        board.write_text("#!/usr/bin/env python3\nimport json, sys\nrecord = json.load(sys.stdin)\n"
+                         "'tabs' in record and sys.exit('知らない列: tabs')\n"
+                         f"open({str(taken)!r}, 'a').write(json.dumps(record) + '\\n')\n")
+        board.chmod(0o755)
+        with patch.object(stall, "BOARD_CHECK", board):
+            self.assertEqual(self.run_watch(NOW), 0)
+        self.assertEqual(len(taken.read_text().splitlines()), 2)
         self.assertEqual(self.run_watch(NOW + timedelta(minutes=15)), 0)
 
         asks = [json.loads(line) for line in self.inbox.read_text().splitlines()][1:]
         self.assertEqual([(item["worktree"], item["env"]) for item in asks], [("stall-watch", "")])
         self.assertIn("answer-left", asks[0]["text"])
         checks = json.loads((self.dir / "work-checks.json").read_text())
-        self.assertEqual({(item["signal"], item["status"], item["inbox_id"]) for item in checks},
-                         {("answer_undelivered", "open", asks[0]["id"]), ("idle_after_report", "open", asks[0]["id"])})
+        self.assertEqual({(item["signal"], item["status"], item["inbox_id"], tuple(item["tabs"])) for item in checks},
+                         {("answer_undelivered", "open", asks[0]["id"], ("term_left",)),
+                          ("idle_after_report", "open", asks[0]["id"], ("term_left",))})
+
+    def test_a_lane_woken_after_two_earlier_signals_is_replanned_on_the_third(self) -> None:
+        (self.dir / "work-checks.json").write_text(json.dumps([
+            {"work": "app/answer-left", "signal": "idle_after_report", "fingerprint": f"earlier-{number}",
+             "checked_at": checked_at, "status": "open", "inbox_id": f"stall-{number}"}
+            for number, checked_at in enumerate(("2026-11-15T22:00:00+09:00", "2026-11-16T08:00:00+09:00"))]))
+        with (self.dir / "answers.jsonl").open("a") as answers:
+            answers.writelines(json.dumps({"id": f"stall-{number}", "ts": ts, "how": "send"}) + "\n"
+                               for number, ts in enumerate(("2026-11-15T22:05:00+09:00", "2026-11-16T08:05:00+09:00")))
+        with sqlite3.connect(self.dir / "board.sqlite3") as db:
+            db.executescript("create table events(type, to_actor, ts); create table work_due(node_key);"
+                             "create table agents(worktree, state, state_started_at);")
+            db.executemany("insert into events values ('send', 'term_left', ?)",
+                           [("2026-11-15T22:05:00+09:00",), ("2026-11-16T08:05:00+09:00",)])
+
+        with patch.object(stall, "BOARD", self.dir / "board.sqlite3"):
+            self.assertEqual(self.run_watch(NOW), 0)
+
+        ask = json.loads(self.inbox.read_text().splitlines()[-1])
+        self.assertIn("11/15 22:05・11/16 08:05 に立て直した。3 回目はせず、この作業を外して計画を立て直す", ask["text"])
 
     def test_a_verdict_read_before_the_lane_spoke_again_does_not_explain_its_quiet(self) -> None:
         saved = json.loads(self.scan.read_text())[0]
