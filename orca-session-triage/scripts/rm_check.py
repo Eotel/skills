@@ -11,6 +11,7 @@ from functools import partial
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import shutil
@@ -66,9 +67,19 @@ GENERATED_BY = {
     "public/git-info.json": "scripts/gen-git-info.js",
 }
 # Ignored outputs a named tool builds again from a tracked file beside them: Cargo's target/ beside Cargo.toml,
-# and Tauri's gen/schemas/ under the directory of its config.
+# Tauri's gen/schemas/ under the directory of its config, Composer's vendor/ beside composer.json and its lock, and
+# the outDir a vite.config.* names, read from its line (`outDir: …` with its string literals joined as path parts)
+# from the config's directory.
 CARGO_MANIFEST = "Cargo.toml"
 TAURI_CONFIGS = ("tauri.conf.json", "tauri.conf.json5", "Tauri.toml")
+COMPOSER_DIR = "vendor"
+COMPOSER_MANIFESTS = ("composer.json", "composer.lock")
+VITE_CONFIGS = ":(glob)**/vite.config.*"
+VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
+VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
+# A config that moves Vite's root resolves a relative outDir from there, so it is not read.
+VITE_ROOT = re.compile(r"^\s*root\s*:", re.MULTILINE)
+JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
@@ -313,12 +324,20 @@ def tracked(worktree: Path, rel: PurePosixPath) -> bool:
 
 def tool_output(worktree: Path, rel: str) -> str | None:
     """What a named tool writes again at this ignored path, from a tracked file the worktree holds, or None:
+    Composer's vendor/ (or a path in it) beside composer.json and composer.lock, the outDir of a vite.config.*,
     Cargo's target/ beside Cargo.toml, Tauri's gen/schemas/ beside its config, a .terraform/ whose backend is not
     local, and a directory of zip files that a Terraform archive_file beside it writes."""
     path = PurePosixPath(rel.rstrip("/"))
     source = worktree / path
+    if COMPOSER_DIR in path.parts:
+        project = PurePosixPath(*path.parts[:path.parts.index(COMPOSER_DIR)])
+        manifests = [project / name for name in COMPOSER_MANIFESTS]
+        if all(tracked(worktree, manifest) for manifest in manifests):
+            return "Composer's packages (%s; composer install writes them again)" % ", ".join(map(str, manifests))
     if source.is_symlink() or not source.is_dir():
         return None
+    if config := vite_config_writing(worktree, path):
+        return "Vite's build output (outDir in %s; npm run build writes it again)" % config
     if path.name == "target" and tracked(worktree, path.parent / CARGO_MANIFEST):
         return "Cargo's build output (%s)" % (path.parent / CARGO_MANIFEST)
     if path.parts[-2:] == ("gen", "schemas"):
@@ -354,6 +373,26 @@ def tool_output(worktree: Path, rel: str) -> str | None:
                               for name in names):
         return None
     return "archives Terraform's archive_file writes (%s)" % ", ".join(map(str, outputs))
+
+
+def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | None:
+    """The tracked vite.config.* whose outDir is `path` or holds it, or None."""
+    for name in git(worktree, "ls-files", "-z", "--", VITE_CONFIGS).stdout.split("\0"):
+        config = PurePosixPath(name)
+        if config.suffix not in VITE_SUFFIXES:
+            continue
+        try:
+            text = (worktree / config).read_text(errors="replace")
+        except OSError:
+            continue
+        if VITE_ROOT.search(text):
+            continue
+        for found in VITE_OUT_DIR.finditer(text):
+            parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
+            if parts and not any("${" in part for part in parts) and within(
+                    str(path), posixpath.normpath(config.parent.joinpath(*parts))):
+                return config
+    return None
 
 
 def archive_outputs(writes: re.Pattern[str], text: str) -> list[str]:
@@ -882,9 +921,9 @@ def processes_in(worktree: str, locks: dict[int, str] | None = None) -> list[dic
     excluding ancestors and the commands reading this check's output.
 
     Each names its current directory where the system shows it (`cwd`), whether it runs in an Orca tab
-    (`in_orca_tab`), that tab's handle when the system shows it (`tab`), and whether the tab runs nothing but
-    its shell (`idle_tab`). A process of the tab running this check counts as outside a tab: it must not close
-    itself.
+    (`in_orca_tab`), the PID Orca's terminal host started for that tab (`tab_root`), the tab's handle when the
+    system shows it (`tab`), and whether the tab runs nothing but its shell (`idle_tab`). A process of the tab
+    running this check counts as outside a tab: it must not close itself.
     """
     processes = process_table()
     if processes is None:
@@ -905,7 +944,8 @@ def processes_in(worktree: str, locks: dict[int, str] | None = None) -> list[dic
         tabs[root] = (idle, next((handles[pid] for pid in sorted(handles)), None))
     return [{**item, "in_orca_tab": item["pid"] in roots,
              "idle_tab": tabs[roots[item["pid"]]][0] if item["pid"] in roots else False,
-             "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None} for item in found]
+             "tab": tabs[roots[item["pid"]]][1] if item["pid"] in roots else None,
+             **({"tab_root": roots[item["pid"]]} if item["pid"] in roots else {})} for item in found]
 
 
 def without_ended(processes: list[dict]) -> list[dict]:

@@ -17,7 +17,11 @@ any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
 changes on its host before applying the same rule; the scan leaves those git
 facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
-<host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. The process check below protects work running
+<host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. gh cannot read GitHub there, so for a spec
+naming a PR without its head it reads that Mac's HEAD and origin and runs `merged_pr_head.py` with this Mac's gh:
+a merged PR's head and `ahead_by` reach `rm_check.py` as `"<path> <PR> <pr-head> <ahead_by>"`, and an open PR's spec
+stays as given, so the `--host` line a scan prints, which names the row's PR, needs no head added by hand. The
+process check below protects work running
 in a tab. To check worktrees of several repositories in one call, give
 `rm-check-batch` full paths (`"<path> <PR|->"`) and no base directory:
 `scan_sessions.py --from SCAN_JSON --rm-specs --row NAME …` prints those specs
@@ -30,14 +34,20 @@ with no `containers`, putting the result in that worktree's line as `removal`
 (it exits 4 when one did not finish). Give it only rows these rules remove
 without asking. Its `--summary` prints one line per worktree instead of the
 JSON (`<name> | ok=… | removal=… | reasons=…`, reasons naming only `.yomiyasu/`
-left out): read those lines rather than parsing the JSON. After the worktrees,
-either form lists every held file in one block (`確認が要るファイル`, one line
-each with the worktree, reason, and decision): ask the user about them together.
+left out, the blockers before the held files, and held files of one kind, reason, and decision under one top
+directory on one line, such as `vendor/ の下の 48 件`): read those lines rather than parsing the JSON. After the
+worktrees, either form lists every held file in one block (`確認が要るファイル`, one line
+each with the worktree, reason, and decision, grouped the same way with `--summary`): ask the user about them
+together.
 With `--from SCAN_JSON`, batch reads the same saved verdicts as `--rm-specs`.
 It counts a scanned meaningful tab only while `orca terminal list` still lists
 it. With `--remove-ok`, it closes the row's scanned tabs through `close_tabs.py`
 before checking; without it, a tab blocker explains that `--remove-ok` closes
 the tabs before removal. Tabs whose worktree moved after the scan stay open.
+For a row whose `removal_decision` allows removal, every process must sit in an idle tab. macOS hides a tab's login
+shell's environment, so `rm_check.py` names no `tab` for an empty one: as many such empty tabs (counted by
+`tab_root`, so two shells of one tab count once) as live tabs it did not name stand for those tabs, which close before
+removal. A live tab left without one keeps the row.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -140,7 +150,10 @@ Run these per worktree, in order.
      such as `.claude/.venv-missing` from `.claude/hooks/worktree_create.sh`),
      an ignored tool output beside the tracked file it is built from (Cargo's
      `target/` beside `Cargo.toml`, Tauri's `gen/schemas/` beside
-     `tauri.conf.json`, a directory whose every zip is one a Terraform
+     `tauri.conf.json`, Composer's `vendor/` (or each path in it) beside a tracked
+     `composer.json` and `composer.lock`, the `outDir` a tracked `vite.config.*`
+     names on its `outDir:` line (its string literals joined as path parts, from
+     the config's directory), a directory whose every zip is one a Terraform
      `archive_file` block beside it (comments left out) declares with `output_path =
      "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
      standing for one path segment, and a
@@ -172,7 +185,8 @@ Run these per worktree, in order.
      (`compose*.y*ml`, `docker-compose*.y*ml`) is blocked until it does; one
      without gets a note and its verdict.
    - `processes` lists commands or current directories using the path. Each
-     says whether it runs in an Orca tab (`in_orca_tab`), the tab's `handle`
+     says whether it runs in an Orca tab (`in_orca_tab`), the PID Orca's
+     terminal host started for that tab (`tab_root`), the tab's `handle`
      when the system shows it (`tab`), and whether that tab runs nothing but
      its login shell or the shell's setup waits (`idle_tab`). An idle tab does
      not block: `orca worktree rm` stops its PTY. A busy tab blocks with the
@@ -199,7 +213,8 @@ Run these per worktree, in order.
    - On a remote Mac whose gh cannot read the PR, `notes` give a
      `merged_pr_head.py` command for a Mac where gh works. It confirms the PR
      is MERGED and prints `--pr-head` and `--head-ahead-of-pr`; pass them to
-     `rm_check.py` on the remote Mac.
+     `rm_check.py` on the remote Mac (`rm-check-batch --host` does this for each
+     spec naming a PR).
 2. Stop those projects with `docker compose -p <project> down` from the worktree.
    Keep named volumes unless the user approved deleting them, and say which
    volumes remain.
@@ -243,7 +258,12 @@ follow "Clearing done cards".
    worktree's transcripts, its triage inbox reports, and its agents' state in
    Orca again, leaving out the calling session's own transcript, pane, and
    reports; a tab whose worktree moved after the scan stays, printed as
-   `KEPT -> 走査の後に動いた（time what）`. Scan again and read that row
+   `KEPT -> 走査の後に動いた（time what）`, a transcript named with its newest line's kind
+   (`assistant の行`, `人の入力`, `ツールの結果`, …). A transcript whose new lines are
+   all Claude Code compacting the idle session on its own (the boundary, the summary,
+   its attachments and links, and the "Compacted while idle" notice) does not count,
+   nor do the agent state changes from the summary's start to 30 seconds after its
+   last line; a line after it counts as before. Scan again and read that row
    before deciding again. Never close a listed tab with a bare
    `orca terminal close`: it closed a lane that deployed after the scan
    (2026-10-28). Closing stops that pane's process and removes a single-pane

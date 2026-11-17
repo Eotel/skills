@@ -4132,6 +4132,41 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("terraform/modules/dms/zip/ is archives Terraform's archive_file writes "
                       "(terraform/modules/dms/monitor.tf), ignored by .gitignore:5:zip", result["notes"])
 
+    def test_ignored_composer_vendor_and_vite_out_dir_are_regenerable_beside_their_tracked_configs(self) -> None:
+        # 2026-11-16 a PHP worktree held 48 vendor/<package>/ lines as unknown (87b26b40); 2026-11-17
+        # orca-board's orca_board/static/, the outDir of its vite.config.js, was held the same way (c087cb4c).
+        sources = {"composer.json": "{}\n", "composer.lock": "{}\n", "tools/composer.json": "{}\n",
+                   "vite.config.js": 'export default {\n  build: {\n'
+                                     '    outDir: fileURLToPath(new URL("./orca_board/static", import.meta.url)),\n'
+                                     '    // outDir: "old_static",\n  },\n}\n',
+                   "web/vite.config.ts": 'export default {\n  root: "src",\n  build: {\n    outDir: "public_build",\n  },\n}\n'}
+        for name, content in sources.items():
+            (self.main / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.main / name).write_text(content)
+        with (self.main / ".gitignore").open("a") as ignore:
+            ignore.write("/vendor/*\ntools/vendor/\norca_board/static/\nold_static/\nweb/public_build/\n")
+        git(self.main, "add", ".gitignore", *sources)
+        git(self.main, "commit", "-q", "-m", "composer and vite")
+        git(self.wt, "merge", "-q", "--ff-only", "main")
+        outputs = {"vendor/autoload.php": "<?php\n", "vendor/ajgl/lib/A.php": "<?php\n",
+                   "tools/vendor/acme/B.php": "<?php\n", "orca_board/static/index.html": "<html></html>\n",
+                   "old_static/index.html": "<html></html>\n", "web/public_build/index.html": "<html></html>\n"}
+        for name, content in outputs.items():
+            (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.wt / name).write_text(content)
+
+        code, result = self.run_main()
+
+        # Without its composer.lock, named only in a comment, or relative to a root the config moved, the directory is
+        # someone's until read.
+        self.assertEqual((code, [item["path"] for item in result["held"]]),
+                         (1, ["old_static/", "tools/vendor/", "web/public_build/"]))
+        self.assertEqual(sorted(result["regenerable"]), ["orca_board/static/", "vendor/ajgl/", "vendor/autoload.php"])
+        self.assertIn("vendor/ajgl/ is Composer's packages (composer.json, composer.lock; composer install writes "
+                      "them again), ignored by .gitignore:4:/vendor/*", result["notes"])
+        self.assertIn("orca_board/static/ is Vite's build output (outDir in vite.config.js; npm run build writes it "
+                      "again), ignored by .gitignore:6:orca_board/static/", result["notes"])
+
     def test_open_pr_at_clean_checkout_head_is_removable(self) -> None:
         (self.wt / "app.txt").write_text("pushed change\n")
         git(self.wt, "commit", "-q", "-am", "change")
@@ -4334,8 +4369,11 @@ class RmCheckTests(unittest.TestCase):
                 patch.object(rmcheck, "process_handles", return_value={}):
             idle_only = self.check()
 
-        tabs = {item["pid"]: (item["in_orca_tab"], item["idle_tab"], item["tab"]) for item in result["processes"]}
-        self.assertEqual(tabs, {21: (True, True, None), 32: (True, False, "term_busy"), 40: (False, False, None)})
+        tabs = {item["pid"]: (item["in_orca_tab"], item["idle_tab"], item["tab"], item.get("tab_root"))
+                for item in result["processes"]}
+        # The tab's root names the tab when its handle cannot be read: rm-check-batch counts idle tabs by it.
+        self.assertEqual(tabs, {21: (True, True, None, 20), 32: (True, False, "term_busy", 30),
+                                40: (False, False, None, None)})
         self.assertEqual(len(result["blockers"]), 2)
         self.assertIn(f"{SCRIPTS / 'close_tabs.py'} --from SCAN_JSON term_busy", result["blockers"][1])
         self.assertIn("PID 40（node server.js、cwd %s）" % wt, result["blockers"][0])
