@@ -414,6 +414,13 @@ class RecoveryTests(unittest.TestCase):
 
         self.assertIn("11/15 10:20・11/15 20:05 に立て直した。3 回目はせず", self.reason(lane, records))
         self.assertIn("立て直し（1 回目）", self.reason({**self.stopped("connection"), "path": "/w/app/other"}, records))
+        # The old lane never reported, so only its signal remembers the tab its earlier wake reached.
+        woken_first = replace(records, stops_by_work={**records.stops_by_work, "app/cut": (
+            stall.EarlierStop(at("2026-11-15T08:00:00+09:00"), "ask-0", ("term_cut",)),
+            *records.stops_by_work["app/cut"])}, answers_by_ask={
+            **records.answers_by_ask, "ask-0": (stall.Answer(at("2026-11-15T08:05:00+09:00"), "send"),)},
+            sends_by_handle={**records.sends_by_handle, "term_cut": (at("2026-11-15T08:05:00+09:00"),)})
+        self.assertIn("11/15 08:05・11/15 10:20・11/15 20:05 に立て直した", self.reason(lane, woken_first))
         # A lane of the same name in another repository is another work.
         self.assertIn("立て直し（1 回目）", self.reason({**lane, "path": "/w/lib/cut-2", "repo": "lib"}, records))
 
@@ -478,15 +485,23 @@ class RunTests(unittest.TestCase):
             return stall.main(["run", "--scan", str(self.scan)])
 
     def test_new_signals_go_out_as_one_ask_from_stall_watch_and_are_not_sent_again(self) -> None:
-        self.assertEqual(self.run_watch(NOW), 0)
+        board, taken = self.dir / "board-check", self.dir / "board-records.jsonl"
+        board.write_text("#!/usr/bin/env python3\nimport json, sys\nrecord = json.load(sys.stdin)\n"
+                         "'tabs' in record and sys.exit('知らない列: tabs')\n"
+                         f"open({str(taken)!r}, 'a').write(json.dumps(record) + '\\n')\n")
+        board.chmod(0o755)
+        with patch.object(stall, "BOARD_CHECK", board):
+            self.assertEqual(self.run_watch(NOW), 0)
+        self.assertEqual(len(taken.read_text().splitlines()), 2)
         self.assertEqual(self.run_watch(NOW + timedelta(minutes=15)), 0)
 
         asks = [json.loads(line) for line in self.inbox.read_text().splitlines()][1:]
         self.assertEqual([(item["worktree"], item["env"]) for item in asks], [("stall-watch", "")])
         self.assertIn("answer-left", asks[0]["text"])
         checks = json.loads((self.dir / "work-checks.json").read_text())
-        self.assertEqual({(item["signal"], item["status"], item["inbox_id"]) for item in checks},
-                         {("answer_undelivered", "open", asks[0]["id"]), ("idle_after_report", "open", asks[0]["id"])})
+        self.assertEqual({(item["signal"], item["status"], item["inbox_id"], tuple(item["tabs"])) for item in checks},
+                         {("answer_undelivered", "open", asks[0]["id"], ("term_left",)),
+                          ("idle_after_report", "open", asks[0]["id"], ("term_left",))})
 
     def test_a_lane_woken_after_two_earlier_signals_is_replanned_on_the_third(self) -> None:
         (self.dir / "work-checks.json").write_text(json.dumps([

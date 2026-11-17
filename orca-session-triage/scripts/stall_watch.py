@@ -39,7 +39,8 @@ Recovery: api_error_turn, idle_after_report, and busy_without_progress name the 
 the same work continued, a full context window (stop kind context_limit) a new lane with a smaller scope, and a run whose
 tool calls failed half the time or more a lane of the other agent (Claude for Codex, Codex for Claude). A recovery is an
 earlier one of those signals of the same work in work-checks.json whose ask the lead answered with a send (`send --ask`)
-that reached the lane's tabs (or the tabs its reports came from) within a minute, or closed with `inbox_read.py answered
+that reached the lane's tabs (its terminals, the tabs its reports came from, or the tabs kept with its signals) within a
+minute, or closed with `inbox_read.py answered
 <id> --note "立て直し: <old worktree> → <new worktree>"`; the new worktree's lane carries the work's recoveries on. Once a work has had two,
 the signal says to take the work out and replan instead of a third recovery.
 
@@ -167,6 +168,7 @@ class Answer:
 class EarlierStop:
     at: datetime
     ask: str
+    tabs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +218,7 @@ class Signal:
     watcher_command: str | None = None
     watcher_started_at: str | None = None
     watcher_pr: str | None = None
+    tabs: tuple[str, ...] = ()
 
     def record(self, checked_at: datetime, inbox_id: str | None) -> dict:
         fields = {key: value for key, value in asdict(self).items() if key != "path"}
@@ -308,7 +311,8 @@ def base_signal(row: Mapping, act: Activity, records: Records, kind: str, finger
                   watcher_pid=watcher.pid if watcher else None,
                   watcher_command=watcher.command if watcher else None,
                   watcher_started_at=iso(watcher.started) if watcher else None,
-                  watcher_pr=watcher.pr if watcher else None)
+                  watcher_pr=watcher.pr if watcher else None,
+                  tabs=tuple(sorted(handles(row) | {report.handle for report in reports if report.handle})))
 
 
 def watcher_signals(row: Mapping, act: Activity, records: Records, now: datetime, probe: Probe) -> list[Signal]:
@@ -512,7 +516,8 @@ def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
         chain.append(earlier)
     found = set()
     for work in chain:
-        lane = tabs(work.rpartition("/")[2]) | (handles(row) if work == chain[0] else set())
+        lane = (tabs(work.rpartition("/")[2]) | (handles(row) if work == chain[0] else set())
+                | {tab for stop in records.stops_by_work.get(work, ()) for tab in stop.tabs})
         sends = [at for tab in lane for at in records.sends_by_handle.get(tab, ())]
         for stop in {stop.ask: stop for stop in records.stops_by_work.get(work, ()) if stop.at <= now}.values():
             found.update(answer.at for answer, _ in handoffs(work, stop))
@@ -772,7 +777,8 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     stops: dict[str, list[EarlierStop]] = {}
     for item in load_checks():
         if item.get("signal") in RECOVERED and (at := parse(item.get("checked_at"))) and at <= now:
-            stops.setdefault(str(item.get("work")), []).append(EarlierStop(at, str(item.get("inbox_id") or "")))
+            stops.setdefault(str(item.get("work")), []).append(
+                EarlierStop(at, str(item.get("inbox_id") or ""), tuple(map(str, item.get("tabs") or ()))))
     state = scan.read_json_file(hourly_state) if hourly_state.is_file() else {}
     state = state if isinstance(state, dict) else {}
     handoffs = state.get("handoffs") or {}
@@ -931,7 +937,8 @@ def to_board(records: Sequence[dict]) -> str | None:
     if not BOARD_CHECK.is_file():
         return None
     for item in records:
-        result = subprocess.run([str(BOARD_CHECK), "check"], input=json.dumps(item, ensure_ascii=False),
+        known = {key: value for key, value in item.items() if key != "tabs"}
+        result = subprocess.run([str(BOARD_CHECK), "check"], input=json.dumps(known, ensure_ascii=False),
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
             return (result.stderr or result.stdout).strip()[:300]
