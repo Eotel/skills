@@ -31,6 +31,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 from typing import Any
@@ -275,6 +276,12 @@ def decide(hook_input: dict, state_dir: str | Path, orca: str = "orca") -> dict[
         return None
     pending_asks = unread_ask_reason(hook_input.get("cwd"), orca)
     if hook_input.get("stop_hook_active"):
+        try:
+            runpy.run_path(str(Path.home() / ".agents/hooks/rule_events.py"))["record_exception"](
+                "triage-stop-repeat", "stop_hook_active=true", hook_input,
+                ["Stop", "stop_hook_active=true"])
+        except Exception:
+            pass
         return {"decision": "block", "reason": pending_asks} if pending_asks else None
     session = Path(state_dir) / hook_input["session_id"]
     # Review and live-watch notices block once; unread asks remain a gate until acked.
