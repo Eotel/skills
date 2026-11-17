@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """PreToolUse hook: give worktree removal and Bash calls on a heavily loaded Mac the longest timeout.
 
 While the 1-minute load is above LOAD_LIMIT, a Bash call with no timeout, or one under TIMEOUT_MS,

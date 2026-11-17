@@ -17,18 +17,18 @@ def entry_scripts() -> list[Path]:
                   if path.parts[-3] not in SNAPSHOTS and '__name__ == "__main__"' in path.read_text())
 
 
-def python39() -> str | None:
+def find_python(request: str) -> str | None:
     uv = shutil.which("uv")
     if uv is None:
         return None
-    found = subprocess.run([uv, "python", "find", "--no-project", "3.9"], capture_output=True, text=True,
+    found = subprocess.run([uv, "python", "find", "--no-project", request], capture_output=True, text=True,
                            timeout=60, check=False)
     return found.stdout.strip() if found.returncode == 0 else None
 
 
 class EntryScriptTests(unittest.TestCase):
     def test_help_exits_zero_with_python39_first_on_path(self) -> None:
-        old = python39()
+        old = find_python("3.9")
         if old is None:
             self.skipTest("no Python 3.9 (uv python install 3.9)")
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,6 +36,25 @@ class EntryScriptTests(unittest.TestCase):
             env = {**os.environ, "PATH": os.pathsep.join((tmp, os.environ.get("PATH", "")))}
             self.assertTrue(subprocess.run(["python3", "--version"], env=env, capture_output=True,
                                            text=True, check=False).stdout.startswith("Python 3.9"))
+            for script in entry_scripts():
+                with self.subTest(script=str(script.relative_to(ROOT))):
+                    result = subprocess.run([script, "--help"], env=env, stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=60, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_help_exits_zero_where_uv_sees_only_a_newer_system_python(self) -> None:
+        newer, uv = find_python(">=3.13"), shutil.which("uv")
+        if newer is None or uv is None:
+            self.skipTest("no Python 3.13 or later (uv python install 3.13)")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, no_managed = Path(tmp, "bin"), Path(tmp, "managed")
+            bin_dir.mkdir()
+            no_managed.mkdir()
+            Path(bin_dir, "python3").symlink_to(newer)
+            Path(bin_dir, "uv").symlink_to(uv)
+            env = {**os.environ, "PATH": str(bin_dir),
+                   "UV_PYTHON_INSTALL_DIR": str(no_managed), "UV_PYTHON_PREFERENCE": "only-system",
+                   "UV_PYTHON_DOWNLOADS": "never"}
             for script in entry_scripts():
                 with self.subTest(script=str(script.relative_to(ROOT))):
                     result = subprocess.run([script, "--help"], env=env, stdin=subprocess.DEVNULL,

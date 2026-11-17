@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Compare bundled snapshots with a fresh ast-grep generation; never rewrite them."""
 
 import argparse

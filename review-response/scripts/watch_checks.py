@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Emit DONE owner/repo@sha ok|FAILED [...] once per commit; exit when all finish.
 
 A FAILED line ends with 未起動 ["job", ...]: <reason> for the failed check runs whose first annotation says GitHub

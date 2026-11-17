@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Print what the lead and the lanes did as one timeline, read from the records they already append.
 
 Each line is one event: its time (JST), who acted (a workspace, 指揮 for the lead's decision log, or the
