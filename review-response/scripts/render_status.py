@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Render caller-supplied review status JSON as a Markdown table."""
 
 from __future__ import annotations

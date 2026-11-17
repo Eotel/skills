@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Queue hourly triage transcripts and turn verified lessons into reversible skill notes.
 
 A live hourly tab reviews itself through a forked Agent and records the result with ``submit``.

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Run the hourly triage reads in parallel and keep each result outside terminal output.
 
 Each invocation creates a unique directory under --output-root and ends by printing

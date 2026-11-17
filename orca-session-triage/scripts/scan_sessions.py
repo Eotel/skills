@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Inventory Orca agent sessions from Orca state and agent transcripts.
 
 GitHub calls per run, for the rows that get PR facts: one GraphQL query per

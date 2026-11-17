@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Drive a macOS desktop app built around a web view (Tauri, wry, WKWebView) behind the user's windows.
 
 The app runs with two helper libraries loaded into it: one keeps it from coming to the front, the

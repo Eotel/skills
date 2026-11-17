@@ -30,11 +30,14 @@ under `tests/`.
 - Scripts use the Python standard library and document their options with
   `--help`.
 - A script run as a command is executable and starts with
-  `#!/usr/bin/env -S uv run --no-project --no-config --python 3.12`; docs and
+  `#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12`; docs and
   printed commands call it by its path, not `python3 <path>`. Every Mac then
-  runs it on Python 3.12, whatever `python3` comes first on PATH (macOS's
-  `/usr/bin/python3` is 3.9). Leave out a PEP 723 block: ty checks such a
-  script alone and stops resolving its sibling imports.
+  runs it on Python 3.12 or later, whatever `python3` comes first on PATH
+  (macOS's `/usr/bin/python3` is 3.9). Keep the lower bound open: a devenv shell
+  can set uv to its own interpreter only (such as 3.13) with downloads off, and
+  an exact version then finds nothing and exits 2, which blocks a PreCompact or
+  Stop hook. Leave out a PEP 723 block: ty checks such a script alone and stops
+  resolving its sibling imports.
 - Tests live in `tests/test_<skill>_scripts.py` as offline `unittest` cases:
   real git in temporary directories, external CLIs mocked at the boundary.
 

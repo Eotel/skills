@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Find Orca lanes that look stopped but need someone, by fixed rules, and wake the lead with one inbox ask.
 
 usage: stall_watch.py run [--scan SCAN_JSON] [--dry-run]

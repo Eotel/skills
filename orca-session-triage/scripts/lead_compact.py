@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Compaction hooks for the appointed lead (hourly_state.py appoint-lead): keep its commitments through a summary.
 
     lead_compact.py pre-compact     PreCompact: print what the summary must keep

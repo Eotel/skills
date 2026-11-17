@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --no-project --no-config --python 3.12
+#!/usr/bin/env -S uv run --no-project --no-config --python >=3.12
 """Read new triage inbox lines by append position, then acknowledge handled lines.
 
 `read` does not advance the cursor. After handling its output, pass the printed
