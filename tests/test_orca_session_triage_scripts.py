@@ -4142,13 +4142,14 @@ class RmCheckTests(unittest.TestCase):
                                      '    // outDir: "old_static",\n    /*\n    outDir: "private_build",\n    */\n'
                                      '  },\n}\n',
                    "web/vite.config.ts": 'export default {\n  root: "src",\n  build: {\n    outDir: "public_build",\n  },\n}\n',
-                   "site/vite.config.mjs": 'export default {\n  build: {\n    outDir: ".",\n  },\n}\n'}
+                   "site/vite.config.mjs": 'export default {\n  build: {\n    outDir: ".",\n  },\n}\n',
+                   "app/vite.config.js": 'export default { root: "frontend",\n  build: {\n    outDir: "bundle",\n  },\n}\n'}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
             (self.main / name).write_text(content)
         with (self.main / ".gitignore").open("a") as ignore:
             ignore.write("/vendor/*\ntools/vendor/\norca_board/static/\nold_static/\nweb/public_build/\nlib/vendor/\n"
-                         "private_build/\nsite/cache/\n")
+                         "private_build/\nsite/cache/\napp/bundle/\n")
         git(self.main, "add", ".gitignore", *sources)
         git(self.main, "commit", "-q", "-m", "composer and vite")
         git(self.wt, "merge", "-q", "--ff-only", "main")
@@ -4156,7 +4157,7 @@ class RmCheckTests(unittest.TestCase):
                    "tools/vendor/acme/B.php": "<?php\n", "orca_board/static/index.html": "<html></html>\n",
                    "old_static/index.html": "<html></html>\n", "web/public_build/index.html": "<html></html>\n",
                    "lib/vendor/acme/C.php": "<?php\n", "private_build/index.html": "<html></html>\n",
-                   "site/cache/notes.txt": "kept\n"}
+                   "site/cache/notes.txt": "kept\n", "app/bundle/notes.txt": "kept\n"}
         for name, content in outputs.items():
             (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
             (self.wt / name).write_text(content)
@@ -4167,8 +4168,8 @@ class RmCheckTests(unittest.TestCase):
         # to a root the config moved, or under an outDir that is the config's own directory, the directory is
         # someone's until read.
         self.assertEqual((code, [item["path"] for item in result["held"]]),
-                         (1, ["lib/vendor/", "old_static/", "private_build/", "site/cache/", "tools/vendor/",
-                              "web/public_build/"]))
+                         (1, ["app/bundle/", "lib/vendor/", "old_static/", "private_build/", "site/cache/",
+                              "tools/vendor/", "web/public_build/"]))
         self.assertEqual(sorted(result["regenerable"]), ["orca_board/static/", "vendor/ajgl/", "vendor/autoload.php"])
         self.assertIn("vendor/ajgl/ is Composer's packages (composer.json, composer.lock; composer install writes "
                       "them again), ignored by .gitignore:4:/vendor/*", result["notes"])

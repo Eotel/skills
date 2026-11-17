@@ -78,7 +78,7 @@ VITE_CONFIGS = ":(glob)**/vite.config.*"
 VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
 # A config that moves Vite's root resolves a relative outDir from there, so it is not read.
-VITE_ROOT = re.compile(r"^\s*root\s*:", re.MULTILINE)
+VITE_ROOT = re.compile(r"""\broot['"]?\s*:""")
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 JS_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
