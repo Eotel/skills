@@ -6223,6 +6223,27 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([(item["id"], item["state"], item["link"]) for item in stale],
                          [("keep:/w/b", "提示済み・未回答", "https://github.com/Acme/app/issues/12")])
 
+    def test_a_presented_key_listed_again_after_it_settled_or_after_its_question_settled_shows_again(self) -> None:
+        decide = hourly_state.lead_decisions.Decision
+        self.call("asked", "--row", "/w/e", "--decision", "other:/w/e", "--covers", "cover:/w/e", "--no-comment",
+                  "--asked-at", "2026-11-17T00:00:00+00:00",
+                  "--final-message-file", self.source("final.txt", "待ちます"),
+                  "--question-file", self.source("question.txt", "残しますか？"))
+        hourly_state.lead_decisions.append(self.root / "decisions.jsonl",
+                                           decide("d1", "cover:/w/e", "残す", "2026-11-17T00:30:00+00:00"),
+                                           decide("d2", "keep:/w/b", "残す", "2026-11-17T02:00:00+00:00"))
+        item = self.source("item.txt", "決める")
+        with patch.object(hourly_state, "stamp", return_value="2026-11-17T01:00:00+00:00"):
+            for key in ("keep:/w/b", "cover:/w/e"):
+                self.call("presented", "--key", key, "--text-file", item, "--since", "2026-11-17T09:00:00+09:00")
+        with patch.object(hourly_state, "stamp", return_value="2026-11-17T03:00:00+00:00"):
+            self.call("presented", "--key", "keep:/w/b", "--text-file", item, "--since", "2026-11-17T11:30:00+09:00")
+
+        _, pending = self.call("pending")
+
+        self.assertEqual(sorted((item["id"], item["since"]) for item in pending["presented"]),
+                         [("cover:/w/e", "2026-11-17T09:00:00+09:00"), ("keep:/w/b", "2026-11-17T11:30:00+09:00")])
+
     def test_left_row_only_stays_left_for_the_saved_final_message(self) -> None:
         old = self.source("old.txt", "Work complete; leave it.\n")
         new = self.source("new.txt", "New work needed.\n")

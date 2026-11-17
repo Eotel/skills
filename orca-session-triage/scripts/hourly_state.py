@@ -379,21 +379,28 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
     return items
 
 
+def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, lead_decisions.Decision]) -> str:
+    """"settled" once closed, or once a question asked under KEY (or covering it) is answered or the lead decides KEY
+    after the item's first listing; "asked" while an open question (ask_state.active) asks KEY; else "open"."""
+    listed = scan_sessions.parse_time(item["presented_at"])
+    settled_at = [scan_sessions.parse_time(at) for at in (
+        *(question.get("answered_at") for question in data["questions"].values()
+          if not question.get("withdrawn_at") and (key == question["decision"] or key in question.get("covers", ()))),
+        getattr(decisions.get(key), "decided_at", None)) if at]
+    if item["closed_at"] is not None or listed is None or any(at and at >= listed for at in settled_at):
+        return "settled"
+    if any(key in question["keys"] for question in ask_state.active(data, decisions)):
+        return "asked"
+    return "open"
+
+
 def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime) -> list[dict]:
-    """Each item an hourly report listed that no answer, lead decision under its key, or presented-close settled
-    after it was first listed, as a stale-asks item. An open question asked under its key shows it instead."""
-    asked = [item for item in data["questions"].values() if not item.get("withdrawn_at")]
+    """Each item an hourly report listed that is still open (presented_state), as a stale-asks item."""
     items = []
     for key, item in data["presented"].items():
-        listed = scan_sessions.parse_time(item["presented_at"]) or now
-        questions = [question for question in asked if key == question["decision"] or key in question.get("covers", ())]
-        settled_at = [scan_sessions.parse_time(at) for at in (
-            *(question.get("answered_at") for question in questions), getattr(decisions.get(key), "decided_at", None))
-            if at]
-        if (item["closed_at"] is not None or any(question["answer"] is None for question in questions)
-                or any(at and at >= listed for at in settled_at)):
+        if presented_state(data, key, item, decisions) != "open":
             continue
-        since = scan_sessions.parse_time(item["since"]) or listed
+        since = scan_sessions.parse_time(item["since"]) or now
         items.append({"id": key, "row": item["owner"], "owner": item["owner"],
                       "name": Path(item["owner"].split("::", 1)[-1]).name if item["owner"] else "-",
                       "state": PRESENTED, "since": item["since"], "question": excerpt(item["text"]),
@@ -1370,7 +1377,8 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         if not key:
             raise ValueError("--key must not be empty")
         earlier = data["presented"].get(key)
-        kept = earlier if earlier and earlier["closed_at"] is None else None
+        decisions = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
+        kept = earlier if earlier and presented_state(data, key, earlier, decisions) != "settled" else None
         data["presented"][key] = {
             "text": file_text(args.text_file), "link": args.link,
             "owner": owner_name(args.owner) if args.owner is not None else None,
@@ -1684,13 +1692,15 @@ def main(argv: list[str] | None = None) -> int:
     presented = commands.add_parser(
         "presented", help="record an item the hourly report listed for the user; pending and stale-asks show it as "
                           f"{PRESENTED} until an answer or a lead decision under its key after its first listing, "
-                          "or presented-close; listing an open key again keeps its first since and listing time")
+                          "or presented-close; listing a key not yet settled again keeps its first since and listing time")
     presented.add_argument("--key", required=True,
                            help="the decision key an answer or lead decision would use, e.g. merge:OWNER/NAME#N")
     presented.add_argument("--text-file", required=True, help="the item as the report put it, in a UTF-8 file")
     presented.add_argument("--since", required=True, help="ISO 8601 time with offset the item began waiting")
     presented.add_argument("--link", help="the issue, PR, or ticket URL the report linked")
     presented.add_argument("--owner", help="the scan row identity (PATH or ENVIRONMENT::PATH) of the lane it holds up")
+    presented.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
+                           help="the lead's decision log, read to tell a settled key from an open one")
     presented_close = commands.add_parser(
         "presented-close", help="close a presented item that its lane started or that no answer or decision settles")
     presented_close.add_argument("--key", required=True)
