@@ -327,7 +327,14 @@ def manifest_names(path: str, content: str) -> set[ManifestEntry]:
 
 
 def added_manifest_names(repo_dir: Path, base: str) -> set[str]:
-    """Names added in committed manifests between the merge-base and HEAD."""
+    """Names added in committed manifests between the merge-base and HEAD.
+
+    A branch name that origin also has means origin's copy: the PR merges into that one.
+    """
+    remote_branch = f"refs/remotes/origin/{base}"
+    branches = _run(("git", "for-each-ref", "--format=%(refname)", remote_branch), repo_dir)
+    if remote_branch in branches.splitlines():
+        base = remote_branch
     ancestor = _run(("git", "merge-base", "--", base, "HEAD"), repo_dir).strip()
     changes = iter(_run(
         ("git", "diff", "--name-status", "-z", "--find-renames", "--diff-filter=AMR",
@@ -376,7 +383,8 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Check the template headings and, with --base, added dependency/feature/extra names.\n"
             f"Read changed manifests ({', '.join(MANIFEST_READERS)}) at the merge-base\n"
-            "of REF and HEAD and at committed HEAD. Version-only changes and removals do not count.\n"
+            "of REF and HEAD and at committed HEAD. A branch REF that origin also has is read as\n"
+            "origin/REF. Version-only changes and removals do not count.\n"
             "Python package and extra names are normalized (lowercase; runs of -, _, . become -).\n"
             "Names in the body are case-insensitive, treat runs of -, _, . as the same, and must be\n"
             "delimited by characters other than ASCII letters, digits, _, -, or . An unresolved base or unreadable\n"

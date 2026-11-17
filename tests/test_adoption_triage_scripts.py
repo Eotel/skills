@@ -352,6 +352,15 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual((unknown.returncode, unknown.stdout), (1, ""))
         self.assertIn("00000000", unknown.stderr)
 
+    def test_list_returns_only_the_proposals_named_by_id_prefix(self) -> None:
+        first, _, third = self.proposal(), self.proposal(), self.proposal()
+        shown = self.run_ledger(["list", "--json", "--id", f"{third[:8]},{first}"])
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual([item["proposal_id"] for item in json.loads(shown.stdout)["items"]], [third, first])
+        unknown = self.run_ledger(["list", "--id", "00000000"])
+        self.assertEqual((unknown.returncode, unknown.stdout), (1, ""))
+        self.assertIn("00000000", unknown.stderr)
+
     def test_closing_a_consolidation_keeps_its_adopted_targets_adopted(self) -> None:
         adopted, pending = self.proposal(), self.proposal()
         merged = json.loads(self.consolidation("merges", [adopted, pending]).stdout)["proposal_id"]

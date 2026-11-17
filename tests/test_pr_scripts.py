@@ -339,6 +339,22 @@ requires = ["hatchling>=1"]
         self.assertIn("new-package", out)
         self.assertNotIn("base-only", out)
 
+    def test_check_compares_a_base_branch_with_its_origin_copy(self) -> None:
+        stale = self.commit_files({"package.json": "{}"})
+        merged = self.commit_files({"package.json": '{"dependencies": {"pool": "1"}}'})
+        self.commit_files({"package.json": '{"dependencies": {"pool": "1", "new-package": "1"}}'})
+        subprocess.run(["git", "checkout", "-q", "--detach"], cwd=self.repo, check=True)
+        subprocess.run(["git", "update-ref", "refs/heads/main", stale], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", merged], cwd=self.repo, check=True
+        )
+        self.body.write_text(REVIEW_FIRST_BODY, encoding="utf-8")
+        status, out, _ = self.run_main(
+            "check", str(self.body), "--kind", "review-first", "--base", "main"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(out.splitlines(), ["missing added dependency/feature in body: new-package"])
+
 
 if __name__ == "__main__":
     unittest.main()
