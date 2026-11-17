@@ -4293,13 +4293,15 @@ class RmCheckTests(unittest.TestCase):
                    "app/vite.config.js": 'export default { root: "frontend",\n  build: {\n    outDir: "bundle",\n  },\n}\n',
                    "concat/vite.config.js": 'export default {\n  build: {\n    outDir: "build-" + "client",\n  },\n}\n',
                    "glob/vite.config.js": "export default {\n  assetsInclude: ['**/*.glb'],\n  root: 'frontend',\n  /* note */\n"
-                                          '  build: {\n    outDir: "private",\n  },\n}\n'}
+                                          '  build: {\n    outDir: "private",\n  },\n}\n',
+                   "rel/vite.config.js": 'export default {\n  root: "web",\n  build: {\n'
+                                         '    outDir: path.relative(__dirname, path.resolve(__dirname, "static")),\n  },\n}\n'}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
             (self.main / name).write_text(content)
         with (self.main / ".gitignore").open("a") as ignore:
             ignore.write("/vendor/*\ntools/vendor/\norca_board/static/\nold_static/\nweb/public_build/\nlib/vendor/\n"
-                         "private_build/\nsite/cache/\napp/bundle/\nconcat/build-/client/\nglob/private/\n")
+                         "private_build/\nsite/cache/\napp/bundle/\nconcat/build-/client/\nglob/private/\nrel/static/\n")
         git(self.main, "add", ".gitignore", *sources)
         git(self.main, "commit", "-q", "-m", "composer and vite")
         git(self.wt, "merge", "-q", "--ff-only", "main")
@@ -4308,7 +4310,8 @@ class RmCheckTests(unittest.TestCase):
                    "old_static/index.html": "<html></html>\n", "web/public_build/index.html": "<html></html>\n",
                    "lib/vendor/acme/C.php": "<?php\n", "private_build/index.html": "<html></html>\n",
                    "site/cache/notes.txt": "kept\n", "app/bundle/notes.txt": "kept\n",
-                   "concat/build-/client/notes.txt": "kept\n", "glob/private/notes.txt": "kept\n"}
+                   "concat/build-/client/notes.txt": "kept\n", "glob/private/notes.txt": "kept\n",
+                   "rel/static/notes.txt": "kept\n"}
         for name, content in outputs.items():
             (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
             (self.wt / name).write_text(content)
@@ -4321,7 +4324,7 @@ class RmCheckTests(unittest.TestCase):
         # until read.
         self.assertEqual((code, [item["path"] for item in result["held"]]),
                          (1, ["app/bundle/", "concat/build-/client/", "glob/private/", "lib/vendor/", "old_static/",
-                              "private_build/", "site/cache/", "tools/vendor/", "web/public_build/"]))
+                              "private_build/", "rel/static/", "site/cache/", "tools/vendor/", "web/public_build/"]))
         self.assertEqual(sorted(result["regenerable"]), ["orca_board/static/", "vendor/ajgl/", "vendor/autoload.php"])
         self.assertIn("vendor/ajgl/ is Composer's packages (composer.json, composer.lock; composer install writes "
                       "them again), ignored by .gitignore:4:/vendor/*", result["notes"])

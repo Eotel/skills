@@ -156,8 +156,8 @@ Run these per worktree, in order.
      outside string literals left out; a value of string literals and the calls
      that join them, such as `fileURLToPath(new URL(…))`, read as path parts from
      the config's directory; only a directory below it; in a config that sets
-     `root`, only an outDir named from the config's file through `import.meta.url`
-     or `__dirname`), a directory whose every zip is one a Terraform
+     `root`, only an outDir of `fileURLToPath(new URL(…, import.meta.url))` or
+     `path.resolve`/`path.join(__dirname, …)`), a directory whose every zip is one a Terraform
      `archive_file` block beside it (comments left out) declares with `output_path =
      "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
      standing for one path segment, and a

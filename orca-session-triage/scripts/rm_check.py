@@ -77,10 +77,12 @@ COMPOSER_MANIFESTS = ("composer.json", "composer.lock")
 VITE_CONFIGS = ":(glob)**/vite.config.*"
 VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
-# A config that moves Vite's root resolves a relative outDir from there, so beside it only an outDir named from the
-# config's own file (import.meta.url, __dirname) is read.
+# A config that moves Vite's root resolves a relative outDir from there, so beside it only an outDir that is an absolute
+# path from the config's own file is read: fileURLToPath(new URL(…, import.meta.url)) or path.resolve/join(__dirname, …),
+# matched with its string literals removed.
 VITE_ROOT = re.compile(r"""\broot['"]?\s*:""")
-VITE_FROM_CONFIG = re.compile(r"\bimport\.meta\.url\b|\b__dirname\b")
+VITE_FROM_CONFIG = re.compile(r"\s*(?:fileURLToPath\(\s*new\s+URL\(\s*,\s*import\.meta\.url\s*\)\s*\)"
+                              r"|(?:path\.)?(?:resolve|join)\(\s*__dirname\s*(?:,\s*)+\))\s*,?\s*")
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 JS_STRING_OR_COMMENT = re.compile(r"""("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|/\*.*?\*/|//[^\n]*""",
                                   re.DOTALL)
@@ -408,7 +410,7 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
             parts = [literal for _, literal in JS_STRING.findall(value)]
             if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(JS_STRING.sub("", value)):
                 continue
-            if moves_root and not VITE_FROM_CONFIG.search(value):
+            if moves_root and not VITE_FROM_CONFIG.fullmatch(JS_STRING.sub("", value)):
                 continue
             out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
             if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
