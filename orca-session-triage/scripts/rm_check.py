@@ -77,14 +77,22 @@ COMPOSER_MANIFESTS = ("composer.json", "composer.lock")
 VITE_CONFIGS = ":(glob)**/vite.config.*"
 VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
-# A config that moves Vite's root resolves a relative outDir from there, so it is not read.
+# More than one outDir (per mode, say) leaves which one builds to the config's code, so such a config is not read.
+VITE_OUT_DIR_ANYWHERE = re.compile(r"""\boutDir['"]?\s*:""")
+# A config that moves Vite's root resolves a relative outDir from there, so beside it only an outDir that is an absolute
+# path from the config's own file is read: fileURLToPath(new URL(…, import.meta.url)) or path.resolve/join(__dirname, …),
+# matched with its string literals removed.
 VITE_ROOT = re.compile(r"""\broot['"]?\s*:""")
+VITE_FROM_CONFIG = re.compile(r"\s*(?:fileURLToPath\(\s*new\s+URL\(\s*,\s*import\.meta\.url\s*\)\s*\)"
+                              r"|(?:path\.)?(?:resolve|join)\(\s*__dirname\s*(?:,\s*)+\))\s*,?\s*")
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 JS_STRING_OR_COMMENT = re.compile(r"""("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|/\*.*?\*/|//[^\n]*""",
                                   re.DOTALL)
 # What an outDir value may hold besides string literals: calls such as fileURLToPath(new URL(…, import.meta.url)) or
 # path.resolve(__dirname, …) that join them as path parts. An operator such as + makes another value, so it is not read.
 VITE_PATH_CALL = re.compile(r"[\w\s.,()]*")
+# A template interpolation, or a URL escape, query or fragment, makes a path other than the literal's own text.
+VITE_UNREAD_LITERAL = re.compile(r"\$\{|[%?#]")
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
@@ -390,7 +398,7 @@ def composer_vendor_dir(manifest: Path) -> bool:
 
 
 def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | None:
-    """The tracked vite.config.* whose outDir, a directory below the config's own, is `path` or holds it, or None."""
+    """The tracked vite.config.* whose one outDir, a directory below the config's own, is `path` or holds it, or None."""
     for name in git(worktree, "ls-files", "-z", "--", VITE_CONFIGS).stdout.split("\0"):
         config = PurePosixPath(name)
         if config.suffix not in VITE_SUFFIXES:
@@ -400,16 +408,17 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
                                             (worktree / config).read_text(errors="replace"))
         except OSError:
             continue
-        if VITE_ROOT.search(text):
+        if len(VITE_OUT_DIR_ANYWHERE.findall(text)) != 1 or (found := VITE_OUT_DIR.search(text)) is None:
             continue
-        for found in VITE_OUT_DIR.finditer(text):
-            parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
-            if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(
-                    JS_STRING.sub("", found.group(1))):
-                continue
-            out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
-            if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
-                return config
+        parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
+        calls = JS_STRING.sub("", found.group(1))
+        if not parts or any(VITE_UNREAD_LITERAL.search(part) for part in parts) or not VITE_PATH_CALL.fullmatch(calls):
+            continue
+        if VITE_ROOT.search(text) and not VITE_FROM_CONFIG.fullmatch(calls):
+            continue
+        out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
+        if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
+            return config
     return None
 
 
