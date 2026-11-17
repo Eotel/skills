@@ -1585,7 +1585,8 @@ def with_processes(row: dict, now: float) -> tuple[str, list[str]]:
 def one_per_path(worktrees: list[dict], terminals: list[dict]) -> tuple[list[dict], list[dict]]:
     """One worktree per checkout. Orca lists a path once per repo it belongs to, which happens when a linked worktree
     is also registered as a repo: the entry Orca created (else the one with a comment, else the first listed) keeps
-    the path, takes the others' agents and tabs, and names their repos in `_other_repos`."""
+    the path, takes the others' agents and tabs, and names their repos in `_other_repos`. It is the main worktree
+    only when every entry is, so the linked entry's row is kept."""
     groups: dict[tuple[str | None, str], list[dict]] = {}
     for w in worktrees:
         groups.setdefault((w.get("_environment"), w["path"]), []).append(w)
@@ -1596,6 +1597,7 @@ def one_per_path(worktrees: list[dict], terminals: list[dict]) -> tuple[list[dic
         if others:
             moved.update({(w.get("_environment"), w.get("worktreeId")): first.get("worktreeId") for w in others})
             first = {**first, "agents": [agent for w in [first, *others] for agent in w.get("agents") or []],
+                     "isMainWorktree": all(w.get("isMainWorktree") for w in group),
                      "_other_repos": [w.get("repo") for w in others]}
         kept.append(first)
     return kept, [{**term, "worktreeId": moved[place]} if (place := (term.get("_environment"), term.get("worktreeId")))
@@ -2556,8 +2558,10 @@ def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
 
 
 def handoff_names(row: Mapping) -> set[str]:
-    """Every name a handoff's from or to may give this row: its identity, path, repo/name, or a local row's name."""
-    names = {row_identity(row), row_name(row), row["path"], f"{row.get('repo')}/{Path(row['path']).name}"}
+    """Every name a handoff's from or to may give this row: its identity, path, repo/name under each repo Orca lists
+    it in, or a local row's name."""
+    names = {row_identity(row), row_name(row), row["path"],
+             *(f"{repo}/{Path(row['path']).name}" for repo in (row.get("repo"), *row.get("other_repos", ())))}
     if not row.get("environment"):
         names.add(Path(row["path"]).name)
     return names

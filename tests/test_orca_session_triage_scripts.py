@@ -566,6 +566,17 @@ class ClassifyTests(unittest.TestCase):
         for name in ("adopt-collect-deploy-1111", "adopt-collect-deploy-1111/adopt-collect-deploy-1111"):
             self.assertIs(scan.select_row(rows, name), rows[0])
 
+    def test_a_merged_checkout_keeps_its_linked_entrys_row_and_answers_to_either_repo_name(self) -> None:
+        path = "/w/collect/deploy"
+        registered = {**worktree(path, main=True), "repo": "deploy", "worktreeId": f"d::{path}"}
+        linked = {**worktree(path), "repo": "collect", "worktreeId": f"c::{path}"}
+        shell = {**terminal(path, None, "term_shell"), "worktreeId": registered["worktreeId"]}
+
+        [row] = self.inventory([registered, linked], [shell])
+
+        self.assertEqual([t["handle"] for t in row["terminals"]], ["term_shell"])
+        self.assertLessEqual({"deploy/deploy", "collect/deploy"}, scan.handoff_names(row))
+
     def test_a_permission_prompt_carries_the_time_of_the_tool_call_it_asks_about(self) -> None:
         # 2026-11-16: tohoku-ui-consult asked to run a command after a 23:27 instruction; stale-asks showed it
         # waiting 174 minutes from the reply before that instruction.
