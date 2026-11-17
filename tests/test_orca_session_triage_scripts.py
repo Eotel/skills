@@ -576,6 +576,8 @@ class ClassifyTests(unittest.TestCase):
 
         self.assertEqual([t["handle"] for t in row["terminals"]], ["term_shell"])
         self.assertLessEqual({"deploy/deploy", "collect/deploy"}, scan.handoff_names(row))
+        reported = scan.with_inbox([row], {("collect", "deploy"): {"done": {"at": "2026-11-16T09:00:00Z", "text": "済み"}}})
+        self.assertEqual(reported[0]["inbox"]["done"]["text"], "済み")
 
     def test_a_permission_prompt_carries_the_time_of_the_tool_call_it_asks_about(self) -> None:
         # 2026-11-16: tohoku-ui-consult asked to run a command after a 23:27 instruction; stale-asks showed it

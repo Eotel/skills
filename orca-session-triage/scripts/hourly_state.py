@@ -618,7 +618,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             undecided = [proposal[:8] for proposal in named if not proposals[proposal].settles(name)]
             settled = bool(named) and not undecided
         lane = [(at, item) for item in entries if item.get("worktree") == name
-                and item.get("repo") in (None, "", row.get("repo"))
+                and (item.get("repo") or "") in scan_sessions.row_repos(row)
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
         keys = {item["id"]: [handoff.decision for handoff in handed if (key := answer_evidence.key_ask_id(handoff.decision))
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
@@ -1110,7 +1110,7 @@ class Inbox:
         named = [row for row in self.rows if Path(row["path"]).name == ask.get("worktree")]
         lanes = [row for row in named if ask.get("handle") and any(
             term.get("handle") == ask["handle"] for term in row.get("terminals") or [])] or [
-            row for row in named if (ask.get("repo") or "") in ("", row.get("repo") or "")]
+            row for row in named if (ask.get("repo") or "") in scan_sessions.row_repos(row)]
         if len(lanes) != 1:
             raise ValueError(f"ask {ask_id} from {ask.get('worktree')} matches {len(lanes)} scan rows; give row: "
                              + (", ".join(scan_sessions.row_identity(row) for row in lanes) or "(none)"))

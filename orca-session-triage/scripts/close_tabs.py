@@ -149,7 +149,7 @@ def inbox_activity(row: dict, inbox: Path, caller: Caller) -> Iterator[Activity]
     except FileNotFoundError:
         return
     ours = (item for item in map(report, lines) if item and item.get("worktree") == Path(row["path"]).name
-            and item.get("repo") in (None, "", row.get("repo"))
+            and (item.get("repo") or "") in scan_sessions.row_repos(row)
             and not (caller.handle and item.get("handle") == caller.handle))
     yield from (Activity(at, f"受信箱 {item.get('kind') or '-'}") for item in ours
                 if (at := scan_sessions.parse_time(item.get("ts"))) is not None)

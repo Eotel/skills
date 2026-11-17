@@ -2456,12 +2456,18 @@ def last_instruction_at(row: dict) -> datetime | None:
     return max((at for at in given if at), default=None)
 
 
+def row_repos(row: Mapping) -> tuple[str, ...]:
+    """The repos a report may name this row under: every repo Orca lists its checkout in, and none."""
+    return tuple(dict.fromkeys((row.get("repo") or "", *row.get("other_repos", ()), "")))
+
+
 def with_inbox(rows: list[dict], reports: InboxReports) -> list[dict]:
-    """Rows carry `inbox`: the newest done and ask their worktree reported, and the newest info it sent after the
-    lane's last instruction, when it reported any. A lane can deliver the work by info and end with other text."""
+    """Rows carry `inbox`: the newest done and ask their worktree reported under any repo Orca lists it in, and the
+    newest info it sent after the lane's last instruction, when it reported any. A lane can deliver the work by info
+    and end with other text."""
     def newest(row: dict) -> dict:
         name = Path(row["path"]).name
-        found = [reports.get((row.get("repo") or "", name)) or {}, reports.get(("", name)) or {}]
+        found = [reports.get((repo, name)) or {} for repo in row_repos(row)]
         inbox = {kind: max(held, key=lambda report: parse_time(report["at"]) or EPOCH)
                  for kind in INBOX_KINDS if (held := [f[kind] for f in found if kind in f])}
         if "info" in inbox and not ((began := last_instruction_at(row))
@@ -2496,7 +2502,7 @@ def with_reported_times(rows: list[dict], entries: Sequence[dict]) -> list[dict]
         if message.get("from") != "screen" or shown is None:
             return row
         reports = sorted(((at, item) for at, item in sent.get(Path(row["path"]).name, [])
-                          if at <= shown and (item.get("repo") or "") in ("", row.get("repo") or "")),
+                          if at <= shown and (item.get("repo") or "") in row_repos(row)),
                          key=lambda pair: pair[0], reverse=True)
         for at, item in reports:
             if (shown - at) % timedelta(days=1) <= REPORT_BEFORE_TURN_END:
@@ -3358,11 +3364,11 @@ def question_sources(row: dict, entries: Sequence[dict]) -> list[dict]:
     if (not labels or row_question(row) != summary or (row.get("claude") or {}).get("transcript")
             or row.get("codex")):
         return []
-    name, repo = Path(row["path"]).name, row.get("repo") or ""
+    name, repos = Path(row["path"]).name, row_repos(row)
     found = []
     for item in entries:
         if (item.get("kind") not in ("ask", "info") or item.get("worktree") != name
-                or (item.get("repo") or "") not in ("", repo) or (at := parse_time(item.get("ts"))) is None):
+                or (item.get("repo") or "") not in repos or (at := parse_time(item.get("ts"))) is None):
             continue
         asked = [str(item.get("text") or ""), *(str(question.get("question") or "")
                                                for question in inbox_read.questions_of(item)
