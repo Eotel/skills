@@ -358,10 +358,14 @@ as `remove:ENVIRONMENT::PATH`. `handoff.py` refuses to send while any
 `--decision` key already has an answer and prints those answers, and records
 each key it sends. It also refuses, and prints what it found, while a report
 from another tab of this workspace (a parallel scheduled run) or an answer to an
-ask the body names reached the inbox or the answer records after `--since`:
-fix the body from them, then pass `--seen ID` (repeat per id: a report's id or
-an answered ask's, or their first 8 or more characters) for each one the body
-now reflects. A delivered answer whose recorded sender worktree and session
+ask the body names reached the inbox or the answer records after `--since`,
+while a worktree a `remove:` key names sent an ask or info after it, and while
+the lead handed work after it (`send` or `spawn-lane`, read from the board's
+event log, `--board-events`) to a worktree the body names or a `remove:` key
+names, printing each send's time, target, and opening text: a close candidate
+or verdict written before that work is stale. Fix the body from them, then
+pass `--seen ID` (repeat per id: a report's, an answered ask's, or a send's id,
+or their first 8 or more characters) for each one the body now reflects. A delivered answer whose recorded sender worktree and session
 both match this run is labelled 「（この回の送信）」 and needs no `--seen`.
 Answer records from `send` and `inbox_read.py answered` now include that source;
 an older record or an unknown session keeps the usual check. It also refuses

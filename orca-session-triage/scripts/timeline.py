@@ -53,6 +53,8 @@ CALL_SLACK = timedelta(hours=2)
 CHUNK = 4 << 20
 STAMP = re.compile(rb'"timestamp":\s*"([^"]+)"')
 REPORTED = {"ask": "質問が届いた", "done": "完了が届いた", "info": "経過が届いた"}
+SENT, STARTED = "送った", "起動した"
+BOARD_EVENTS = Path("~/.local/share/orca-board/events.jsonl")
 ADOPTION_DECIDED = {"adopt": "案を採用した", "reject": "案を却下した", "defer": "案を保留した",
                     "revoke": "案の採用を取り消した"}
 ADOPTION_DONE = {"handed_off": "案を渡した", "applied": "案を入れた"}
@@ -213,7 +215,7 @@ class Records:
         return cls(inbox=path("TRIAGE_INBOX", briefs / "triage-inbox.jsonl"),
                    answers=path("TRIAGE_ASK_ANSWERS", briefs / "ask-answers.jsonl"),
                    decisions=path("TRIAGE_LEAD_DECISIONS", home / ".cache/orca-session-triage/lead-decisions.jsonl"),
-                   board=path("ORCA_BOARD_EVENTS", home / ".local/share/orca-board/events.jsonl"),
+                   board=path("ORCA_BOARD_EVENTS", BOARD_EVENTS),
                    briefs=briefs.expanduser(),
                    adoption=path("ADOPTION_TRIAGE_EVENTS", home / ".local/share/adoption-triage/events.jsonl"),
                    adoption_imports=path("ADOPTION_TRIAGE_IMPORTS", home / ".local/share/adoption-triage/imports"))
@@ -256,12 +258,16 @@ class Names:
         return self.handles.get(str(handle)) or str(handle or "?")[:13]
 
 
+def recorded_names(inbox: list[dict], board: list[dict]) -> dict[str, str]:
+    """The workspace the records give each tab's handle: the lanes' reports, and the lanes spawn-lane started."""
+    return {**{str(item["handle"]): str(item["worktree"]) for item in inbox
+               if item.get("handle") and item.get("worktree")},
+            **{str(item["to"]): Path(str(item["worktree"])).name for item in board
+               if item.get("type") == "start" and item.get("to") and item.get("worktree")}}
+
+
 def names(inbox: list[dict], board: list[dict], host: SessionHost) -> Names:
-    recorded = {**{str(item["handle"]): str(item["worktree"]) for item in inbox
-                   if item.get("handle") and item.get("worktree")},
-                **{str(item["to"]): Path(str(item["worktree"])).name for item in board
-                   if item.get("type") == "start" and item.get("to") and item.get("worktree")}}
-    return Names({**recorded, **host.tab_workspaces()})
+    return Names({**recorded_names(inbox, board), **host.tab_workspaces()})
 
 
 def reports(inbox: list[dict], window: Window) -> Iterator[Event]:
@@ -306,10 +312,10 @@ def board_events(board: list[dict], window: Window, lanes: Names) -> Iterator[Ev
             continue
         ref = str(item.get("id"))
         if item.get("type") == "send" and item.get("source") == "send":
-            yield Event(at, lanes.of(item.get("from")), "送った", str(item.get("text") or ""), "board", ref,
+            yield Event(at, lanes.of(item.get("from")), SENT, str(item.get("text") or ""), "board", ref,
                         lanes.of(item.get("to")))
         elif item.get("type") == "start":
-            yield Event(at, lanes.of(item.get("from")), "起動した", f"{item.get('task')}（{item.get('brief')}）", "board",
+            yield Event(at, lanes.of(item.get("from")), STARTED, f"{item.get('task')}（{item.get('brief')}）", "board",
                         ref, Path(str(item.get("worktree"))).name)
         elif item.get("type") == "post" and item.get("source") == "backlog-post":
             yield Event(at, str(item.get("worktree") or lanes.of(item.get("from"))), "投稿した",
