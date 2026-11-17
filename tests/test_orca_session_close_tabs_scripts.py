@@ -119,12 +119,20 @@ class CloseTabsTests(unittest.TestCase):
             {"type": "cost-state", "totalCostUSD": 1.0}]
         self.write_transcript(*compaction)
         self.touch(self.transcript, SCANNED_AT + timedelta(seconds=98))
-        changes = [SCANNED_AT + timedelta(seconds=97), SCANNED_AT + timedelta(seconds=98)]
+        changes = [close_tabs.AgentChange("tab-agent:leaf", SCANNED_AT + timedelta(seconds=seconds)) for seconds in (97, 98)]
         tabs = FakeTabs({(None, str(self.worktree)): changes})
 
         code, out = self.run_close(tabs, "term_agent")
 
         self.assertEqual((code, tabs.closed), (0, [(None, "term_agent")]), out)
+
+        # The transcript names no pane: beside another agent, a change in the span may be that agent starting work.
+        tabs = FakeTabs({(None, str(self.worktree)): [
+            *changes, close_tabs.AgentChange("tab-other:leaf", SCANNED_AT + timedelta(seconds=97))]})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []), out)
 
         self.write_transcript(*compaction, {"type": "assistant", "timestamp": at(120)})
         tabs = FakeTabs({(None, str(self.worktree)): changes})

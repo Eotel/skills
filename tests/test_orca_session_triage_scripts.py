@@ -4136,31 +4136,39 @@ class RmCheckTests(unittest.TestCase):
         # 2026-11-16 a PHP worktree held 48 vendor/<package>/ lines as unknown (87b26b40); 2026-11-17
         # orca-board's orca_board/static/, the outDir of its vite.config.js, was held the same way (c087cb4c).
         sources = {"composer.json": "{}\n", "composer.lock": "{}\n", "tools/composer.json": "{}\n",
+                   "lib/composer.json": '{"config": {"vendor-dir": "deps"}}\n', "lib/composer.lock": "{}\n",
                    "vite.config.js": 'export default {\n  build: {\n'
                                      '    outDir: fileURLToPath(new URL("./orca_board/static", import.meta.url)),\n'
-                                     '    // outDir: "old_static",\n  },\n}\n',
-                   "web/vite.config.ts": 'export default {\n  root: "src",\n  build: {\n    outDir: "public_build",\n  },\n}\n'}
+                                     '    // outDir: "old_static",\n    /*\n    outDir: "private_build",\n    */\n'
+                                     '  },\n}\n',
+                   "web/vite.config.ts": 'export default {\n  root: "src",\n  build: {\n    outDir: "public_build",\n  },\n}\n',
+                   "site/vite.config.mjs": 'export default {\n  build: {\n    outDir: ".",\n  },\n}\n'}
         for name, content in sources.items():
             (self.main / name).parent.mkdir(parents=True, exist_ok=True)
             (self.main / name).write_text(content)
         with (self.main / ".gitignore").open("a") as ignore:
-            ignore.write("/vendor/*\ntools/vendor/\norca_board/static/\nold_static/\nweb/public_build/\n")
+            ignore.write("/vendor/*\ntools/vendor/\norca_board/static/\nold_static/\nweb/public_build/\nlib/vendor/\n"
+                         "private_build/\nsite/cache/\n")
         git(self.main, "add", ".gitignore", *sources)
         git(self.main, "commit", "-q", "-m", "composer and vite")
         git(self.wt, "merge", "-q", "--ff-only", "main")
         outputs = {"vendor/autoload.php": "<?php\n", "vendor/ajgl/lib/A.php": "<?php\n",
                    "tools/vendor/acme/B.php": "<?php\n", "orca_board/static/index.html": "<html></html>\n",
-                   "old_static/index.html": "<html></html>\n", "web/public_build/index.html": "<html></html>\n"}
+                   "old_static/index.html": "<html></html>\n", "web/public_build/index.html": "<html></html>\n",
+                   "lib/vendor/acme/C.php": "<?php\n", "private_build/index.html": "<html></html>\n",
+                   "site/cache/notes.txt": "kept\n"}
         for name, content in outputs.items():
             (self.wt / name).parent.mkdir(parents=True, exist_ok=True)
             (self.wt / name).write_text(content)
 
         code, result = self.run_main()
 
-        # Without its composer.lock, named only in a comment, or relative to a root the config moved, the directory is
+        # Without its composer.lock, beside a composer.json that moves vendor-dir, named only in a comment, relative
+        # to a root the config moved, or under an outDir that is the config's own directory, the directory is
         # someone's until read.
         self.assertEqual((code, [item["path"] for item in result["held"]]),
-                         (1, ["old_static/", "tools/vendor/", "web/public_build/"]))
+                         (1, ["lib/vendor/", "old_static/", "private_build/", "site/cache/", "tools/vendor/",
+                              "web/public_build/"]))
         self.assertEqual(sorted(result["regenerable"]), ["orca_board/static/", "vendor/ajgl/", "vendor/autoload.php"])
         self.assertIn("vendor/ajgl/ is Composer's packages (composer.json, composer.lock; composer install writes "
                       "them again), ignored by .gitignore:4:/vendor/*", result["notes"])

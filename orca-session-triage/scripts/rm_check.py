@@ -80,6 +80,7 @@ VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
 # A config that moves Vite's root resolves a relative outDir from there, so it is not read.
 VITE_ROOT = re.compile(r"^\s*root\s*:", re.MULTILINE)
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
+JS_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
@@ -332,7 +333,7 @@ def tool_output(worktree: Path, rel: str) -> str | None:
     if COMPOSER_DIR in path.parts:
         project = PurePosixPath(*path.parts[:path.parts.index(COMPOSER_DIR)])
         manifests = [project / name for name in COMPOSER_MANIFESTS]
-        if all(tracked(worktree, manifest) for manifest in manifests):
+        if all(tracked(worktree, manifest) for manifest in manifests) and composer_vendor_dir(worktree / manifests[0]):
             return "Composer's packages (%s; composer install writes them again)" % ", ".join(map(str, manifests))
     if source.is_symlink() or not source.is_dir():
         return None
@@ -375,22 +376,33 @@ def tool_output(worktree: Path, rel: str) -> str | None:
     return "archives Terraform's archive_file writes (%s)" % ", ".join(map(str, outputs))
 
 
+def composer_vendor_dir(manifest: Path) -> bool:
+    """Whether the composer.json at `manifest` installs into the default vendor/ (its config sets no other vendor-dir)."""
+    try:
+        config = json.loads(manifest.read_text()).get("config") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(config, dict) and posixpath.normpath(str(config.get("vendor-dir", COMPOSER_DIR))) == COMPOSER_DIR
+
+
 def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | None:
-    """The tracked vite.config.* whose outDir is `path` or holds it, or None."""
+    """The tracked vite.config.* whose outDir, a directory below the config's own, is `path` or holds it, or None."""
     for name in git(worktree, "ls-files", "-z", "--", VITE_CONFIGS).stdout.split("\0"):
         config = PurePosixPath(name)
         if config.suffix not in VITE_SUFFIXES:
             continue
         try:
-            text = (worktree / config).read_text(errors="replace")
+            text = JS_BLOCK_COMMENT.sub("", (worktree / config).read_text(errors="replace"))
         except OSError:
             continue
         if VITE_ROOT.search(text):
             continue
         for found in VITE_OUT_DIR.finditer(text):
             parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
-            if parts and not any("${" in part for part in parts) and within(
-                    str(path), posixpath.normpath(config.parent.joinpath(*parts))):
+            if not parts or any("${" in part for part in parts):
+                continue
+            out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
+            if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
                 return config
     return None
 

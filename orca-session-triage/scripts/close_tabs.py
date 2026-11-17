@@ -15,8 +15,9 @@ after the scan and was waiting for a check). A remote row's transcripts are
 on its own Mac; Orca's agent states and the inbox stand in for them. A tab
 whose host cannot be read stays too. A transcript whose new lines are all
 Claude Code compacting the idle session on its own ("Compacted while idle")
-does not count, nor do the agent state changes within that compaction; a line
-after it, from the agent or a person, counts as before.
+does not count, nor, when the worktree has one agent besides the caller, do
+its state changes within that compaction; a line after it, from the agent or a
+person, counts as before.
 
 The caller's own activity is left out: its Claude transcript ($CLAUDE_CODE_SESSION_ID), the agent of its
 Orca pane ($ORCA_PANE_KEY), and the reports its terminal sent ($ORCA_TERMINAL_HANDLE).
@@ -240,12 +241,14 @@ def moved_after_scan(row: dict, host: TabHost, projects: Path, inbox: Path, call
     if started is None:
         raise ValueError("the scan has no scanned_at (saved before close_tabs.py existed): scan again")
     compactions: list[Span] = []
-    seen = [*transcript_activity(transcripts(row, projects, caller), started, compactions),
-            *inbox_activity(row, inbox, caller),
-            *(Activity(change.at, "Orca の agent の状態")
-              for change in host.agent_changes(row.get("environment"), row["path"])
-              if not (caller.pane and change.pane == caller.pane)
-              and not any(span.holds(change.at) for span in compactions))]
+    written = [*transcript_activity(transcripts(row, projects, caller), started, compactions)]
+    changes = [change for change in host.agent_changes(row.get("environment"), row["path"])
+               if not (caller.pane and change.pane == caller.pane)]
+    panes = {change.pane for change in changes}
+    compacting_agent_is_the_only_one = len(panes) == 1 and None not in panes
+    seen = [*written, *inbox_activity(row, inbox, caller),
+            *(Activity(change.at, "Orca の agent の状態") for change in changes
+              if not (compacting_agent_is_the_only_one and any(span.holds(change.at) for span in compactions)))]
     return sorted((activity for activity in seen if activity.at > started), key=lambda activity: activity.at)
 
 

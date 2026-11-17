@@ -151,9 +151,10 @@ Run these per worktree, in order.
      an ignored tool output beside the tracked file it is built from (Cargo's
      `target/` beside `Cargo.toml`, Tauri's `gen/schemas/` beside
      `tauri.conf.json`, Composer's `vendor/` (or each path in it) beside a tracked
-     `composer.json` and `composer.lock`, the `outDir` a tracked `vite.config.*`
-     names on its `outDir:` line (its string literals joined as path parts, from
-     the config's directory), a directory whose every zip is one a Terraform
+     `composer.json` that sets no other `vendor-dir` and a tracked `composer.lock`,
+     the `outDir` a tracked `vite.config.*` that sets no `root` names on its
+     `outDir:` line (block comments left out, its string literals joined as path
+     parts, from the config's directory, and only a directory below it), a directory whose every zip is one a Terraform
      `archive_file` block beside it (comments left out) declares with `output_path =
      "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
      standing for one path segment, and a
@@ -262,8 +263,9 @@ follow "Clearing done cards".
    (`assistant の行`, `人の入力`, `ツールの結果`, …). A transcript whose new lines are
    all Claude Code compacting the idle session on its own (the boundary, the summary,
    its attachments and links, and the "Compacted while idle" notice) does not count,
-   nor do the agent state changes from the summary's start to 30 seconds after its
-   last line; a line after it counts as before. Scan again and read that row
+   nor, when the worktree has one agent besides the caller, do its state changes from
+   the summary's start to 30 seconds after its last line (a transcript names no pane,
+   so beside another agent every change counts); a line after it counts as before. Scan again and read that row
    before deciding again. Never close a listed tab with a bare
    `orca terminal close`: it closed a lane that deployed after the scan
    (2026-10-28). Closing stops that pane's process and removes a single-pane
