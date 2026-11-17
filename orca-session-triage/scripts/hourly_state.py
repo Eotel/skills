@@ -55,6 +55,7 @@ GH_TIMEOUT = 60
 REMOTE_ORCA_TIMEOUT = 15
 READ_ERRORS = (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError)
 # A lane's info that offers the user a choice; open-asks never lists one (2026-10-29: 14 hours unseen).
+PRESENTED = "提示済み・未回答"
 CHOICE = re.compile(r"【要(?:判断|承認|確認)】|どちら|どれに|選択肢|選んで|(?:ます|です|でしょう)か[。？?]")
 EXCERPT = 160
 # A question's 「関わる issue」 on GitHub: owner/name#12, or the issue's or PR's URL. A Backlog key is not read.
@@ -374,6 +375,29 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
         items.append({"row": wait["row"], "name": Path(wait["row"].split("::", 1)[-1]).name if wait["row"] else "-",
                       "state": "user_wait", "id": key, "since": wait["started_at"], "question": excerpt(wait["text"]),
                       "checks": checks, "checks_done": all(map(check_done, checks)), "ask": None, "answer": None,
+                      "age_minutes": int((now - since).total_seconds() // 60)})
+    return items
+
+
+def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime) -> list[dict]:
+    """Each item an hourly report listed that no answer, lead decision under its key, or presented-close settled
+    after it was first listed, as a stale-asks item. An open question asked under its key shows it instead."""
+    asked = [item for item in data["questions"].values() if not item.get("withdrawn_at")]
+    items = []
+    for key, item in data["presented"].items():
+        listed = scan_sessions.parse_time(item["presented_at"]) or now
+        questions = [question for question in asked if key == question["decision"] or key in question.get("covers", ())]
+        settled_at = [scan_sessions.parse_time(at) for at in (
+            *(question.get("answered_at") for question in questions), getattr(decisions.get(key), "decided_at", None))
+            if at]
+        if (item["closed_at"] is not None or any(question["answer"] is None for question in questions)
+                or any(at and at >= listed for at in settled_at)):
+            continue
+        since = scan_sessions.parse_time(item["since"]) or listed
+        items.append({"id": key, "row": item["owner"], "owner": item["owner"],
+                      "name": Path(item["owner"].split("::", 1)[-1]).name if item["owner"] else "-",
+                      "state": PRESENTED, "since": item["since"], "question": excerpt(item["text"]),
+                      "link": item["link"], "presented_at": item["presented_at"], "ask": None, "answer": None,
                       "age_minutes": int((now - since).total_seconds() // 60)})
     return items
 
@@ -757,14 +781,15 @@ def waiting_sender(waits_on: str, report: dict) -> bool:
 def read(path: Path) -> dict:
     if not path.exists():
         return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}, "user_waits": {},
-                "comments": {}}
+                "presented": {}, "comments": {}}
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1 or any(
             not isinstance(data.get(key), dict) for key in ("left", "questions", "handoffs")) or any(
-                not isinstance(data.get(key, {}), dict) for key in ("requests", "user_waits", "comments")):
+                not isinstance(data.get(key, {}), dict) for key in ("requests", "user_waits", "presented", "comments")):
         raise ValueError(f"invalid hourly state: {path}")
     data.setdefault("requests", {})
     data.setdefault("user_waits", {})
+    data.setdefault("presented", {})
     # By workspace whose Orca comment this script writes: {"run": the line of its last run, or None}.
     data.setdefault("comments", {})
     return data
@@ -1285,6 +1310,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                      for key, item in data["handoffs"].items() if item["delivered_at"] is None],
         "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
         "user_waits": [{"id": key, **item} for key, item in data["user_waits"].items() if item["closed_at"] is None],
+        "presented": presented_now(data, decisions, now),
         "left": [{"row": row, **item} for row, item in data["left"].items()],
         "unrecorded_questions": unrecorded or [],
     }
@@ -1339,6 +1365,26 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         if wait["closed_at"] is None:
             wait.update(closed_at=recorded_at(args.closed_at), closure_evidence=evidence)
         return {"id": args.id, **wait}
+    if args.action == "presented":
+        key = args.key.strip()
+        if not key:
+            raise ValueError("--key must not be empty")
+        earlier = data["presented"].get(key)
+        kept = earlier if earlier and earlier["closed_at"] is None else None
+        data["presented"][key] = {
+            "text": file_text(args.text_file), "link": args.link,
+            "owner": owner_name(args.owner) if args.owner is not None else None,
+            "since": kept["since"] if kept else recorded_at(args.since),
+            "presented_at": kept["presented_at"] if kept else stamp(), "closed_at": None, "closure_evidence": None}
+        return {"id": key, **data["presented"][key]}
+    if args.action == "presented-close":
+        item = data["presented"][args.key]
+        evidence = file_text(args.evidence_file)
+        if item["closed_at"] is not None and item["closure_evidence"] != evidence:
+            raise ValueError("presented item already closed; inspect the state before changing it")
+        if item["closed_at"] is None:
+            item.update(closed_at=stamp(), closure_evidence=evidence)
+        return {"id": args.key, **item}
     if args.action == "leave":
         data["left"][args.row] ={"final_message": file_text(args.final_message_file), "left_at": stamp()}
         return data["left"][args.row]
@@ -1426,6 +1472,8 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
                     or item.get("final_message"))
         line = (f"{name} | {state} | since={since or '-'} | age_minutes={age} "
                 f"| {f'ask={ask_id}' if ask_id else f'id={item.get('id') or '-'}'} | {excerpt(question)}")
+        if item.get("link"):
+            line += f" | {item['link']}"
         if item.get("evidence"):
             line += " | 済み: " + "; ".join(
                 f"{proof['decision']}@{proof['decided_at']}" if "decision" in proof
@@ -1633,6 +1681,20 @@ def main(argv: list[str] | None = None) -> int:
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
     withdraw.add_argument("--replaced-by", metavar="ID", help="the existing question that replaces this one")
+    presented = commands.add_parser(
+        "presented", help="record an item the hourly report listed for the user; pending and stale-asks show it as "
+                          f"{PRESENTED} until an answer or a lead decision under its key after its first listing, "
+                          "or presented-close; listing an open key again keeps its first since and listing time")
+    presented.add_argument("--key", required=True,
+                           help="the decision key an answer or lead decision would use, e.g. merge:OWNER/NAME#N")
+    presented.add_argument("--text-file", required=True, help="the item as the report put it, in a UTF-8 file")
+    presented.add_argument("--since", required=True, help="ISO 8601 time with offset the item began waiting")
+    presented.add_argument("--link", help="the issue, PR, or ticket URL the report linked")
+    presented.add_argument("--owner", help="the scan row identity (PATH or ENVIRONMENT::PATH) of the lane it holds up")
+    presented_close = commands.add_parser(
+        "presented-close", help="close a presented item that its lane started or that no answer or decision settles")
+    presented_close.add_argument("--key", required=True)
+    presented_close.add_argument("--evidence-file", required=True)
     promise = commands.add_parser("promise", help="remember when one lane's result should go to another")
     promise.add_argument("--from-row", required=True)
     promise.add_argument("--to-row", required=True)
@@ -1691,7 +1753,8 @@ def main(argv: list[str] | None = None) -> int:
                                 decided=decided, rejected=rejected,
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
-            result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc))],
+            result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
+                data, {key: items[-1] for key, items in decided.items() if items}, datetime.now(timezone.utc))],
                             key=lambda item: -item["age_minutes"])
             identities = {item["row"] for item in result if item.get("row")}
             prs = row_prs([row for row in rows if scan_sessions.row_identity(row) in identities])
@@ -1762,7 +1825,8 @@ def main(argv: list[str] | None = None) -> int:
                                  inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
             elif args.action == "get":
                 result = next(({"id": args.id, **data[kind][args.id]} for kind in
-                               ("questions", "handoffs", "requests", "user_waits", "left") if args.id in data[kind]),
+                               ("questions", "handoffs", "requests", "user_waits", "presented", "left")
+                               if args.id in data[kind]),
                               None)
                 if result is None:
                     raise ValueError(f"unknown id: {args.id}")

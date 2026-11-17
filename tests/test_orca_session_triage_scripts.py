@@ -6194,6 +6194,35 @@ class HourlyStateTests(unittest.TestCase):
             self.call("promise", "--from-row", "/w/a", "--to-row", "/w/d", "--condition", "x", "--task", "y",
                       "--not-before", "11/17")
 
+    def test_an_item_the_hourly_report_listed_stays_presented_until_an_answer_a_decision_or_its_start(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text("[]")
+        (self.root / "inbox.jsonl").write_text("")
+        for key in ("merge:Acme/app#12", "keep:/w/b", "release:/w/c", "q4:/w/d"):
+            code, item = self.call("presented", "--key", key, "--text-file", self.source("item.txt", f"{key} を決める"),
+                                   "--since", "2026-11-16T18:27:00+09:00", "--owner", "/w/lane",
+                                   "--link", "https://github.com/Acme/app/issues/12")
+            self.assertEqual((code, item["since"]), (0, "2026-11-16T18:27:00+09:00"))
+        later = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+        hourly_state.lead_decisions.append(self.root / "decisions.jsonl",
+                                           hourly_state.lead_decisions.Decision("d1", "merge:Acme/app#12", "merge する",
+                                                                                later),
+                                           hourly_state.lead_decisions.Decision("d2", "keep:/w/b", "残す",
+                                                                                "2026-11-01T00:00:00+00:00"))
+        _, asked = self.call("asked", "--row", "/w/c", "--decision", "release:/w/c", "--no-comment",
+                             "--final-message-file", self.source("final.txt", "公開を待ちます"),
+                             "--question-file", self.source("question.txt", "公開しますか？"))
+        self.call("answered", "--id", asked["id"], "--answer-file", self.source("answer.txt", "公開する"))
+        self.call("presented-close", "--key", "q4:/w/d", "--evidence-file", self.source("start.txt", "担当が着手した"))
+
+        _, pending = self.call("pending")
+        _, stale = self.call("stale-asks", "--from", str(saved))
+
+        self.assertEqual([(item["id"], item["state"], item["owner"]) for item in pending["presented"]],
+                         [("keep:/w/b", "提示済み・未回答", "/w/lane")])
+        self.assertEqual([(item["id"], item["state"], item["link"]) for item in stale],
+                         [("keep:/w/b", "提示済み・未回答", "https://github.com/Acme/app/issues/12")])
+
     def test_left_row_only_stays_left_for_the_saved_final_message(self) -> None:
         old = self.source("old.txt", "Work complete; leave it.\n")
         new = self.source("new.txt", "New work needed.\n")

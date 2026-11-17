@@ -462,6 +462,10 @@ until the lead observes that its recorded symptom is gone. Then:
   the answer before directing a lane. Other rows' verdicts are acted on in
   every run, changed or not, so a finished or stalled row is handled again
   until it is closed; `cleanup.md` decides which removals need no question.
+- Record each item the report lists for the user without an AskUserQuestion
+  (a decision shown in its text, a wait carried from an earlier run) with
+  `hourly_state.py presented`, so the next run reads it from `pending` and
+  `stale-asks` as 提示済み・未回答 instead of from this run's transcript.
 - When nothing needs the user, end with one line and no question.
 - Before the comment, run the retrospective in a forked Agent as
   `references/retro.md` describes and wait for its one-line result.
