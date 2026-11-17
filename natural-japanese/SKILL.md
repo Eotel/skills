@@ -1,6 +1,6 @@
 ---
 name: natural-japanese
-description: Review and revise human-facing Japanese to replace awkward literal translations and vague jargon with wording that fits the reader and context. Use when drafting Japanese replies, UI copy, documentation, or shared messages, or checking existing prose for these expressions.
+description: Write and revise human-facing Japanese in the terms the reader uses, replacing awkward literal translations and vague metaphors while keeping the field's established kango and katakana terms. Use when drafting Japanese replies, UI copy, documentation, or shared messages, or checking existing prose for these expressions.
 ---
 
 # Natural Japanese
@@ -12,6 +12,9 @@ description: Review and revise human-facing Japanese to replace awkward literal 
 
 言葉の珍しさではなく、その文で意味が伝わるか、もっと自然で正確な言い方が
 あるかを判断する。専門用語、正式名称、読者に定着した呼び方は必要なら残す。
+語は読み手の分野で決める。開発者に向けた文では、その分野の漢語・カタカナ語
+（回答、登録、参照、レビュー）を和語にひらかない。言い換えるのは、比喩や造語で
+役割をぼかした語と直訳語。
 単語を別の単語に置き換えるだけで伝わりにくさが残る場合は、文を書き直す。
 
 具体的な動作や結果を示す。ただし原文にない効果、原因、確実性を補わない。
@@ -20,6 +23,9 @@ description: Review and revise human-facing Japanese to replace awkward literal 
 
 ## 資料と検査
 
+- 返信、報告、Issue・PR のコメントを書くときは、書き始める前に
+  [references/replies.md](references/replies.md) を読み、語彙、読点、依頼の書き方を
+  そろえる。
 - 日本語を作成・修正するときは
   [references/word-choice.json](references/word-choice.json) を読み、見直す場面と
   残す場面を参照する。登録語は例であり、一覧以外の直訳や曖昧な比喩も見直す。

@@ -105,6 +105,16 @@ class NaturalJapaneseScriptsTests(unittest.TestCase):
         self.assertEqual([item["match"] for item in findings if item["rule_id"] == "guard-noun"],
                          ["止め", "止め", "止め"])
 
+    def test_requests_that_hide_who_acts_are_candidates(self) -> None:
+        findings = self.findings("一覧はこの方針で直してから、また見てもらいます。\n"
+                                 "修正後、再度レビューをお願いします。\n"
+                                 "設定は管理者が画面で選ぶ形にします。\n"
+                                 "修正しますので、改めてレビューをお願いします。\n"
+                                 "確認させていただきます。ご確認いただきますようお願いします。\n"
+                                 "名札を受け取っていただきました。丸い形です。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["reader-action-as-plan", "hidden-actor-request", "vague-form"])
+
     def test_opt_in_exit_status_means_review_is_needed(self) -> None:
         result = run_check("正本です。", "--fail-on-findings", "--format", "json")
         self.assertEqual(result.returncode, 1)
