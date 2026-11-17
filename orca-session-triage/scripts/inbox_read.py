@@ -17,7 +17,8 @@ event log). It names each ask left unanswered for 15 minutes, once, gathers the 
 seconds into one line, and advances its own cursor once that line is out. `--exit-on-event`
 ends it there, for a background command started again each time it ends. `--hold-seconds`
 keeps the lines other than a new ask (done, a waited info, reminders, 伺い中) up to that long
-before the line goes out; a new ask sends them along at once. One watch reads a cursor at a time.
+before the line goes out; a new ask sends them along at once. It is 600 with `--exit-on-event`,
+whose line wakes the tab, and 0 otherwise. One watch reads a cursor at a time.
 
 Being read and being answered differ. `answered` records an ask (or one of its
 questions, `<ask id>:<n>`) as answered in ~/.cache/orca-briefs/ask-answers.jsonl
@@ -73,6 +74,7 @@ WATCHED_KINDS = frozenset(("ask", "done"))
 ANSWERS = Path.home() / ".cache/orca-briefs/ask-answers.jsonl"
 CLAIMS = Path.home() / ".cache/orca-briefs/ask-claims.jsonl"
 REMIND_AFTER_MINUTES = 15
+WAKING_HOLD_SECONDS = 600
 # send's hold records and its send records (orca-board's event log), for the info this tab waits on.
 HOLDS = Path.home() / ".cache/orca-briefs/holds.sqlite"
 EVENTS = Path.home() / ".local/share/orca-board/events.jsonl"
@@ -1041,9 +1043,10 @@ def main(argv: list[str] | None = None) -> int:
     watch_command.add_argument("--interval", type=float, default=10, help="seconds between reads (default: 10)")
     watch_command.add_argument("--batch-seconds", type=float, default=30,
                                help="seconds to gather lines into one line (default: %(default)s)")
-    watch_command.add_argument("--hold-seconds", type=float, default=0,
+    watch_command.add_argument("--hold-seconds", type=float,
                                help="seconds to keep lines other than a new ask before they go out; a new ask "
-                                    "sends them at once (default: %(default)s, the --batch-seconds behavior)")
+                                    f"sends them at once (default: {WAKING_HOLD_SECONDS} with --exit-on-event, "
+                                    "whose line wakes the tab; otherwise 0, the --batch-seconds behavior)")
     watch_command.add_argument("--remind-after", type=int, default=REMIND_AFTER_MINUTES,
                                help="minutes before an unanswered ask is named (default: %(default)s)")
     ending = watch_command.add_mutually_exclusive_group()
@@ -1122,7 +1125,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "watch":
             watch(inbox, cursor, answers_path(), WatchOptions(
                 once=args.once, exit_on_event=args.exit_on_event, interval=args.interval,
-                batch_seconds=args.batch_seconds, hold_seconds=args.hold_seconds, remind_after=args.remind_after))
+                batch_seconds=args.batch_seconds, remind_after=args.remind_after,
+                hold_seconds=args.hold_seconds if args.hold_seconds is not None
+                else WAKING_HOLD_SECONDS if args.exit_on_event else 0))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)
