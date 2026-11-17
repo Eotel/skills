@@ -8598,7 +8598,8 @@ class InboxReadTests(unittest.TestCase):
             ended: list[int] = []
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as first:
                 watcher = Thread(daemon=True, target=lambda: ended.append(inbox_read.main(
-                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0"])))
+                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0",
+                     "--hold-seconds", "0"])))
                 watcher.start()
                 watcher.join(10)
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as again:
@@ -8616,6 +8617,7 @@ class InboxReadTests(unittest.TestCase):
 
     def test_watch_holds_notices_other_than_an_ask_until_an_ask_comes_or_the_hold_ends(self) -> None:
         # 2026-11-16: the lead woke about 112 times a day on notices; a done can wait, an ask cannot.
+        # 11/17 14:36: the lead started its watch again without --hold-seconds 600, so the watch that wakes holds.
         with tempfile.TemporaryDirectory() as root:
             inbox, cursor = Path(root) / "inbox.jsonl", Path(root) / "watch.offset"
             now = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -8624,16 +8626,15 @@ class InboxReadTests(unittest.TestCase):
             environment = {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor),
                            "TRIAGE_ASK_ANSWERS": str(Path(root) / "answers.jsonl")}
 
-            def run(hold: str) -> tuple[Thread, list[int]]:
+            def run(*hold: str) -> tuple[Thread, list[int]]:
                 ended: list[int] = []
                 watcher = Thread(daemon=True, target=lambda: ended.append(inbox_read.main(
-                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0",
-                     "--hold-seconds", hold])))
+                    ["watch", "--exit-on-event", "--interval", "0.01", "--batch-seconds", "0", *hold])))
                 watcher.start()
                 return watcher, ended
 
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as held:
-                watcher, ended = run("600")
+                watcher, ended = run()
                 write_jsonl(inbox, [{"id": "d1", "ts": now, "kind": "done", "host": "h", "worktree": "x",
                                      "text": "終えた"}])
                 watcher.join(0.5)
@@ -8643,7 +8644,7 @@ class InboxReadTests(unittest.TestCase):
                                              "text": "質問"}) + "\n")
                 watcher.join(10)
             with patch.dict(os.environ, environment), redirect_stdout(io.StringIO()) as timed:
-                watcher, ended_by_time = run("0.3")
+                watcher, ended_by_time = run("--hold-seconds", "0.3")
                 with inbox.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps({"id": "d2", "ts": now, "kind": "done", "host": "h", "worktree": "z",
                                              "text": "終えた"}) + "\n")
