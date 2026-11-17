@@ -80,7 +80,11 @@ VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
 # A config that moves Vite's root resolves a relative outDir from there, so it is not read.
 VITE_ROOT = re.compile(r"""\broot['"]?\s*:""")
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
-JS_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+JS_STRING_OR_COMMENT = re.compile(r"""("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|/\*.*?\*/|//[^\n]*""",
+                                  re.DOTALL)
+# What an outDir value may hold besides string literals: calls such as fileURLToPath(new URL(…, import.meta.url)) or
+# path.resolve(__dirname, …) that join them as path parts. An operator such as + makes another value, so it is not read.
+VITE_PATH_CALL = re.compile(r"[\w\s.,()]*")
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
@@ -392,14 +396,16 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
         if config.suffix not in VITE_SUFFIXES:
             continue
         try:
-            text = JS_BLOCK_COMMENT.sub("", (worktree / config).read_text(errors="replace"))
+            text = JS_STRING_OR_COMMENT.sub(lambda found: found.group(1) or "",
+                                            (worktree / config).read_text(errors="replace"))
         except OSError:
             continue
         if VITE_ROOT.search(text):
             continue
         for found in VITE_OUT_DIR.finditer(text):
             parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
-            if not parts or any("${" in part for part in parts):
+            if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(
+                    JS_STRING.sub("", found.group(1))):
                 continue
             out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
             if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):
