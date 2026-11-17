@@ -151,7 +151,7 @@ class Span:
 # listings it attaches again, a notice, and its links again; Orca's agent states move with it.
 IDLE_COMPACTION_NOTICE = "Compacted while idle"
 COMPACTION_COMPANIONS = {"attachment", "pr-link", "frame-link"}
-COMPACTION_SLACK = timedelta(seconds=30)
+COMPACTION_SLACK = timedelta(seconds=5)
 
 
 def timed_entries(path: Path) -> list[tuple[datetime, dict]]:

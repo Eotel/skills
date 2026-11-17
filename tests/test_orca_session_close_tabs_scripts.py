@@ -126,6 +126,14 @@ class CloseTabsTests(unittest.TestCase):
 
         self.assertEqual((code, tabs.closed), (0, [(None, "term_agent")]), out)
 
+        # 20 seconds after the compaction's last line, the agent's change is its own work again.
+        tabs = FakeTabs({(None, str(self.worktree)): [
+            *changes, close_tabs.AgentChange("tab-agent:leaf", SCANNED_AT + timedelta(seconds=117.6))]})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []), out)
+
         # The transcript names no pane: beside another agent, a change in the span may be that agent starting work.
         tabs = FakeTabs({(None, str(self.worktree)): [
             *changes, close_tabs.AgentChange("tab-other:leaf", SCANNED_AT + timedelta(seconds=97))]})
