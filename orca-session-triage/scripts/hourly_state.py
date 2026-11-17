@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import fcntl
 from functools import cached_property
 import hashlib
@@ -618,7 +618,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             undecided = [proposal[:8] for proposal in named if not proposals[proposal].settles(name)]
             settled = bool(named) and not undecided
         lane = [(at, item) for item in entries if item.get("worktree") == name
-                and item.get("repo") in (None, "", row.get("repo"))
+                and (item.get("repo") or "") in scan_sessions.row_repos(row)
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
         keys = {item["id"]: [handoff.decision for handoff in handed if (key := answer_evidence.key_ask_id(handoff.decision))
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
@@ -1110,7 +1110,7 @@ class Inbox:
         named = [row for row in self.rows if Path(row["path"]).name == ask.get("worktree")]
         lanes = [row for row in named if ask.get("handle") and any(
             term.get("handle") == ask["handle"] for term in row.get("terminals") or [])] or [
-            row for row in named if (ask.get("repo") or "") in ("", row.get("repo") or "")]
+            row for row in named if (ask.get("repo") or "") in scan_sessions.row_repos(row)]
         if len(lanes) != 1:
             raise ValueError(f"ask {ask_id} from {ask.get('worktree')} matches {len(lanes)} scan rows; give row: "
                              + (", ".join(scan_sessions.row_identity(row) for row in lanes) or "(none)"))
@@ -1280,7 +1280,9 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                               "reissued": withdrawn_by(question_ask(item, entries or []), entries or [])})
     return {
         "questions": questions, "settled": settled,
-        "handoffs": [{"id": key, **item} for key, item in data["handoffs"].items() if item["delivered_at"] is None],
+        "handoffs": [{"id": key, **item, **({} if scan_sessions.promise_due(item, now)
+                                            else {"state": scan_sessions.not_before_label(item)})}
+                     for key, item in data["handoffs"].items() if item["delivered_at"] is None],
         "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
         "user_waits": [{"id": key, **item} for key, item in data["user_waits"].items() if item["closed_at"] is None],
         "left": [{"row": row, **item} for row, item in data["left"].items()],
@@ -1375,6 +1377,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         key = identifier(args.from_row, args.to_row, args.condition, args.task)
         data["handoffs"].setdefault(key, {"from": args.from_row, "to": args.to_row,
                                           "condition": args.condition, "task": args.task,
+                                          **({"not_before": args.not_before.isoformat()} if args.not_before else {}),
                                           "promised_at": stamp(), "delivered_at": None})
         return {"id": key, **data["handoffs"][key]}
     if args.action == "delivered":
@@ -1635,6 +1638,9 @@ def main(argv: list[str] | None = None) -> int:
     promise.add_argument("--to-row", required=True)
     promise.add_argument("--condition", required=True)
     promise.add_argument("--task", required=True)
+    promise.add_argument("--not-before", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                         help="the JST day the task may first go out; before it, pending shows the promise as "
+                              "期限前（M/D） and the scan keeps its destination open without counting it stalled")
     delivered = commands.add_parser("delivered", help="mark a promised task sent to its lane")
     delivered.add_argument("--id", required=True)
     delivered.add_argument("--delivery", required=True, choices=("queued", "turn_started"))

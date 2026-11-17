@@ -27,11 +27,12 @@ judge each row from its own facts.
   older message. `claude.last_user`: the prompt the transcript's message answered.
 - `comment`: the worktree's Orca comment, written by the agent or the triage.
   Orca keeps no time for it.
-- `inbox`: the newest `done` and `ask` the worktree sent to the triage inbox
+- `inbox`: the newest `done` and `ask` the worktree sent to the triage inbox,
+  and the newest `info` it sent after the lane's last instruction
   (`at`, `text`), when it sent any; an ask the user answered carries
   `answered` (`at`, `note`). `newest_report` names which came last of
-  the final message, that `done`, and that `ask` (`source`: `final_message`,
-  `inbox_done`, or `inbox_ask`).
+  the final message and those reports (`source`: `final_message`,
+  `inbox_done`, `inbox_ask`, or `inbox_info`).
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
   CLOSED, `review`, `latest_human_activity` from a person other than the PR author,
   `requested` reviewers, `checks`), or null.
@@ -64,6 +65,9 @@ judge each row from its own facts.
    the comment should be rewritten.
    An `inbox.ask` with `answered` is settled: leave it out of `question` and
    do not class the row `waiting` for it.
+   An `inbox.info` answers the last instruction like a `done` when it reports
+   that work delivered (a lane can send its result by info and end its turn on
+   other text): do not class the row `in_progress` for work that info delivered.
    `pr.reply_after_last_commit` and `waits_on: self` mean a human added a
    review, PR comment, or line comment after the latest commit date. Read it
    and give the lane `in_progress` if it can respond now. GitHub does not
