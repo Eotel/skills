@@ -202,7 +202,11 @@ SCAN_JSON --out FILE` publish complete JSON atomically without stdout.
 `cleanup_hourly_tabs.py` checks Orca's run, terminal and agent records before closing previous
 scheduled tabs. Each per-tab `keep` or `closed` line includes the run's scheduled
 and start times in local time (`scheduled`, `started`; `-` when unknown).
-Workspace tabs without a matching run stay open with `keep: …: run の記録に無い`.
+Workspace tabs without a matching run stay open with `keep: …: run の記録に無い`,
+except one whose agents are done, whose rendered screen ends on a usage-limit
+notice followed by the turn-end line with no reply between, whose composer is
+empty, and that has printed nothing for `--min-idle-minutes`: a run the limit
+stopped at once leaves no run record, and that tab is closed.
 It keeps a tab if its turn or background work is active, a
 question from that tab (or one without a recorded owner) is unanswered, its
 latest conversation has an unanswered AskUserQuestion or no final message, its

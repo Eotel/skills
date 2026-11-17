@@ -7362,6 +7362,44 @@ class HourlyTabCleanupTests(unittest.TestCase):
             self.assertIn("scheduled=-, started=-", line)
         self.assertEqual(calls.call_count, 2)  # no screen read, send, or close without a run
 
+    def test_an_unrecorded_tab_whose_turn_the_usage_limit_ended_closes(self) -> None:
+        notice = ["⎿  You've hit your weekly limit · resets Nov 19 at 2am (Asia/Tokyo)",
+                  "/usage-credits to finish what you’re working on."]
+        composer = ["─" * 40, "❯", "─" * 40, "[Opus 5.5] 📁 triage-hourly"]
+        screens = {"limit": [*notice, "✻ Baked for 0s · done 5:00", *composer],
+                   "resumed": [*notice, "⏺ 再開しました。", "✻ Baked for 2m 3s · done 9:02", *composer],
+                   "draft": [*notice, "✻ Baked for 0s · done 6:00", "─" * 40, "❯ 次の指示", "─" * 40]}
+        terms = [{"worktreeId": "repo::/w/triage", "tabId": name, "leafId": "leaf", "handle": name,
+                  "connected": True, "lastOutputAt": (time.time() - 3600) * 1000}
+                 for name in (*screens, "busy")]
+        agents = [{"paneKey": f"{name}:leaf", "state": "working" if name == "busy" else "done",
+                   "mainAgent": {"state": "done"}} for name in (*screens, "busy")]
+        closed = []
+
+        def orca(_: str, *args: str) -> dict:
+            if args == ("terminal", "list"):
+                return {"terminals": terms}
+            if args == ("worktree", "ps"):
+                return {"worktrees": [{"path": "/w/triage", "agents": agents}]}
+            if args[:2] == ("terminal", "read"):
+                return {"source": "screen", "tail": screens[args[3]]}
+            if args[:2] == ("terminal", "close"):
+                closed.append(args[3])
+                return {}
+            raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(cleanup_hourly.hourly_runtime, "scheduled_runs", return_value=[]), \
+                patch.object(cleanup_hourly.hourly_runtime, "orca_result", side_effect=orca), \
+                redirect_stdout(io.StringIO()) as out:
+            code = cleanup_hourly.main(["--workspace", "/w/triage", "--agent-status-file", "/missing/status.json",
+                                        "--state-file", str(Path(root) / "no-state.json")])
+
+        self.assertEqual((code, closed), (0, ["limit"]))
+        self.assertIn("closed: limit", out.getvalue())
+        for kept in ("resumed", "draft", "busy"):
+            self.assertIn(f"keep: {kept} (run -, scheduled=-, started=-): run の記録に無い", out.getvalue())
+
     def test_rendered_empty_composer_overrides_an_old_orca_draft(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             transcript = Path(root) / "session.jsonl"
