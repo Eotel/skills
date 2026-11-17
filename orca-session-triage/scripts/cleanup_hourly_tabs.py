@@ -65,10 +65,20 @@ def tab_label(term: dict[str, Any], runs: list[dict[str, Any]]) -> str:
     return f"{term.get('handle') or hourly_runtime.pane_key(term)} ({timings or 'run -, scheduled=-, started=-'})"
 
 
+LIMIT_HEAD = 80
+
+
+def all_done(agents: list[dict[str, Any]]) -> bool:
+    return bool(agents) and all(agent.get("state") == "done" and (agent.get("mainAgent") or {}).get("state") == "done"
+                                for agent in agents)
+
+
 def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agents: list[dict[str, Any]],
                workspace: str, current_pane: str | None,
-               sessions: dict[str, PaneSession] | None = None) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
-    """Only completed scheduled runs with an idle, owned terminal can be closed."""
+               sessions: dict[str, PaneSession] | None = None,
+               ) -> Iterator[tuple[dict[str, Any] | None, dict[str, Any]]]:
+    """Only completed scheduled runs with an idle, owned terminal can be closed. A connected tab with a handle that
+    no run record names comes with None while its agents are done: it closes only on a usage-limit screen."""
     sessions = sessions or {}
     recorded = [session.transcript for session in sessions.values() if session.transcript]
     transcripts = [(run, transcript_for(run, Path.home(), recorded)) for run in runs
@@ -85,25 +95,26 @@ def prior_tabs(runs: list[dict[str, Any]], terminals: list[dict[str, Any]], agen
             matches = [run for run, transcript in transcripts
                        if saved and transcript and transcript.stem == saved.session_id]
         label = tab_label(term, matches)
+        owned_agents = [agent for agent in agents
+                        if agent.get("paneKey") == pane or agent.get("parentPaneKey") == pane]
+        if not owned_agents and term.get("orphaned") and saved and saved.agent:
+            owned_agents = [saved.agent]
         if not matches:
-            print(f"keep: {label}: run の記録に無い")
+            if term.get("handle") and term.get("connected") and all_done(owned_agents):
+                yield None, term
+            else:
+                print(f"keep: {label}: run の記録に無い")
             continue
         if len(matches) != 1:
             print(f"keep: {label}: no unique scheduled run and transcript")
             continue
         run = matches[0]
-        owned_agents = [agent for agent in agents
-                        if agent.get("paneKey") == pane or agent.get("parentPaneKey") == pane]
-        if not owned_agents and term.get("orphaned") and saved and saved.agent:
-            owned_agents = [saved.agent]
         problems = []
         if run.get("status") not in ENDED_RUNS:
             problems.append("scheduled run is not completed")
         if not term.get("handle") or not term.get("connected"):
             problems.append("terminal is not connected or has no handle")
-        if not owned_agents or any(agent.get("state") != "done" or
-                                   (agent.get("mainAgent") or {}).get("state") != "done"
-                                   for agent in owned_agents):
+        if not all_done(owned_agents):
             problems.append("agent or background work is active or unknown")
         if problems:
             print(f"keep: {label}: " + "; ".join(problems))
@@ -215,6 +226,32 @@ def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes:
     final_text, asking, _ = latest_exchange(transcript)
     if asking or not final_text:
         problems.append("unanswered conversation question")
+    return problems + screen_blockers(term, screen)
+
+
+def limit_notices(lines: list[str]) -> list[int]:
+    """The indexes of the stripped lines a usage-limit notice ends on. Claude Code prints it as a result line (⎿),
+    which a narrow pane wraps onto the next line mid-word or at a space; a reply (⏺) naming a limit is not one."""
+    def notice(text: str) -> bool:
+        return text.startswith("⎿") and bool(scan_sessions.USAGE_LIMIT.search(text[:LIMIT_HEAD]))
+
+    return [index for index, line in enumerate(lines)
+            if notice(line) or index and not notice(lines[index - 1])
+            and any(notice(lines[index - 1] + glue + line) for glue in ("", " "))]
+
+
+def ended_on_usage_limit(screen: dict) -> bool:
+    """Whether the screen's last turn ended on a usage-limit notice: its turn-end line follows the notice with no
+    reply or tool call (⏺) between."""
+    lines = [line.strip() for line in scan_sessions.screen_lines(screen)]
+    notices = limit_notices(lines)
+    after = lines[notices[-1] + 1:] if notices else []
+    return (bool(notices) and not any(line.startswith("⏺ ") for line in after)
+            and any(scan_sessions.CLAUDE_TURN_END.match(line) for line in after))
+
+
+def screen_blockers(term: dict, screen: dict) -> list[str]:
+    problems = []
     if (term.get("title") or "")[:1] in SPINNERS:
         problems.append("title is spinning")
     if screen.get("source") != "screen":
@@ -301,6 +338,24 @@ def dismiss_settled(args: argparse.Namespace, term: dict, pane: str) -> dict | N
     return read.get("terminal") or read
 
 
+def close_unrecorded(args: argparse.Namespace, term: dict) -> None:
+    """Close a tab no run record names once its screen shows a turn the usage limit ended, an empty composer, and
+    no output for --min-idle-minutes: a run the limit stopped at once leaves no record to match."""
+    label = tab_label(term, [])
+    quiet = term.get("lastOutputAt")
+    if (not isinstance(quiet, (int, float)) or time.time() - quiet / 1000 < args.min_idle_minutes * 60
+            or not no_pending_questions(args.state_file, hourly_runtime.pane_key(term))):
+        print(f"keep: {label}: run の記録に無い")
+        return
+    read = hourly_runtime.orca_result(args.orca, "terminal", "read", "--terminal", term["handle"], "--screen")
+    screen = read.get("terminal") or read
+    if not ended_on_usage_limit(screen) or screen_blockers(term, screen):
+        print(f"keep: {label}: run の記録に無い")
+        return
+    hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
+    print(f"closed: {label}: run の記録に無いが、利用上限の通知で turn が終わり composer が空")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", default=hourly_runtime.workspace_path(
@@ -329,6 +384,9 @@ def main(argv: list[str] | None = None) -> int:
         recorded = [session.transcript for session in sessions.values() if session.transcript]
         for run, term in prior_tabs(runs, terminals, row.get("agents") or [], args.workspace, current,
                                     sessions):
+            if run is None:
+                close_unrecorded(args, term)
+                continue
             label = tab_label(term, [run])
             if not no_pending_questions(args.state_file, run["terminalPaneKey"]):
                 print(f"keep: {label} may have an unanswered question")
