@@ -99,6 +99,57 @@ class CloseTabsTests(unittest.TestCase):
 
         self.assertEqual((code, tabs.closed), (0, [(None, "term_agent")]), out)
 
+    def test_an_idle_compaction_after_the_scan_does_not_keep_the_tab_until_the_agent_answers(self) -> None:
+        # 2026-11-16: a finished lane's tab stayed for "17:08:37 会話記録 … ほか 2 件": the lines and the agent's
+        # state changes Claude Code wrote compacting the idle session on its own (dacd0ab4).
+        def at(seconds: float) -> str:
+            return (SCANNED_AT + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+        compaction = [
+            {"type": "assistant", "timestamp": "2026-10-28T04:40:00.000Z"},
+            {"type": "pr-link", "timestamp": at(96.5), "prNumber": 3784},
+            {"type": "system", "subtype": "compact_boundary", "timestamp": at(96.6), "content": "Conversation compacted",
+             "compactMetadata": {"trigger": "auto", "durationMs": 177702}},
+            {"type": "user", "isCompactSummary": True, "timestamp": at(96.5),
+             "message": {"role": "user", "content": "This session is being continued from a previous conversation"}},
+            {"type": "attachment", "timestamp": at(96.7), "attachment": {"type": "file"}},
+            {"type": "attachment", "timestamp": at(97.3), "attachment": {"type": "hook_additional_context"}},
+            {"type": "system", "subtype": "informational", "timestamp": at(97.5),
+             "content": "Compacted while idle, before the prompt cache expired"},
+            {"type": "pr-link", "timestamp": at(97.6), "prNumber": 3784},
+            {"type": "cost-state", "totalCostUSD": 1.0}]
+        self.write_transcript(*compaction)
+        self.touch(self.transcript, SCANNED_AT + timedelta(seconds=98))
+        changes = [close_tabs.AgentChange("tab-agent:leaf", SCANNED_AT + timedelta(seconds=seconds)) for seconds in (97, 98)]
+        tabs = FakeTabs({(None, str(self.worktree)): changes})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (0, [(None, "term_agent")]), out)
+
+        # 20 seconds after the compaction's last line, the agent's change is its own work again.
+        tabs = FakeTabs({(None, str(self.worktree)): [
+            *changes, close_tabs.AgentChange("tab-agent:leaf", SCANNED_AT + timedelta(seconds=117.6))]})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []), out)
+
+        # The transcript names no pane: beside another agent, a change in the span may be that agent starting work.
+        tabs = FakeTabs({(None, str(self.worktree)): [
+            *changes, close_tabs.AgentChange("tab-other:leaf", SCANNED_AT + timedelta(seconds=97))]})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []), out)
+
+        self.write_transcript(*compaction, {"type": "assistant", "timestamp": at(120)})
+        tabs = FakeTabs({(None, str(self.worktree)): changes})
+
+        code, out = self.run_close(tabs, "term_agent")
+
+        self.assertEqual((code, tabs.closed), (1, []), out)
+        self.assertIn("会話記録 6a0027d4.jsonl の assistant の行", out)
+
     def test_a_report_the_worktree_sent_after_the_scan_keeps_its_tab(self) -> None:
         self.inbox.write_text(json.dumps({
             "ts": "2026-10-28T14:12:40+0900", "kind": "info", "worktree": "fix-login",
