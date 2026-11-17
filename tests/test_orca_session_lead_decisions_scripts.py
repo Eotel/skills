@@ -233,6 +233,40 @@ class LeadDecisionsTests(unittest.TestCase):
         self.assertEqual(shown["merge:Eotel/skills#80"]["answer"], "merge する")
         self.assertEqual(shown["merge:Eotel/skills#81"]["decided_at"], "2026-10-27T10:00:00+09:00")
 
+    def test_answered_at_in_an_answer_becomes_its_recorded_time_in_jst(self) -> None:
+        answer_file = self.root / "answer.txt"
+        answer_file.write_text("答え「担当に渡す」（定時のタブの AskUserQuestion、{answered_at}）",
+                               encoding="utf-8")
+        braces = "URL は /ui/{system}/xxx/、@{u}..HEAD、terraform/{devel,stage,prod}/、${each.key}、{\"note\": \"x\"}"
+
+        single = self.run_tool("record", "--decision", "assign:backlog:DEMO-378::hand-off",
+                               "--answer-file", str(answer_file), "--decided-at", "2026-11-16T08:18:30+00:00")
+        many = self.run_tool("record-many", stdin=json.dumps(
+            {"decision": "merge:Eotel/skills#80", "answer": f"{{answered_at}} に merge してよいと答えた。{braces}",
+             "decided_at": "2026-11-16T17:19:00+09:00"}, ensure_ascii=False))
+
+        for result in (single, many):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["answer"] for item in json.loads(self.run_tool("show").stdout)], [
+            "答え「担当に渡す」（定時のタブの AskUserQuestion、17:18）",
+            f"17:19 に merge してよいと答えた。{braces}"])
+
+    def test_an_answer_with_a_placeholder_left_unfilled_writes_nothing(self) -> None:
+        answer_file = self.root / "answer.txt"
+        answer_file.write_text("答え（{decided_at}）: merge する", encoding="utf-8")
+
+        single = self.run_tool("record", "--decision", "merge:Eotel/skills#80", "--answer-file", str(answer_file))
+        many = self.run_tool("record-many", stdin="".join(json.dumps(line, ensure_ascii=False) + "\n" for line in [
+            {"decision": "merge:Eotel/skills#80", "answer": "{answered_at} に merge する"},
+            {"decision": "merge:Eotel/skills#81", "answer": "待つ（{asked_at} の問い）"}]))
+
+        self.assertEqual(single.returncode, 1)
+        self.assertIn("{decided_at}", single.stderr)
+        self.assertEqual(many.returncode, 1)
+        self.assertRegex(many.stderr, r"line 2: .*\{asked_at\}")
+        self.assertNotIn("line 1", many.stderr)
+        self.assertFalse(self.log.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

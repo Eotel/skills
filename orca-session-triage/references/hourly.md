@@ -406,7 +406,11 @@ object per line: `{"decision": KEY, "answer": TEXT}`, adding `"decided_at"`
 item also takes `"value"`, what it puts there (`record --value`): `true` or
 `false` for `complete`, the Asana user gid for `assignee`, the option name for
 the others. `asana99_status.py` shows a 「答えと違う」 row while Asana holds
-another value; without `"value"` it cannot compare. `record-many` checks every line first,
+another value; without `"value"` it cannot compare. Write `{answered_at}` in
+the answer where its time goes: both commands replace it with the recorded
+time in JST (`17:18`), as `hourly_state.py answered` does, and refuse an
+answer that still holds another `{snake_case}` placeholder, naming it.
+`record-many` checks every line first,
 names each wrong one, and records nothing until all are right; do not call
 `record` in a shell loop. When the lead relays the answer to a lane, it uses
 `send --decision <answer> --key KEY` instead (repeat per key, with `--ask <id>`

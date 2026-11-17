@@ -4,6 +4,8 @@
 The lead never types into a scheduled triage tab, so it appends each answer here with `record`,
 or several at once with `record-many` (JSON Lines of {"decision", "answer", "decided_at"?, "value"?}:
 every line is checked first, and nothing is written while one is wrong).
+{answered_at} in an answer becomes its recorded time in JST (HH:MM), as `hourly_state.py answered` writes it;
+an answer that still holds another {snake_case} placeholder is refused.
 An answer on an Asana 99 item (asana:<item>:<owner/repo>#<number>) may carry the value it puts
 there, which asana99_status.py compares with Asana: true or false for complete, an Asana user gid
 for assignee, an option name for priority, review-state and pr-state. No other key takes a value.
@@ -54,6 +56,7 @@ CUT = "…（続きは --json）"
 # A record that only says an answer was passed on decides nothing: on 2026-11-06 「中継済み（12:2x send
 # montly-report）」 hid 「1,000 万円のまま」, recorded under the same key the hour before.
 DELIVERY_ONLY = re.compile(r"(?:(?:中継|送達|送信|転送)済み|中継した|送った|伝えた)(?:[（(][^）)]*[）)])?[。.]?")
+PLACEHOLDER = re.compile(r"(?<![$@{])\{[a-z][a-z0-9]*(?:_[a-z0-9]+)+\}(?!\})")
 
 
 @dataclass(frozen=True)
@@ -227,6 +230,19 @@ def non_empty(path: Path) -> str:
     return text
 
 
+def stamped(answer: str, at: str) -> str:
+    """The answer with {answered_at} as its recorded time `at` in JST, as `hourly_state.py answered` writes it;
+    ValueError names a {snake_case} placeholder still in it.
+    Other times of day in the text are not checked against `at`: a lead's answer cites the times of earlier events."""
+    import hourly_state
+
+    text = hourly_state.stamped_answer(answer, at) if hourly_state.ANSWERED_AT in answer else answer
+    if left := list(dict.fromkeys(PLACEHOLDER.findall(text))):
+        raise ValueError(f"the answer keeps the placeholder {', '.join(left)}: only {hourly_state.ANSWERED_AT} is "
+                         "filled in (with the recorded time, JST HH:MM); write the text itself in place of the others")
+    return text
+
+
 def answer_line(raw: str) -> Decision:
     """A `record-many` line as the record to append; ValueError says what is wrong with it."""
     try:
@@ -245,9 +261,9 @@ def answer_line(raw: str) -> Decision:
     when = item.get("decided_at")
     if when is not None and not isinstance(when, str):
         raise ValueError("decided_at must be an ISO 8601 time with its timezone offset")
-    decision = str(texts["decision"]).strip()
-    return Decision(id=uuid.uuid4().hex, decision=decision, answer=str(texts["answer"]).strip(),
-                    decided_at=decided_at(when), value=answer_value(decision, item.get("value")))
+    decision, at = str(texts["decision"]).strip(), decided_at(when)
+    return Decision(id=uuid.uuid4().hex, decision=decision, answer=stamped(str(texts["answer"]).strip(), at),
+                    decided_at=at, value=answer_value(decision, item.get("value")))
 
 
 def checked_line(number: int, raw: str) -> Decision | BadLine:
@@ -487,14 +503,17 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
     record = commands.add_parser("record", help="append the lead's answer to one handed-off question")
     record.add_argument("--decision", required=True,
                         help="the key the hourly handoff gave the question, e.g. remove:ENVIRONMENT::PATH")
-    record.add_argument("--answer-file", type=Path, required=True, help="UTF-8 file with the exact answer")
+    record.add_argument("--answer-file", type=Path, required=True,
+                        help="UTF-8 file with the exact answer; {answered_at} in it becomes the recorded time "
+                             "(JST HH:MM), and another {snake_case} placeholder is refused")
     record.add_argument("--decided-at", help="original ISO 8601 time when recording an earlier answer")
     record.add_argument("--value", help="for an asana:<item>: key, the value the answer puts in that item: "
                                         "true or false (complete), an Asana user gid (assignee), or an option name")
     many = commands.add_parser(
         "record-many", help='append several answers from JSON Lines of {"decision": KEY, "answer": TEXT, '
                             '"decided_at": ISO time with offset (optional), "value": what an asana:<item>: answer '
-                            'puts in that item (optional)}; a wrong line writes nothing')
+                            'puts in that item (optional)}; {answered_at} in an answer as with record; a wrong line '
+                            'writes nothing')
     many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     show = commands.add_parser("show", help="print the latest answer for each decision")
     show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
@@ -532,8 +551,9 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
             decision = args.decision.strip()
             if not decision:
                 raise ValueError("--decision is empty")
-            entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=non_empty(args.answer_file),
-                             decided_at=decided_at(args.decided_at), value=answer_value(decision, args.value))
+            at = decided_at(args.decided_at)
+            entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=stamped(non_empty(args.answer_file), at),
+                             decided_at=at, value=answer_value(decision, args.value))
             warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)
             result: object = asdict(entry)
