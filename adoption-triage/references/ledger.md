@@ -1,7 +1,8 @@
 # 採用台帳
 
 `scripts/ledger.py list` は、案の ID・状態・優先度・提案の順で、1 件を 1 行に出す。
-`list --json` の最上位は `{"items": [...]}` で、`items` に各案の詳細が入る。
+`list --json` の最上位は `{"items": [...]}` で、`items` に各案の詳細が入る。各案の ID は `proposal_id` で、`id` は案を出した行の UUID。
+`list --id <案の ID か 8 文字以上の頭>[,…]` は、名指した案だけを名指した順に返す。一致しない ID があれば、名指して失敗する。
 
 各 Mac の `~/.local/share/adoption-triage/events.jsonl` に追記する。`scripts/ledger.py collect` は SSH で別の Mac の記録を読み、`imports/` に Mac 別の写しを原子的に保存する。元の記録は変更しない。接続先は `~/.config/adoption-triage/hosts.json` の `hosts` 配列（`name`, `ssh_target`, `remote_path`）で指定する。`name` は写しのファイル名に使う固定の識別名で、OS のホスト名と一致させる必要はない。Mac の改名後も同じ `name` を使う。`remote_path` はその Mac の記録の絶対パスとする。
 

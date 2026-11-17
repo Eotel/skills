@@ -92,7 +92,9 @@ already have a lane in the ledger, naming the lane on stderr; `~/.agents/skills/
 <proposal id>` shows a proposal's lane, brief, and whether it is done.
 `scripts/retro.py status --pending` lists undecided proposal IDs, titles, and
 waiting minutes. `~/.agents/skills/adoption-triage/scripts/ledger.py list` prints one proposal per
-line; `list --json` returns `{"items": [...]}`.
+line; `list --json` returns `{"items": [...]}`, each keyed by `proposal_id` (its `id` is the
+proposing row's UUID). `list --json --id <proposal id>[,…]` (8 or more characters each) returns
+only those proposals, with their decision times.
 Before either tab asks the user an inbox ask itself, it records that with
 `scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
 `~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another

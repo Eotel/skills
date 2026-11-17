@@ -678,8 +678,14 @@ def main() -> int:
     commands.add_parser("record", help="append one execution result from stdin JSON")
     commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
     listing = commands.add_parser("list", help="read current proposals",
-                                   description="Without --json, print one proposal per line: id, status, priority, proposal.")
-    listing.add_argument("--json", action="store_true", help='print {"items": [...]} instead of one proposal per line')
+                                   description="Without --json, print one proposal per line: "
+                                               "proposal_id, status, priority, proposal.")
+    listing.add_argument("--json", action="store_true",
+                         help='print {"items": [...]} instead of one proposal per line; an item\'s proposal ID is '
+                              "proposal_id, and its id is the UUID of the row that proposed it")
+    listing.add_argument("--id", dest="ids", action="extend", type=lambda value: value.split(","),
+                         metavar="PREFIX[,PREFIX]",
+                         help="only these proposals, in this order: proposal IDs, or their first 8 or more characters")
     listing.add_argument("--candidates", action="store_true",
                          help="only pending, held, and unimplemented adopted proposals not already in an open consolidation")
     owning = commands.add_parser("owner", help="print, one line per proposal, its status, the lane holding it "
@@ -707,8 +713,10 @@ def main() -> int:
             print(json.dumps(append(args.events, args.imports, validate_evidence(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "list":
             items = project(all_rows(args.events, args.imports))
+            known = {item["proposal_id"]: item for item in items}
+            if args.ids:
+                items = named_proposals(items, args.ids)
             if args.candidates:
-                known = {item["proposal_id"]: item for item in items}
                 items = [item for item in items if consolidation_blocker(item, known) is None]
             if args.json:
                 print(json.dumps({"items": items}, ensure_ascii=False))
