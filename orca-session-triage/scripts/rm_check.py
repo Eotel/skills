@@ -89,6 +89,8 @@ JS_STRING_OR_COMMENT = re.compile(r"""("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`
 # What an outDir value may hold besides string literals: calls such as fileURLToPath(new URL(…, import.meta.url)) or
 # path.resolve(__dirname, …) that join them as path parts. An operator such as + makes another value, so it is not read.
 VITE_PATH_CALL = re.compile(r"[\w\s.,()]*")
+# A template interpolation, or a URL escape, query or fragment, makes a path other than the literal's own text.
+VITE_UNREAD_LITERAL = re.compile(r"\$\{|[%?#]")
 # `terraform init` downloads providers and modules into .terraform/ and records the backend in its terraform.tfstate;
 # with any backend but local, the state itself is kept by the backend.
 TERRAFORM_DIR = ".terraform"
@@ -408,7 +410,8 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
         for found in VITE_OUT_DIR.finditer(text):
             value = found.group(1)
             parts = [literal for _, literal in JS_STRING.findall(value)]
-            if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(JS_STRING.sub("", value)):
+            if not parts or any(VITE_UNREAD_LITERAL.search(part) for part in parts) or not VITE_PATH_CALL.fullmatch(
+                    JS_STRING.sub("", value)):
                 continue
             if moves_root and not VITE_FROM_CONFIG.fullmatch(JS_STRING.sub("", value)):
                 continue

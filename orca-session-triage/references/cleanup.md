@@ -153,7 +153,8 @@ Run these per worktree, in order.
      `tauri.conf.json`, Composer's `vendor/` (or each path in it) beside a tracked
      `composer.json` that sets no other `vendor-dir` and a tracked `composer.lock`,
      the `outDir` a tracked `vite.config.*` names on its `outDir:` line (comments
-     outside string literals left out; a value of string literals and the calls
+     outside string literals left out; a value of string literals (none with `${`,
+     `%`, `?` or `#`) and the calls
      that join them, such as `fileURLToPath(new URL(…))`, read as path parts from
      the config's directory; only a directory below it; in a config that sets
      `root`, only an outDir of `fileURLToPath(new URL(…, import.meta.url))` or
