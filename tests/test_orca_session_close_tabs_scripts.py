@@ -12,6 +12,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 spec = importlib.util.spec_from_file_location("close_tabs", SCRIPTS / "close_tabs.py")
@@ -263,6 +266,7 @@ class CloseTabsTests(unittest.TestCase):
         orca.write_text(f"""#!{sys.executable}
 import json, sys, time
 from pathlib import Path
+
 state = Path({str(state)!r})
 if sys.argv[1:3] == ["terminal", "close"]:
     state.write_text("closed")

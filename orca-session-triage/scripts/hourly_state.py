@@ -36,6 +36,7 @@ import uuid
 
 import answer_evidence
 import ask_state
+from commitment_store import CommitmentWriteError, read_document, writing
 import hourly_runs
 import hourly_runtime
 import inbox_read
@@ -786,10 +787,11 @@ def waiting_sender(waits_on: str, report: dict) -> bool:
 
 
 def read(path: Path) -> dict:
-    if not path.exists():
+    document = read_document(path)
+    if document is None:
         return {"version": 1, "left": {}, "questions": {}, "handoffs": {}, "requests": {}, "user_waits": {},
                 "presented": {}, "comments": {}}
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(document)
     if not isinstance(data, dict) or data.get("version") != 1 or any(
             not isinstance(data.get(key), dict) for key in ("left", "questions", "handoffs")) or any(
                 not isinstance(data.get(key, {}), dict) for key in ("requests", "user_waits", "presented", "comments")):
@@ -803,18 +805,21 @@ def read(path: Path) -> dict:
 
 
 def save(path: Path, data: dict) -> None:
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                     prefix=path.name + ".", delete=False) as output:
-        temp = Path(output.name)
-        try:
-            json.dump(data, output, ensure_ascii=False, indent=2)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        except BaseException:
-            temp.unlink(missing_ok=True)
-            raise
-    temp.replace(path)
+    document = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with writing(path, document=document) as write_file:
+        if not write_file:
+            return
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as output:
+            temp = Path(output.name)
+            try:
+                output.write(document)
+                output.flush()
+                os.fsync(output.fileno())
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
+        temp.replace(path)
 
 
 def stamp() -> str:
@@ -1890,7 +1895,7 @@ def main(argv: list[str] | None = None) -> int:
                     skipped = True
                     notices.append(f"記録しなかった: 既存 {item['id']}（取り下げ済み）"
                                    + (f"。置き換え先: {item['replaced_by']}" if item.get("replaced_by") else ""))
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, CommitmentWriteError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
     if args.action == "asking" and args.summary and isinstance(result, list):

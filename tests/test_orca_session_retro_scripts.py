@@ -39,6 +39,10 @@ import retro  # noqa: E402
 import retro_service  # noqa: E402
 import stop_check  # noqa: E402
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
+
 
 def transcript(path: Path, cwd: str = "/tmp/hourly-triage") -> None:
     rows = [

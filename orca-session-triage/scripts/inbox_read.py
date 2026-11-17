@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -64,6 +64,7 @@ import time
 from typing import Literal, NamedTuple, cast
 
 import answer_evidence
+from commitment_store import CommitmentWriteError, read_lines, writing
 import hourly_runtime
 import json_output
 
@@ -227,7 +228,7 @@ def claims_path() -> Path:
 
 def read_claims(path: Path) -> dict[str, Claim]:
     """The latest claim on each ask or question id."""
-    return parsed_claims(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return parsed_claims("".join(read_lines(path)))
 
 
 def parsed_claims(text: str) -> dict[str, Claim]:
@@ -458,10 +459,8 @@ def inbox_entries(inbox: Path) -> list[dict]:
 
 def answer_records(path: Path) -> dict[str, dict]:
     """The first delivered answer per id, else its first mark; a later delivery can supply a note-only mark's answer."""
-    if not path.exists():
-        return {}
     found: dict[str, dict] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in "".join(read_lines(path)).splitlines():
         try:
             record = json.loads(line)
         except ValueError:
@@ -641,14 +640,16 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = at or datetime.now().astimezone().isoformat(timespec="seconds")
     sender = answer_sender()
-    lines = "".join(json.dumps({"id": answer, "ts": stamp, "how": how, "sender": sender,
+    lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": sender,
                                **({"note": note} if note else {})},
-                               ensure_ascii=False) + "\n" for answer in ids)
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.write(lines)
-        stream.flush()
-        os.fsync(stream.fileno())
+                               ensure_ascii=False) + "\n" for answer in ids]
+    with writing(path, lines=lines) as write_file:
+        if write_file:
+            with path.open("a", encoding="utf-8") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                stream.writelines(lines)
+                stream.flush()
+                os.fsync(stream.fileno())
 
 
 def overlapping_claims(claims: dict[str, Claim], claimed: str, open_keys: frozenset[str]) -> list[Claim]:
@@ -667,10 +668,13 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
     question they cover: then return those claims and write nothing, so two tabs never both go on to ask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    with path.open("a+", encoding="utf-8") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.seek(0)
-        held = parsed_claims(stream.read())
+    with ExitStack() as locks:
+        lock = locks.enter_context(path.with_name(path.name + ".lock").open("a+"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stream = locks.enter_context(path.open("a+", encoding="utf-8")) if path.exists() else None
+        if stream is not None:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+        held = read_claims(path)
         taken = list({claim.id: claim for claimed in ids for claim in overlapping_claims(held, claimed, open_keys)
                       if claim.by != by}.values())
         if taken and not take_over:
@@ -678,10 +682,17 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
         # Taking over an ask also takes its questions another worktree claimed one by one.
         written = dict.fromkeys([*ids, *(claim.id for claim in taken
                                          if any(claim.id.startswith(f"{claimed}:") for claimed in ids))])
-        stream.write("".join(json.dumps({"id": claimed, "by": by, "ts": stamp}, ensure_ascii=False) + "\n"
-                             for claimed in written))
-        stream.flush()
-        os.fsync(stream.fileno())
+        lines = [json.dumps({"id": claimed, "by": by, "ts": stamp}, ensure_ascii=False) + "\n"
+                 for claimed in written]
+        with writing(path, lines=lines) as write_file:
+            if write_file:
+                if stream is None:
+                    stream = locks.enter_context(path.open("a+", encoding="utf-8"))
+                    fcntl.flock(stream, fcntl.LOCK_EX)
+                stream.seek(0, os.SEEK_END)
+                stream.writelines(lines)
+                stream.flush()
+                os.fsync(stream.fileno())
     return []
 
 
@@ -1217,7 +1228,8 @@ def main(argv: list[str] | None = None) -> int:
         save(cursor, args.position)
         print(f"acknowledged through {args.position}")
         return 0
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, sqlite3.Error) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError, sqlite3.Error,
+            CommitmentWriteError) as exc:
         print(f"inbox-read: {exc}", file=sys.stderr)
         return 1
 

@@ -31,6 +31,7 @@ from pathlib import Path
 import re
 
 import lead_decisions
+from commitment_store import read_lines
 import scan_sessions
 
 # How ask-answers.jsonl records an answer send delivered to the ask, with and without --decision.
@@ -167,9 +168,7 @@ def decisions(log: Path) -> Iterator[Answer]:
 
 
 def delivered(log: Path) -> Iterator[Answer]:
-    if not log.exists():
-        return
-    for raw in log.read_text(encoding="utf-8").splitlines():
+    for raw in "".join(read_lines(log)).splitlines():
         try:
             record = json.loads(raw)
         except ValueError:

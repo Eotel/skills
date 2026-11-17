@@ -20,6 +20,10 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "orca-session-triage" / "scripts"
 sys.path.insert(0, str(SCRIPTS))

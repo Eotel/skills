@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import hourly_runtime
+from commitment_store import read_document
 import scan_sessions
 
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
@@ -272,9 +273,10 @@ def screen_blockers(term: dict, screen: dict) -> list[str]:
 
 
 def no_pending_questions(state_file: Path, pane: str) -> bool:
-    if not state_file.exists():
+    document = read_document(state_file)
+    if document is None:
         return True
-    data = json.loads(state_file.read_text())
+    data = json.loads(document)
     questions = data["questions"]
     return isinstance(questions, dict) and all(
         isinstance(question, dict) and
@@ -298,9 +300,10 @@ def settled_selector(state_file: Path, pane: str, transcript: Path, screen: dict
     prompt = scan_sessions.question_prompt(screen, pane)
     if screen.get("source") != "screen" or not prompt or scan_sessions.permission_prompt(screen, pane):
         return False
-    if not state_file.exists():
+    document = read_document(state_file)
+    if document is None:
         return False
-    records = [item for item in json.loads(state_file.read_text())["questions"].values()
+    records = [item for item in json.loads(document)["questions"].values()
                if item.get("owner_pane") == pane and item.get("session") in (None, transcript.stem)]
     pending = [(asked, taken, left) for asked, taken, left in hourly_state.paired_calls(records, transcript)
                if not asked[0].result_received]

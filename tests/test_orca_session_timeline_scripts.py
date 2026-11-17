@@ -9,11 +9,15 @@ import sys
 import tempfile
 import unittest
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts" / "timeline.py"
 # orca is outside this repository: answer `orca terminal list --json` with the terminals in FAKE_ORCA_TERMINALS.
 FAKE_ORCA = """#!{python}
 import json, os, sys
+
 if sys.argv[1:3] != ["terminal", "list"]:
     sys.exit("unexpected orca call: " + " ".join(sys.argv[1:]))
 print(json.dumps({{"ok": True, "result": {{"terminals": json.loads(os.environ["FAKE_ORCA_TERMINALS"])}}}}))

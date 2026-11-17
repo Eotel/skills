@@ -10,6 +10,10 @@ import sys
 import tempfile
 import unittest
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "orca-session-triage/scripts"
 

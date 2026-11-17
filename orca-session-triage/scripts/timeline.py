@@ -44,6 +44,7 @@ import sys
 from typing import BinaryIO, Literal, Protocol
 
 import inbox_read
+from commitment_store import read_lines
 
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
@@ -223,10 +224,7 @@ class Records:
 
 def entries(path: Path) -> list[dict]:
     """A JSON Lines record's objects; a missing record is empty and a damaged line is skipped."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return []
+    text = "".join(read_lines(path))
     return [item for item in map(parse, text.splitlines()) if item is not None]
 
 

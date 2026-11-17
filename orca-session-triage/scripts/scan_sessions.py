@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hourly_runtime
 import inbox_read
+from commitment_store import read_document, read_lines
 import retro_ledger
 import rm_check
 from worktree_notes import keep_note
@@ -2406,7 +2407,14 @@ def row_final_at(row: dict) -> str | None:
 def ask_answers(path: Path) -> dict[str, AnsweredAsk]:
     """The latest answer to each ask id, or `<ask id>:<n>` question, that inbox_read.py recorded."""
     try:
-        records = load_jsonl(path)
+        records = []
+        for line in read_lines(path):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
     except (OSError, UnicodeDecodeError):
         return {}
     timed = sorted(((at, record) for record in records if isinstance(record.get("id"), str)
@@ -2563,9 +2571,10 @@ def row_identity(row: Mapping) -> str:
 
 def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
     """Undelivered promises addressed to this row, read again before closing its tabs."""
-    if not state_file.exists():
+    document = read_document(state_file)
+    if document is None:
         return []
-    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data = json.loads(document)
     names = handoff_names(row)
     return [item for item in data.get("handoffs", {}).values()
             if item.get("delivered_at") is None and item.get("to") in names]

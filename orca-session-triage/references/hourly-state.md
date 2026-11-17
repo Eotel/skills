@@ -1,12 +1,22 @@
 # State shared by hourly runs
 
-The hourly automation starts a fresh session each time. Read the single state
-file with `~/.claude/skills/orca-session-triage/scripts/hourly_state.py show` at the start of the run and
+The hourly automation starts a fresh session each time. Read the shared state
+with `~/.claude/skills/orca-session-triage/scripts/hourly_state.py show` at the start of the run and
 again immediately before asking or acting on a saved decision. The default is
-`~/.cache/orca-session-triage/hourly-state.json`. The script locks and replaces
-it on writes. Keep the file when changing the automation; it carries decisions
-across sessions. If it is malformed, repair it from its contents before running
-another triage: the script refuses to overwrite it.
+`~/.cache/orca-session-triage/hourly-state.json`. File writes keep the script's
+lock and atomic replacement. Keep the stored state when changing the automation;
+it carries decisions across sessions. If it is malformed, repair it from its
+contents before running another triage: the script refuses to overwrite it.
+
+Reads and writes of `hourly-state.json`, `lead-decisions.jsonl`,
+`handed-off.jsonl`, `ask-answers.jsonl`, and `ask-claims.jsonl` use
+`$ORCA_BRIEFS_BIN/orca_board_commitments.py` (default
+`~/.cache/orca-briefs/bin`). Without that component they use the files directly.
+In `file-first` the component leaves storage to the files; in `db-first` it
+updates the board DB before the same bytes go to the files. `db-read` also
+reads from the DB mirror, and `db-only` reads and writes only the board DB.
+A failed DB write prints its error and exits 1 without that file write.
+`triage-inbox.jsonl` and `holds.sqlite` remain plain files.
 
 The commands below use that script path. They accept `--state-file PATH` before
 the subcommand for an isolated copy. Use a local scratch file for each exact
