@@ -22,6 +22,7 @@ from typing import Any
 
 import hourly_runtime
 from commitment_store import read_document
+import orca_agent_status
 import scan_sessions
 
 SPINNERS = set("◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✻✽✢·")
@@ -43,11 +44,8 @@ class PaneSession:
 
 def saved_sessions(path: Path, workspace: str) -> dict[str, PaneSession]:
     """The provider conversation each pane last reported through Orca's agent hooks."""
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
     sessions = {}
-    for pane, entry in (data.get("entries") or {}).items():
+    for pane, entry in orca_agent_status.pane_entries(path).items():
         if hourly_runtime.workspace_path(entry.get("worktreeId")) != os.path.realpath(workspace):
             continue
         provider = entry.get("providerSession") or {}
@@ -367,9 +365,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-file", type=Path, default=Path.home() /
                         ".cache/orca-session-triage/hourly-state.json")
     parser.add_argument("--min-idle-minutes", type=int, default=5)
-    parser.add_argument("--agent-status-file", type=Path, default=Path.home() /
-                        "Library/Application Support/orca/agent-hooks/last-status.json",
-                        help="Orca's saved pane and provider-session records (default: %(default)s)")
+    parser.add_argument("--agent-status-file", type=Path, default=orca_agent_status.DEFAULT_PATH,
+                        help="Orca's saved pane and provider-session records, last-status.db "
+                             "(default: %(default)s); a missing or unreadable file stops the cleanup")
     args = parser.parse_args(argv)
     if not args.workspace:
         parser.error("--workspace or ORCA_WORKTREE_ID is required")
