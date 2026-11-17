@@ -414,6 +414,8 @@ class RecoveryTests(unittest.TestCase):
 
         self.assertIn("11/15 10:20・11/15 20:05 に立て直した。3 回目はせず", self.reason(lane, records))
         self.assertIn("立て直し（1 回目）", self.reason({**self.stopped("connection"), "path": "/w/app/other"}, records))
+        # A lane of the same name in another repository is another work.
+        self.assertIn("立て直し（1 回目）", self.reason({**lane, "path": "/w/lib/cut-2", "repo": "lib"}, records))
 
 
 class LiveProbeTests(unittest.TestCase):

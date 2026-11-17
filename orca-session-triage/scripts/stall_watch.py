@@ -116,7 +116,7 @@ STEPS = {"connection": "通信断。同じ続きを送る（止まったとこ�
          "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
          "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
                        " spawn-lane し、今の担当は止める）"}
-HANDED_TO = re.compile(r"立て直し[:：]\s*([\w.-]+)\s*(?:→|->)\s*([\w.-]+)")
+HANDED_TO = re.compile(r"立て直し[:：]\s*([\w.:/-]+)\s*(?:→|->)\s*([\w.:/-]+)")
 SEND_LANDS = timedelta(minutes=1)
 PERSON_STEPS = {"login": "人がログインし直す（起こしても直らない）", "other": "人がエラーを読む（起こしても同じエラーになる）"}
 DECISION_MARKER = "要判断"
@@ -499,15 +499,17 @@ def recoveries(row: Mapping, records: Records, now: datetime) -> list[datetime]:
         return tuple(answer for answer in records.answers_by_ask.get(stop.ask, ()) if answer.at <= now)
 
     def handoffs(work: str, stop: EarlierStop) -> list[tuple[Answer, str]]:
-        return [(answer, new) for answer in answered(stop) if answer.how == "inbox_read.py answered"
-                for old, new in HANDED_TO.findall(answer.note) if old == work.rpartition("/")[2]]
+        """A bare new worktree name is in the old work's repository and on its Mac."""
+        place = work.rpartition("/")[0]
+        return [(answer, new if "/" in new or not place else f"{place}/{new}") for answer in answered(stop)
+                if answer.how == "inbox_read.py answered" for old, new in HANDED_TO.findall(answer.note)
+                if old in (work, work.rpartition("/")[2])]
 
     handed = {new: work for work, stops in records.stops_by_work.items() for stop in stops
               for _, new in handoffs(work, stop)}
-    chain, name = [work_name(row)], Path(row["path"]).name
-    while (earlier := handed.get(name)) and earlier not in chain:
+    chain = [work_name(row)]
+    while (earlier := handed.get(chain[-1])) and earlier not in chain:
         chain.append(earlier)
-        name = earlier.rpartition("/")[2]
     found = set()
     for work in chain:
         lane = tabs(work.rpartition("/")[2]) | (handles(row) if work == chain[0] else set())

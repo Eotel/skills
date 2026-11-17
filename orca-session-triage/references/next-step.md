@@ -63,8 +63,9 @@ names the step in each signal's 「立て直し」:
 
 After a new lane takes the work, close the signal with
 `inbox_read.py answered <id> --note "立て直し: <old worktree> → <new worktree>"`
-(worktree names; one pair per lane the ask named): the new lane then carries
-the work's recoveries.
+(one pair per lane the ask named; a bare name is in the old work's repository
+and on its Mac, else write it as the ask does, `<environment>::repo/name`):
+the new lane then carries the work's recoveries.
 | No error (`idle_after_report`, or `busy_without_progress` whose calls succeed) | read its screen, then continue it with one line, close it, or wait |
 
 A work recovered twice is not recovered a third time. When its signal says
