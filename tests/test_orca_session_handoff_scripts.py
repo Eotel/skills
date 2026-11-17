@@ -12,6 +12,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts" / "handoff.py"
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location("lead_decisions", SCRIPT.with_name("lead_decisions.py"))
 assert spec is not None and spec.loader is not None
 lead_decisions = importlib.util.module_from_spec(spec)
@@ -38,6 +39,7 @@ class HandoffTests(unittest.TestCase):
         self.body = self.root / "body.txt"
         self.body.write_text("定時の引き継ぎ: A を消してよいか\n")
         self.handoffs = self.root / "handoffs"
+        self.board = self.root / "events.jsonl"
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -47,6 +49,7 @@ class HandoffTests(unittest.TestCase):
                                "--decisions-file", str(self.decisions), "--handed-off-file", str(self.handed_off),
                                "--state-file", str(self.root / "hourly-state.json"),
                                "--claude-projects", str(self.projects), "--handoffs-dir", str(self.handoffs),
+                               "--board-events", str(self.board),
                                "--notify", str(self.notify), "--body-file", str(self.body), *args],
                               capture_output=True, text=True,
                               env={**os.environ, "ORCA_WORKTREE_ID": "repo1::/w/triage", "TRIAGE_HOST": "mac-a",
@@ -131,6 +134,43 @@ class HandoffTests(unittest.TestCase):
                 self.assertEqual(both.returncode, 0, both.stderr)
                 self.sent.unlink()
                 self.handed_off.unlink()
+
+    def test_refuses_while_the_lead_handed_work_to_a_worktree_the_body_names(self) -> None:
+        scanned = {"id": "s1", "ts": "2026-11-16T09:00:00+09:00", "kind": "info", "worktree": "fix-ledger",
+                   "handle": "term_fix", "text": "調べ終わりました"}
+        seen = json.dumps(scanned, ensure_ascii=False) + "\n"
+        self.inbox.write_text(seen)
+        lead = {"type": "send", "source": "send", "from": "term_lead", "worktree": "triage-lead"}
+        self.board.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in [
+            {**lead, "id": "old00000-send", "ts": "2026-11-16T08:50:00+0900", "to": "term_fix", "text": "前の依頼"},
+            {**lead, "id": "a7b6d5ce-send", "ts": "2026-11-16T09:01:51+0900", "to": "term_fix",
+             "text": "#18 の新しい依頼です（PR を作る）"},
+            {**lead, "id": "unnamed0-send", "ts": "2026-11-16T09:02:00+0900", "to": "term_other", "text": "別の作業場へ"},
+            {"type": "send", "source": "send", "id": "lane0000-send", "ts": "2026-11-16T09:03:00+0900",
+             "from": "term_lane", "worktree": "read-prod", "to": "term_fix", "text": "担当どうしの連絡"},
+            {"type": "start", "source": "spawn-lane", "id": "d1de47a2-start", "ts": "2026-11-16T09:07:28+0900",
+             "from": "term_lead", "to": "term_new", "worktree": "/w/jst-fix", "task": "jst-fix",
+             "brief": "/b/jst-fix.md"}]))
+        self.body.write_text("閉じる候補: fix-ledger（分類の判定 finished）と jst-fix\n")
+        args = ("--since", str(len(seen.encode())), "--lead-worktree", "/w/triage-lead")
+
+        refused = self.run_tool(*args)
+        self.assertFalse(self.sent.exists())
+        reflected = self.run_tool(*args, "--seen", "a7b6d5ce", "--seen", "d1de47a2")
+
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("11/16 09:01:51 送った triage-lead → fix-ledger id=a7b6d5ce-send  #18 の新しい依頼です",
+                      refused.stderr)
+        self.assertIn("id=d1de47a2-start", refused.stderr)
+        for other in ("old00000", "unnamed0", "lane0000"):
+            self.assertNotIn(other, refused.stderr)
+        self.assertEqual(reflected.returncode, 0, reflected.stderr)
+        self.sent.unlink()
+        self.body.write_text("閉じる候補は上の鍵の 1 件\n")
+        keyed = self.run_tool(*args, "--decision", "remove:mac::/w/fix-ledger")
+        self.assertEqual(keyed.returncode, 1, keyed.stderr)
+        self.assertIn("id=a7b6d5ce-send", keyed.stderr)
+        self.assertFalse(self.sent.exists())
 
     def test_lead_state_marks_only_notifications_whose_every_report_was_read_or_answered(self) -> None:
         ids = [f"aaaaaaaa-0000-0000-0000-{number:012d}" for number in range(8)]

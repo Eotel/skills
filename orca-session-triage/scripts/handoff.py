@@ -23,7 +23,10 @@ An answer delivered by this same source worktree and session is labelled 「（�
 The shared answer writer records that source for send and inbox_read.py answered; older records or an unknown
 session still need --seen, and an administrative answered mark is not a delivery.
 An ask or info received after --since from a worktree named by --decision remove:PATH (also
-remove:ENVIRONMENT::PATH) likewise needs --seen before recommending its removal.
+remove:ENVIRONMENT::PATH) likewise needs --seen before recommending its removal. So does each send and
+spawn-lane by which the lead handed work after --since (the board's event log, --board-events) to a worktree
+the body names by its name, or a remove: key names: a verdict written before that work, such as a close
+candidate, is stale. Each prints with its time, target, and opening text.
 `search WORD...` prints each kept handoff whose text or decision keys hold any of the words (case ignored): its
 time, kind, and file, then the matching lines and keys.
 `--decision-ask KEY=ID` binds a key to an inbox ask in the handed-off log.
@@ -69,6 +72,7 @@ import hourly_state
 import json_output
 import lead_decisions
 import scan_sessions
+import timeline
 
 NOTIFY = "~/.cache/orca-briefs/bin/triage-notify"
 INBOX = "~/.cache/orca-briefs/triage-inbox.jsonl"
@@ -172,6 +176,11 @@ class Reason(NamedTuple):
     own: bool = False
 
 
+def read_time(before: list[dict]) -> datetime | None:
+    """When the inbox the run read at `since` was last written: the newest report before it."""
+    return max(filter(None, (scan_sessions.parse_time(item.get("ts")) for item in before)), default=None)
+
+
 def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_read.Sender, handle: str,
               answers: Path) -> list[Reason]:
     """What reached the inbox or the answer records after `since` that the handoff may repeat or contradict:
@@ -182,7 +191,7 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
              for item in after if sender.sent(item) and item.get("handle", "") != handle]
     named = {item["id"] for item in [*before, *after] if item.get("kind") == "ask" and isinstance(item.get("id"), str)
              and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
-    read_at = max(filter(None, (scan_sessions.parse_time(item.get("ts")) for item in before)), default=None)
+    read_at = read_time(before)
     try:
         records = answers.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -205,16 +214,40 @@ def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
             and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
 
 
+def removal_targets(keys: list[str]) -> set[str]:
+    """The leaf of each worktree a remove: key names, as inbox reports name a worktree."""
+    return {Path(key.removeprefix("remove:").split("::", 1)[-1]).name for key in keys if key.startswith("remove:")}
+
+
 def removal_reports(keys: list[str], reports: list[dict]) -> list[Reason]:
     """A target's new report can change the recommendation even when its id is absent from the body.
 
     Inbox reports name the worktree by its leaf, so same-name worktrees on other hosts also require review.
     """
-    targets = {Path(key.removeprefix("remove:").split("::", 1)[-1]).name
-               for key in keys if key.startswith("remove:")}
+    targets = removal_targets(keys)
     return [Reason(str(item.get("id") or ""),
                    f"{report_head(item)} (removal target reported)  {excerpt(item.get('text'))}")
             for item in reports if item.get("kind") in ("ask", "info") and item.get("worktree") in targets]
+
+
+def handed_work(board: list[dict], reports: list[dict], lead: str, since: datetime | None, body: str,
+                keys: list[str]) -> list[Reason]:
+    """Each send and spawn-lane of the lead at or after `since` to a worktree the body names, or a remove: key names:
+    a verdict on it written before that work, such as a close candidate, is stale.
+
+    The lead is each tab that sent from the lead's worktree; a target is named by its leaf, as inbox reports name it.
+    """
+    name = Path(lead).name
+    handles = {str(item["from"]) for item in board
+               if item.get("type") == "send" and item.get("from") and item.get("worktree") == name}
+    lanes = timeline.Names({**timeline.recorded_names(reports, board), **dict.fromkeys(handles, name)})
+    window = timeline.Window(since or datetime.min.replace(tzinfo=timezone.utc), None)
+    targets = removal_targets(keys)
+    return [Reason(event.ref, f"- {event.at:%m/%d %H:%M:%S} {event.kind} {event.lane} → {event.to} id={event.ref}  "
+                              f"{excerpt(event.text)}")
+            for event in timeline.board_events(board, window, lanes)
+            if event.kind in (timeline.SENT, timeline.STARTED) and event.lane == name and event.to
+            and (event.to in targets or re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(event.to)}(?![A-Za-z0-9_-])", body))]
 
 
 def search(directory: Path, words: list[str], since: datetime | None) -> int:
@@ -534,12 +567,16 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
     found.extend(removal_reports(keys, after))
+    if args.lead_worktree:
+        found.extend(handed_work(timeline.entries(args.board_events.expanduser()), [*before, *after],
+                                 args.lead_worktree, read_time(before), body, keys))
     if own := [reason.line for reason in found if reason.own]:
         print("handoff: this run's deliveries need no --seen:", *own, sep="\n", file=sys.stderr)
     if not args.force and (left := unseen(found, args.seen)):
         print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
-              "was answered, or a removal target sent an ask/info. Read each one in full "
-              "(inbox_read.py read --id ID) and fix the body; then pass --seen ID "
+              "was answered, or a removal target sent an ask/info, or the lead handed work (send, spawn-lane) to a "
+              "worktree the body or a remove: key names. Read each one in full (inbox_read.py read --id ID; a send "
+              "or spawn-lane with timeline.py --since HH:MM --lane NAME --json) and fix the body; then pass --seen ID "
               "for each one the body reflects, or --force to send it as written:",
               *left, sep="\n", file=sys.stderr)
         return 1
@@ -623,14 +660,19 @@ def main(argv: list[str] | None = None) -> int:
                               help="a report or answered ask the body already reflects, by its id or first 8+ "
                                    "characters, taken off the reasons not to send; repeat per id")
     send_command.add_argument("--force", action="store_true",
-                              help="send past every check: a later scheduled run, another tab's reports, and "
-                                   "answers to the asks the body names, and removal targets' new reports")
+                              help="send past every check: a later scheduled run, another tab's reports, "
+                                   "answers to the asks the body names, removal targets' new reports, and the "
+                                   "lead's sends to worktrees the body names")
     send_command.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                               help="Orca CLI executable that lists the later scheduled runs (default: %(default)s)")
     send_command.add_argument("--kind", choices=("ask", "info"), default="ask",
                               help="triage-notify kind (default: ask)")
     send_command.add_argument("--inbox", type=Path, default=Path(os.environ.get("TRIAGE_INBOX") or INBOX),
                               help="triage inbox (default: $TRIAGE_INBOX or %(default)s)")
+    send_command.add_argument("--board-events", type=Path,
+                              default=Path(os.environ.get("ORCA_BOARD_EVENTS") or timeline.BOARD_EVENTS),
+                              help="the board's event log, where send and spawn-lane record the work they hand a "
+                                   "worktree (default: $ORCA_BOARD_EVENTS or %(default)s)")
     send_command.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                               help="the lead's decision log (default: %(default)s)")
     send_command.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG,
