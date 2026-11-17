@@ -9164,12 +9164,30 @@ class StopCheckTests(unittest.TestCase):
         (self.root / "read.offset").write_text("0")
         # The answer hook reads the hourly state and the inbox; a host's real ones must never reach a test run.
         for isolated in (patch.object(stopcheck, "HOURLY_STATE", str(self.root / "hourly-state.json")),
+                         patch.object(Path, "home", return_value=self.root),
                          patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl")})):
             isolated.start()
             self.addCleanup(isolated.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_repeated_stop_reports_the_exception_and_preserves_unread_ask_blocking(self) -> None:
+        reporter = self.root / ".agents/hooks/rule_events.py"
+        reporter.parent.mkdir(parents=True)
+        reporter.write_text(
+            "import json\nfrom pathlib import Path\n"
+            "def record_exception(rule: str, reason: str, payload: dict, words: list[str]) -> None:\n"
+            "    with (Path.home() / 'events.jsonl').open('a') as stream:\n"
+            "        stream.write(json.dumps(dict(payload, rule=rule, reason=reason, words=words)) + '\\n')\n")
+        with patch.object(stopcheck, "unread_ask_reason", return_value="unread ask"):
+            self.assertEqual(self.check(active=True), {"decision": "block", "reason": "unread ask"})
+        events = (self.root / "events.jsonl").read_text().splitlines()
+        self.assertEqual(len(events), 1)
+        event = json.loads(events[0])
+        self.assertEqual(event["rule"], "triage-stop-repeat")
+        self.assertEqual(event["reason"], "stop_hook_active=true")
+        self.assertEqual(event["session_id"], "s1")
 
     def queue(self, *paths: str, at: str = "2026-10-07T10:00:00+00:00") -> None:
         (self.dir / "review-queue.json").write_text(json.dumps(
