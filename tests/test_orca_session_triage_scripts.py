@@ -4280,10 +4280,11 @@ class RmCheckTests(unittest.TestCase):
 
     def test_ignored_composer_vendor_and_vite_out_dir_are_regenerable_beside_their_tracked_configs(self) -> None:
         # 2026-11-16 a PHP worktree held 48 vendor/<package>/ lines as unknown (87b26b40); 2026-11-17
-        # orca-board's orca_board/static/, the outDir of its vite.config.js, was held the same way (c087cb4c).
+        # orca-board's orca_board/static/, the outDir of its vite.config.js, was held the same way (c087cb4c): that
+        # config moves root, but names outDir from its own file's URL.
         sources = {"composer.json": "{}\n", "composer.lock": "{}\n", "tools/composer.json": "{}\n",
                    "lib/composer.json": '{"config": {"vendor-dir": "deps"}}\n', "lib/composer.lock": "{}\n",
-                   "vite.config.js": 'export default {\n  build: {\n'
+                   "vite.config.js": 'export default {\n  root: "web",\n  build: {\n'
                                      '    outDir: fileURLToPath(new URL("./orca_board/static", import.meta.url)),\n'
                                      '    // outDir: "old_static",\n    /*\n    outDir: "private_build",\n    */\n'
                                      '  },\n}\n',

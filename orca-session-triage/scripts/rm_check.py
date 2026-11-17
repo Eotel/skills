@@ -77,8 +77,10 @@ COMPOSER_MANIFESTS = ("composer.json", "composer.lock")
 VITE_CONFIGS = ":(glob)**/vite.config.*"
 VITE_SUFFIXES = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts")
 VITE_OUT_DIR = re.compile(r"^\s*outDir\s*:(.*)$", re.MULTILINE)
-# A config that moves Vite's root resolves a relative outDir from there, so it is not read.
+# A config that moves Vite's root resolves a relative outDir from there, so beside it only an outDir named from the
+# config's own file (import.meta.url, __dirname) is read.
 VITE_ROOT = re.compile(r"""\broot['"]?\s*:""")
+VITE_FROM_CONFIG = re.compile(r"\bimport\.meta\.url\b|\b__dirname\b")
 JS_STRING = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 JS_STRING_OR_COMMENT = re.compile(r"""("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|/\*.*?\*/|//[^\n]*""",
                                   re.DOTALL)
@@ -400,12 +402,13 @@ def vite_config_writing(worktree: Path, path: PurePosixPath) -> PurePosixPath | 
                                             (worktree / config).read_text(errors="replace"))
         except OSError:
             continue
-        if VITE_ROOT.search(text):
-            continue
+        moves_root = VITE_ROOT.search(text) is not None
         for found in VITE_OUT_DIR.finditer(text):
-            parts = [literal for _, literal in JS_STRING.findall(found.group(1))]
-            if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(
-                    JS_STRING.sub("", found.group(1))):
+            value = found.group(1)
+            parts = [literal for _, literal in JS_STRING.findall(value)]
+            if not parts or any("${" in part for part in parts) or not VITE_PATH_CALL.fullmatch(JS_STRING.sub("", value)):
+                continue
+            if moves_root and not VITE_FROM_CONFIG.search(value):
                 continue
             out = PurePosixPath(posixpath.normpath(config.parent.joinpath(*parts)))
             if ".." not in out.parts and config.parent in out.parents and within(str(path), str(out)):

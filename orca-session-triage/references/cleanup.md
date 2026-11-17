@@ -152,10 +152,12 @@ Run these per worktree, in order.
      `target/` beside `Cargo.toml`, Tauri's `gen/schemas/` beside
      `tauri.conf.json`, Composer's `vendor/` (or each path in it) beside a tracked
      `composer.json` that sets no other `vendor-dir` and a tracked `composer.lock`,
-     the `outDir` a tracked `vite.config.*` that sets no `root` names on its
-     `outDir:` line (comments outside string literals left out; a value of string
-     literals and the calls that join them, such as `fileURLToPath(new URL(…))`,
-     read as path parts from the config's directory; only a directory below it), a directory whose every zip is one a Terraform
+     the `outDir` a tracked `vite.config.*` names on its `outDir:` line (comments
+     outside string literals left out; a value of string literals and the calls
+     that join them, such as `fileURLToPath(new URL(…))`, read as path parts from
+     the config's directory; only a directory below it; in a config that sets
+     `root`, only an outDir named from the config's file through `import.meta.url`
+     or `__dirname`), a directory whose every zip is one a Terraform
      `archive_file` block beside it (comments left out) declares with `output_path =
      "${path.module}/<dir>/…"`, an interpolation such as `${each.key}`
      standing for one path segment, and a
