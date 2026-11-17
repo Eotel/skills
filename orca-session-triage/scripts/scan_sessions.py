@@ -18,7 +18,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from itertools import dropwhile, takewhile
 import hashlib
@@ -33,7 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, NamedTuple, NotRequired, TypedDict
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -368,6 +368,7 @@ def running_claude_transcripts(worktree_paths: Sequence[str], session_dirs: Sequ
 # Lines read from the end of a transcript for its newest entry.
 TAIL_LINES = 400
 EPOCH = datetime.fromtimestamp(0, timezone.utc)
+JST = timezone(timedelta(hours=9))
 
 
 def last_entry_at(path: Path) -> datetime | None:
@@ -440,6 +441,7 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
     last = max((i for i, e in enumerate(rows) if is_real_user_message(e)), default=-1)
     texts, final_at, asked, answered, api_error, api_error_kind = [], None, {}, set(), None, None
     question_times: dict[str, str] = {}
+    call_times: dict[str, str] = {}
     for entry in rows[last + 1:]:
         content = message_of(entry).get("content")
         if not isinstance(content, list):
@@ -457,6 +459,8 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
                 asked[block.get("id")] = block.get("input")
                 if entry.get("timestamp"):
                     question_times[block.get("id")] = entry["timestamp"]
+            elif kind == "tool_use" and entry.get("timestamp"):
+                call_times[block.get("id")] = entry["timestamp"]
             elif kind == "tool_result":
                 answered.add(block.get("tool_use_id"))
     return {
@@ -467,6 +471,7 @@ def read_claude(projects_root: str | Path, worktree_path: str, running: Sequence
         "final_at": final_at,
         "pending_questions": [q for i, q in asked.items() if i not in answered],
         "pending_question_at": max((at for key, at in question_times.items() if key not in answered), default=None),
+        "pending_call_at": max((at for key, at in call_times.items() if key not in answered), default=None),
         "api_error": api_error,
         "api_error_kind": api_error_kind,
         "one_shot_schedules": one_shot_schedules(rows),
@@ -536,6 +541,7 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     return cwd, {
         "rollout": str(path),
         "last_user": last_user[1] if last_user else None,
+        "last_user_at": last_user[0] if last_user else None,
         "last_assistant": last_assistant,
         "last_assistant_at": last_assistant_at,
         "last_role": last_role,
@@ -1097,6 +1103,20 @@ def question_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     return {"tab": tab, "question": unwrapped(asked), "choices": [CHOICE.sub(r"\1", line) for line in choices]}
 
 
+def waiting_prompt(terms: list[dict], screens: Screens,
+                   environment: str | None) -> tuple[PromptWaiting, Literal["pending_call_at", "pending_question_at"]] | None:
+    """The first prompt a tab's screen waits on, with the transcript field that says when it was asked: a permission
+    prompt holds back the tool call it asks about, and a selector is an AskUserQuestion call."""
+    for term in terms:
+        if not term.get("handle") or not (screen := rendered(screens.get((environment, term["handle"])))):
+            continue
+        if prompt := permission_prompt(screen, term["handle"]):
+            return prompt, "pending_call_at"
+        if prompt := question_prompt(screen, term["handle"]):
+            return prompt, "pending_question_at"
+    return None
+
+
 def screen_tail(screen: dict) -> list[str]:
     """The last lines a rendered screen shows, without blank lines and rules."""
     shown = [line.strip() for line in screen_lines(screen) if line.strip() and not RULE.fullmatch(line.strip())]
@@ -1562,6 +1582,26 @@ def with_processes(row: dict, now: float) -> tuple[str, list[str]]:
     return row["class"], row["reasons"]
 
 
+def one_per_path(worktrees: list[dict], terminals: list[dict]) -> tuple[list[dict], list[dict]]:
+    """One worktree per checkout. Orca lists a path once per repo it belongs to, which happens when a linked worktree
+    is also registered as a repo: the entry Orca created (else the one with a comment, else the first listed) keeps
+    the path, takes the others' agents and tabs, and names their repos in `_other_repos`."""
+    groups: dict[tuple[str | None, str], list[dict]] = {}
+    for w in worktrees:
+        groups.setdefault((w.get("_environment"), w["path"]), []).append(w)
+    kept, moved = [], {}
+    for group in groups.values():
+        first = max(group, key=lambda w: (w.get("createdAt") is not None, bool(w.get("comment"))))
+        others = [w for w in group if w is not first]
+        if others:
+            moved.update({(w.get("_environment"), w.get("worktreeId")): first.get("worktreeId") for w in others})
+            first = {**first, "agents": [agent for w in [first, *others] for agent in w.get("agents") or []],
+                     "_other_repos": [w.get("repo") for w in others]}
+        kept.append(first)
+    return kept, [{**term, "worktreeId": moved[place]} if (place := (term.get("_environment"), term.get("worktreeId")))
+                  in moved else term for term in terminals]
+
+
 def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: str | Path,
                     codex_by_cwd: dict[str, list[dict]], decision_marker: str, now: float | None = None,
                     shell_idle_minutes: float = 30, judge: Callable[[str], dict | None] = lambda message: None,
@@ -1586,6 +1626,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     """
     screens = screens or {}
     now = time.time() if now is None else now
+    worktrees, terminals = one_per_path(worktrees, terminals)
     by_worktree = {}
     for term in terminals:
         # An orphaned shell with no agent, title, screen, or output time cannot
@@ -1610,6 +1651,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         screen_said = ""
         if remote and not orca_said(w):
             terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"))
+        waiting = waiting_prompt(terms, screens, w.get("_environment"))
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
@@ -1624,20 +1666,18 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "codex_screen_error": next((error for t in terms if t.get("agentIdentity") == "codex"
                                         if (error := api_failure(t.get("preview")))), None),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
-            "prompt_waiting": next((prompt for term in terms if term.get("handle")
-                                    if (screen := rendered(screens.get((w.get("_environment"), term["handle"]))))
-                                    if (prompt := permission_prompt(screen, term["handle"])
-                                        or question_prompt(screen, term["handle"]))), None),
+            "prompt_waiting": waiting[0] if waiting else None,
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
         if not remote and (sessions := (live_sessions or {}).get(w["path"])):
             row["claude_sessions"] = sessions
+        if w.get("_other_repos"):
+            row["other_repos"] = w["_other_repos"]
         row["queued_input"] = (queued_input(Path(row["claude"]["transcript"]),
                                             datetime.fromtimestamp(now, timezone.utc)) if row["claude"] else [])
-        if row["prompt_waiting"] and "target" not in row["prompt_waiting"] and row["claude"]:
-            if asked_at := row["claude"].get("pending_question_at"):
-                row["prompt_waiting"]["asked_at"] = asked_at
+        if waiting and row["claude"] and (asked_at := row["claude"].get(waiting[1])):
+            waiting[0]["asked_at"] = asked_at
         if remote:
             spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
             if spoken:
@@ -2320,7 +2360,7 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
 QUEUE_FIELDS = ("path", "repo", "environment", "class", "reasons", "waits_on", "comment",
                 "jev", "pr", "git", "claude", "orca_message", "prompt_waiting")
 INBOX_FILE = "~/.cache/orca-briefs/triage-inbox.jsonl"
-INBOX_KINDS = ("done", "ask")
+INBOX_KINDS = ("done", "ask", "info")
 VERDICTS_FILE = "~/.cache/orca-session-triage/verdicts.json"
 VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finished")
 READ_CLASSES = ("unsure", "stalled", "waiting")
@@ -2375,7 +2415,7 @@ def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | Non
 
 
 def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
-    """The newest `done` and `ask` each worktree sent to the triage inbox, by (repo, worktree name).
+    """The newest `done`, `ask`, and `info` each worktree sent to the triage inbox, by (repo, worktree name).
 
     An entry from before reports named their repository is keyed by ("", name).
     Each ask keeps its id and, once covered, its latest answer's time and note.
@@ -2406,13 +2446,26 @@ def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
     return reports
 
 
+def last_instruction_at(row: dict) -> datetime | None:
+    """When the lane's Claude or Codex last took a prompt, or None when this Mac has neither transcript."""
+    codex = row.get("codex") or []
+    given = [parse_time(at) for at in ((row.get("claude") or {}).get("last_user_at"),
+                                       codex[-1].get("last_user_at") if codex else None) if at]
+    return max((at for at in given if at), default=None)
+
+
 def with_inbox(rows: list[dict], reports: InboxReports) -> list[dict]:
-    """Rows carry `inbox`: the newest done and ask their worktree reported, when it reported any."""
+    """Rows carry `inbox`: the newest done and ask their worktree reported, and the newest info it sent after the
+    lane's last instruction, when it reported any. A lane can deliver the work by info and end with other text."""
     def newest(row: dict) -> dict:
         name = Path(row["path"]).name
         found = [reports.get((row.get("repo") or "", name)) or {}, reports.get(("", name)) or {}]
-        return {kind: max(held, key=lambda report: parse_time(report["at"]) or EPOCH)
-                for kind in INBOX_KINDS if (held := [f[kind] for f in found if kind in f])}
+        inbox = {kind: max(held, key=lambda report: parse_time(report["at"]) or EPOCH)
+                 for kind in INBOX_KINDS if (held := [f[kind] for f in found if kind in f])}
+        if "info" in inbox and not ((began := last_instruction_at(row))
+                                    and (parse_time(inbox["info"]["at"]) or EPOCH) > began):
+            del inbox["info"]
+        return inbox
     return [{**row, "inbox": inbox} if (inbox := newest(row)) else row for row in rows]
 
 
@@ -2529,33 +2582,68 @@ def with_automation_workspaces(rows: list[dict], orca: str) -> list[dict]:
     return rows
 
 
-def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path) -> list[dict]:
+def promise_due(item: Mapping, now: datetime) -> bool:
+    """Whether a promise may go out now: it has no `not_before` date, or that date has come in JST."""
+    return not item.get("not_before") or now.astimezone(JST).date() >= date.fromisoformat(item["not_before"])
+
+
+def promise_task(item: Mapping) -> str:
+    return item.get("task") or item.get("condition") or ""
+
+
+def not_before_label(item: Mapping) -> str:
+    """「期限前（11/17）」 for a promise before its `not_before` date."""
+    day = date.fromisoformat(item["not_before"])
+    return f"期限前（{day.month}/{day.day}）"
+
+
+def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
+                             now: datetime | None = None) -> list[dict]:
+    """Keep the tabs and checkout of rows that a block, an undelivered promise, or a removal answer holds.
+
+    A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
+    reading a saved scan again does not repeat it. `removal_decision` is the newest answer to the row's own removal
+    keys and decides `allows_removal`; a newer answer to one of their `::` sub-keys is shown as its `newest`.
+    """
     import lead_decisions
     decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    now = now or datetime.now(timezone.utc)
+
+    def moment(item: lead_decisions.Decision) -> datetime:
+        return lead_decisions.moment(item.decided_at) or EPOCH
+
     for row in rows:
         if blocker := row.get("automation_blocker"):
             row.update(closable=[], open_pr_cleanup=False)
-            if blocker not in row.get("reasons", []):
-                row["reasons"] = [*row.get("reasons", []), blocker]
         promises = pending_handoffs(row, state_file)
+        due = [item for item in promises if promise_due(item, now)]
         if promises:
             row.update(pending_handoffs=promises, closable=[], open_pr_cleanup=False)
-            row["reasons"] = [*row.get("reasons", []), "未配信の約束の送り先: " +
-                              "; ".join(item.get("task") or item.get("condition") or "" for item in promises)]
+        if due:
             if row.get("class") == "finished":
                 row["class"] = "stalled"
             if (row.get("verdict") or {}).get("class") == "finished":
                 row.pop("verdict", None)
+        early = [item for item in promises if item not in due]
+        added = [*([blocker] if blocker else []),
+                 *(["未配信の約束の送り先: " + "; ".join(promise_task(item) for item in due)] if due else []),
+                 *(f"{not_before_label(item)}の約束の送り先: {promise_task(item)}" for item in early)]
+        row["reasons"] = [*row.get("reasons", []), *dict.fromkeys(reason for reason in added
+                                                                  if reason not in row.get("reasons", []))]
         keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}",
                 f"remove:{row['path']}", f"remove:{row_identity(row)}"}
         if not row.get("environment"):
             keys.add(f"remove:local::{row['path']}")
         answered = [decisions[key] for key in keys if key in decisions]
         if answered:
-            answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or
-                         datetime.min.replace(tzinfo=timezone.utc))
+            answer = max(answered, key=moment)
+            later = [item for key, item in decisions.items() if any(key.startswith(base + "::") for base in keys)
+                     and moment(item) > moment(answer)]
+            newest = max(later, key=moment) if later else None
             row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
-                                       "decided_at": answer.decided_at}
+                                       "decided_at": answer.decided_at,
+                                       **({"newest": {"decision": newest.decision, "answer": newest.answer,
+                                                      "decided_at": newest.decided_at}} if newest else {})}
         if answer := row.get("removal_decision"):
             answer["allows_removal"] = removal_approved(row)
         names = {row["path"], row_identity(row), row_name(row),
@@ -2978,7 +3066,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     views.add_argument("--cards", action="store_true",
                        help="print one line per done card (handle, agent, interrupted, first 60 draft characters, "
                             "whether its screen composer is empty, Orca's last message, and screen end), closable tab, and "
-                            "meaningful tab, each led by the worktree's name and class as in --rows")
+                            "meaningful tab, each led by the worktree's name and class as in --rows; with --row NAME "
+                            "(repeatable), only the named rows")
     parser.add_argument("--row", metavar="NAME", action="append", default=[],
                         help="print one row as JSON with fixed keys: " + ", ".join(ROW_KEYS) + ". "
                              "Strings are never null, `final` is the newest "
@@ -2989,7 +3078,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              'is owner/repo from origin; '
                              "NAME is repo/name, the last path segment (with optional ENVIRONMENT:: on another "
                              "Mac), its path, or its row identity. Reviews are read from $TRIAGE_REVIEW_DIR "
-                             "or " + REVIEW_DIR + ". With --rm-specs, repeatable: the spec of each named row")
+                             "or " + REVIEW_DIR + ". With --rm-specs or --cards, repeatable: the spec or the "
+                             "lines of each named row")
     views.add_argument("--rm-specs", action="store_true",
                        help="with --from, print <path> <PR|-> for this Mac's open_pr_cleanup rows and finished "
                             "rows without meaningful tabs, for rm-check-batch; another Mac's rows are counted on "
@@ -3007,8 +3097,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                         help="read the rows a previous scan printed as JSON instead of scanning again")
     parser.add_argument("--inbox", default=os.environ.get("TRIAGE_INBOX") or INBOX_FILE,
-                        help="triage inbox whose newest done and ask per worktree go into the review queue "
-                             "(default: $TRIAGE_INBOX or %(default)s)")
+                        help="triage inbox whose newest done and ask per worktree, and newest info since the "
+                             "lane's last instruction, go into the review queue (default: $TRIAGE_INBOX or %(default)s)")
     parser.add_argument("--ask-answers", default=str(inbox_read.answers_path()),
                         help="answer records for inbox asks (default: $TRIAGE_ASK_ANSWERS or %(default)s)")
     parser.add_argument("--verdicts", default=VERDICTS_FILE,
@@ -3030,12 +3120,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.classes and not args.rows:
         parser.error("--class needs --rows")
     if args.row and (other := next((flag for flag, on in (("--summary", args.summary), ("--rows", args.rows),
-                                                          ("--cards", args.cards), ("--wake", args.wake)) if on), None)):
+                                                          ("--wake", args.wake)) if on), None)):
         parser.error(f"argument --row: not allowed with argument {other}")
-    if len(args.row) > 1 and not args.rm_specs:
-        parser.error("--row is repeatable only with --rm-specs")
-    if args.transcripts and args.rm_specs:
-        parser.error("--transcripts needs --row without --rm-specs")
+    if len(args.row) > 1 and not (args.rm_specs or args.cards):
+        parser.error("--row is repeatable only with --rm-specs or --cards")
+    if args.transcripts and (args.rm_specs or args.cards):
+        parser.error("--transcripts needs --row without --rm-specs or --cards")
     if args.transcripts and not args.row:
         parser.error("--transcripts needs --row")
     return args
@@ -3076,7 +3166,9 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
         if blocker := row.get("automation_blocker"):
             print(f"{row_name(row)}: {blocker}")
         if answer := row.get("removal_decision"):
-            print(f"removal decision: {row_name(row)} {answer['decided_at']} {answer['answer']}")
+            newest = answer.get("newest")
+            print(f"removal decision: {row_name(row)} {answer['decided_at']} {answer['answer']}" + (
+                f" | newer {newest['decision']} {newest['decided_at']} {newest['answer']}" if newest else ""))
     hooks = [(row, error) for row in rows for error in row.get("hook_errors") or []]
     print(f"hook errors: {len(hooks)}")
     for row, error in hooks:
@@ -3088,26 +3180,40 @@ def row_name(row: Mapping) -> str:
     return f"{row['environment']}::{name}" if row.get("environment") else name
 
 
+def row_aliases(row: Mapping) -> list[str]:
+    """The names a view shows for a row, shortest first: name, repo/name (also under each other repo Orca lists the
+    path in), the name another Mac's row shows, that with repo/name, and the path."""
+    name = Path(row["path"]).name
+    qualified = [f"{repo or ''}/{name}" for repo in (row.get("repo"), *(row.get("other_repos") or []))]
+    remote = [f"{row['environment']}::{each}" for each in qualified] if row.get("environment") else []
+    return [name, *qualified, row_name(row), *remote, row["path"]]
+
+
+def matching_rows(rows: Sequence[dict], key: str) -> list[dict]:
+    """The rows `key` names, an exact identity taking precedence over aliases."""
+    return [row for row in rows if row_identity(row) == key] or [row for row in rows if key in row_aliases(row)]
+
+
+def row_choice(rows: Sequence[dict], row: dict) -> str:
+    """The name the views show when it selects the row alone, else its first alias that does, else its identity."""
+    return next((alias for alias in (row_name(row), *row_aliases(row))
+                 if len(found := matching_rows(rows, alias)) == 1 and found[0] is row), row_identity(row))
+
+
 def select_row(rows: Sequence[dict], key: str, option: str = "--row") -> dict:
-    """Resolve names shown by the views, with an exact identity taking precedence over aliases."""
-    found = [row for row in rows if row_identity(row) == key]
-    if not found:
-        for row in rows:
-            name = Path(row["path"]).name
-            qualified = f"{row.get('repo') or ''}/{name}"
-            aliases = (row["path"], name, qualified, row_name(row),
-                       f"{row['environment']}::{qualified}" if row.get("environment") else qualified)
-            if key in aliases:
-                found.append(row)
+    """Resolve names shown by the views. Several matches are listed with the environment, the repo, and the value
+    that selects each one."""
+    found = matching_rows(rows, key)
     if len(found) == 1:
         return found[0]
+    if found:
+        choices = [f"{row_choice(rows, row)} (environment {row.get('environment') or 'local'}, "
+                   f"repo {row.get('repo') or '-'})" for row in found]
+        raise ValueError(f"{option} {key}: matches multiple rows; candidates: " + ", ".join(choices))
     # With no match, the rows whose name or path contains the key, else every row.
-    candidates = found or [row for row in rows if key.casefold() in f"{row_name(row)} {row['path']}".casefold()] or rows
-    names = [row_name(row) for row in candidates]
-    choices = [name if names.count(name) == 1 else row_identity(row)
-               for row, name in zip(candidates, names)]
-    raise ValueError(f"{option} {key}: " + ("matches multiple rows" if found else "no row has this name")
-                     + "; candidates: " + (", ".join(choices) or "(none)"))
+    candidates = [row for row in rows if key.casefold() in f"{row_name(row)} {row['path']}".casefold()] or rows
+    raise ValueError(f"{option} {key}: no row has this name; candidates: "
+                     + (", ".join(row_choice(rows, row) for row in candidates) or "(none)"))
 
 
 def transcript_final(row: dict) -> dict:
@@ -3636,7 +3742,13 @@ def print_rm_specs(specs: list[str], scan_file: Path) -> None:
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
     if args.row and args.rm_specs:
         return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute())
-    if args.row:
+    if args.row and args.cards:
+        try:
+            rows = list({id(row): row for row in (select_row(rows, name) for name in args.row)}.values())
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 1
+    elif args.row:
         return print_row(rows, args.row[0], args.transcripts, Path(args.inbox).expanduser())
     if args.rows:
         if args.sort == "final":

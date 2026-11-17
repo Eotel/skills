@@ -550,6 +550,45 @@ class ClassifyTests(unittest.TestCase):
                                      live_transcripts={"/w/report": [child]}, screens={(None, "term_q"): screen})
         self.assertEqual(row["prompt_waiting"]["asked_at"], "2026-11-09T02:00:00Z")
 
+    def test_one_path_orca_lists_under_two_repos_is_one_row(self) -> None:
+        # 2026-11-16: Orca had the worktree adopt-collect-deploy-1111 of collect registered as a repo too, so the scan
+        # showed its path twice and --row named both rows by the same path.
+        path = "/w/collect/adopt-collect-deploy-1111"
+        listed = {**worktree(path, comment="forge の復旧待ち"), "repo": "collect", "worktreeId": f"c::{path}",
+                  "createdAt": 1794380265077}
+        alias = {**worktree(path), "repo": "adopt-collect-deploy-1111", "worktreeId": f"a::{path}", "createdAt": None}
+        tab = {**terminal(path, "claude", "term_alias"), "worktreeId": alias["worktreeId"]}
+
+        rows = self.inventory([alias, listed], [tab])
+
+        self.assertEqual([(row["repo"], row["comment"], [t["handle"] for t in row["terminals"]]) for row in rows],
+                         [("collect", "forge の復旧待ち", ["term_alias"])])
+        for name in ("adopt-collect-deploy-1111", "adopt-collect-deploy-1111/adopt-collect-deploy-1111"):
+            self.assertIs(scan.select_row(rows, name), rows[0])
+
+    def test_a_permission_prompt_carries_the_time_of_the_tool_call_it_asks_about(self) -> None:
+        # 2026-11-16: tohoku-ui-consult asked to run a command after a 23:27 instruction; stale-asks showed it
+        # waiting 174 minutes from the reply before that instruction.
+        self.claude_says("/w/consult", {**user("前の作業"), "timestamp": "2026-11-16T11:30:00Z"},
+                         {**assistant(text("前の作業を終えました。")), "timestamp": "2026-11-16T11:37:54Z"},
+                         {**user("東北AIつづけて"), "timestamp": "2026-11-16T14:27:30Z"},
+                         {**assistant({"type": "tool_use", "id": "ran", "name": "Bash", "input": {"command": "ls"}}),
+                          "timestamp": "2026-11-16T14:28:00Z"},
+                         {**user([{"type": "tool_result", "tool_use_id": "ran", "content": "ok"}]),
+                          "timestamp": "2026-11-16T14:28:01Z"},
+                         {**assistant({"type": "tool_use", "id": "asks", "name": "Bash",
+                                       "input": {"command": "bee issue create"}}),
+                          "timestamp": "2026-11-16T14:31:10Z"})
+        screen = {"source": "screen", "tail": [
+            "─" * 80, " Bash command", " Create the Backlog issue", "╌" * 80, " │ bee issue create", "╌" * 80,
+            " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel · Tab to amend"]}
+
+        [row] = scan.build_inventory([worktree("/w/consult")], [terminal("/w/consult", "claude", "term_p")],
+                                     self.projects, {}, "要判断", now=NOW, judge=judging({}),
+                                     screens={(None, "term_p"): screen})
+
+        self.assertEqual(row["prompt_waiting"]["asked_at"], "2026-11-16T14:31:10Z")
+
     def test_a_running_claude_transcript_outside_the_worktree_is_read(self) -> None:
         sessions = Path(self.tmp.name) / "profile/sessions"
         sessions.mkdir(parents=True)
@@ -2246,6 +2285,35 @@ class NextStepFactTests(unittest.TestCase):
                                                     "text": "復旧と一時 RDS の削除が済みました"}})
         self.assertEqual(queued["newest_report"], {"source": "inbox_done", "at": "2026-10-27T13:14:00+0900"})
 
+    def test_a_queued_row_carries_the_info_its_lane_sent_after_the_last_instruction(self) -> None:
+        # 2026-11-16: maint-migration-explainer delivered version 2 by info after the 12:55 instruction, and the
+        # saved in_progress verdict held, so the triage nearly woke a lane that was done.
+        with tempfile.TemporaryDirectory() as root:
+            inbox = Path(root) / "inbox.jsonl"
+            write_jsonl(inbox, [
+                {"ts": "2026-11-16T12:40:00+0900", "kind": "info", "repo": "app", "worktree": "explainer",
+                 "text": "前の指示の経過"},
+                {"ts": "2026-11-16T12:59:00+0900", "kind": "info", "repo": "app", "worktree": "explainer",
+                 "text": "版 2 を同じ URL に出し直しました"}])
+            reports = scan.inbox_reports(inbox, Path(root) / "no-answers.jsonl")
+        claude = {"last_user": "書き直して写真を info で送って", "last_user_at": "2026-11-16T03:55:00Z",
+                  "final_text": "根拠表を更新しました", "final_at": "2026-11-16T04:02:38Z"}
+        row = {"path": "/w/app/explainer", "repo": "app", "class": "unsure", "reasons": ["r"], "jev": {"asks": 0.49},
+               "comment": "", "pr": None, "git": {"dirty": 0}, "codex": [], "claude": claude}
+        saved = {"/w/app/explainer": {"read": scan.read_key(row), "class": "in_progress"}}
+        codex_row = {**row, "claude": None, "codex": [{"last_user_at": claude["last_user_at"],
+                                                       "last_assistant": "根拠表を更新しました",
+                                                       "last_assistant_at": claude["final_at"]}]}
+        later = {**row, "claude": {**claude, "last_user_at": "2026-11-16T04:00:00Z"}}
+
+        [queued] = scan.review_queue(scan.with_inbox([row], reports), saved)
+        [from_codex, instructed_since] = scan.with_inbox([codex_row, later], reports)
+
+        info = {"at": "2026-11-16T12:59:00+0900", "host": None, "text": "版 2 を同じ URL に出し直しました"}
+        self.assertEqual(queued["inbox"], {"info": info})
+        self.assertEqual(from_codex["inbox"], {"info": info})
+        self.assertNotIn("inbox", instructed_since)
+
     def test_rows_a_reader_classes_get_git_and_pr_facts(self) -> None:
         # A waiting row is read too: its decision marker may be answered by a merge.
         rows = [{"path": "/w/linked", "class": "stalled", "linked_pr": {"number": 7, "state": "open"}},
@@ -2602,6 +2670,44 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual([line.split(" | ")[0] for line in out.getvalue().splitlines()],
                          ["mbp16::app", "dotfiles-73", "fix-login", "mbp16::fix-login"])
 
+    def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
+        # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
+        path = "/w/collect-catalog-left-pane-scroll"
+        decisions = self.dir / "decisions.jsonl"
+        write_jsonl(decisions, [
+            {"id": "base", "decision": f"remove:local::{path}", "decided_at": "2026-10-28T23:16:19+00:00",
+             "answer": "起票の info が来たら片付けてよい。"},
+            {"id": "sub", "decision": f"remove:local::{path}::db-down", "decided_at": "2026-11-16T16:24:55+09:00",
+             "answer": "コンテナは消す（volume は残す）"},
+            {"id": "other", "decision": f"remove:local::{path}-2::db-down", "decided_at": "2026-11-17T00:00:00+09:00",
+             "answer": "別の作業場"}])
+        row = {"path": path, "repo": "collect", "class": "finished", "reasons": [], "closable": []}
+
+        [shown] = scan.with_cleanup_constraints([row], self.dir / "no-state.json", decisions)
+
+        self.assertEqual(shown["removal_decision"], {
+            "decision": f"remove:local::{path}", "answer": "起票の info が来たら片付けてよい。",
+            "decided_at": "2026-10-28T23:16:19+00:00", "allows_removal": False,
+            "newest": {"decision": f"remove:local::{path}::db-down", "answer": "コンテナは消す（volume は残す）",
+                       "decided_at": "2026-11-16T16:24:55+09:00"}})
+
+    def test_a_promise_before_its_date_keeps_the_row_open_without_stalling_it_and_names_it_once(self) -> None:
+        # 2026-11-16: a promise for 11/17 was shown as undelivered on every run, twice in the same row's reasons.
+        state = self.dir / "state.json"
+        state.write_text(json.dumps({"handoffs": {"h": {
+            "to": "app/recount", "delivered_at": None, "task": "recount.sh を流す", "not_before": "2026-11-17"}}}))
+        row = {"path": "/w/recount", "repo": "app", "class": "finished", "reasons": [], "closable": ["term_1"]}
+        before = datetime(2026, 11, 16, 23, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        [early] = scan.with_cleanup_constraints([dict(row)], state, self.dir / "none.jsonl", now=before)
+        [again] = scan.with_cleanup_constraints([early], state, self.dir / "none.jsonl", now=before)
+        [due] = scan.with_cleanup_constraints([dict(row)], state, self.dir / "none.jsonl",
+                                             now=before + timedelta(hours=1))
+
+        self.assertEqual((again["class"], again["closable"], again["reasons"]),
+                         ("finished", [], ["期限前（11/17）の約束の送り先: recount.sh を流す"]))
+        self.assertEqual((due["class"], due["reasons"]), ("stalled", ["未配信の約束の送り先: recount.sh を流す"]))
+
     def test_cleanup_excludes_undelivered_destinations_and_rows_with_removal_answers(self) -> None:
         saved = self.dir / "scan.json"
         state, decisions = self.dir / "state.json", self.dir / "decisions.jsonl"
@@ -2674,6 +2780,16 @@ class ScanCommandTests(unittest.TestCase):
             f"fix-login | waiting (scan: stalled) | close: {SCRIPTS / 'close_tabs.py'} --from {saved} term_2",
             "mbp16::app | waiting | card - codex interrupted | draft unknown | composer unknown | - | screen: -",
         ])
+
+    def test_cards_with_row_print_only_the_named_rows_lines(self) -> None:
+        # 2026-11-16: to get one workspace's tab handles, the hourly tab passed --row with --cards, was refused, and
+        # grepped the whole --cards output.
+        saved, _ = self.saved_scan()
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--cards", "--row", "mbp16::app"]), 0)
+
+        self.assertEqual(out.getvalue().splitlines(), [
+            "mbp16::app | waiting | card - codex interrupted | draft unknown | composer unknown | - | screen: -"])
 
     def test_cards_show_the_start_of_the_draft_beside_whether_the_screen_composer_is_empty(self) -> None:
         saved, _ = self.saved_scan()
@@ -2751,8 +2867,8 @@ class ScanCommandTests(unittest.TestCase):
             with self.subTest(name=name), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(scan.main(["--from", str(saved), "--row", name]), 1)
                 self.assertEqual(out.getvalue(), "")
-                self.assertIn("mbp16::fix-login", err.getvalue())
-                self.assertIn("candidates:", err.getvalue())
+                self.assertIn("candidates: /w/app/fix-login (environment local, repo app), "
+                              "mbp16::fix-login (environment mbp16, repo app)", err.getvalue())
 
     def test_row_lists_both_agents_transcript_paths(self) -> None:
         saved, _ = self.saved_scan()
@@ -6046,6 +6162,24 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in pending["handoffs"]], [handoff["id"]])
         self.assertEqual(pending["requests"], [])
         self.assertEqual([item["row"] for item in pending["left"]], ["/w/c"])
+
+    def test_pending_names_a_promise_before_its_date_instead_of_undelivered(self) -> None:
+        today = datetime.now(timezone(timedelta(hours=9))).date()
+        tomorrow = today + timedelta(days=1)
+        _, later = self.call("promise", "--from-row", "/w/a", "--to-row", "/w/b", "--condition", "10 営業日後",
+                             "--task", "recount を流す", "--not-before", tomorrow.isoformat())
+        self.call("promise", "--from-row", "/w/a", "--to-row", "/w/c", "--condition", "今日",
+                  "--task", "結果を渡す", "--not-before", today.isoformat())
+
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "pending", "--summary"]), 0)
+
+        self.assertEqual(later["not_before"], tomorrow.isoformat())
+        self.assertEqual([line.split(" | ")[1] for line in out.getvalue().splitlines()],
+                         [f"期限前（{tomorrow.month}/{tomorrow.day}）", "undelivered"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.call("promise", "--from-row", "/w/a", "--to-row", "/w/d", "--condition", "x", "--task", "y",
+                      "--not-before", "11/17")
 
     def test_left_row_only_stays_left_for_the_saved_final_message(self) -> None:
         old = self.source("old.txt", "Work complete; leave it.\n")

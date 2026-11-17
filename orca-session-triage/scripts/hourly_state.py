@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import fcntl
 from functools import cached_property
 import hashlib
@@ -1280,7 +1280,9 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                               "reissued": withdrawn_by(question_ask(item, entries or []), entries or [])})
     return {
         "questions": questions, "settled": settled,
-        "handoffs": [{"id": key, **item} for key, item in data["handoffs"].items() if item["delivered_at"] is None],
+        "handoffs": [{"id": key, **item, **({} if scan_sessions.promise_due(item, now)
+                                            else {"state": scan_sessions.not_before_label(item)})}
+                     for key, item in data["handoffs"].items() if item["delivered_at"] is None],
         "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
         "user_waits": [{"id": key, **item} for key, item in data["user_waits"].items() if item["closed_at"] is None],
         "left": [{"row": row, **item} for row, item in data["left"].items()],
@@ -1375,6 +1377,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         key = identifier(args.from_row, args.to_row, args.condition, args.task)
         data["handoffs"].setdefault(key, {"from": args.from_row, "to": args.to_row,
                                           "condition": args.condition, "task": args.task,
+                                          **({"not_before": args.not_before.isoformat()} if args.not_before else {}),
                                           "promised_at": stamp(), "delivered_at": None})
         return {"id": key, **data["handoffs"][key]}
     if args.action == "delivered":
@@ -1635,6 +1638,9 @@ def main(argv: list[str] | None = None) -> int:
     promise.add_argument("--to-row", required=True)
     promise.add_argument("--condition", required=True)
     promise.add_argument("--task", required=True)
+    promise.add_argument("--not-before", type=date.fromisoformat, metavar="YYYY-MM-DD",
+                         help="the JST day the task may first go out; before it, pending shows the promise as "
+                              "期限前（M/D） and the scan keeps its destination open without counting it stalled")
     delivered = commands.add_parser("delivered", help="mark a promised task sent to its lane")
     delivered.add_argument("--id", required=True)
     delivered.add_argument("--delivery", required=True, choices=("queued", "turn_started"))

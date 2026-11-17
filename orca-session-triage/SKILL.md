@@ -74,8 +74,9 @@ board's done cards; close what the user approves.
   tabs of worktrees Orca keeps no agent for, and another Mac's shell tabs Orca
   lists without output: a permission selector or an AskUserQuestion selector
   (`Enter to select`) makes the row `waiting` with `prompt_waiting` (`tab`,
-  `question`, `choices`, and for a permission prompt `target`: the tool and
-  its description, the command's first line, and a PreToolUse hook's reason)
+  `question`, `choices`, for a permission prompt `target`: the tool and
+  its description, the command's first line, and a PreToolUse hook's reason,
+  and `asked_at` when the transcript has the pending call it waits on)
   whatever verdict was saved, and its question, followed by the target, is the
   row's `question`; a notice that a restart dropped background jobs adds a reason,
   and such a shell ending at a bare prompt is `closable` (`references/cleanup.md`).
@@ -130,13 +131,20 @@ board's done cards; close what the user approves.
   asks for changes on the current head) beside `merge_question`. NAME is
   repo/name as `--summary` prints it, the name (a unique one on another Mac
   needs no `ENVIRONMENT::`), the path, or the row identity; with no single
-  match it lists candidates on stderr and exits 1. `--from SCAN_JSON` reads a saved scan
+  match it lists candidates on stderr, each with the value that selects it and,
+  when several match, its environment and repo, and exits 1. A path Orca lists
+  under two repos (a linked worktree also registered as a repo) is one row
+  whose `other_repos` names the other ones, and repo/name selects it under
+  either. `--from SCAN_JSON` reads a saved scan
   instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
   `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
   commands). `--rm-specs --row NAME` (repeatable) prints only the named rows,
   a finished one also while its tabs remain. An explicit removal approval in
   `removal_decision` also permits a check; retain or defer answers keep the row.
+  Only the row's own `remove:` keys decide it; a newer answer to one of their
+  `::` sub-keys (`remove:local::PATH::db-down`) is shown as its `newest`
+  (`decision`, `answer`, `decided_at`), and `--summary` adds it after the answer.
   `rm-check-batch --from` checks the same decision in a preview and before removal,
   closes approved idle tabs through `close_tabs.py`, and keeps all process and
   post-scan activity checks. A row it leaves out is named on
@@ -175,7 +183,7 @@ board's done cards; close what the user approves.
   characters), `closable` tab, and `meaningful_tabs` entry on its own line,
   led by the worktree's name, a card or meaningful tab with a handle followed
   by its `read: orca terminal read --terminal HANDLE` command: read cards
-  through it. With
+  through it. `--cards --row NAME` (repeatable) prints only the named rows. With
   `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
   that closes them, and a finished or open PR cleanup row with its
   `rm_check.py` command. Each row records the scan's start (`scanned_at`).
@@ -214,8 +222,9 @@ board's done cards; close what the user approves.
   queues and results in `reads/<run>/` and session directories. The next scan keeps each verdict in
   `~/.cache/orca-session-triage/verdicts.json` and shows it as the row's
   `verdict` until its final message, PR, latest review or comment from a person other than
-  the PR author, tree, permission prompt, Orca comment, or newest `done` or `ask` in the
-  triage inbox or that ask's answer changes (a reply read from another Mac's
+  the PR author, tree, permission prompt, Orca comment, newest `done` or `ask` in the
+  triage inbox or that ask's answer, or newest `info` sent after the lane's last
+  instruction changes (a reply read from another Mac's
   screen has no time, so its text stands for it), or until every issue and PR
   its `waits_on` names closed (reason 「everything the saved verdict waits on
   closed: …」; read in the same GraphQL query: `repo#N` is the repository of the
