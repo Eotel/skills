@@ -9,12 +9,16 @@ import sys
 import tempfile
 import unittest
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "orca-session-triage" / "scripts" / "lead_decisions.py"
 # gh is outside this repository: answer each GraphQL query from a fixture of {"owner/name": {number: pr}} and
 # log the repository it asked for; a repository missing from the fixture fails as gh does for one it cannot read.
 FAKE_GH = """#!{python}
 import json, os, re, sys
+
 query = next(arg[len("query="):] for arg in sys.argv if arg.startswith("query="))
 slug = "/".join(re.search(r'repository\\(owner: "([^"]+)", name: "([^"]+)"\\)', query).groups())
 open(os.environ["FAKE_GH_LOG"], "a").write(slug + "\\n")

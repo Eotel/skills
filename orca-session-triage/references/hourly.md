@@ -15,9 +15,10 @@ full context of an `info` is needed. Both modes leave the cursor unchanged.
 For a large inbox, `read --summary` shows each entry on one line with its
 `id=` and the first 160 characters of its text, and `read --id ID[,ID]` prints
 only those entries in full, wherever the cursor stands (an acknowledged one is
-marked 既読). Every read marks an ask, or one of its questions, that
-`~/.cache/orca-briefs/ask-answers.jsonl` records answered with
-「回答済み（MM/DD HH:MM・how）」: do not hand it off as open. When a scheduled
+marked 既読). Every read marks answered asks and questions with
+「回答済み（MM/DD HH:MM・how）」: do not hand them off as open. Answers use
+`~/.cache/orca-briefs/ask-answers.jsonl` through the board component; its storage
+modes are in `references/hourly-state.md`. When a scheduled
 run of this workspace due after this tab's run began, or the precheck skipped
 one because this run was still working, `read` first prints a 「注意:」 line
 with that run's time, status, and pane: the later run owns the read position
@@ -96,8 +97,9 @@ line; `list --json` returns `{"items": [...]}`, each keyed by `proposal_id` (its
 proposing row's UUID). `list --json --id <proposal id>[,…]` (8 or more characters each) returns
 only those proposals, with their decision times.
 Before either tab asks the user an inbox ask itself, it records that with
-`scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>` (in
-`~/.cache/orca-briefs/ask-claims.jsonl`, apart from the answers). If another
+`scripts/inbox_read.py claim <id>[:<n>],… --by <its worktree name>`.
+Claims use `~/.cache/orca-briefs/ask-claims.jsonl` through the same component,
+separately from answers. If another
 worktree already claims one of them, `claim` names that claim, writes nothing,
 and exits 1: do not ask it (`--take-over` only once that tab is known not to be
 asking). `open-asks`

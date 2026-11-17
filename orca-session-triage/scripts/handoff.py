@@ -67,6 +67,7 @@ import sys
 from typing import NamedTuple, Protocol
 
 import answer_evidence
+from commitment_store import CommitmentWriteError, read_lines
 import inbox_read
 import hourly_state
 import json_output
@@ -192,10 +193,7 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
     named = {item["id"] for item in [*before, *after] if item.get("kind") == "ask" and isinstance(item.get("id"), str)
              and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
     read_at = read_time(before)
-    try:
-        records = answers.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        records = []
+    records = "".join(read_lines(answers)).splitlines()
     source = inbox_read.answer_sender()
     for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
@@ -712,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         command = "Orca" if args.action == "lead-state" else "triage-notify"
         print(f"handoff: {command} failed: {(error.stderr or '').strip() or error}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, LookupError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, LookupError, subprocess.TimeoutExpired, CommitmentWriteError) as error:
         print(f"handoff: {error}", file=sys.stderr)
         return 1
 

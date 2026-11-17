@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -43,6 +44,7 @@ import uuid
 
 import inbox_read
 import ask_state
+from commitment_store import CommitmentWriteError, read_lines, writing
 
 DEFAULT_LOG = Path(os.environ.get("TRIAGE_LEAD_DECISIONS", "~/.cache/orca-session-triage/lead-decisions.jsonl"))
 HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session-triage/handed-off.jsonl"))
@@ -165,11 +167,10 @@ def answer_value(decision: str, value: object) -> str | bool | None:
 
 def lines(log: Path) -> Iterator[tuple[str, str]]:
     """Each non-empty line of an append-only log, with its place for error messages."""
-    if not log.exists():
-        return
-    with log.open(encoding="utf-8") as stream:
-        fcntl.flock(stream, fcntl.LOCK_SH)
-        read = stream.read().splitlines()
+    with log.open(encoding="utf-8") if log.exists() else nullcontext() as stream:
+        if stream is not None:
+            fcntl.flock(stream, fcntl.LOCK_SH)
+        read = "".join(read_lines(log)).splitlines()
     yield from ((raw, f"{log}:{number}") for number, raw in enumerate(read, start=1) if raw.strip())
 
 
@@ -217,10 +218,13 @@ def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]
 
 def append(log: Path, *entries: Decision | HandOff) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.writelines(json.dumps(asdict(entry), ensure_ascii=False) + "\n" for entry in entries)
-        stream.flush()
+    lines = [json.dumps(asdict(entry), ensure_ascii=False) + "\n" for entry in entries]
+    with writing(log, lines=lines) as write_file:
+        if write_file:
+            with log.open("a", encoding="utf-8") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                stream.writelines(lines)
+                stream.flush()
 
 
 def non_empty(path: Path) -> str:
@@ -601,7 +605,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                         print(f"  candidates: {json.dumps(candidate, ensure_ascii=False)}")
                 print(f"settled: {len(result['settled'])}")
                 return 0
-    except (OSError, ValueError, LookupError) as error:
+    except (OSError, ValueError, LookupError, CommitmentWriteError) as error:
         print(f"lead decisions: {error}", file=sys.stderr)
         return 1
     if warnings:

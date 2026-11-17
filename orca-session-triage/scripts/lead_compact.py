@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TextIO
 
 import ask_state
+from commitment_store import read_document
 import hourly_state
 
 DIGEST_TOKENS = "3000"
@@ -36,7 +37,8 @@ def board() -> Path:
 def is_lead(cwd: str) -> bool:
     state_file = Path(os.environ.get("TRIAGE_HOURLY_STATE", hourly_state.DEFAULT_STATE)).expanduser()
     try:
-        lead = hourly_state.appointed_lead(json.loads(state_file.read_text(encoding="utf-8")))
+        document = read_document(state_file)
+        lead = hourly_state.appointed_lead(json.loads(document)) if document is not None else None
     except (OSError, ValueError, AttributeError):
         return False
     if lead is None:

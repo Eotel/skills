@@ -70,6 +70,7 @@ from typing import Literal, Protocol
 from urllib.parse import urlparse
 
 import inbox_read
+from commitment_store import read_document, read_lines
 import scan_sessions as scan
 
 HOME = Path.home()
@@ -728,9 +729,9 @@ def judge(row: Mapping, verdict: Mapping | None, records: Records, now: datetime
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    if not path.is_file():
+    if path.exists() and not path.is_file():
         return []
-    return [item for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    return [item for line in "".join(read_lines(path)).splitlines() if line.strip()
             for item in [safe_json(line)] if isinstance(item, dict)]
 
 
@@ -780,7 +781,11 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
         if item.get("signal") in RECOVERED and (at := parse(item.get("checked_at"))) and at <= now:
             stops.setdefault(str(item.get("work")), []).append(
                 EarlierStop(at, str(item.get("inbox_id") or ""), tuple(map(str, item.get("tabs") or ()))))
-    state = scan.read_json_file(hourly_state) if hourly_state.is_file() else {}
+    try:
+        document = read_document(hourly_state)
+        state = json.loads(document) if document is not None else {}
+    except (OSError, ValueError):
+        state = {}
     state = state if isinstance(state, dict) else {}
     handoffs = state.get("handoffs") or {}
     open_names = {name for item in (handoffs.values() if isinstance(handoffs, dict) else handoffs)

@@ -31,6 +31,9 @@ from unittest.mock import patch
 import urllib.error
 import urllib.request
 
+NO_BOARD_COMPONENT = tempfile.TemporaryDirectory(prefix="triage-tests-bin-")
+os.environ["ORCA_BRIEFS_BIN"] = NO_BOARD_COMPONENT.name
+
 
 
 class TextRunOptions(TypedDict):
@@ -149,6 +152,283 @@ class FakeGitHub:
 
     def rest(self) -> list[list[str]]:
         return [call for call in self.calls if call[:3] != ["gh", "api", "graphql"]]
+
+
+class CommitmentRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.trace = self.root / "calls.jsonl"
+        self.mirror = self.root / "mirror.json"
+        self.mirror.write_text("{}")
+        environment = patch.dict(os.environ, {
+            "ORCA_BRIEFS_BIN": str(self.bin), "COMMITMENT_TEST_TRACE": str(self.trace),
+            "COMMITMENT_TEST_MIRROR": str(self.mirror), "COMMITMENT_TEST_MODE": "db-first",
+            "CODEX_THREAD_ID": "fixture-session", "ORCA_WORKTREE_ID": "repo::/w/fixture",
+            "TRIAGE_INBOX": str(self.root / "triage-inbox.jsonl"),
+            "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl"),
+            "TRIAGE_ASK_CLAIMS": str(self.root / "ask-claims.jsonl"),
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def install_component(self) -> None:
+        (self.bin / "orca_board_commitments.py").write_text('''
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from io import StringIO
+import json
+import os
+from pathlib import Path
+
+
+@dataclass
+class Loaded:
+    name: str
+
+class CommitmentWriteError(RuntimeError):
+    pass
+
+def record(event: dict) -> None:
+    with Path(os.environ["COMMITMENT_TEST_TRACE"]).open("a") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False) + "\\n")
+
+@contextmanager
+def writing(path: Path, *, lines: list[str] | None = None, document: str | None = None) -> Generator[bool]:
+    if os.environ["COMMITMENT_TEST_MODE"] == "error":
+        raise CommitmentWriteError("約束のDB更新に失敗しました。mode file-first で戻してください")
+    before = path.read_bytes() if path.exists() else b""
+    record({"operation": "writing", "name": path.name, "lines": lines, "document": document})
+    write_file = os.environ["COMMITMENT_TEST_MODE"] != "db-only"
+    yield write_file
+    if write_file:
+        expected = document.encode() if document is not None else before + "".join(lines).encode()
+        assert path.read_bytes() == expected, "component and file received different bytes"
+
+def read_lines(path: Path) -> list[str]:
+    record({"operation": "read_lines", "name": path.name})
+    if os.environ["COMMITMENT_TEST_MODE"] in ("db-read", "db-only"):
+        return StringIO(json.loads(Path(os.environ["COMMITMENT_TEST_MIRROR"]).read_text()).get(path.name, "")).readlines()
+    return StringIO(path.read_text()).readlines() if path.exists() else []
+
+def read_document(path: Path) -> str | None:
+    record({"operation": "read_document", "name": path.name})
+    if os.environ["COMMITMENT_TEST_MODE"] in ("db-read", "db-only"):
+        return json.loads(Path(os.environ["COMMITMENT_TEST_MIRROR"]).read_text()).get(path.name)
+    return path.read_text() if path.exists() else None
+''')
+
+    def test_hourly_write_passes_exact_document_to_component_before_atomic_replace(self) -> None:
+        self.install_component()
+        state = self.root / "hourly-state.json"
+        state.write_text('{"previous": true}\n')
+
+        hourly_state.save(state, {"question": "確認\n続き"})
+
+        self.assertEqual(state.read_bytes(), '{\n  "question": "確認\\n続き"\n}\n'.encode())
+        self.assertEqual(json.loads(self.trace.read_text()), {
+            "operation": "writing", "name": "hourly-state.json", "lines": None,
+            "document": '{\n  "question": "確認\\n続き"\n}\n'})
+
+
+    def writers(self) -> dict[str, Callable[[Path], object]]:
+        lead = handoff.lead_decisions
+        return {
+            "hourly-state.json": lambda path: hourly_state.save(path, {"version": 1, "left": {},
+                "questions": {}, "handoffs": {}, "requests": {}, "user_waits": {}, "presented": {}, "comments": {}}),
+            "ask-answers.jsonl": lambda path: inbox_read.record_answers(
+                path, ["ask-1", "ask-2:1"], "send", "回答\n続き", at="2026-11-17T01:00:00Z"),
+            "ask-claims.jsonl": lambda path: inbox_read.record_claims(
+                path, ["ask-1", "ask-2:1"], "fixture", frozenset(("ask-1", "ask-2:1"))),
+            "lead-decisions.jsonl": lambda path: lead.append(
+                path, lead.Decision("decision-1", "merge:owner/repo#1", "保留", "2026-11-17T01:00:00Z")),
+            "handed-off.jsonl": lambda path: lead.append(
+                path, lead.HandOff("merge:owner/repo#1", "2026-11-17T01:00:00Z", "ask-1")),
+        }
+
+    def test_no_component_keeps_plain_file_writes_and_reads(self) -> None:
+        import commitment_store
+
+        for name, write in self.writers().items():
+            with self.subTest(name=name):
+                path = self.root / name
+                write(path)
+                if name.endswith(".jsonl"):
+                    self.assertEqual(commitment_store.read_lines(path), path.read_text().splitlines(True))
+                else:
+                    self.assertEqual(commitment_store.read_document(path), path.read_text())
+                    self.assertEqual(hourly_state.read(path)["version"], 1)
+        self.assertEqual(inbox_read.answer_records(self.root / "ask-answers.jsonl")["ask-1"]["note"], "回答\n続き")
+        self.assertEqual(inbox_read.read_claims(self.root / "ask-claims.jsonl")["ask-1"].by, "fixture")
+        self.assertEqual(commitment_store.read_lines(self.root / "absent"), [])
+        self.assertIsNone(commitment_store.read_document(self.root / "absent"))
+        self.assertFalse(self.trace.exists())
+
+    def test_db_first_appends_exact_lines_for_every_log(self) -> None:
+        self.install_component()
+        for name, write in self.writers().items():
+            if not name.endswith(".jsonl"):
+                continue
+            with self.subTest(name=name):
+                path = self.root / name
+                path.write_text("\n")
+                write(path)
+                calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
+                call = next(item for item in reversed(calls) if item["operation"] == "writing")
+                self.assertEqual(call["name"], name)
+                self.assertEqual("".join(call["lines"]).encode(), path.read_bytes()[1:])
+                self.assertTrue(all(line.endswith("\n") for line in call["lines"]))
+                self.assertIsNone(call["document"])
+
+    def test_db_only_leaves_absent_and_existing_files_unchanged(self) -> None:
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "db-only"
+        for name, write in self.writers().items():
+            path = self.root / name
+            for exists in (False, True):
+                with self.subTest(name=name, exists=exists):
+                    if exists:
+                        path.write_bytes(b"\n")
+                    write(path)
+                    self.assertEqual(path.read_bytes() if path.exists() else None, b"\n" if exists else None)
+
+    def test_component_failure_exits_one_without_changing_decision_log(self) -> None:
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "error"
+        path = self.root / "lead-decisions.jsonl"
+        answer = self.root / "answer.txt"
+        answer.write_text("保留")
+        for exists in (False, True):
+            with self.subTest(exists=exists):
+                if exists:
+                    path.write_bytes(b"\n")
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                    code = handoff.lead_decisions.main(["--decisions-file", str(path), "record", "--decision",
+                        "merge:owner/repo#1", "--answer-file", str(answer)])
+                self.assertEqual(code, 1)
+                self.assertIn("約束のDB更新に失敗しました。mode file-first で戻してください", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
+                self.assertEqual(path.read_bytes() if path.exists() else None, b"\n" if exists else None)
+
+    def test_failed_db_write_leaves_every_mirrored_file_unchanged(self) -> None:
+        from commitment_store import CommitmentWriteError
+
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "error"
+        for name, write in self.writers().items():
+            path = self.root / name
+            for exists in (False, True):
+                with self.subTest(name=name, exists=exists):
+                    if exists:
+                        path.write_bytes(b"\n")
+                    with self.assertRaisesRegex(CommitmentWriteError, "mode file-first"):
+                        write(path)
+                    self.assertEqual(path.read_bytes() if path.exists() else None, b"\n" if exists else None)
+
+    def test_hourly_and_inbox_commands_report_failed_db_writes(self) -> None:
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "error"
+        write_jsonl(self.root / "triage-inbox.jsonl", [{"id": "aaaaaaaa", "kind": "ask", "text": "確認しますか？"}])
+        commands = [(hourly_state.main, ["--state-file", str(self.root / "hourly-state.json"),
+                     "appoint-lead", "--worktree", str(self.root)]),
+                    (inbox_read.main, ["answered", "aaaaaaaa", "--note", "保留"]),
+                    (inbox_read.main, ["claim", "aaaaaaaa", "--by", "fixture"])]
+        for main, args in commands:
+            with self.subTest(command=args), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(main(args), 1)
+                self.assertIn("mode file-first", err.getvalue())
+        self.assertFalse((self.root / "hourly-state.json").exists())
+        self.assertFalse((self.root / "ask-answers.jsonl").exists())
+        self.assertFalse((self.root / "ask-claims.jsonl").exists())
+
+    def test_db_only_claim_conflict_is_checked_against_mirror(self) -> None:
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "db-only"
+        claim = {"id": "ask-1", "by": "other", "ts": "2026-11-17T01:00:00Z"}
+        self.mirror.write_text(json.dumps({"ask-claims.jsonl": json.dumps(claim) + "\n"}))
+        path = self.root / "ask-claims.jsonl"
+
+        taken = inbox_read.record_claims(path, ["ask-1"], "fixture", frozenset(("ask-1",)))
+
+        self.assertEqual([(item.id, item.by) for item in taken], [("ask-1", "other")])
+        self.assertFalse(path.exists())
+        self.assertNotIn('"writing"', self.trace.read_text())
+
+    def test_db_read_supplies_records_even_without_mirrored_files(self) -> None:
+        import stall_watch
+        import timeline
+
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "db-read"
+        state = {"version": 1, "left": {}, "questions": {"q": {"owner_pane": "pane", "answer": None}},
+                 "handoffs": {"h": {"to": "/w/lane", "delivered_at": None}}, "lead": {"worktree": "/w/lead"}}
+        answer = {"id": "aaaaaaaa-1111", "how": "send", "note": "回答", "ts": "2026-11-17T01:00:00Z"}
+        decision = {"id": "d", "decision": "merge:owner/repo#1", "answer": "保留",
+                    "decided_at": "2026-11-17T01:00:00Z"}
+        handed = {"decision": decision["decision"], "handed_off_at": decision["decided_at"]}
+        claim = {"id": answer["id"], "by": "fixture", "ts": answer["ts"]}
+        self.mirror.write_text(json.dumps({name: json.dumps(value, ensure_ascii=False) + "\n" for name, value in {
+            "hourly-state.json": state, "ask-answers.jsonl": answer, "ask-claims.jsonl": claim,
+            "lead-decisions.jsonl": decision, "handed-off.jsonl": handed}.items()}))
+        answers = self.root / "ask-answers.jsonl"
+        hourly = self.root / "hourly-state.json"
+        lead = handoff.lead_decisions
+
+        self.assertEqual(inbox_read.answer_records(answers), {answer["id"]: answer})
+        self.assertEqual(inbox_read.read_claims(self.root / "ask-claims.jsonl")[answer["id"]].by, "fixture")
+        self.assertEqual(hourly_state.read(hourly)["questions"], state["questions"])
+        self.assertEqual([item.answer for item in lead.records(self.root / "lead-decisions.jsonl")], ["保留"])
+        self.assertEqual([item.decision for item in lead.handed_off(self.root / "handed-off.jsonl")], [handed["decision"]])
+        self.assertEqual([item.text for item in inbox_read.answer_evidence.delivered(answers)], ["回答"])
+        self.assertEqual(stall_watch.read_jsonl(answers), [answer])
+        self.assertEqual(scan.ask_answers(answers), {answer["id"]: {"at": answer["ts"], "note": "回答"}})
+        self.assertEqual(scan.pending_handoffs({"path": "/w/lane", "repo": "repo"}, hourly), [state["handoffs"]["h"]])
+        self.assertEqual(timeline.entries(answers), [answer])
+        self.assertEqual(stopcheck.read_json(hourly), state)
+        self.assertFalse(cleanup_hourly.no_pending_questions(hourly, "pane"))
+        reasons = handoff.overtaken("aaaaaaaa", [{"kind": "ask", "id": answer["id"]}], [],
+                                   inbox_read.Sender("fixture", "fixture-host"), "tab:fixture", answers)
+        self.assertEqual([reason.id for reason in reasons], [answer["id"]])
+        with patch.dict(os.environ, {"TRIAGE_HOURLY_STATE": str(hourly)}):
+            self.assertTrue(lead_compact.is_lead("/w/lead"))
+        with patch.multiple(stall_watch, INBOX=self.root / "triage-inbox.jsonl", ANSWERS=answers,
+                            HOLDS=self.root / "holds.sqlite", BOARD=self.root / "board.sqlite3", HOURLY_STATE=hourly,
+                            REMOTES=self.root / "remotes.json", CHECKS=self.root / "checks.json"):
+            records = stall_watch.load_records(datetime.fromisoformat("2026-11-17T02:00:00Z"), [])
+        self.assertEqual(records.open_handoff_names, frozenset(("/w/lane",)))
+        self.assertEqual(records.lead_path, "/w/lead")
+        write_jsonl(self.root / "triage-inbox.jsonl", [
+            {"id": value, "kind": "ask", "text": "確認しますか？", "ts": "2026-11-17T00:00:00Z"}
+            for value in (answer["id"], "bbbbbbbb-2222")])
+        write_jsonl(answers, [{**answer, "id": "bbbbbbbb-2222"}])
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(inbox_read.main(["open-asks", "--json"]), 0)
+        self.assertEqual([item["id"] for item in json.loads(out.getvalue())], ["bbbbbbbb-2222"])
+
+    def test_db_read_settled_selector_uses_shared_state_without_a_file(self) -> None:
+        self.install_component()
+        os.environ["COMMITMENT_TEST_MODE"] = "db-read"
+        question = "公開しますか？"
+        state = {"questions": {"q": {"owner_pane": "pane", "asked_in": "/w/triage",
+                 "asked_at": "2026-11-17T00:00:00Z", "question": question, "answer": "はい"}}}
+        self.mirror.write_text(json.dumps({"hourly-state.json": json.dumps(state)}))
+        transcript = self.root / "session.jsonl"
+        write_jsonl(transcript, [{**assistant({"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_1",
+                     "input": {"questions": [{"question": question}]}}), "timestamp": "2026-11-17T00:01:00Z"}])
+        screen = {"source": "screen", "tail": ["────────", question, "❯ 1. はい", "2. いいえ",
+                  "Enter to select · ↑/↓ to navigate · Esc to cancel"]}
+
+        self.assertTrue(cleanup_hourly.settled_selector(self.root / "hourly-state.json", "pane", transcript, screen))
+
+    def test_plain_answer_read_preserves_unicode_line_separators_inside_json_strings(self) -> None:
+        answers = self.root / "ask-answers.jsonl"
+        answers.write_text('{"id":"ask","note":"前\u2028後","ts":"2026-11-17T01:00:00Z"}\n')
+
+        self.assertEqual(scan.ask_answers(answers), {"ask": {"at": "2026-11-17T01:00:00Z", "note": "前\u2028後"}})
 
 
 class ClaudeTranscriptTests(unittest.TestCase):

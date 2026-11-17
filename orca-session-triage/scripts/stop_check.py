@@ -38,6 +38,7 @@ from typing import Any
 import unicodedata
 
 import answer_evidence
+from commitment_store import read_document
 import ask_state
 import handoff
 import hourly_state
@@ -58,7 +59,8 @@ WATCH_LIFECYCLE = "<task-type>artifact-watch-lifecycle</task-type>"
 
 def read_json(path: Path) -> object:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        document = read_document(path)
+        return json.loads(document) if document is not None else None
     except (OSError, ValueError):
         return None
 
