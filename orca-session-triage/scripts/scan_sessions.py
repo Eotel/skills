@@ -3482,7 +3482,7 @@ def row_line(view: dict) -> str:
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
 # Runs rm_check.py on another Mac over ssh; see references/cleanup.md.
-RM_CHECK_BATCH = Path.home() / ".cache/orca-briefs/bin/rm-check-batch"
+RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
 
 
 def pr_number(row: dict) -> int | None:

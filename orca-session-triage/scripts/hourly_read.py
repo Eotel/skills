@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="parent of the unique run directory (default: %(default)s)")
     parser.add_argument("--state-file", type=Path, default=Path(hourly_state.DEFAULT_STATE))
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"))
-    parser.add_argument("--bin-dir", type=Path, default=Path("~/.cache/orca-briefs/bin"),
+    parser.add_argument("--bin-dir", type=Path, default=Path("~/.local/share/eotel-harness/current/bin"),
                         help="installed backlog-watch, asana99_status.py, topic and project-status commands")
     parser.add_argument("--timeout", type=float, default=600, help="seconds per command (default: %(default)s)")
     args = parser.parse_args(argv)

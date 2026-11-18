@@ -38,7 +38,7 @@ def _load(path: Path) -> ModuleType:
 def _component(path: Path) -> ModuleType | None:
     if path.name not in MIRRORED:
         return None
-    binary = Path(os.environ.get("ORCA_BRIEFS_BIN") or "~/.cache/orca-briefs/bin").expanduser()
+    binary = Path(os.environ.get("ORCA_BRIEFS_BIN") or "~/.local/share/eotel-harness/current/bin").expanduser()
     component = binary / "orca_board_commitments.py"
     if not component.is_file():
         return None
@@ -83,7 +83,7 @@ def read_document(path: Path) -> str | None:
 
 def hold_rows(path: Path) -> list[dict]:
     if path.name == "holds.sqlite":
-        binary = Path(os.environ.get("ORCA_BRIEFS_BIN") or "~/.cache/orca-briefs/bin").expanduser()
+        binary = Path(os.environ.get("ORCA_BRIEFS_BIN") or "~/.local/share/eotel-harness/current/bin").expanduser()
         component = binary / "orca_board_commitments.py"
         if component.is_file():
             module = _load(component)

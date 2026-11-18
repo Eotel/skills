@@ -16,7 +16,7 @@ them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
 changes on its host before applying the same rule; the scan leaves those git
-facts unknown until that check. `~/.cache/orca-briefs/bin/rm-check-batch --host
+facts unknown until that check. `~/.local/share/eotel-harness/current/bin/rm-check-batch --host
 <host>` runs `rm_check.py` on that Mac under a python3 of 3.10 or later. gh cannot read GitHub there, so for a spec
 naming a PR without its head it reads that Mac's HEAD and origin and runs `merged_pr_head.py` with this Mac's gh:
 a merged PR's head and `ahead_by` reach `rm_check.py` as `"<path> <PR> <pr-head> <ahead_by>"`, and an open PR's spec

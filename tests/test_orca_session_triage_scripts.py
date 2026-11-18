@@ -8367,7 +8367,7 @@ class InboxWatchServiceTests(unittest.TestCase):
                 root, python="/test/bin/python3", orca="/app/bin/orca"))
             self.assertEqual(payload["ProgramArguments"], [
                 "/test/bin/python3",
-                f"{root}/.cache/orca-briefs/bin/watch-inbox",
+                f"{root}/.local/share/eotel-harness/current/bin/watch-inbox",
                 f"{root}/.cache/orca-briefs/offsets/close-done-triage.offset"])
             self.assertTrue(payload["KeepAlive"])
             self.assertIn("/app/bin", payload["EnvironmentVariables"]["PATH"])
@@ -9938,7 +9938,7 @@ class BashTimeoutHookTests(unittest.TestCase):
         self.assertEqual(self.hook_output(390.0, {**call, "timeout": 600000}), "")
 
     def test_worktree_removal_gets_ten_minutes_even_at_low_load(self) -> None:
-        command = "~/.cache/orca-briefs/bin/rm-check-batch --remove-ok --summary '/w/done -'"
+        command = "~/.local/share/eotel-harness/current/bin/rm-check-batch --remove-ok --summary '/w/done -'"
         call = {"command": command, "timeout": 120000}
         self.assertEqual(json.loads(self.hook_output(1.0, call))["hookSpecificOutput"]["updatedInput"],
                          {**call, "timeout": 600000})

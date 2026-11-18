@@ -43,7 +43,7 @@
   found in that repository's earlier transcripts (for example
   `$ship <issue URL>`).
 - Before asking the user about a Backlog ticket or posting to it, run
-  `~/.cache/orca-briefs/bin/ticket-activity <KEY>` and drop the questions and
+  `~/.local/share/eotel-harness/current/bin/ticket-activity <KEY>` and drop the questions and
   posts another tab already settled. On 2026-10-19 the triage asked about two
   tickets and drafted a reply on a third that a lead tab in another workspace
   had already settled.
@@ -79,7 +79,7 @@
 - When a meeting or a review gives feedback on a case's work, write its
   feedback record first, in `~/.cache/orca-briefs/<case>/`: the transcript as
   said, links to the pages or PRs made from it, and the fixes as `- [F1] …`
-  lines (form: `~/.cache/orca-briefs/bin/feedback_record.py --help`). A
+  lines (form: `~/.local/share/eotel-harness/current/bin/feedback_record.py --help`). A
   scratchpad is deleted with its session. When the case has an implementation
   lane, hand the record over in the same pass: `send <worktree> --feedback
   <record>` to a running lane, `spawn-lane … --feedback <record>` to a new one.

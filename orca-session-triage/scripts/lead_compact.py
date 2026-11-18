@@ -8,7 +8,7 @@
 Each reads the hook's JSON on stdin. Only the appointed lead's session, by its cwd or ORCA_WORKTREE_ID, gets
 anything; every other session gets no output. The hook always exits 0. When the board cannot be read, the lead
 gets one line naming the command to run by hand. The board command is ORCA_BOARD_COMMITMENTS
-(default ~/.cache/orca-briefs/bin/orca_board_commitments.py).
+(default ~/.local/share/eotel-harness/current/bin/orca_board_commitments.py).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ KEEP = ("要約では、ボード（orca_board_commitments.py）に記録した�
 
 def board() -> Path:
     return Path(os.environ.get("ORCA_BOARD_COMMITMENTS",
-                               "~/.cache/orca-briefs/bin/orca_board_commitments.py")).expanduser()
+                               "~/.local/share/eotel-harness/current/bin/orca_board_commitments.py")).expanduser()
 
 
 def is_lead(cwd: str) -> bool:

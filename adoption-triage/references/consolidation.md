@@ -18,7 +18,7 @@
 読む場所は次のとおり。ホームや `~/ghq` 全体を find・grep しない。
 
 - skill: 配られた写しは `~/.agents/skills/`、Eotel/skills の source は `~/ghq/github.com/Eotel/skills`
-- 指揮の道具: `~/.cache/orca-briefs/bin`
+- 指揮の道具: `~/.local/share/eotel-harness/current/bin`
 - ボード: `~/ghq/github.com/Eotel/orca-board`
 - 会話記録: 案の `source.session` と `evidence` が指すもの。Claude の記録は `~/.claude/projects` にある。
 
@@ -31,7 +31,7 @@
 - 取り下げる: 置き換わった・食い違う案ごとに、または理由が同じ案をまとめて、取り下げの案を出し、`retires` に元の案を並べる。`proposal` は「〜を取り下げる」とし、`fact` と `evidence` に、置き換わった・食い違うことの根拠を書く。すでに入っている採用済みの案は、取り下げでなく実施の確認にする（取り下げは採用を取り消す）。
 - 残す: 今も有効で、重なりもない案は書き換えない。新しい根拠があれば `support` で足す。
 
-文の案は、[policy.md](policy.md)「案の形」に従い、道具の引数・既定値・検査・出力で守らせる案にまとめ直す。新しい案の `target` はその形に合わせる。Eotel/skills の script を直す案は `triage-retro:skill:<skill>:script`、直せない外の道具は `triage-retro:skill:<skill>:upstream`、skill の外（`~/.cache/orca-briefs/bin`・orca-board など）は repository とファイルを書いた文にする。`priority` は元の案のうち最も高いものにする。
+文の案は、[policy.md](policy.md)「案の形」に従い、道具の引数・既定値・検査・出力で守らせる案にまとめ直す。新しい案の `target` はその形に合わせる。Eotel/skills の script を直す案は `triage-retro:skill:<skill>:script`、直せない外の道具は `triage-retro:skill:<skill>:upstream`、skill の外（`~/.local/share/eotel-harness/current/bin`・orca-board など）は repository とファイルを書いた文にする。`priority` は元の案のうち最も高いものにする。
 
 三浦さんがまとめた案・取り下げの案を採用すると、台帳が元の案を同じ操作で閉じる。実施の確認の案を採用すると、元の案は採用のまま実施済みになる。取り下げ・実施の確認だけの案は、採用で済む。まとめた案には、元の案から残すべき事実・根拠・対象をすべて入れる。
 
@@ -39,7 +39,7 @@
 
 ## 終わり
 
-候補を全部見たら、`~/.cache/orca-briefs/bin/triage-notify --kind done` で次を知らせる。この報告で、ボードの「整理中」の表示が消える。
+候補を全部見たら、`~/.local/share/eotel-harness/current/bin/triage-notify --kind done` で次を知らせる。この報告で、ボードの「整理中」の表示が消える。
 
 1. 見た候補の件数と、変えずに残した件数
 2. まとめた案の件数と、それに含めた元の案の件数
