@@ -32,9 +32,11 @@ turn.
    preserve unrelated worktree state. From here on, the PR is the resume point.
 5. **Open the PR.** Push, assign Eotel, include `Closes #N` for resolved issues,
    and describe the verification evidence.
-6. **Clear remote gates.** Monitor required checks to green. Diagnose and fix
-   failures caused by the change, then rerun the affected local check before
-   pushing again.
+6. **Clear remote gates.** Wait for required checks to go green with the
+   waiting tools in [review completion](references/review-completion.md), not
+   with `gh pr checks --watch`, `gh run watch`, or a loop of gh calls. Diagnose
+   and fix failures caused by the change, then rerun the affected local check
+   before pushing again.
 7. **Resolve review.** When the PR is open, follow
    [review completion](references/review-completion.md).
 
