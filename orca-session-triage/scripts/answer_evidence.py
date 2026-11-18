@@ -78,10 +78,11 @@ def matches_ask(answer: Answer, ask_id: str, number: int | None = None) -> bool:
 
 def shown_question(question: dict) -> str:
     """A structured question as inbox_read.ask_user_question shows it to the user: its context (what the work
-    is and what choosing does) first, then the question, then the issue."""
-    context = f"{question['context']} " if question.get("context") else ""
+    is and what choosing does) first, then its impact (what users see after a production write), then the
+    question, then the issue."""
+    before = "".join(f"{question[key]} " for key in ("context", "impact") if question.get(key))
     issue = f"（{question['issue']}）" if question.get("issue") else ""
-    return context + str(question.get("question") or "") + issue
+    return before + str(question.get("question") or "") + issue
 
 
 def questions_of(ask: dict) -> list[str]:
