@@ -104,6 +104,17 @@ class NaturalJapaneseScriptsTests(unittest.TestCase):
         self.assertIn("読み込", "".join(findings[2]["alternatives"]))
         self.assertIn("配置", "".join(findings[4]["alternatives"]))
 
+    def test_polite_past_of_a_system_action_is_a_candidate(self) -> None:
+        findings = self.findings("保存するとエラーが出ました。設定を読みました。機材を置きました。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["system-show", "system-read", "system-place"])
+
+    def test_before_and_after_of_a_compound_verb_are_not_candidates(self) -> None:
+        text = "設定を見直す前にログを確認します。テストをやり直した後で結果を共有します。\n"
+        self.assertEqual(self.findings(text), [])
+        findings = self.findings("手順は、直す前と同じです。不具合を直した後に再実行します。\n")
+        self.assertEqual([item["rule_id"] for item in findings], ["fix-before-after"] * 2)
+
     def test_technical_verbs_and_compound_verbs_are_not_candidates(self) -> None:
         text = ("メッセージを表示します。設定を読み込みます。値を読み取り、読み書きします。\n"
                 "機材を配置し、文字列を置き換えます。ファイルを書き出し、関数を呼び出します。\n"
