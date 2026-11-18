@@ -6679,6 +6679,58 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([(item["id"], item["state"], item["link"]) for item in stale],
                          [("keep:/w/b", "提示済み・未回答", "https://github.com/Acme/app/issues/12")])
 
+    def test_a_presented_user_item_lists_the_owner_s_later_done_and_info_as_candidates_that_settle_it(self) -> None:
+        # 2026-11-17 20:00: the lanes' done and info (19:47, 20:21) had settled two login waits, and the run kept them.
+        saved = self.root / "scan.json"
+        saved.write_text("[]")
+        for key in ("user:lane::prod-login", "merge:Acme/app#12"):
+            self.call("presented", "--key", key, "--text-file", self.source("item.txt", f"{key} を待つ"),
+                      "--since", "2026-11-17T19:00:00+09:00", "--owner", "/w/lane")
+        write_jsonl(self.root / "inbox.jsonl", [
+            {"id": f"{name}-0000", "kind": kind, "worktree": worktree, "ts": f"2026-11-17T{at}:00+09:00",
+             "text": f"{name}: 本番にログインして確かめました"}
+            for name, kind, worktree, at in (("before01", "info", "lane", "18:59"), ("info0001", "info", "lane", "19:47"),
+                                             ("done0001", "done", "lane", "20:21"), ("ask00001", "ask", "lane", "20:30"),
+                                             ("other001", "info", "other", "20:40"))])
+
+        _, pending = self.call("pending")
+        with redirect_stdout(io.StringIO()) as out:
+            hourly_state.main(["--state-file", str(self.state), "stale-asks", "--from", str(saved), "--summary"])
+
+        self.assertEqual({item["id"]: [report["id"] for report in item["waiting_reports"]] for item in pending["presented"]},
+                         {"user:lane::prod-login": ["info0001-0000", "done0001-0000"], "merge:Acme/app#12": []})
+        line = next(line for line in out.getvalue().splitlines() if "id=user:lane::prod-login" in line)
+        self.assertIn(" | 解消の候補: info0001 info0001: 本番にログインして確かめました"
+                      " | 解消の候補: done0001 done0001: 本番にログインして確かめました", line)
+
+    def test_stale_asks_marks_an_ask_the_lead_spoke_past_without_its_transcripts_naming_it(self) -> None:
+        saved = self.root / "scan.json"
+        saved.write_text(json.dumps([{"path": f"/w/{name}", "repo": "app", "class": "waiting", "claude": {
+            "final_at": "2026-11-18T03:00:00Z", "final_text": "どうしますか？"}} for name in ("read", "unread")]))
+        asks = {name: f"{digit * 8}-0000-0000-0000-000000000000" for name, digit in (("read", "1"), ("unread", "2"))}
+        write_jsonl(self.root / "inbox.jsonl", [{"id": ident, "kind": "ask", "worktree": name, "repo": "app",
+                                                 "ts": "2026-11-18T03:30:00Z", "text": "どうしますか？"}
+                                                for name, ident in asks.items()])
+        self.call("appoint-lead", "--worktree", "/w/lead")
+        lead = self.root / "claude/projects/-w-lead"
+        lead.mkdir(parents=True)
+        write_jsonl(lead / "s.jsonl", [
+            {"type": "user", "timestamp": "2026-11-18T03:40:00Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "r", "content": f"id={asks['read']} どうしますか？"}]}},
+            {"type": "assistant", "timestamp": "2026-11-18T03:56:00Z",
+             "message": {"content": [{"type": "text", "text": "新しく届いた連絡はありません。"}]}}])
+
+        code, result = self.call("stale-asks", "--from", str(saved))
+        with redirect_stdout(io.StringIO()) as out:
+            hourly_state.main(["--state-file", str(self.state), "stale-asks", "--from", str(saved), "--summary"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual({item["name"]: item.get("lead_unseen", False) for item in result},
+                         {"read": False, "unread": True})
+        lines = {line.split(" | ")[0]: line for line in out.getvalue().splitlines()}
+        self.assertIn(" | 指揮が未読", lines["unread"])
+        self.assertNotIn("指揮が未読", lines["read"])
+
     def test_a_presented_key_listed_again_after_it_settled_or_after_its_question_settled_shows_again(self) -> None:
         decide = hourly_state.lead_decisions.Decision
         self.call("asked", "--row", "/w/e", "--decision", "other:/w/e", "--covers", "cover:/w/e", "--no-comment",

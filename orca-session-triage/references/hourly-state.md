@@ -249,7 +249,14 @@ that record when no answer will come (its session ended). An
 unanswered one lists the answers to the same question found in the
 recorded worktrees' transcripts as `unrecorded_answers`. `pending --summary` and
 `stale-asks --summary` print one line per item: name, state, since,
-age_minutes, the ask id (or the entry's id), and the question's start. It
+age_minutes, the ask id (or the entry's id), and the question's start; a
+`stale-asks` item whose ask is one of the appointed lead's `unseen_asks`
+(`handoff.py lead-state`) carries `lead_unseen` and adds 指揮が未読. A
+presented `user:` item (the user's own action) with an owner lists, in
+`waiting_reports`, the `done` and `info` its owner's worktree sent after its
+`since`, each shown as 「解消の候補: <id の頭 8 文字> <本文の先頭>」: read them
+before reporting the item as still waiting, and close it with `presented-close`
+once one settles it. It
 does not infer a user's answer from a tab closing or from a later verdict.
 Consult the actual answer and update the state. A waiting tab is not an
 invitation to ask the same question in the new session.
