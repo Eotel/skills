@@ -277,6 +277,92 @@ def read_document(path: Path) -> str | None:
         self.assertIsNone(commitment_store.read_document(self.root / "absent"))
         self.assertFalse(self.trace.exists())
 
+    def hold_records(self) -> list[dict]:
+        created = datetime.fromisoformat("2026-11-17T00:00:00Z").timestamp()
+        active = {"id": "h-active", "handle": "lane-a", "condition_kind": "signal", "condition_value": "lead",
+                  "instruction": "Wait", "created_at": created, "released_at": None, "signalled_at": None,
+                  "status": "active", "extra": "preserved"}
+        return [active, {**active, "id": "h-staged", "handle": "lane-b", "status": "staged"},
+                {**active, "id": "h-later", "handle": "lane-c", "status": "released", "released_at": created + 7200},
+                {**active, "id": "h-other", "handle": "lane-d", "condition_value": "other", "created_at": created + 3600},
+                {**active, "id": "h-time", "handle": "lane-e", "condition_kind": "time"},
+                {**active, "id": "h-future", "handle": "lane-f", "created_at": created + 10800},
+                {**active, "id": "h-ended", "handle": "lane-g", "status": "released", "released_at": created + 3600}]
+
+    def write_holds(self, path: Path) -> None:
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE TABLE holds (id TEXT, handle TEXT, condition_kind TEXT, condition_value TEXT, "
+                       "instruction TEXT, created_at REAL, released_at REAL, signalled_at REAL, status TEXT, extra TEXT)")
+            db.executemany("INSERT INTO holds VALUES (:id, :handle, :condition_kind, :condition_value, :instruction, "
+                           ":created_at, :released_at, :signalled_at, :status, :extra)", self.hold_records())
+
+    def assert_hold_readers(self, path: Path) -> None:
+        import stall_watch
+        import timeline
+
+        self.assertEqual(inbox_read.held_until_signal("lead", path),
+                         {"lane-a": "h-active", "lane-b": "h-staged", "lane-f": "h-future"})
+        now = datetime.fromisoformat("2026-11-17T01:00:00Z")
+        window = timeline.Window(now - timedelta(hours=1), now + timedelta(hours=1))
+        events = list(timeline.holds(path, window, timeline.Names({})))
+        self.assertEqual([(item.ref, item.lane, item.kind) for item in events], [
+            ("h-active", "lane-a", "保留を置いた"), ("h-staged", "lane-b", "保留を置いた"),
+            ("h-later", "lane-c", "保留を置いた"), ("h-later", "lane-c", "保留を解いた"),
+            ("h-other", "lane-d", "保留を置いた"), ("h-time", "lane-e", "保留を置いた"),
+            ("h-ended", "lane-g", "保留を置いた"), ("h-ended", "lane-g", "保留を解いた")])
+        with patch.multiple(stall_watch, INBOX=self.root / "triage-inbox.jsonl", ANSWERS=self.root / "ask-answers.jsonl",
+                            HOLDS=path, BOARD=self.root / "board.sqlite3", HOURLY_STATE=self.root / "hourly-state.json",
+                            REMOTES=self.root / "remotes.json", CHECKS=self.root / "checks.json"):
+            records = stall_watch.load_records(now, [])
+        self.assertEqual(records.held_handles, frozenset(("lane-a", "lane-c", "lane-d", "lane-e")))
+
+    def test_hold_readers_keep_file_results_without_component_or_with_older_component(self) -> None:
+        path = self.root / "holds.sqlite"
+        self.write_holds(path)
+        self.assert_hold_readers(path)
+        self.install_component()
+        self.assert_hold_readers(path)
+
+    def test_hold_readers_use_component_rows_with_missing_or_stale_file(self) -> None:
+        path = self.root / "holds.sqlite"
+        self.mirror.write_text(json.dumps(self.hold_records()))
+        (self.bin / "orca_board_commitments.py").write_text('''
+import json
+import os
+from pathlib import Path
+
+def hold_rows(path: Path) -> list[dict]:
+    assert path.name == "holds.sqlite"
+    return json.loads(Path(os.environ["COMMITMENT_TEST_MIRROR"]).read_text())
+''')
+        self.assert_hold_readers(path)
+        self.assertFalse(path.exists())
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE TABLE holds (id TEXT)")
+        self.assert_hold_readers(path)
+
+    def test_hold_rows_preserves_all_columns_and_missing_file_is_empty(self) -> None:
+        import commitment_store
+
+        path = self.root / "holds.sqlite"
+        self.assertEqual(commitment_store.hold_rows(path), [])
+        self.assertFalse(path.exists())
+        self.write_holds(path)
+        self.assertEqual(commitment_store.hold_rows(path), self.hold_records())
+
+    def test_hold_rows_reads_other_filenames_from_sqlite_even_with_component(self) -> None:
+        import commitment_store
+
+        path = self.root / "local #?.sqlite"
+        self.write_holds(path)
+        (self.bin / "orca_board_commitments.py").write_text('''
+from pathlib import Path
+
+def hold_rows(path: Path) -> list[dict]:
+    raise AssertionError("only holds.sqlite goes through the component")
+''')
+        self.assertEqual(commitment_store.hold_rows(path), self.hold_records())
+
     def test_db_first_appends_exact_lines_for_every_log(self) -> None:
         self.install_component()
         for name, write in self.writers().items():

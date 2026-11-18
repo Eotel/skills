@@ -16,7 +16,11 @@ In `file-first` the component leaves storage to the files; in `db-first` it
 updates the board DB before the same bytes go to the files. `db-read` also
 reads from the DB mirror, and `db-only` reads and writes only the board DB.
 A failed DB write prints its error and exits 1 without that file write.
-`triage-inbox.jsonl` and `holds.sqlite` remain plain files.
+Holds reads use the component's `hold_rows(path)` for `holds.sqlite`. When the
+board holds the canonical copy and the path is its holds file, the component
+reads `board.sqlite3`; otherwise it reads the SQLite file at that path. Without
+the component or its `hold_rows` function, reads use the SQLite file directly.
+`triage-inbox.jsonl` remains a plain file.
 
 The commands below use that script path. They accept `--state-file PATH` before
 the subcommand for an isolated copy. Use a local scratch file for each exact

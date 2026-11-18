@@ -10,7 +10,7 @@ person the adoption ledger names), to whom, what happened, a summary, and the re
 - decision: the lead's decision log (指揮が決めた), `TRIAGE_LEAD_DECISIONS`;
 - board: the board's event log, the only record of what `send` delivered (送った), the lanes `spawn-lane`
   started (起動した), and the Backlog comments `backlog-post` posted (投稿した), `ORCA_BOARD_EVENTS`;
-- hold: when each hold was set and released, `holds.sqlite` under `ORCA_BRIEFS_ROOT`;
+- hold: when each hold was set and released, through the board component for `holds.sqlite` under `ORCA_BRIEFS_ROOT`;
 - undelivered: sends kept for a resend because the lane's screen was unreadable, under `ORCA_BRIEFS_ROOT`;
 - adoption: the adoption ledger's proposals, decisions, hand-offs and applications,
   `ADOPTION_TRIAGE_EVENTS` and the other Macs' copies in `ADOPTION_TRIAGE_IMPORTS`;
@@ -38,13 +38,12 @@ import json
 import os
 from pathlib import Path
 import re
-import sqlite3
 import subprocess
 import sys
 from typing import BinaryIO, Literal, Protocol
 
 import inbox_read
-from commitment_store import read_lines
+from commitment_store import hold_rows, read_lines
 
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
@@ -321,12 +320,7 @@ def board_events(board: list[dict], window: Window, lanes: Names) -> Iterator[Ev
 
 
 def holds(path: Path, window: Window, lanes: Names) -> Iterator[Event]:
-    if not path.exists():
-        return
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT * FROM holds").fetchall()
-    for row in rows:
+    for row in hold_rows(path):
         kind, value = row["condition_kind"], row["condition_value"]
         until = {"pr-merged": f"{value} の merge まで", "pr-reviewed": f"{value} にレビューが付くまで",
                  "time": f"{value} まで"}.get(kind, f"{lanes.of(value)} の解除の連絡まで")
