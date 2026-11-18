@@ -2630,7 +2630,9 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
     reading a saved scan again does not repeat it. `removal_decision` is the newest answer to the row's own removal
-    keys and decides `allows_removal`; a newer answer to one of their `::` sub-keys is shown as its `newest`.
+    keys and decides `allows_removal`; a newer answer to one of their `::` sub-keys is shown as its `newest`. An answer
+    recorded with removal terms carries `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub
+    now, its state (or null when it cannot be read) in `after_state`.
     """
     import lead_decisions
     decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
@@ -2670,9 +2672,9 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
                                        "decided_at": answer.decided_at,
                                        **({"newest": {"decision": newest.decision, "answer": newest.answer,
-                                                      "decided_at": newest.decided_at}} if newest else {})}
-        if answer := row.get("removal_decision"):
-            answer["allows_removal"] = removal_approved(row)
+                                                      "decided_at": newest.decided_at}} if newest else {}),
+                                       **({"after": answer.removal.after, "discard": list(answer.removal.discard),
+                                           "compose_down": answer.removal.compose_down} if answer.removal else {})}
         names = {row["path"], row_identity(row), row_name(row),
                  f"{row.get('repo')}/{Path(row['path']).name}"}
         if not row.get("environment"):
@@ -2684,12 +2686,30 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         if answered:
             answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or EPOCH)
             row["wake_decision"] = {"answer": answer.answer, "decided_at": answer.decided_at}
+    conditions: dict[str, set[int]] = {}
+    for pr in (lead_decisions.RemovalTerms(removal.get("after")).pull_request()
+               for row in rows if (removal := row.get("removal_decision"))):
+        if pr:
+            conditions.setdefault(pr.repo, set()).add(pr.number)
+    states = {(repo, number): state.state for repo, numbers in conditions.items()
+              for number, state in (lead_decisions.github_pr_states(repo, sorted(numbers)) or {}).items()}
+    for row in rows:
+        if removal := row.get("removal_decision"):
+            if pr := lead_decisions.RemovalTerms(removal.get("after")).pull_request():
+                removal["after_state"] = states.get((pr.repo, pr.number))
+            removal["allows_removal"] = removal_approved(row)
     return rows
 
 
 def removal_approved(row: dict) -> bool:
-    """An explicit removal answer; retaining or deferring in that answer takes precedence."""
-    text = str((row.get("removal_decision") or {}).get("answer") or "")
+    """An explicit removal answer; retaining or deferring in that answer takes precedence. An answer recorded with
+    removal terms is decided by them, whatever conditions its words give: one with a PR condition (`after`) once that
+    PR merged, and one with only cleanup (`discard`, `compose_down`), which rm-check-batch runs first, at once."""
+    if (decision := row.get("removal_decision") or {}).get("after"):
+        return decision.get("after_state") == "MERGED"
+    if decision.get("discard") or decision.get("compose_down"):
+        return True
+    text = str(decision.get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
     text = re.sub(r"rm_check(?:\.py)?\s*(?:が\s*)?ok\s*なら|検査が通れば", "", text, flags=re.IGNORECASE)
     text = re.sub(r"タブを閉じてから|--archive-scratch\s*で(?:作業記録を|控えに)?移してから", "", text)

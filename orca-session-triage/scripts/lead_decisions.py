@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sys
 from typing import Protocol
@@ -50,7 +50,10 @@ DEFAULT_LOG = Path(os.environ.get("TRIAGE_LEAD_DECISIONS", "~/.cache/orca-sessio
 HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session-triage/handed-off.jsonl"))
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
-ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value"))
+REMOVAL_KEYS = ("after", "discard", "compose_down")
+ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value", *REMOVAL_KEYS))
+# The one removal condition: the worktree goes once that PR merged.
+PR_MERGED = re.compile(r"pr-merged:https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/pull/(?P<number>\d+)")
 ASANA_ITEM = re.compile(r"asana:(?P<item>complete|priority|assignee|review-state|pr-state):")
 JST = timezone(timedelta(hours=9))
 EXCERPT = 160
@@ -62,21 +65,77 @@ PLACEHOLDER = re.compile(r"(?<![$@{])\{[a-z][a-z0-9]*(?:_[a-z0-9]+)+\}(?!\})")
 
 
 @dataclass(frozen=True)
+class PullRequest:
+    repo: str
+    number: int
+
+
+@dataclass(frozen=True)
+class RemovalTerms:
+    """What a remove: answer waits for before the worktree goes, and what goes with it first."""
+    after: str | None = None  # pr-merged:<PR URL>
+    discard: tuple[str, ...] = ()  # files inside the worktree, relative to it
+    compose_down: bool = False  # docker compose -p <project> down -v for each project the check lists
+
+    @classmethod
+    def checked(cls, decision: str, after: object, discard: object, compose_down: object) -> RemovalTerms | None:
+        """The terms an answer gives, or None without any; ValueError says why its key or a value cannot hold them."""
+        if after is None and not discard and compose_down is False:
+            return None
+        if not decision.startswith("remove:"):
+            raise ValueError("a removal condition or cleanup (after, discard, compose_down) goes only with a remove: key")
+        if after is not None and not (isinstance(after, str) and PR_MERGED.fullmatch(after.strip())):
+            raise ValueError("after must be pr-merged:https://github.com/<owner>/<repo>/pull/<number>")
+        if not isinstance(discard, (list, tuple)) or not all(isinstance(path, str) and inside(path) for path in discard):
+            raise ValueError("each discard path must be a relative path inside the worktree, such as .env")
+        if not isinstance(compose_down, bool):
+            raise ValueError("compose_down must be true or false")
+        return cls(after.strip() if isinstance(after, str) else None, tuple(path.strip() for path in discard),
+                   compose_down)
+
+    @classmethod
+    def stored(cls, value: object) -> RemovalTerms | None:
+        if not isinstance(value, dict):
+            return None
+        return cls(value.get("after"), tuple(value.get("discard") or ()), value.get("compose_down") is True)
+
+    def pull_request(self) -> PullRequest | None:
+        """The PR whose merge `after` waits for."""
+        found = PR_MERGED.fullmatch(self.after or "")
+        return PullRequest(found["repo"], int(found["number"])) if found else None
+
+
+def inside(path: str) -> bool:
+    """A relative path that stays inside the directory it is relative to and names something in it."""
+    parts = PurePosixPath(path.strip()).parts
+    return bool(parts) and not PurePosixPath(path.strip()).is_absolute() and ".." not in parts and parts != (".",)
+
+
+@dataclass(frozen=True)
 class Decision:
     id: str
     decision: str
     answer: str
     decided_at: str
     value: str | bool | None = None  # what an answer on an Asana 99 item puts there (answer_value)
+    removal: RemovalTerms | None = None  # a remove: answer's condition and cleanup
 
     @classmethod
     def parse(cls, raw: str, where: str) -> Decision:
         try:
             item = json.loads(raw)
             return cls(id=str(item["id"]), decision=str(item["decision"]), answer=str(item["answer"]),
-                       decided_at=str(item["decided_at"]), value=item.get("value"))
+                       decided_at=str(item["decided_at"]), value=item.get("value"),
+                       removal=RemovalTerms.stored(item.get("removal")))
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
+
+    def view(self) -> dict:
+        """The record as the log keeps it: an answer without removal terms has no `removal` key."""
+        found = asdict(self)
+        if self.removal is None:
+            del found["removal"]
+        return found
 
 
 @dataclass(frozen=True)
@@ -98,12 +157,6 @@ class HandOff:
     def now(cls, decision: str, ask_id: str | None = None) -> HandOff:
         return cls(decision=decision, handed_off_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                    ask_id=ask_id)
-
-
-@dataclass(frozen=True)
-class PullRequest:
-    repo: str
-    number: int
 
 
 @dataclass(frozen=True)
@@ -218,7 +271,8 @@ def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]
 
 def append(log: Path, *entries: Decision | HandOff) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps(asdict(entry), ensure_ascii=False) + "\n" for entry in entries]
+    lines = [json.dumps(entry.view() if isinstance(entry, Decision) else asdict(entry), ensure_ascii=False) + "\n"
+             for entry in entries]
     with writing(log, lines=lines) as write_file:
         if write_file:
             with log.open("a", encoding="utf-8") as stream:
@@ -267,7 +321,9 @@ def answer_line(raw: str) -> Decision:
         raise ValueError("decided_at must be an ISO 8601 time with its timezone offset")
     decision, at = str(texts["decision"]).strip(), decided_at(when)
     return Decision(id=uuid.uuid4().hex, decision=decision, answer=stamped(str(texts["answer"]).strip(), at),
-                    decided_at=at, value=answer_value(decision, item.get("value")))
+                    decided_at=at, value=answer_value(decision, item.get("value")),
+                    removal=RemovalTerms.checked(decision, item.get("after"), item.get("discard", []),
+                                                 item.get("compose_down", False)))
 
 
 def checked_line(number: int, raw: str) -> Decision | BadLine:
@@ -418,7 +474,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     last = {}
     for key in keys:
         item = history[key][-1] if key in history else None
-        answer = (asdict(answered[key]) if key in answered else
+        answer = (answered[key].view() if key in answered else
                   next((found for entry in reversed(history.get(key, []))
                         if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
         delivered = answer is not None and (key in answered or genuine_answer(answer))
@@ -476,7 +532,7 @@ class ShownAnswer:
         return f"{stamp} {self.item.decision}{marks}  {cut}"
 
     def view(self) -> dict[str, object]:
-        return {**asdict(self.item), "marks": list(self.marks)}
+        return {**self.item.view(), "marks": list(self.marks)}
 
 
 def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None,
@@ -513,11 +569,21 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
     record.add_argument("--decided-at", help="original ISO 8601 time when recording an earlier answer")
     record.add_argument("--value", help="for an asana:<item>: key, the value the answer puts in that item: "
                                         "true or false (complete), an Asana user gid (assignee), or an option name")
+    record.add_argument("--after", metavar="pr-merged:PR_URL",
+                        help="for a remove: key, what the removal waits for: the scan approves it once that PR "
+                             "merged, whatever conditions the answer's words give")
+    record.add_argument("--discard", action="append", default=[], metavar="PATH",
+                        help="for a remove: key, a file inside the worktree (relative to it, such as .env) that "
+                             "rm-check-batch --remove-ok deletes before checking again; repeat per file")
+    record.add_argument("--compose-down", action="store_true",
+                        help="for a remove: key: rm-check-batch --remove-ok runs docker compose -p <project> down -v "
+                             "for each compose project the check lists before checking again")
     many = commands.add_parser(
         "record-many", help='append several answers from JSON Lines of {"decision": KEY, "answer": TEXT, '
                             '"decided_at": ISO time with offset (optional), "value": what an asana:<item>: answer '
-                            'puts in that item (optional)}; {answered_at} in an answer as with record; a wrong line '
-                            'writes nothing')
+                            'puts in that item (optional), and for a remove: key "after", "discard": [PATH, ...], '
+                            'and "compose_down": true as record --after, --discard, and --compose-down (optional)}; '
+                            '{answered_at} in an answer as with record; a wrong line writes nothing')
     many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     show = commands.add_parser("show", help="print the latest answer for each decision")
     show.add_argument("--match", action="append", default=[], help="word in the key or answer, ignoring case; repeat per word")
@@ -557,10 +623,11 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                 raise ValueError("--decision is empty")
             at = decided_at(args.decided_at)
             entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=stamped(non_empty(args.answer_file), at),
-                             decided_at=at, value=answer_value(decision, args.value))
+                             decided_at=at, value=answer_value(decision, args.value),
+                             removal=RemovalTerms.checked(decision, args.after, args.discard, args.compose_down))
             warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)
-            result: object = asdict(entry)
+            result: object = entry.view()
         elif args.action == "record-many":
             given, bad = answers(args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read())
             if bad or not given:
@@ -568,7 +635,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                                                                    for item in bad) or ": no answers were given"))
             warnings = hidden_answers(history(records(log)), given)
             append(log, *given)
-            result = [asdict(entry) for entry in given]
+            result = [entry.view() for entry in given]
         elif args.action == "show":
             keys = history(records(log))
             items = [item for found in keys.values() for item in (found if args.history else found[-1:])]
@@ -586,8 +653,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                 else:
                     print("\n".join(answer.line() for answer in shown))
                 return 0
-            result = [{**asdict(found[-1]), "replaced": [asdict(item) for item in found[:-1]]} if args.history
-                      else asdict(found[-1]) for found in keys.values()]
+            result = [{**found[-1].view(), "replaced": [item.view() for item in found[:-1]]} if args.history
+                      else found[-1].view() for found in keys.values()]
         else:
             inbox = inbox_read.paths()[0].expanduser()
             entries = inbox_read.inbox_entries(inbox) if inbox.exists() else []

@@ -237,6 +237,51 @@ class HandoffTests(unittest.TestCase):
         self.assertIn(notification([ids[2]]), body)
         self.assertIn("User instruction", body)
 
+    def test_lead_state_and_the_handoff_name_open_asks_the_lead_spoke_past_without_its_transcripts_naming_them(
+            self) -> None:
+        # 2026-11-18 12:56: three asks reached the inbox while the lead's AskUserQuestion was open, and the lead
+        # said nothing new had come.
+        read, unread, queued, answered, later = (f"{digit * 8}-0000-0000-0000-000000000000" for digit in "12345")
+        self.inbox.write_text("".join(json.dumps({"id": ident, "kind": "ask", "ts": f"2026-11-18T12:3{minute}:00+09:00",
+                                                  "worktree": "lane", "repo": "app", "text": f"質問 {ident[:8]} です"})
+                                      + "\n" for minute, ident in enumerate((read, unread, queued, answered)))
+                              + json.dumps({"id": later, "kind": "ask", "ts": "2026-11-18T13:10:00+09:00",
+                                            "worktree": "lane", "text": "後の質問"}) + "\n")
+        (self.root / "ask-answers.jsonl").write_text(json.dumps(
+            {"id": answered, "ts": "2026-11-18T03:40:00Z", "how": "send", "note": "答えた"}) + "\n")
+        lead = self.projects / "-w-lead"
+        lead.mkdir(parents=True)
+        (lead / "old.jsonl").write_text(json.dumps({"type": "user", "timestamp": "2026-11-18T03:31:00Z", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "r", "content": f"id={read[:8]} 質問"}]}}) + "\n")
+        os.utime(lead / "old.jsonl", (1, 1))
+        (lead / "now.jsonl").write_text("".join(json.dumps(entry) + "\n" for entry in [
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-18T03:41:00Z",
+             "content": f"<task-notification>ask app/lane id={queued}</task-notification>"},
+            {"type": "assistant", "timestamp": "2026-11-18T03:56:00Z",
+             "message": {"content": [{"type": "text", "text": "新しく届いた連絡はありません。"}]}}]))
+        orca = self.root / "orca"
+        orca.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                        "result = {'worktrees': [{'path': '/w/lead', 'worktreeId': 'lead', 'agents': []}]} "
+                        "if sys.argv[1:3] == ['worktree', 'ps'] else {'terminals': []}\n"
+                        "print(json.dumps({'result': result}))\n")
+        orca.chmod(0o755)
+        env = {"TRIAGE_INBOX": str(self.inbox), "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl")}
+
+        shown = subprocess.run([sys.executable, str(SCRIPT), "lead-state", "--lead-worktree", "/w/lead",
+                                "--orca", str(orca), "--claude-projects", str(self.projects),
+                                "--handoffs-dir", str(self.handoffs)], text=True, capture_output=True,
+                               env={**os.environ, **env})
+        sent = self.run_tool("--since", str(self.inbox.stat().st_size), "--lead-worktree", "/w/lead", env=env)
+
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual([(item["id"], item["source"], item["text"]) for item in json.loads(shown.stdout)["unseen_asks"]],
+                         [(unread, "app/lane", f"質問 {unread[:8]} です"), (queued, "app/lane", f"質問 {queued[:8]} です")])
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        body = json.loads(self.sent.read_text())[-1]
+        self.assertIn(f"指揮が未読の ask 2 件（最後の発言より前に届き、会話記録に id が無い）:\n"
+                      f"- {unread[:8]} 2026-11-18T12:31:00+09:00 app/lane 質問 {unread[:8]} です\n"
+                      f"- {queued[:8]} 2026-11-18T12:32:00+09:00 app/lane 質問 {queued[:8]} です", body)
+
     def test_refuses_while_another_tab_of_this_workspace_reported_after_the_scan(self) -> None:
         # 11/10 09:08: the 07:00 tab handed off 4 asks as open after the 02:00 tab of the same workspace
         # handed off (09:05) and corrected them as answered (09:06).

@@ -3,7 +3,8 @@
 
 `send` appends, at the moment it sends, every inbox report that arrived after the
 byte offset the run read at its start (`--since`, its first NEXT_OFFSET), and the
-lead's latest message, unanswered question count, and undelivered queued input read again from its transcript. It
+lead's latest message, unanswered question count, undelivered queued input, and unseen asks (as lead-state names
+them, under 「指揮が未読の ask」) read again from its transcripts. It
 refuses to send while a handed-off decision key already has the lead's answer in
 lead_decisions.py: follow that answer and drop the question instead. Just before sending it
 records each --decision key as handed off (lead_decisions.handed_off reads them), so tools can
@@ -33,7 +34,9 @@ time, kind, and file, then the matching lines and keys.
 `lead-state` reads the lead's agents and rendered screens through Orca and prints JSON with its
 latest message of its own (also while a turn runs or after an API error such as a usage limit ended it),
 unanswered questions and ask times, the questions answered (`answered`) and closed unanswered (`rejected`,
-with ask and close times) since the newest kept handoff, and undelivered queued input. It includes the
+with ask and close times) since the newest kept handoff, undelivered queued input, and `unseen_asks`: the open asks
+that reached the inbox before its latest message whose id's first 8 characters none of its transcripts holds outside
+queued input it was never given. It includes the
 current transcript path and timestamped user_messages since that handoff (excluding task notifications).
 `lead-state --grep WORD [--since HH:MM|ISO]` adds matching timestamped transcript events in `matches`:
 lead and user speech, AskUserQuestion calls, and tool results (literal WORD, case ignored).
@@ -278,6 +281,60 @@ def lead_claude(projects: Path, worktree: str) -> dict | None:
     return scan_sessions.read_claude(projects, worktree, live.get(worktree, []))
 
 
+def seen_in(transcript: Path, prefixes: set[str]) -> set[str]:
+    """The prefixes the transcript holds outside its queued input (queue-operation), which the lead may never get."""
+    data = transcript.read_bytes()
+    found = set()
+    for prefix in prefixes:
+        needle, at = prefix.encode(), 0
+        while (at := data.find(needle, at)) >= 0:
+            end = data.find(b"\n", at)
+            line = data[data.rfind(b"\n", 0, at) + 1:end if end >= 0 else len(data)]
+            if (inbox_read.entry(line) or {}).get("type") != "queue-operation":
+                found.add(prefix)
+                break
+            at += len(needle)
+    return found
+
+
+def unseen_asks(transcripts: list[Path], said_at: datetime | None) -> list[dict]:
+    """The open asks that reached the inbox before the lead last spoke and whose id's first 8 characters no transcript
+    of the lead holds: the lead spoke past them unread (2026-11-18 12:56, three asks sent while its AskUserQuestion
+    was open)."""
+    if said_at is None:
+        return []
+    asks = [ask for ask in inbox_read.open_asks(hourly_state.inbox_entries(),
+                                                inbox_read.answered_ids(inbox_read.answers_path()))
+            if ask.at is not None and ask.at < said_at]
+    left = {str(ask.report["id"])[:8] for ask in asks}
+    for transcript in transcripts:
+        left -= seen_in(transcript, left)
+    return [{"id": ask.report["id"], "ts": ask.report.get("ts") or "", "source": inbox_read.source_of(ask.report),
+             "text": excerpt(ask.report.get("text"))} for ask in asks if str(ask.report["id"])[:8] in left]
+
+
+def lead_transcripts(projects: Path, worktree: str, claude: dict | None) -> list[Path]:
+    """Every transcript of the lead's worktree, the current one first: a session the lead started after closing a
+    question is the newest one."""
+    return list(dict.fromkeys([*([Path(claude["transcript"])] if claude else []),
+                               *answer_evidence.transcripts_of(projects, [Path(worktree)])]))
+
+
+def lead_unseen_asks(projects: Path, worktree: str) -> list[dict]:
+    """unseen_asks against the lead's own newest message."""
+    claude = lead_claude(projects, worktree)
+    if claude is None:
+        return []
+    said = last_said(scan_sessions.load_jsonl(Path(claude["transcript"])))
+    return unseen_asks(lead_transcripts(projects, worktree, claude), scan_sessions.parse_time(said["at"]))
+
+
+def unseen_lines(asks: list[dict]) -> str:
+    return (f"\n指揮が未読の ask {len(asks)} 件（最後の発言より前に届き、会話記録に id が無い）:" if asks else "") + "".join(
+        f"\n- {item['id'][:8]} {item['ts'] or '-'} {item['source']} {hourly_state.headline(item['text'])}"
+        for item in asks)
+
+
 def lead_state(projects: Path, worktree: str) -> str:
     claude = lead_claude(projects, worktree)
     name = Path(worktree).name
@@ -288,7 +345,8 @@ def lead_state(projects: Path, worktree: str) -> str:
     return (f"指揮の今（{name}）: 未回答の質問 {len(claude['pending_questions'])} 件。"
             f"最後の発言 {claude.get('final_at') or '-'}: {said[:200]}" + ("…" if len(said) > 200 else "")
             + "".join(f"\n未配信の指示（{item['enqueued_at'] or '-'}、{item['minutes']} 分経過）: {item['text']}"
-                      for item in queued if not item.get("handled_at")))
+                      for item in queued if not item.get("handled_at"))
+            + unseen_lines(lead_unseen_asks(projects, worktree)))
 
 
 def last_said(entries: list[dict]) -> dict[str, str | None]:
@@ -460,6 +518,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
     if resumed and claude:
         claude.update(api_error=None, api_error_kind=None)
     final: dict[str, str | None] = {"at": None, "text": None}
+    said_at = None
     questions = {}
     queued = []
     transcript = None
@@ -469,6 +528,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
         entries = scan_sessions.load_jsonl(transcript)
         events = transcript_events(entries)
         final = last_said(entries)
+        said_at = scan_sessions.parse_time(final["at"])
         if resumed and resumed.text:
             final = {"at": None, "text": resumed.text}
         # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
@@ -486,9 +546,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
                 elif block.get("type") == "tool_result":
                     questions.pop(block.get("tool_use_id"), None)
         queued = queued_instructions(transcript)
-    # Every transcript of the worktree: a session the lead started after closing a question is the newest one.
-    transcripts = list(dict.fromkeys([*answer_evidence.transcripts_of(projects, [Path(worktree)]),
-                                      *([Path(claude["transcript"])] if claude else [])]))
+    transcripts = lead_transcripts(projects, worktree, claude)
     handoff_since = last_sent_at(handoffs)
     rejected = answer_evidence.rejected_questions(transcripts, handoff_since)
     if questions:
@@ -507,7 +565,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
             "api_error": claude.get("api_error") if claude else None,
             "pending_questions": list(questions.values()),
             "answered": answer_evidence.answered_questions(transcripts, handoff_since), "rejected": rejected,
-            "terminals": tabs, "queued_input": queued}
+            "unseen_asks": unseen_asks(transcripts, said_at), "terminals": tabs, "queued_input": queued}
     if grep is not None:
         result["matches"] = [event for event in events if grep.casefold() in event["text"].casefold()
                              and (since is None or (at := scan_sessions.parse_time(event["at"])) is not None
@@ -631,6 +689,8 @@ def main(argv: list[str] | None = None) -> int:
                     "answered (questions answered since the newest kept handoff: id, asked_at, answered_at, "
                     "answers by question, notes by question), "
                     "rejected (questions closed unanswered since the newest kept handoff, with ask/close times), "
+                    "unseen_asks (id, ts, source, text: open asks that reached the inbox before final whose id's "
+                    "first 8 characters no transcript of the lead holds outside queued input), "
                     "terminals (handle, screen_tail: 画面の末尾の行の配列（文字列ではない）), "
                     "queued_input (instructions and enqueue times; handled_at marks notifications already read "
                     "or answered, excluded from stall judgment and send's undelivered list). "

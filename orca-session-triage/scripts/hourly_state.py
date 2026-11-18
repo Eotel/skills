@@ -395,8 +395,19 @@ def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, le
     return "open"
 
 
-def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime) -> list[dict]:
-    """Each item an hourly report listed that is still open (presented_state), as a stale-asks item."""
+def owner_reports(owner: str, since: datetime | None, entries: list[dict]) -> list[dict]:
+    """The done and info the owner's worktree sent after `since`, named by its leaf as inbox reports name it."""
+    name = Path(owner.split("::", 1)[-1]).name
+    return [{**report_view(entry), "worktree": entry.get("worktree"), "repo": entry.get("repo")} for entry in entries
+            if entry.get("kind") in ("done", "info") and entry.get("worktree") == name and since is not None
+            and (at := scan_sessions.parse_time(entry.get("ts"))) is not None and at > since]
+
+
+def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime,
+                  entries: list[dict] | None = None) -> list[dict]:
+    """Each item an hourly report listed that is still open (presented_state), as a stale-asks item. A `user:` item
+    (the user's own action) lists in `waiting_reports` the done and info its owner sent after its `since` from the
+    inbox `entries`: candidates that it is settled (2026-11-17 20:00, two login waits the lanes had reported done)."""
     items = []
     for key, item in data["presented"].items():
         if presented_state(data, key, item, decisions) != "open":
@@ -406,6 +417,9 @@ def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], 
                       "name": Path(item["owner"].split("::", 1)[-1]).name if item["owner"] else "-",
                       "state": PRESENTED, "since": item["since"], "question": excerpt(item["text"]),
                       "link": item["link"], "presented_at": item["presented_at"], "ask": None, "answer": None,
+                      "waiting_reports": owner_reports(item["owner"], scan_sessions.parse_time(item["since"]),
+                                                       entries or []) if key.startswith("user:") and item["owner"]
+                      else [],
                       "age_minutes": int((now - since).total_seconds() // 60)})
     return items
 
@@ -1322,7 +1336,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                      for key, item in data["handoffs"].items() if item["delivered_at"] is None],
         "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
         "user_waits": [{"id": key, **item} for key, item in data["user_waits"].items() if item["closed_at"] is None],
-        "presented": presented_now(data, decisions, now),
+        "presented": presented_now(data, decisions, now, entries),
         "left": [{"row": row, **item} for row, item in data["left"].items()],
         "unrecorded_questions": unrecorded or [],
     }
@@ -1516,7 +1530,10 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
         for asking in item.get("asking") or []:
             line += f" | 伺い中 {asking['by']}（{asking['at']}、{', '.join(asking['keys'])}）。重ねて伺わない"
         for report in item.get("waiting_reports") or []:
-            line += f" | 待ち先から届いた（{report['ts']}・報告 {report['id']}・{report['worktree']}）"
+            line += (f" | 解消の候補: {report['id'][:8]} {headline(report['text'])}" if item.get("state") == PRESENTED
+                     else f" | 待ち先から届いた（{report['ts']}・報告 {report['id']}・{report['worktree']}）")
+        if item.get("lead_unseen"):
+            line += " | 指揮が未読"
         if item.get("waits_on"):
             line += f" | waits_on={item['waits_on']} | next_step={item.get('next_step') or ''}"
         if item.get("related_issues_closed"):
@@ -1586,7 +1603,9 @@ def main(argv: list[str] | None = None) -> int:
                            "that name only the lane or its PR numbers, age_minutes, and the ask's 関わる issue "
                            "(related_issues with their states; related_issues_closed when every one is closed or "
                            "merged, 関わる issue が閉じた in --summary) and the later asks that withdrew its ask "
-                           "(reissued, 出し直しあり in --summary); each AskUserQuestion of the --asked-in transcripts "
+                           "(reissued, 出し直しあり in --summary), and lead_unseen (指揮が未読 in --summary) when "
+                           "the ask is one of the appointed lead's unseen_asks (handoff.py lead-state); "
+                           "each AskUserQuestion of the --asked-in transcripts "
                            "closed unanswered since the newest saved handoff, as rejected; and each open user-wait, "
                            "its checks read now with gh, as user_wait")
     stale.add_argument("--from", dest="from_file", metavar="SCAN_JSON", required=True,
@@ -1697,7 +1716,9 @@ def main(argv: list[str] | None = None) -> int:
     presented = commands.add_parser(
         "presented", help="record an item the hourly report listed for the user; pending and stale-asks show it as "
                           f"{PRESENTED} until an answer or a lead decision under its key after its first listing, "
-                          "or presented-close; listing a key not yet settled again keeps its first since and listing time")
+                          "or presented-close; listing a key not yet settled again keeps its first since and listing "
+                          "time. A user: item with --owner lists the done and info its owner sent after --since as "
+                          "waiting_reports (解消の候補 in --summary)")
     presented.add_argument("--key", required=True,
                            help="the decision key an answer or lead decision would use, e.g. merge:OWNER/NAME#N")
     presented.add_argument("--text-file", required=True, help="the item as the report put it, in a UTF-8 file")
@@ -1769,8 +1790,18 @@ def main(argv: list[str] | None = None) -> int:
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
-                data, {key: items[-1] for key, items in decided.items() if items}, datetime.now(timezone.utc))],
-                            key=lambda item: -item["age_minutes"])
+                data, {key: items[-1] for key, items in decided.items() if items}, datetime.now(timezone.utc),
+                entries)], key=lambda item: -item["age_minutes"])
+            unseen: set[str] = set()
+            if lead := appointed_lead(data):
+                try:
+                    unseen = {item["id"] for item in handoff.lead_unseen_asks(args.claude_projects.expanduser(),
+                                                                              str(lead))}
+                except READ_ERRORS as error:
+                    print(f"hourly state: 指揮が未読の ask を確かめていない: {error}", file=sys.stderr)
+            for item in result:
+                if (item.get("ask") or {}).get("id") in unseen:
+                    item["lead_unseen"] = True
             identities = {item["row"] for item in result if item.get("row")}
             prs = row_prs([row for row in rows if scan_sessions.row_identity(row) in identities])
             for item in result:

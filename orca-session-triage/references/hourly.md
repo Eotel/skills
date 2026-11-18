@@ -285,7 +285,8 @@ send --body-file FILE --since <the NEXT_OFFSET of the run's first inbox read>
 (`--kind info` with nothing to hand off but cleanup). At the moment it sends,
 it adds every inbox report that arrived after the scan began and the lead's
 latest message, unanswered question count, and undelivered queued instructions
-with their enqueue times and elapsed minutes, read again from its transcript.
+with their enqueue times and elapsed minutes, read again from its transcript,
+and under 「指揮が未読の ask」 each `unseen_asks` entry of `lead-state` below.
 `--decision-ask KEY=ID` binds a decision to its inbox ask (repeat per key).
 The lead defaults to the shared state's appointed worktree; `--lead-worktree`
 overrides it, and `--state-file` selects the shared state for both `send` and
@@ -299,7 +300,10 @@ notifications), `pending_questions` (unanswered questions, choices, and ask time
 (questions answered since the newest kept handoff, with the choice and note per
 question and ask and answer times), `rejected`
 (questions closed without an answer since the newest kept handoff, with ask and
-close times), `queued_input` (undelivered instructions and enqueue times), and
+close times), `unseen_asks` (`id`, `ts`, `source`, `text`: the open asks that
+reached the inbox before `final`, whose id's first 8 characters none of the
+lead's transcripts holds outside queued input it was never given), `queued_input`
+(undelivered instructions and enqueue times), and
 `terminals` (handles and `screen_tail`, an array of the screen's last lines,
 not a string);
 `--orca` selects its CLI.
