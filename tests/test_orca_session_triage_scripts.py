@@ -5753,7 +5753,7 @@ class LeadDecisionProposalTests(unittest.TestCase):
         result = json.loads(shown)
         self.assertEqual([item["decision"] for item in result["unanswered"]], ["old"])
         self.assertEqual(result["settled"], [{"decision": "bound", "answer": answer},
-                                              {"decision": "direct", "answer": self.lead.asdict(decision)}])
+                                              {"decision": "direct", "answer": decision.view()}])
         code, selected = self.call("unanswered", "--handed-off-file", str(self.handed),
                                    "--decision", "bound", "--decision", "new")
         self.assertEqual(code, 0)
