@@ -3096,6 +3096,28 @@ class ScanCommandTests(unittest.TestCase):
             "newest": {"decision": f"remove:local::{path}::db-down", "answer": "コンテナは消す（volume は残す）",
                        "decided_at": "2026-11-16T16:24:55+09:00"}})
 
+    def test_a_removal_answer_with_a_pr_condition_is_approved_once_that_pr_merged_whatever_its_words(self) -> None:
+        # 2026-11-18 15:07: 「merge させてから消す」 kept iot-stick-purchase-1118 out of --rm-specs after PR #6 merged.
+        decisions = self.dir / "decisions.jsonl"
+        write_jsonl(decisions, [{"id": name, "decision": f"remove:local::/w/{name}", "decided_at": "2026-11-18T05:13:57Z",
+                                 "answer": "担当に文書 PR として commit・merge させてから消す", "removal": {
+                                     "after": f"pr-merged:https://github.com/acme/{name}/pull/6", "discard": [".env"],
+                                     "compose_down": True}} for name in ("merged", "open", "unread")])
+        rows = [{"path": f"/w/{name}", "repo": name, "class": "finished", "reasons": [], "closable": []}
+                for name in ("merged", "open", "unread")]
+        states = {"acme/merged": {"pr_6": {"state": "MERGED", "updatedAt": "2026-11-18T05:18:09Z"}},
+                  "acme/open": {"pr_6": {"state": "OPEN", "updatedAt": "2026-11-18T05:00:00Z"}}}
+
+        with patch.object(scan, "graphql_repository", side_effect=lambda slug, query, *_: states.get(slug)), \
+                redirect_stderr(io.StringIO()):
+            shown = scan.with_cleanup_constraints(rows, self.dir / "no-state.json", decisions)
+
+        self.assertEqual([(row["removal_decision"]["after_state"], row["removal_decision"]["allows_removal"])
+                          for row in shown], [("MERGED", True), ("OPEN", False), (None, False)])
+        self.assertEqual({key: shown[0]["removal_decision"][key] for key in ("after", "discard", "compose_down")},
+                         {"after": "pr-merged:https://github.com/acme/merged/pull/6", "discard": [".env"],
+                          "compose_down": True})
+
     def test_a_promise_before_its_date_keeps_the_row_open_without_stalling_it_and_names_it_once(self) -> None:
         # 2026-11-16: a promise for 11/17 was shown as undelivered on every run, twice in the same row's reasons.
         state = self.dir / "state.json"

@@ -159,6 +159,34 @@ class LeadDecisionsTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertFalse(self.log.exists())
 
+    def test_a_removal_answer_keeps_its_condition_and_cleanup_and_other_keys_refuse_them(self) -> None:
+        # 2026-11-18: 「merge させてから消す」 and 「.env は捨て、compose project と volume も消す」 were only words.
+        url = "https://github.com/acme/app/pull/6"
+        answer_file = self.root / "answer.txt"
+        answer_file.write_text("担当に PR を merge させてから消す", encoding="utf-8")
+
+        single = self.run_tool("record", "--decision", "remove:local::/w/docs", "--answer-file", str(answer_file),
+                               "--after", f"pr-merged:{url}")
+        many = self.run_tool("record-many", stdin=json.dumps(
+            {"decision": "remove:local::/w/group", "answer": "消してよい（.env は捨て、compose project と volume も消す）",
+             "discard": [".env"], "compose_down": True}, ensure_ascii=False))
+
+        for result in (single, many):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(item["decision"], item["removal"]) for item in json.loads(self.run_tool("show").stdout)],
+                         [("remove:local::/w/docs", {"after": f"pr-merged:{url}", "discard": [], "compose_down": False}),
+                          ("remove:local::/w/group", {"after": None, "discard": [".env"], "compose_down": True})])
+        written = self.log.read_text(encoding="utf-8")
+        for line, reason in (({"decision": "merge:acme/app#6", "answer": "消す", "compose_down": True}, "remove:"),
+                             ({"decision": "remove:/w/x", "answer": "消す", "after": "merged:acme/app#6"}, "pr-merged:"),
+                             ({"decision": "remove:/w/x", "answer": "消す", "discard": ["../main/.env"]}, "inside"),
+                             ({"decision": "remove:/w/x", "answer": "消す", "discard": ["/w/x/.env"]}, "inside")):
+            with self.subTest(line=line):
+                result = self.run_tool("record-many", stdin=json.dumps(line, ensure_ascii=False))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.log.read_text(encoding="utf-8"), written)
+
     def test_an_empty_answer_is_refused_and_nothing_is_written(self) -> None:
         answer_file = self.root / "empty.txt"
         answer_file.write_text("  \n", encoding="utf-8")
