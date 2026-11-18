@@ -51,10 +51,11 @@ removal. A live tab left without one keeps the row.
 Record a removal answer's condition and cleanup as values, not only in its words. `lead_decisions.py record --decision
 remove:… --after pr-merged:<PR URL>` approves the row once the scan reads that PR as merged, whatever conditions the
 words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` (repeatable, relative to the
-worktree, such as a `.env` pointing only at localhost) or `--compose-down`, `rm-check-batch --from SCAN_JSON
---remove-ok` closes the row's scanned tabs without the idle-tab check, runs `docker compose -p <project> down -v` for
-each project the check lists, deletes those files, and checks again before it removes the worktree. It does this only
-for this Mac's worktrees; an answer without those values is checked as above.
+worktree, such as a `.env` pointing only at localhost) or `--compose-down`, the scan approves the row whatever the
+words give, and `rm-check-batch --from SCAN_JSON --remove-ok` closes the row's scanned tabs without the idle-tab
+check, runs `docker compose -p <project> down -v` for each project the check lists, deletes those files, and checks
+again before it removes the worktree. It refuses such a row on another Mac (`--host`): clean up there by hand. An
+answer without those values is checked as above.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`

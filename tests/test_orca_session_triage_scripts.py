@@ -3096,15 +3096,18 @@ class ScanCommandTests(unittest.TestCase):
             "newest": {"decision": f"remove:local::{path}::db-down", "answer": "コンテナは消す（volume は残す）",
                        "decided_at": "2026-11-16T16:24:55+09:00"}})
 
-    def test_a_removal_answer_with_a_pr_condition_is_approved_once_that_pr_merged_whatever_its_words(self) -> None:
+    def test_a_removal_answer_with_terms_is_decided_by_them_whatever_its_words(self) -> None:
         # 2026-11-18 15:07: 「merge させてから消す」 kept iot-stick-purchase-1118 out of --rm-specs after PR #6 merged.
         decisions = self.dir / "decisions.jsonl"
         write_jsonl(decisions, [{"id": name, "decision": f"remove:local::/w/{name}", "decided_at": "2026-11-18T05:13:57Z",
                                  "answer": "担当に文書 PR として commit・merge させてから消す", "removal": {
                                      "after": f"pr-merged:https://github.com/acme/{name}/pull/6", "discard": [".env"],
-                                     "compose_down": True}} for name in ("merged", "open", "unread")])
+                                     "compose_down": True}} for name in ("merged", "open", "unread")] + [
+            {"id": "cleanup", "decision": "remove:local::/w/cleanup", "decided_at": "2026-11-18T05:13:57Z",
+             "answer": "compose を止めて .env を捨ててから消す", "removal": {"after": None, "discard": [".env"],
+                                                                            "compose_down": True}}])
         rows = [{"path": f"/w/{name}", "repo": name, "class": "finished", "reasons": [], "closable": []}
-                for name in ("merged", "open", "unread")]
+                for name in ("merged", "open", "unread", "cleanup")]
         states = {"acme/merged": {"pr_6": {"state": "MERGED", "updatedAt": "2026-11-18T05:18:09Z"}},
                   "acme/open": {"pr_6": {"state": "OPEN", "updatedAt": "2026-11-18T05:00:00Z"}}}
 
@@ -3112,8 +3115,8 @@ class ScanCommandTests(unittest.TestCase):
                 redirect_stderr(io.StringIO()):
             shown = scan.with_cleanup_constraints(rows, self.dir / "no-state.json", decisions)
 
-        self.assertEqual([(row["removal_decision"]["after_state"], row["removal_decision"]["allows_removal"])
-                          for row in shown], [("MERGED", True), ("OPEN", False), (None, False)])
+        self.assertEqual([(row["removal_decision"].get("after_state"), row["removal_decision"]["allows_removal"])
+                          for row in shown], [("MERGED", True), ("OPEN", False), (None, False), (None, True)])
         self.assertEqual({key: shown[0]["removal_decision"][key] for key in ("after", "discard", "compose_down")},
                          {"after": "pr-merged:https://github.com/acme/merged/pull/6", "discard": [".env"],
                           "compose_down": True})
