@@ -324,8 +324,8 @@ permitted cleanup, and any handoff in `references/hourly.md`.
     recovered twice is replanned instead, and each is reported.
   - A task the user approved as the follow-up of another lane's result ("when
     A settles it, give B the task") goes to B once A reports it.
-  - A lane confirmation in the user's standing approvals is answered once it
-    has waited for the lead, as `references/hourly.md` describes.
+- When a lane waits for a permission or trust decision, report the prompt to
+  the operator who can answer it in the lane's terminal (see `references/hourly.md`).
 - Relay answers verbatim; the session answers the user's follow-up questions.
 - In an hourly run, the automation's session directs the lanes unless another
   tab was explicitly appointed lead; `references/hourly.md` bounds the other
