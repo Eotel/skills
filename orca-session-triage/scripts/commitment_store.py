@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from functools import lru_cache
 import importlib.util
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from types import ModuleType
 
@@ -78,3 +79,18 @@ def read_document(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+
+
+def hold_rows(path: Path) -> list[dict]:
+    if path.name == "holds.sqlite":
+        binary = Path(os.environ.get("ORCA_BRIEFS_BIN") or "~/.cache/orca-briefs/bin").expanduser()
+        component = binary / "orca_board_commitments.py"
+        if component.is_file():
+            module = _load(component)
+            if hasattr(module, "hold_rows"):
+                return module.hold_rows(path)
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10)) as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute("SELECT * FROM holds")]

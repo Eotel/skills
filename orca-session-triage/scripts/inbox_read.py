@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, closing
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -64,7 +64,7 @@ import time
 from typing import Literal, NamedTuple, cast
 
 import answer_evidence
-from commitment_store import CommitmentWriteError, read_lines, writing
+from commitment_store import CommitmentWriteError, hold_rows, read_lines, writing
 import hourly_runtime
 import json_output
 
@@ -846,12 +846,9 @@ def events_path() -> Path:
 def held_until_signal(me: str, holds: Path) -> dict[str, str]:
     """The lanes on hold until this tab signals their release (`send --hold-until signal:<this tab>`):
     hold id by the held lane's handle."""
-    if not holds.exists():
-        return {}
-    with closing(sqlite3.connect(f"{holds.resolve().as_uri()}?mode=ro", uri=True, timeout=10)) as db:
-        rows = db.execute("SELECT id, handle FROM holds WHERE condition_kind = 'signal' AND condition_value = ? "
-                          "AND status IN ('staged', 'active')", (me,)).fetchall()
-    return {str(handle): str(hold_id) for hold_id, handle in rows}
+    return {str(row["handle"]): str(row["id"]) for row in hold_rows(holds)
+            if row["condition_kind"] == "signal" and row["condition_value"] == me
+            and row["status"] in ("staged", "active")}
 
 
 def sends_to(me: str, handles: set[str], events: Path) -> dict[str, list[datetime]]:

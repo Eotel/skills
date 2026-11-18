@@ -70,7 +70,7 @@ from typing import Literal, Protocol
 from urllib.parse import urlparse
 
 import inbox_read
-from commitment_store import read_document, read_lines
+from commitment_store import hold_rows, read_document, read_lines
 import scan_sessions as scan
 
 HOME = Path.home()
@@ -758,7 +758,6 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
         if at and at <= now and item.get("id"):
             given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or ""), str(item.get("note") or "")))
     sends: dict[str, list[datetime]] = {}
-    held: set[str] = set()
     due: set[str] = set()
     agent_done: dict[str, datetime] = {}
     if board.is_file():
@@ -770,12 +769,10 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
             for worktree, state, since in db.execute("select worktree, state, state_started_at from agents"):
                 if state == "done" and isinstance(since, (int, float)) and worktree:
                     agent_done[worktree] = datetime.fromtimestamp(since / 1000, timezone.utc)
-    if holds.is_file():
-        with sqlite3.connect(f"file:{holds}?mode=ro", uri=True) as db:
-            stamp = now.timestamp()
-            held = {handle for handle, created, released, status in db.execute(
-                "select handle, created_at, released_at, status from holds")
-                if created <= stamp and (status == "active" if released is None else released > stamp)}
+    stamp = now.timestamp()
+    held = {row["handle"] for row in hold_rows(holds)
+            if row["created_at"] <= stamp
+            and (row["status"] == "active" if row["released_at"] is None else row["released_at"] > stamp)}
     stops: dict[str, list[EarlierStop]] = {}
     for item in load_checks():
         if item.get("signal") in RECOVERED and (at := parse(item.get("checked_at"))) and at <= now:
