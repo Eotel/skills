@@ -9,9 +9,11 @@
 - An inbox `ask` sent with `triage-notify --questions` carries its questions in
   AskUserQuestion's shape. `scripts/inbox_read.py questions` prints the next
   four as AskUserQuestion input (`questions`: the question's `context`, one
-  sentence on what the work is and what choosing does, before it, the issue
-  named after it, and the recommended option first and marked; `read --id` also
-  shows the context before the question) with each one's `id`, `source`,
+  sentence on what the work is and what choosing does, and for a production
+  write its `impact`, what users' screens, reports, and imports see after the
+  write, before it, the issue named after it, and the recommended option first
+  and marked; `read --id` also shows the context and impact before the
+  question) with each one's `id`, `source`,
   and `handle` in `items` for relaying the answer. Relay each answer with
   `send --decision <answer> --ask <id>`: the question drops out of the next
   batch once the send lands. A question a later ask of the same lane withdrew

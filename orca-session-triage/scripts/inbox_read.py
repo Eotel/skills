@@ -315,8 +315,10 @@ def full_text(item: dict, answers: Mapping[str, dict] | None = None) -> str:
         note = question_note(item, number, answers or {})
         label = f"Q{number} id={item.get('id')}:{number} [{question.get('header')}]" + (f" 回答済み（{note}）" if note else "")
         asked = f"{question.get('question')}（推奨: {question.get('recommended')}）"
-        # The context (what the work is and what choosing does) comes before the question it explains.
-        lines.extend((f"{label} {question['context']}", f"  {asked}") if question.get("context")
+        # The context (what the work is and what choosing does) and the impact (what users see after a
+        # production write) come before the question they explain.
+        before = [question[key] for key in ("context", "impact") if question.get(key)]
+        lines.extend((f"{label} {before[0]}", *(f"  {text}" for text in before[1:]), f"  {asked}") if before
                      else (f"{label} {asked}",))
         lines.extend(f"  - {option.get('label')}: {option.get('description')}"
                      for option in question.get("options") or [] if isinstance(option, dict))
@@ -760,8 +762,8 @@ def pending_questions(asks: list[OpenAsk]) -> list[PendingQuestion]:
 
 
 def ask_user_question(question: dict) -> dict:
-    """AskUserQuestion's question: its context before it, the issue named after it, and the recommended option
-    first and marked."""
+    """AskUserQuestion's question: its context and impact before it, the issue named after it, and the
+    recommended option first and marked."""
     recommended = question.get("recommended")
     options = sorted(question["options"], key=lambda option: option["label"] != recommended)
     return {"question": answer_evidence.shown_question(question), "header": question["header"],

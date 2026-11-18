@@ -8630,6 +8630,22 @@ class InboxReadTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in rest["items"]], ["r3:2"])
         self.assertEqual([item["id"] for item in after_answered["items"]], ["r3:2"])
 
+    def test_a_production_write_question_shows_its_impact_between_its_context_and_the_question(self) -> None:
+        # 2026-11-17: asked to write production with only the values and the undo, the user asked back
+        # "これって結んだときに起こる問題を教えて. 画面対応はいらないの？" instead of choosing.
+        question = {"context": "本番に one-shot を流す作業です。", "impact": "契約の画面は変わりません。帳票は未確認です。",
+                    "question": "本番に流しますか？", "header": "本番", "multiSelect": False, "recommended": "流す",
+                    "options": [{"label": "流す", "description": "今日流す"}, {"label": "待つ", "description": "確かめてから"}],
+                    "issue": "example/app#14"}
+
+        asked = inbox_read.ask_user_question(question)["question"]
+        shown = inbox_read.full_text({"id": "r1", "text": "本番の書き込み", "questions": [question]})
+
+        self.assertEqual(asked, "本番に one-shot を流す作業です。 契約の画面は変わりません。帳票は未確認です。 "
+                                "本番に流しますか？（example/app#14）")
+        self.assertLess(shown.index("one-shot を流す作業"), shown.index("契約の画面は変わりません"))
+        self.assertLess(shown.index("契約の画面は変わりません"), shown.index("本番に流しますか？"))
+
     def test_open_asks_lists_unanswered_asks_oldest_first_until_answered(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox = Path(root) / "inbox.jsonl"
