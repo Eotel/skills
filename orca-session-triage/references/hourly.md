@@ -486,25 +486,12 @@ Check the external watch with
 The Stop hook names a stopped service. Do not start a replacement Monitor in
 the tab.
 
-## Confirmations approved in advance
+## Permission and trust prompts
 
-Some lane confirmations were approved by the user in advance. They are listed
-in one local file, `~/.cache/orca-briefs/standing-approvals.json`, with the
-limits each entry checks and the user's original words, time, and where they
-were given. Add an entry only with all three. The docstring of
-`~/.cache/orca-briefs/bin/standing_approvals.py` describes what each kind
-compares before answering.
-
-The external watch answers a listed confirmation after it has waited the
-file's `grace_seconds` without the lead's answer, and reports the answer as
-`info`. Before then, a confirmation on a lane whose brief was delivered is
-reported as `ask` once. A confirmation that differs from the list is left
-for the lead. When the scan finds a lane stopped on such a confirmation and
-the watch is not running, run
-`~/.cache/orca-briefs/bin/standing-approve answer HANDLE --worktree PATH`.
-Exit 0 means it answered; 3 means the lead still has time, and it recorded
-when it first saw the prompt; 2 means the lead must answer. Hand anything it
-leaves to the lead as before.
+When a lane waits for permission to run a tool or asks whether to trust a
+folder or hook, report the worktree, terminal handle, and prompt to the
+operator. Leave the prompt open for the operator to answer in that terminal.
+Check the lane again before retrying any pending delivery.
 
 ## External inbox service and cutover
 
