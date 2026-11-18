@@ -88,6 +88,48 @@ class NaturalJapaneseScriptsTests(unittest.TestCase):
         self.assertTrue(all(item["rule_id"] == "software-version" for item in findings))
         self.assertTrue(any("書籍" in context for context in findings[0]["keep_when"]))
 
+    def test_version_after_kana_is_a_candidate(self) -> None:
+        findings = self.findings("履歴の版を表示中は編集できません。提出した版に名前を付けます。\n")
+        self.assertEqual([item["rule_id"] for item in findings], ["software-version"] * 2)
+
+    def test_system_actions_in_everyday_verbs_are_candidates(self) -> None:
+        findings = self.findings("入力欄の下にメッセージが出ます。ボタンは出ません。\n"
+                                 "`ListsPanel` はこの値を読みます。設定を読んでから起動します。\n"
+                                 "機材をボードに置きます。置いたあとで選択します。\n"
+                                 "直す前は失敗し、直した後は成功します。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["system-show"] * 2 + ["system-read"] * 2 + ["system-place"] * 2
+                         + ["fix-before-after"] * 2)
+        self.assertIn("表示", "".join(findings[0]["alternatives"]))
+        self.assertIn("読み込", "".join(findings[2]["alternatives"]))
+        self.assertIn("配置", "".join(findings[4]["alternatives"]))
+
+    def test_polite_past_of_a_system_action_is_a_candidate(self) -> None:
+        findings = self.findings("保存するとエラーが出ました。設定を読みました。機材を置きました。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["system-show", "system-read", "system-place"])
+
+    def test_before_and_after_of_a_compound_verb_are_not_candidates(self) -> None:
+        text = "設定を見直す前にログを確認します。テストをやり直した後で結果を共有します。\n"
+        self.assertEqual(self.findings(text), [])
+        findings = self.findings("手順は、直す前と同じです。不具合を直した後に再実行します。\n")
+        self.assertEqual([item["rule_id"] for item in findings], ["fix-before-after"] * 2)
+
+    def test_verbs_ending_a_compound_are_not_candidates(self) -> None:
+        text = "既定値は据え置きます。既存の設定を据え置いたまま更新します。在庫を取り置きます。\n"
+        self.assertEqual(self.findings(text), [])
+        findings = self.findings("起動時に設定ファイルから読みます。PR 出します。\n"
+                                 "`ListsPanel` は入力の可否をこの 2 つを通して読みます。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["system-read", "system-show", "system-read"])
+        self.assertEqual(self.findings("計画を立て直す前に確認します。\n"), [])
+
+    def test_technical_verbs_and_compound_verbs_are_not_candidates(self) -> None:
+        text = ("メッセージを表示します。設定を読み込みます。値を読み取り、読み書きします。\n"
+                "機材を配置し、文字列を置き換えます。ファイルを書き出し、関数を呼び出します。\n"
+                "修正前は失敗し、修正後は成功します。書き直してから見直します。\n")
+        self.assertEqual(self.findings(text), [])
+
     def test_normal_uses_are_review_candidates_and_do_not_fail_by_default(self) -> None:
         text = "契約書の正本を保管。固定資産台帳を確認。数学の閉包。薬が効く。\n"
         findings = self.findings(text)
