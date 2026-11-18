@@ -115,6 +115,15 @@ class NaturalJapaneseScriptsTests(unittest.TestCase):
         findings = self.findings("手順は、直す前と同じです。不具合を直した後に再実行します。\n")
         self.assertEqual([item["rule_id"] for item in findings], ["fix-before-after"] * 2)
 
+    def test_verbs_ending_a_compound_are_not_candidates(self) -> None:
+        text = "既定値は据え置きます。既存の設定を据え置いたまま更新します。在庫を取り置きます。\n"
+        self.assertEqual(self.findings(text), [])
+        findings = self.findings("起動時に設定ファイルから読みます。PR 出します。\n"
+                                 "`ListsPanel` は入力の可否をこの 2 つを通して読みます。\n")
+        self.assertEqual([item["rule_id"] for item in findings],
+                         ["system-read", "system-show", "system-read"])
+        self.assertEqual(self.findings("計画を立て直す前に確認します。\n"), [])
+
     def test_technical_verbs_and_compound_verbs_are_not_candidates(self) -> None:
         text = ("メッセージを表示します。設定を読み込みます。値を読み取り、読み書きします。\n"
                 "機材を配置し、文字列を置き換えます。ファイルを書き出し、関数を呼び出します。\n"
