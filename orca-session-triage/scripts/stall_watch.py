@@ -9,7 +9,7 @@ run      reads the newest saved scan (~/.cache/orca-session-triage/reads/*/scan.
          transcripts, rollouts, and background processes again, and judges every row. New signals go to the triage
          inbox as one `ask` from the worktree `stall-watch` (triage-notify run in ~/.cache/orca-briefs/stall-watch
          without ORCA_WORKTREE_ID or ORCA_TERMINAL_HANDLE), and to the work_check table through
-         ~/.cache/orca-briefs/bin/orca_board_commitments.py check when that command exists. Every signal is kept in
+         ~/.local/share/eotel-harness/current/bin/orca_board_commitments.py check when that command exists. Every signal is kept in
          ~/.cache/orca-session-triage/work-checks.json, and one already there (same work, signal, and fingerprint)
          is never sent again. --dry-run prints the ask and writes nothing.
 replay   judges a saved scan at a past moment from the records as they stood then (inbox, answers, sends, holds),
@@ -84,8 +84,9 @@ INBOX = BRIEFS / "triage-inbox.jsonl"
 ANSWERS = BRIEFS / "ask-answers.jsonl"
 HOLDS = BRIEFS / "holds.sqlite"
 REMOTES = BRIEFS / "remote-inboxes.json"
-NOTIFY = BRIEFS / "bin/triage-notify"
-BOARD_CHECK = BRIEFS / "bin/orca_board_commitments.py"
+BIN = HOME / ".local/share/eotel-harness/current/bin"
+NOTIFY = BIN / "triage-notify"
+BOARD_CHECK = BIN / "orca_board_commitments.py"
 SENDER = BRIEFS / "stall-watch"
 BOARD = HOME / ".local/share/orca-board/board.sqlite3"
 

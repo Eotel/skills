@@ -11,7 +11,7 @@ contents before running another triage: the script refuses to overwrite it.
 Reads and writes of `hourly-state.json`, `lead-decisions.jsonl`,
 `handed-off.jsonl`, `ask-answers.jsonl`, and `ask-claims.jsonl` use
 `$ORCA_BRIEFS_BIN/orca_board_commitments.py` (default
-`~/.cache/orca-briefs/bin`). Without that component they use the files directly.
+`~/.local/share/eotel-harness/current/bin`). Without that component they use the files directly.
 In `file-first` the component leaves storage to the files; in `db-first` it
 updates the board DB before the same bytes go to the files. `db-read` also
 reads from the DB mirror, and `db-only` reads and writes only the board DB.

@@ -31,7 +31,7 @@ def paths(home: str | Path | None = None) -> tuple[Path, Path, Path, Path]:
     home = Path(home or Path.home())
     cache = home / ".cache/orca-briefs"
     return (home / "Library/LaunchAgents" / f"{LABEL}.plist",
-            cache / "bin/watch-inbox",
+            home / ".local/share/eotel-harness/current/bin/watch-inbox",
             cache / "offsets/close-done-triage.offset",
             cache / "triage-watch.log")
 
@@ -47,7 +47,7 @@ def plist_bytes(home: str | Path | None = None, python: str | None = None, orca:
     return plistlib.dumps({
         "Label": LABEL,
         "ProgramArguments": [python, str(watch), str(offset)],
-        "EnvironmentVariables": {"PATH": service_path},
+        "EnvironmentVariables": {"PATH": service_path, "ORCA_BRIEFS_BIN": str(watch.parent)},
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 10,

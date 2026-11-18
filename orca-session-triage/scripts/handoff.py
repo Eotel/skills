@@ -75,7 +75,7 @@ import lead_decisions
 import scan_sessions
 import timeline
 
-NOTIFY = "~/.cache/orca-briefs/bin/triage-notify"
+NOTIFY = "~/.local/share/eotel-harness/current/bin/triage-notify"
 INBOX = "~/.cache/orca-briefs/triage-inbox.jsonl"
 HANDOFFS = Path("~/.cache/orca-session-triage/handoffs")
 EXCERPT = 160

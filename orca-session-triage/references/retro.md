@@ -47,7 +47,7 @@ an upstream issue for one it cannot change (category `upstream`), with the
 workaround as a separate fact until the fix ships. A procedure that a tool's
 arguments, defaults, checks, or output could enforce also becomes a `script`
 proposal. A fact that names a script in Eotel/skills or
-`~/.cache/orca-briefs/bin` is never adopted automatically. An adopted
+`~/.local/share/eotel-harness/current/bin` is never adopted automatically. An adopted
 `script` or `upstream` proposal is not written as a note: the worker records
 one `handed_off` execution, and the lane that ships it records `applied`
 by sending its done with `triage-notify --kind done --applied <ID>`.

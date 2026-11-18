@@ -1120,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
                 named = (f" ({owner_line(owner)}), not this tab (pane {os.environ.get('ORCA_PANE_KEY') or '-'})"
                          if owner else "")
                 raise ValueError(f"the default inbox cursor belongs to the latest scheduled triage tab{named}; "
-                                 "read without it: ~/.cache/orca-briefs/bin/inbox --since HH:MM --wt NAME "
+                                 "read without it: ~/.local/share/eotel-harness/current/bin/inbox --since HH:MM --wt NAME "
                                  "(HH:MM: when this run began; NAME: the worktree whose reports to read), "
                                  "or read --since HH:MM")
         if args.action == "read":

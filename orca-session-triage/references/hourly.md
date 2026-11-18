@@ -23,7 +23,7 @@ run of this workspace due after this tab's run began, or the precheck skipped
 one because this run was still working, `read` first prints a 「注意:」 line
 with that run's time, status, and pane: the later run owns the read position
 and the handoff, so leave them to it. An id may be its first 8 or more characters, as handoffs and
-`~/.cache/orca-briefs/bin/inbox` print it; one naming several entries lists them
+`~/.local/share/eotel-harness/current/bin/inbox` print it; one naming several entries lists them
 and prints nothing. `read --text WORD` searches every entry's whole text and
 structured questions, ignoring case and wherever the cursor stands, and prints
 each match's header (time, kind, host, source, `id=`; 既読 when acknowledged)
@@ -252,7 +252,7 @@ requested again, and assign the task to that reviewer. A 「答えと違う」 r
 lead answer whose recorded value Asana does not hold: write the answer with
 `asana_pr.py ensure`.
 
-In every hourly run on a Mac that has `~/.cache/orca-briefs/bin/topic`, run
+In every hourly run on a Mac that has `~/.local/share/eotel-harness/current/bin/topic`, run
 `topic check --all`. Each drift row names the record, what disagrees, and the
 workspace that should fix it (its newest writer that still exists, with live
 agents). The writer fixes its own drift: never route a row to the user. A row
@@ -496,7 +496,7 @@ Check the lane again before retrying any pending delivery.
 ## External inbox service and cutover
 
 `scripts/inbox_watch_service.py render` prints the launchd user agent for
-review. It runs the existing `~/.cache/orca-briefs/bin/watch-inbox` with the
+review. It runs the existing `~/.local/share/eotel-harness/current/bin/watch-inbox` with the
 existing `~/.cache/orca-briefs/offsets/close-done-triage.offset`, restarts it
 after exits, and appends its output to `~/.cache/orca-briefs/triage-watch.log`.
 The generated service pins the local `python3` and `orca` paths so launchd can

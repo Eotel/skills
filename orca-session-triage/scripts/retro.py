@@ -33,7 +33,7 @@ from retro_ledger import LedgerClient, DEFAULT_SCRIPT
 
 STATE = Path("~/.cache/orca-session-triage/retro").expanduser()
 SOURCE = Path(os.environ.get("TRIAGE_RETRO_SKILLS_REPO", "~/ghq/github.com/Eotel/skills")).expanduser()
-NOTIFY = Path(os.environ.get("TRIAGE_NOTIFY", "~/.cache/orca-briefs/bin/triage-notify")).expanduser()
+NOTIFY = Path(os.environ.get("TRIAGE_NOTIFY", "~/.local/share/eotel-harness/current/bin/triage-notify")).expanduser()
 MAX_NIGHTLY_AUTO = 3
 MAX_SKILL_BYTES = 12_000
 MAX_NOTES_PER_SKILL = 3
@@ -467,7 +467,7 @@ RETRO_PROMPT = (
     "note は190字以内の一行にする。fact なら既存 skill に追記できる具体的な道具・パス・エラー対処だけを書き、"
     "script・upstream なら直す内容を書く。"
     "道具の使いにくさから出た教訓は、使い方として書かず道具を直す案にする。自分たちの道具"
-    "（下の skill の scripts、~/.cache/orca-briefs/bin、orca-board）なら、引数・option を足すか出力を直す案を"
+    "（下の skill の scripts、~/.local/share/eotel-harness/current/bin、orca-board）なら、引数・option を足すか出力を直す案を"
     "category script で出す。直せない外の道具（gh・bee など）なら上流への issue の案を category upstream で出し、"
     "直るまでの使い方は別に category fact で出してよい。"
     "手順や決まりの案でも、道具の機能（引数・既定値・検査・出力）で間違いを決定論的に防げるなら、"
@@ -668,7 +668,7 @@ def remember_versions(data: dict, *targets: Path) -> None:
 
 def own_tools(root: Path = SOURCE) -> frozenset[str]:
     """File names of the tools this setup maintains; a lesson about one becomes a fix to it, not a usage note."""
-    tools = (*root.glob("*/scripts/*"), *(Path.home() / ".cache/orca-briefs/bin").glob("*"))
+    tools = (*root.glob("*/scripts/*"), *(Path.home() / ".local/share/eotel-harness/current/bin").glob("*"))
     return frozenset(path.name for path in tools
                      if path.is_file() and re.search(r"[._-]", path.name)
                      and not re.search(r"\.bak|backup", path.name) and path.suffix != ".md")
