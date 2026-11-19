@@ -1078,10 +1078,11 @@ def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
         return None
     heading = max((index for index in range(footer) if lines[index] == CODEX_PERMISSION), default=-1)
     body = lines[heading + 1:footer]
-    if heading < 0 or not body or not body[0].startswith("$ "):
+    command = next((line for line in body if line.startswith("$ ")), None)
+    if heading < 0 or command is None:
         return None
-    target = body[0][:COMMAND_HEAD] + ("…" if len(body[0]) > COMMAND_HEAD else "")
-    choices = [choice[1] for line in body[1:] if (choice := CODEX_PERMISSION_CHOICE.fullmatch(line))]
+    target = command[:COMMAND_HEAD] + ("…" if len(command) > COMMAND_HEAD else "")
+    choices = [choice[1] for line in body if (choice := CODEX_PERMISSION_CHOICE.fullmatch(line))]
     return {"tab": tab, "question": lines[heading], "choices": choices, "target": target}
 
 

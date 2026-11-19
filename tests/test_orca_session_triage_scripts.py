@@ -885,7 +885,8 @@ class ClassifyTests(unittest.TestCase):
         tree = worktree("/w/confirm", "waiting")
         term = terminal(tree["path"], "codex", "term_codex")
         heading, command = "Would you like to run the following command?", "$ git status"
-        tail = [heading, "", command, "› 1. Yes, proceed (y)", "  2. No (esc)",
+        tail = [heading, "", "Environment: local", "", "Reason: read the Git status", "",
+                command, "› 1. Yes, proceed (y)", "  2. No (esc)",
                 "Press enter to confirm or esc to cancel"]
         screens = {(None, "term_codex"): {"source": "screen", "tail": tail}}
         rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, screens=screens)
