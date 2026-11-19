@@ -881,6 +881,27 @@ class ClassifyTests(unittest.TestCase):
         moved = {"source": "screen", "tail": [question, "  1. Yes", "❯ 2. No"]}
         self.assertEqual(scan.permission_prompt(moved, "term_prompt")["choices"], ["1. Yes", "2. No"])
 
+    def test_codex_command_confirmation_lists_the_blocked_command_and_process(self) -> None:
+        tree = worktree("/w/confirm", "waiting")
+        term = terminal(tree["path"], "codex", "term_codex")
+        heading, command = "Would you like to run the following command?", "$ git status"
+        tail = [heading, "", command, "› 1. Yes, proceed (y)", "  2. No (esc)",
+                "Press enter to confirm or esc to cancel"]
+        screens = {(None, "term_codex"): {"source": "screen", "tail": tail}}
+        rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, screens=screens)
+
+        with patch.object(scan.rm_check, "process_table", return_value={13: (1, "codex"), 14: (1, "codex")}), \
+             patch.object(scan.rm_check, "process_cwds", return_value={13: tree["path"], 14: "/w/other"}):
+            scan.with_codex_permission_reasons(rows)
+
+        self.assertEqual(rows[0]["class"], "waiting")
+        self.assertEqual(rows[0]["prompt_waiting"], {"tab": "term_codex", "question": heading, "target": command,
+                                                       "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
+        self.assertIn("Codex process 13 was started without the approvals bypass flag", rows[0]["reasons"])
+        self.assertFalse(any("process 14" in reason for reason in rows[0]["reasons"]))
+        self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
+            *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
+
     def test_a_permission_prompt_names_the_command_and_the_hooks_reason_it_asks_about(self) -> None:
         # 2026-10-28: svm-320-321-reply waited on this frame; the scan showed only "Do you want to proceed?".
         screen = {"source": "screen", "tail": [

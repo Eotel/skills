@@ -807,7 +807,7 @@ def prompt_question(prompt: dict) -> str:
 def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     reasons = []
     if prompt := row.get("prompt_waiting"):
-        kind = "permission prompt" if prompt["question"].startswith(PERMISSION_QUESTION) else "question"
+        kind = "permission prompt" if prompt["question"].startswith((PERMISSION_QUESTION, CODEX_PERMISSION)) else "question"
         reasons.append(f"{kind} on screen: " + prompt_question(prompt))
     claude = row["claude"] or {}
     jev = row.get("jev") or {}
@@ -1011,6 +1011,9 @@ def composer_empty(screen: dict) -> bool | None:
 # Claude Code's permission selector: "Do you want to make this edit to …?", then "❯ 1. Yes", "2. No", …,
 # with ❯ on whichever choice the user has moved to.
 PERMISSION_QUESTION = "Do you want to"
+CODEX_PERMISSION = "Would you like to run the following command?"
+CODEX_PERMISSION_FOOTER = "press enter to confirm or esc to cancel"
+CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
 CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
 FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 # What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
@@ -1067,6 +1070,21 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
             **({"target": target} if target else {})}
 
 
+def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
+    lines = [line.strip() for line in screen_lines(screen) if line.strip()]
+    footer = next((index for index in range(len(lines) - 1, max(-1, len(lines) - 4), -1)
+                   if CODEX_PERMISSION_FOOTER in lines[index].casefold()), None)
+    if footer is None:
+        return None
+    heading = max((index for index in range(footer) if lines[index] == CODEX_PERMISSION), default=-1)
+    body = lines[heading + 1:footer]
+    if heading < 0 or not body or not body[0].startswith("$ "):
+        return None
+    target = body[0][:COMMAND_HEAD] + ("…" if len(body[0]) > COMMAND_HEAD else "")
+    choices = [choice[1] for line in body[1:] if (choice := CODEX_PERMISSION_CHOICE.fullmatch(line))]
+    return {"tab": tab, "question": lines[heading], "choices": choices, "target": target}
+
+
 def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screens,
                           environment: str | None) -> list[str]:
     """A reason per screen line saying a restart dropped background waits, timed by its pane's agent when known."""
@@ -1113,12 +1131,14 @@ def question_prompt(screen: dict, tab: str) -> PromptWaiting | None:
 
 
 def waiting_prompt(terms: list[dict], screens: Screens,
-                   environment: str | None) -> tuple[PromptWaiting, Literal["pending_call_at", "pending_question_at"]] | None:
+                   environment: str | None) -> tuple[PromptWaiting, Literal["pending_call_at", "pending_question_at"] | None] | None:
     """The first prompt a tab's screen waits on, with the transcript field that says when it was asked: a permission
     prompt holds back the tool call it asks about, and a selector is an AskUserQuestion call."""
     for term in terms:
         if not term.get("handle") or not (screen := rendered(screens.get((environment, term["handle"])))):
             continue
+        if term.get("agentIdentity") == "codex" and (prompt := codex_permission_prompt(screen, term["handle"])):
+            return prompt, None
         if prompt := permission_prompt(screen, term["handle"]):
             return prompt, "pending_call_at"
         if prompt := question_prompt(screen, term["handle"]):
@@ -1687,7 +1707,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["other_repos"] = w["_other_repos"]
         row["queued_input"] = (queued_input(Path(row["claude"]["transcript"]),
                                             datetime.fromtimestamp(now, timezone.utc)) if row["claude"] else [])
-        if waiting and row["claude"] and (asked_at := row["claude"].get(waiting[1])):
+        if waiting and waiting[1] and row["claude"] and (asked_at := row["claude"].get(waiting[1])):
             waiting[0]["asked_at"] = asked_at
         if remote:
             spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
@@ -1738,6 +1758,24 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
     return rows
+
+
+def with_codex_permission_reasons(rows: list[dict]) -> None:
+    waiting = {row["path"]: row for row in rows if not row.get("environment")
+               and (row.get("prompt_waiting") or {}).get("question") == CODEX_PERMISSION}
+    if not waiting:
+        return
+    codex_processes = {}
+    for pid, (_, command) in (rm_check.process_table() or {}).items():
+        args = command.split()
+        if any(Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")
+               for token in args[:2]):
+            codex_processes[pid] = args
+    if not codex_processes:
+        return
+    for pid, cwd in (rm_check.process_cwds(codex_processes.keys()) or {}).items():
+        if cwd in waiting and "--dangerously-bypass-approvals-and-sandbox" not in codex_processes[pid]:
+            waiting[cwd]["reasons"].append(f"Codex process {pid} was started without the approvals bypass flag")
 
 
 def github_slug(remote_url: str | None) -> str | None:
@@ -3651,6 +3689,8 @@ def main(argv: list[str] | None = None) -> int:
                                                processes=processes, live_sessions=live_sessions),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
+    if not args.ps_json:
+        with_codex_permission_reasons(rows)
     if down := reach.down():
         line = f"ネットワーク断: {'。'.join(down)}。接続が戻ってから走査し直してください（--review-out は書いていません）"
         print(line)
