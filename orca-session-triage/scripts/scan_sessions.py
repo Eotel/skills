@@ -1757,8 +1757,10 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         if main and not w.get("agents"):
             continue
         terms = by_worktree.get((w.get("_environment"), w.get("worktreeId")), [])
-        agents_by_pane = {agent["paneKey"]: agent.get("agentType") for agent in w.get("agents") or []
-                          if agent.get("paneKey")}
+        ordered_agents = sorted(w.get("agents") or [], key=lambda agent: (
+            agent.get("state") in ("working", "waiting"), agent.get("updatedAt") or 0))
+        agents_by_pane = {agent["paneKey"]: agent["agentType"] for agent in ordered_agents
+                          if agent.get("paneKey") and agent.get("agentType")}
         terms = [term if term.get("agentIdentity") else
                  {**term, "agentIdentity": agents_by_pane.get(hourly_runtime.pane_key(term))} for term in terms]
         prompts = list(waiting_prompts(terms, screens, w.get("_environment")))

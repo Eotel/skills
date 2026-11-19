@@ -3073,6 +3073,31 @@ class ScanCommandTests(unittest.TestCase):
                 else:
                     self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", second["handle"]))
 
+    def test_an_old_agent_record_does_not_hide_a_current_codex_pane_failure(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        current = tree["agents"][0]
+        current["paneKey"] = "tab:other"
+        prior = done_agent("claude", "tab:other", said="Earlier Claude reply")
+        pending = in_pane(terminal(lane, "codex", "term_pending"), "tab:pending")
+        other = in_pane(terminal(lane, None, "term_other"), "tab:other")
+        screens = {
+            (environment, pending["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
+            (environment, other["handle"]): {"source": "screen", "tail": [
+                "⏺ Earlier Claude reply", "› check the build", "• Checking the build.",
+                "■ stream disconnected before completion"]},
+        }
+        pending["_environment"] = other["_environment"] = environment
+        for agents in ([current, prior], [prior, current]):
+            with self.subTest(agent_order=[agent["agentType"] for agent in agents]):
+                tree["agents"] = agents
+                row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+                self.assertIsNotNone(row["stop"])
+                self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
+                self.assertEqual(row["stop"]["agent"], "codex")
+
     def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
         lane = str(self.dir / "shared")
         with_agent = worktree(lane, "working", agent="codex")
