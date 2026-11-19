@@ -2800,35 +2800,6 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
-    def test_a_live_scan_reads_a_working_codex_tab_with_an_existing_rollout(self) -> None:
-        lane = str(self.dir / "codex-lane")
-        tree = worktree(lane, "working", agent="codex")
-        term = terminal(lane, "codex", "term_approval")
-        rollouts = self.dir / "rollouts"
-        rollouts.mkdir()
-        write_jsonl(rollouts / "rollout-approval.jsonl", [
-            codex_row("2026-11-19T00:00:00Z", "session_meta", {"cwd": lane}),
-        ])
-        screen = {"source": "screen", "tail": ["Would you like to run the following command?",
-                                                "Environment: local", "Reason: Read Git status", "$ git status",
-                                                "› 1. Yes, proceed (y)", "2. No (esc)",
-                                                "Press enter to confirm or esc to cancel"]}
-        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree], [term])),
-              patch.object(scan, "read_screens", return_value={(None, term["handle"]): screen}) as screens,
-              patch.object(scan, "read_mail", return_value={}),
-              patch.object(scan, "worktree_processes", return_value={}),
-              patch.object(scan, "with_automation_workspaces", side_effect=lambda rows, _: rows),
-              patch.object(scan, "running_claude_transcripts", return_value={}),
-              patch.object(scan, "process_table", return_value={}),
-              patch.object(scan.rm_check, "process_table", return_value={}),
-              redirect_stdout(io.StringIO()) as out):
-            self.assertEqual(scan.main(["--orca", "orca", "--codex-sessions", str(rollouts), "--since-hours", "0",
-                                        "--claude-projects", str(self.dir / "claude"), "--row", lane]), 0)
-        screens.assert_called_once_with("orca", [term])
-        row = json.loads(out.getvalue())
-        self.assertEqual(row["class"], "waiting")
-        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
-
     def test_open_pr_cleanup_summary_provides_one_batch_command_with_nested_and_scratch_options(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "stalled",
@@ -2862,6 +2833,35 @@ class ScanCommandTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_a_live_scan_reads_a_working_codex_tab_with_an_existing_rollout(self) -> None:
+        lane = str(self.dir / "codex-lane")
+        tree = worktree(lane, "working", agent="codex")
+        term = terminal(lane, "codex", "term_approval")
+        rollouts = self.dir / "rollouts"
+        rollouts.mkdir()
+        write_jsonl(rollouts / "rollout-approval.jsonl", [
+            codex_row("2026-11-19T00:00:00Z", "session_meta", {"cwd": lane}),
+        ])
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?",
+                                                "Environment: local", "Reason: Read Git status", "$ git status",
+                                                "› 1. Yes, proceed (y)", "2. No (esc)",
+                                                "Press enter to confirm or esc to cancel"]}
+        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree], [term])),
+              patch.object(scan, "read_screens", return_value={(None, term["handle"]): screen}) as screens,
+              patch.object(scan, "read_mail", return_value={}),
+              patch.object(scan, "worktree_processes", return_value={}),
+              patch.object(scan, "with_automation_workspaces", side_effect=lambda rows, _: rows),
+              patch.object(scan, "running_claude_transcripts", return_value={}),
+              patch.object(scan, "process_table", return_value={}),
+              patch.object(scan.rm_check, "process_table", return_value={}),
+              redirect_stdout(io.StringIO()) as out):
+            self.assertEqual(scan.main(["--orca", "orca", "--codex-sessions", str(rollouts), "--since-hours", "0",
+                                        "--claude-projects", str(self.dir / "claude"), "--row", lane]), 0)
+        screens.assert_called_once_with("orca", [term])
+        row = json.loads(out.getvalue())
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
 
     def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
         # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
