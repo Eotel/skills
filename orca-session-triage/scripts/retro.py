@@ -882,10 +882,11 @@ def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_
             adoption_id = decision["id"]
         elif decision["decision"] == "revoke" and adoption_id is not None and decision["id"] not in reverted:
             action_key = f"{item['proposal_id']}:revoked:{decision['ts']}"
-            if (attempts.get(action_key, 0) >= 3 and adoption_id in applications and skill_available and
+            if (attempts.get(action_key, 0) >= 3 and skill_available and
+                    (adoption_id in applications or checkpoint_id == adoption_id) and
                     failures.get(decision["id"]) == "target skill is missing"):
                 action_key = f"{action_key}:target-restored"
-            if attempts.get(action_key, 0) < 3 or checkpoint_id == adoption_id:
+            if attempts.get(action_key, 0) < 3:
                 return adoption_id, decision, action_key
     return None
 
@@ -895,10 +896,17 @@ def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
                         applications: dict[str, str]) -> str | None:
     if checkpoint is None:
         return None
-    if recorded and recorded["line_hash"] == hashlib.sha256(checkpoint["line"].encode()).hexdigest():
+    reverted = {row["decision_id"] for row in item.get("executions", []) if row["outcome"] == "reverted"}
+    adoptions = []
+    for entry in item["decisions"]:
+        if entry["decision"] == "adopt":
+            adoptions.append(entry)
+        elif entry["decision"] == "revoke" and entry["id"] in reverted:
+            adoptions.pop()
+    if (isinstance(recorded, dict) and any(entry["id"] == recorded.get("decision_id") for entry in adoptions) and
+            recorded.get("line_hash") == hashlib.sha256(checkpoint["line"].encode()).hexdigest()):
         return recorded["decision_id"]
     proposal_id = item["proposal_id"]
-    adoptions = [entry for entry in item["decisions"] if entry["decision"] == "adopt"]
     for adoption in reversed(adoptions):
         decision_id = adoption["id"]
         if (note := rewrites.get(decision_id)) and note_line({"id": proposal_id, "note": note}) == checkpoint["line"]:
@@ -948,9 +956,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                 data["applied_actions"].pop(proposal_id, None)
                 data["applied_action_ids"].pop(proposal_id, None)
             data["rewrites"].pop(decision_id, None)
-            # Retries counted under an earlier decision no longer stand for a failure once the proposal settles.
             data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
-                                       if not key.startswith(f"{proposal_id}:")}
+                                       if not key.startswith(f"{proposal_id}:adopted:")}
             continue
         if status == "adopted" and (item.get("retires") or item.get("confirms")) and not item.get("merges"):
             # Adopting a retirement or a confirmation closes or settles other proposals; no note or lane is left.
@@ -1054,6 +1061,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                 data["applied_actions"].pop(proposal_id, None)
                 data["applied_action_ids"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
+            data["action_attempts"].pop(action_key.removesuffix(":target-restored"), None)
             data["rewrites"].pop(adoption_id, None)
             changed += 1
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
