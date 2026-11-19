@@ -459,12 +459,13 @@ until the lead observes that its recorded symptom is gone. Then:
   file stays after the review ends, so never wait for it to disappear. If the
   row has no command, confirm the PR's source before starting. The independent
   review is a draft; do not submit a GitHub review from this step. When
-  relaying the findings, use the status from the Asana sync: before any review
-  or review comment by another person, tell the author to keep 「レビュー待ち」.
-  An independent or bot review does not advance that status. After the author
-  addresses a human review and requests re-review, keep 「指摘対応済み（未承認）」.
-  For
-  「指摘対応担当」, start the lane in this run with `spawn-lane --topic <PR URL>`.
+  relaying findings, include the review status from the Asana sync. Before the
+  first human review or human comment in the PR conversation or diff, keep
+  「レビュー待ち」 after handling independent or bot findings. When the author has
+  addressed all human findings and requested re-review, use 「指摘対応済み（未承認）」
+  if the sync confirms it. For 「要確認」, read the review and comment bodies
+  and check for outstanding findings before relaying the status.
+  For 「指摘対応担当」, start the lane in this run with `spawn-lane --topic <PR URL>`.
 - Record each new question as `references/hourly-state.md` says and ask with
   AskUserQuestion. Recording it sets the triage workspace's Orca comment to
   「要判断: …」 (「The triage workspace's comment」 there).
