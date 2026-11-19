@@ -176,22 +176,24 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
                                  r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
-                                 r"|\d{1,2}:\d{2}|\d{1,2}/\d{1,2}|承認を得(?:てから|た後|る前|た場合|なかった場合)"
-                                 r"|jst|utc|再起動|稼働を続け"
+                                 r"|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2}|\d{1,2}/\d{1,2}"
+                                 r"|承認を得(?:てから|た後|る前|た場合|なかった場合)|承認取得[前後]"
+                                 r"|以降|以前|(?<=[0-9日時分曜])\s*まで(?:に)?|jst|utc|再起動|リスタート|稼働を続け"
                                  r"|本番|検証環境|ステージング|(?<![a-z])(?:production|prod|staging|stg)(?![a-z])"
                                  r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
 ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
 ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![a-z0-9_-])", re.I)
 BARE_ASK_CITATION = re.compile(r"(?<![a-z0-9_-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"
                                r"(?::[1-9]\d*)?(?![a-z0-9_-])", re.I)
-SAME_CONDITION = {"本日": "今日", "production": "本番", "prod": "本番",
+SAME_CONDITION = {"本日": "今日", "リスタート": "再起動", "production": "本番", "prod": "本番",
                   "staging": "ステージング", "stg": "ステージング"}
 DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
 
 
 def question_conditions(value: str) -> list[str]:
     return [SAME_CONDITION.get(term, term)
-            for term in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))]
+            for raw in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))
+            if (term := raw.strip())]
 
 
 def question_scope_agrees(original: dict, current: dict) -> bool:

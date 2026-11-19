@@ -609,7 +609,7 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     asks = {row["id"]: row for row in inbox_read.inbox_entries(inbox)
             if row.get("kind") == "ask" and row.get("id")} if bound else {}
     choices = lead_decisions.ask_answers(inbox_read.answers_path()) if asks else {}
-    questions = hourly_state.read(Path(hourly_state.DEFAULT_STATE).expanduser())["questions"].values() if asks else ()
+    questions = hourly_state.read(args.state_file.expanduser())["questions"].values() if asks else ()
     settled = []
     for key in keys:
         if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), bound.get(key)):

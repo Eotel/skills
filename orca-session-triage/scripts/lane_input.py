@@ -252,10 +252,10 @@ def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
 
 
 def export_candidates(inbox: Path, path: Path, orca: str, wanted: set[str]) -> dict[str, list[dict]]:
-    def scopes() -> dict[str, str]:
+    def related_reports() -> dict[str, list[dict]]:
         entries = inbox_read.inbox_entries(inbox) if inbox.is_file() else []
-        asks = [row for row in entries if row.get("kind") == "ask" and row.get("id")]
-        signatures = {}
+        asks = [row for row in entries if row.get("kind") == "ask" and row.get("id") and not inbox_read.is_handoff(row)]
+        related = {}
         for ask in asks:
             if ask["id"] not in wanted:
                 continue
@@ -264,30 +264,46 @@ def export_candidates(inbox: Path, path: Path, orca: str, wanted: set[str]) -> d
             ids = {row["id"] for row in nearby}
             updates = [row for row in entries if any(isinstance(ref, str) and ref.partition(":")[0] in ids
                                                       for ref in row.get("withdraws") or [])]
-            signatures[ask["id"]] = sha256(json.dumps([nearby, updates], sort_keys=True).encode()).hexdigest()
-        return signatures
+            related[ask["id"]] = [*nearby, *updates]
+        return related
+
+    def signature(related: dict[str, list[dict]], ask_id: str, record: dict) -> str | None:
+        at = inbox_read.asked_at(record)
+        if at is None or ask_id not in related:
+            return None
+        preceding = [row for row in related[ask_id] if not (when := inbox_read.asked_at(row)) or when < at]
+        return sha256(json.dumps(preceding, sort_keys=True).encode()).hexdigest()
 
     cache = path.resolve().with_name(path.name + ".lane-candidates.json")
     with retro.locked(cache.with_suffix(".lock")):
-        versions = scopes()
+        before = related_reports()
         detected = candidate_answers(inbox, path, orca, wanted)
-        if versions != scopes():
-            return {}
+        after = related_reports()
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
         except FileNotFoundError:
             data = {}
-        saved: dict[str, list[dict]] = data.get("candidates", {})
-        stored_versions: dict[str, str] = data.get("versions", {})
-        saved = {key: rows for key, rows in saved.items()
-                 if (ask := key.partition(":")[0]) not in wanted or stored_versions.get(ask) == versions.get(ask)}
-        for answer_id, records in detected.items():
-            combined = {(row["ts"], row["input"]): row for row in [*saved.get(answer_id, ()), *records]}
-            saved[answer_id] = list(combined.values())
-        if detected:
-            retro.atomic_text(cache, json.dumps({"versions": stored_versions | versions, "candidates": saved},
-                                                ensure_ascii=False) + "\n")
-        return {answer_id: records for answer_id, records in saved.items() if answer_id.partition(":")[0] in versions}
+        saved: dict[str, list[dict]] = data.get("inputs", {})
+        updated = dict(saved)
+        result = {}
+        for answer_id in saved.keys() | detected.keys():
+            ask_id = answer_id.partition(":")[0]
+            if ask_id not in wanted:
+                continue
+            candidates = {(row["record"]["ts"], row["record"]["input"]): row for row in saved.get(answer_id, [])
+                          if row["signature"] == signature(after, ask_id, row["record"])}
+            for row in detected.get(answer_id, []):
+                scope = signature(before, ask_id, row)
+                if scope is not None and scope == signature(after, ask_id, row):
+                    candidates[(row["ts"], row["input"])] = {"record": row, "signature": scope}
+            if candidates:
+                updated[answer_id] = list(candidates.values())
+                result[answer_id] = [entry["record"] for entry in candidates.values()]
+            else:
+                updated.pop(answer_id, None)
+        if updated != saved:
+            retro.atomic_text(cache, json.dumps({"inputs": updated}, ensure_ascii=False) + "\n")
+        return result
 
 
 def inferred_answers(inbox: Path, path: Path, orca: str, wanted: set[str] | None = None) -> dict[str, dict]:

@@ -381,7 +381,8 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
     return items
 
 
-def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, lead_decisions.Decision]) -> str:
+def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, lead_decisions.Decision],
+                    answer_at: datetime | None = None) -> str:
     """"settled" once closed, or once a question asked under KEY (or covering it) is answered or the lead decides KEY
     after the item's first listing; "asked" while an open question (ask_state.active) asks KEY; else "open"."""
     listed = scan_sessions.parse_time(item["presented_at"])
@@ -389,7 +390,7 @@ def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, le
         *(question.get("answered_at") for question in data["questions"].values()
           if not question.get("withdrawn_at") and (key == question["decision"] or key in question.get("covers", ()))),
         getattr(decisions.get(key), "decided_at", None)) if at]
-    if item["closed_at"] is not None or listed is None or any(at and at >= listed for at in settled_at):
+    if item["closed_at"] is not None or listed is None or any(at and at >= listed for at in [*settled_at, answer_at]):
         return "settled"
     if any(key in question["keys"] for question in ask_state.active(data, decisions)):
         return "asked"
@@ -405,13 +406,13 @@ def owner_reports(owner: str, since: datetime | None, entries: list[dict]) -> li
 
 
 def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime,
-                  entries: list[dict] | None = None) -> list[dict]:
+                  entries: list[dict] | None = None, answers: Mapping[str, datetime] | None = None) -> list[dict]:
     """Each item an hourly report listed that is still open (presented_state), as a stale-asks item. A `user:` item
     (the user's own action) lists in `waiting_reports` the done and info its owner sent after its `since` from the
     inbox `entries`: candidates that it is settled (2026-11-17 20:00, two login waits the lanes had reported done)."""
     items = []
     for key, item in data["presented"].items():
-        if presented_state(data, key, item, decisions) != "open":
+        if presented_state(data, key, item, decisions, (answers or {}).get(key)) != "open":
             continue
         since = scan_sessions.parse_time(item["since"]) or now
         items.append({"id": key, "row": item["owner"], "owner": item["owner"],
@@ -657,7 +658,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                    if not (refs := ask_state.references(item, known_asks))
                    or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
                    or any(not (ask_state.reference(cover, known_asks)
-                               or ((ref := handoff_refs.get(cover)) and ask_state.covered(ref, closed_ids, known_asks)))
+                               or ((ref := handoff_refs.get(cover) or ask_state.reference(item.get("ask_id") or "", known_asks))
+                                   and ref[1] and ask_state.covered(ref, closed_ids, known_asks)))
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
@@ -1859,16 +1861,19 @@ def main(argv: list[str] | None = None) -> int:
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
             latest_handoffs = {item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())}
-            presented_decisions = {key: items[-1] for key, items in decided.items()}
-            known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
-            evidence = lead_decisions.ask_answers(answers_log) if decided.keys() & latest_handoffs.keys() else {}
             for key in decided.keys() & latest_handoffs.keys():
                 if lead_decisions.decision_for_handoff(decided[key][-1].view(), latest_handoffs[key].ask_id) is None:
                     del decided[key]
-                    ref = ask_state.handoff_ref(latest_handoffs[key].ask_id, key, list(known.values()),
-                                                data["questions"].values())
-                    if not ref or not lead_decisions.ask_answer_for_handoff(ref, evidence, known):
-                        del presented_decisions[key]
+            known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
+            evidence = lead_decisions.ask_answers(answers_log) if data["presented"] else {}
+            presented_answers = {}
+            for key in data["presented"]:
+                ask_id = latest_handoffs[key].ask_id if key in latest_handoffs else None
+                ref = ask_state.handoff_ref(ask_id, key, list(known.values()), data["questions"].values())
+                if ref and (proof := lead_decisions.ask_answer_for_handoff(ref, evidence, known)):
+                    stamps = [at for part in proof.get("answers", [proof]) if (at := scan_sessions.parse_time(part.get("ts")))]
+                    if stamps:
+                        presented_answers[key] = max(stamps)
             handed = [item for key, item in latest_handoffs.items() if key not in decided]
             since = handoff.last_sent_at(args.handoffs_dir.expanduser())
             rejected = [{**item, "worktree": worktree.name} for worktree in answer_evidence.asking_worktrees(args)
@@ -1882,8 +1887,8 @@ def main(argv: list[str] | None = None) -> int:
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
-                data, presented_decisions, datetime.now(timezone.utc),
-                entries)], key=lambda item: -item["age_minutes"])
+                data, {key: items[-1] for key, items in decided.items()}, datetime.now(timezone.utc),
+                entries, presented_answers)], key=lambda item: -item["age_minutes"])
             unseen: set[str] = set()
             if lead := appointed_lead(data):
                 try:
