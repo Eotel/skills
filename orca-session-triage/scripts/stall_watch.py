@@ -541,12 +541,14 @@ def recovery(row: Mapping, records: Records, now: datetime, step: str | None) ->
 
 def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     stop = row.get("stop")
-    if not stop or stop.get("kind") not in STOP_KINDS:
-        return []
-    if candidates := row.get("codex_interruptions"):
-        candidate_row = {key: value for key, value in row.items() if key != "codex_interruptions"}
-        return [signal for candidate in candidates
-                for signal in error_signals({**candidate_row, "stop": candidate}, act, records, now)]
+    interruptions = row.get("codex_interruptions") or ()
+    stops = [*([stop] if stop and (not interruptions or stop.get("kind") != "interrupted") else []),
+             *interruptions]
+    return [signal for item in stops if item.get("kind") in STOP_KINDS
+            for signal in stop_signals(row, item, act, records, now)]
+
+
+def stop_signals(row: Mapping, stop: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     interrupted = stop["kind"] == "interrupted"
     if interrupted:
         at = parse(stop.get("stopped_at"))
@@ -915,7 +917,9 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
             if seen and (not seen[1] or not stop.get("screen_turn") or seen[1] == stop["screen_turn"]):
                 surviving.append(stop)
         if interruptions(row):
-            row = {**row, "codex_interruptions": surviving, "stop": next(iter(surviving), None)}
+            stop = row.get("stop") or {}
+            row = {**row, "codex_interruptions": surviving,
+                   "stop": stop if stop.get("kind") != "interrupted" and stop else next(iter(surviving), None)}
         if not row.get("environment") and isinstance(path := row.get("path"), str):
             row = {**row, "claude": scan.read_claude(projects, path, live.get(path, [])),
                    "codex": codex.get(path) or row.get("codex") or [],

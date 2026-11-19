@@ -786,6 +786,7 @@ class StopReason(TypedDict):
     rollout: NotRequired[str]
     turn_key: NotRequired[str]
     screen_turn: NotRequired[str]
+    screen_marks: NotRequired[int]
 
 
 def codex_moved_since(row: Mapping, stopped_at: datetime, resume_rollout: str | None) -> bool:
@@ -1048,21 +1049,22 @@ def last_codex_activity(lines: list[str]) -> str | None:
                       or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
 
 
-def current_interruption(screen: dict) -> tuple[str, str, bool] | None:
+def current_interruption(screen: dict) -> tuple[str, str, int] | None:
     lines = [line.strip() for line in screen_lines(screen)]
-    position = max((i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)), default=-1)
-    if position < 0:
+    positions = [i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)]
+    if not positions:
         return None
+    position = positions[-1]
     later = lines[position + 1:]
     prompts = [line for line in later if line == "›" or line.startswith(CODEX_PROMPT)]
     if len(prompts) > 1 or any(CODEX_TURN_END.fullmatch(line) or api_failure(line)
                                or (line.startswith(CODEX_REPLY) and not line.startswith("• Feedback uploaded."))
                                for line in later):
         return None
-    previous = max((i for i, line in enumerate(lines[:position]) if CODEX_INTERRUPTED.match(line)), default=-1)
+    previous = positions[-2] if len(positions) > 1 else -1
     prompt = next((line for line in reversed(lines[previous + 1:position]) if line.startswith(CODEX_PROMPT)), "")
     turn = hashlib.sha256(prompt.encode()).hexdigest() if prompt else ""
-    return lines[position], turn, previous >= 0 and bool(prompt)
+    return lines[position], turn, len(positions)
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1767,7 +1769,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     live_transcripts: dict[str, list[Path]] | None = None,
                     processes: dict[str, list[WorktreeProcess]] | None = None,
                     live_sessions: dict[str, list[dict]] | None = None,
-                    interruption_times: dict[str, StopReason] | None = None) -> list[dict]:
+                    interruption_times: dict[str, StopReason] | None = None,
+                    interruption_observations: dict[str, str] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1840,56 +1843,45 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                           and (term.get("agentIdentity") == "codex"
                                or (not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
         interruptions: list[StopReason] = []
-        lane_rollouts = [] if remote else codex_by_cwd.get(w["path"], [])
         for term in terms:
             handle = term.get("handle")
             frame = rendered(screens.get((w.get("_environment"), handle)))
             if not handle or not frame or handle not in codex_activity:
                 continue
             key = json.dumps([w.get("_environment"), handle])
+            if interruption_observations is not None:
+                interruption_observations[key] = frame.get("_observed_at") or scanned_at
             interruption = current_interruption(frame)
             if not interruption or handle in approval_tabs:
                 interruption_times.pop(key, None)
                 continue
             agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
             state_at = iso_time(agent.get("stateStartedAt")) if agent.get("interrupted") else None
-            state_time = parse_time(state_at)
-            matches = [event for event in lane_rollouts
-                       if state_time is not None and (at := parse_time(event.get("interrupted_at")))
-                       and abs((at - state_time).total_seconds()) <= 2]
-            rollout = matches[0] if len(matches) == 1 else {}
-            event_at = rollout.get("interrupted_at")
-            turn_key = event_at or state_at
-            error, screen_turn, intervening_turn = interruption
+            mtime = iso_time(term.get("lastOutputAt")) or scanned_at
+            error, screen_turn, screen_marks = interruption
             previous = interruption_times.get(key)
             if previous:
                 last_stop = parse_time(previous["stopped_at"])
-                event_time = parse_time(turn_key)
-                new_turn = (event_time is not None and last_stop is not None
-                            and (event_time > last_stop or (previous.get("turn_key")
-                                 and turn_key != previous["turn_key"])))
-                old_screen_turn = previous.get("screen_turn")
-                new_prompt = screen_turn and screen_turn != old_screen_turn and (old_screen_turn or intervening_turn)
-                if not (new_turn or new_prompt):
-                    if screen_turn and not old_screen_turn:
+                event_time = parse_time(state_at)
+                new_state = event_time is not None and last_stop is not None and event_time > last_stop
+                old_prompt = previous.get("screen_turn", "")
+                old_marks = previous.get("screen_marks", 1)
+                new_prompt = screen_turn and screen_turn != old_prompt and (old_prompt or screen_marks > 1)
+                output_at = parse_time(mtime)
+                repeat_prompt = (screen_turn and screen_marks > old_marks
+                                 and output_at is not None and last_stop is not None and output_at > last_stop)
+                if not (new_state or new_prompt or repeat_prompt):
+                    if screen_turn and not old_prompt:
                         previous["screen_turn"] = screen_turn
-                    if turn_key:
-                        previous["turn_key"] = turn_key
-                    if event_at and rollout.get("rollout"):
-                        previous["rollout"] = rollout["rollout"]
+                    previous["screen_marks"] = max(old_marks, screen_marks)
                     interruptions.append(previous)
                     continue
-            stopped_at = turn_key
-            if not stopped_at:
-                stopped_at = iso_time(term.get("lastOutputAt")) or scanned_at
+                if not new_state:
+                    state_at = None
+            stopped_at = state_at or mtime
             stop: StopReason = {"kind": "interrupted", "action": "wake", "agent": "codex",
                                 "error": error, "resets": None, "tab": handle, "stopped_at": stopped_at,
-                                "stopped_by": "rollout" if event_at else "agent_state",
-                                "screen_turn": screen_turn}
-            if turn_key:
-                stop["turn_key"] = turn_key
-            if event_at and rollout.get("rollout"):
-                stop["rollout"] = rollout["rollout"]
+                                "stopped_by": "agent_state", "screen_turn": screen_turn, "screen_marks": screen_marks}
             interruption_times[key] = stop
             interruptions.append(stop)
         screen_error: tuple[str | None, str | None] = (None, None)
@@ -1944,7 +1936,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 "approval_observed_at": approval_observed, "approval_capture_by_tab": approval_captures}
                if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
-            "codex": lane_rollouts,
+            "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
         if not remote and (sessions := (live_sessions or {}).get(w["path"])):
             row["claude_sessions"] = sessions
@@ -3148,21 +3140,19 @@ def write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
-def save_interruption_times(path: Path, before: Mapping, after: dict[str, StopReason]) -> None:
+def save_interruption_times(path: Path, observed: Mapping[str, str], stops: dict[str, StopReason]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        latest = read_json_file(path)
-        current = latest if isinstance(latest, dict) else {}
-        for key in before.keys() - after.keys():
-            if current.get(key) == before[key]:
-                current.pop(key, None)
-        for key, stop in after.items():
-            saved = current.get(key, {})
-            if stop != before.get(key) and (
-                    saved == before.get(key, {}) or stop["stopped_at"] >= saved.get("stopped_at", "")):
-                current[key] = stop
-        write_json_atomically(path, current)
+        stored = read_json_file(path)
+        current = stored if isinstance(stored, dict) else {}
+        oldest = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        for key, observed_at in observed.items():
+            entry = current.get(key, {})
+            if observed_at > entry.get("observed_at", ""):
+                current[key] = {"observed_at": observed_at, "stop": stops.get(key)}
+        write_json_atomically(path, {key: entry for key, entry in current.items()
+                                     if entry.get("stop") or entry.get("observed_at", "") >= oldest})
 
 
 def load_verdicts(store_path: str | Path) -> dict[str, dict]:
@@ -4071,20 +4061,21 @@ def main(argv: list[str] | None = None) -> int:
     cached_times = read_json_file(interruption_path) if screens else None
     interruption_times: dict[str, StopReason] = {}
     if isinstance(cached_times, dict):
-        interruption_times = {key: cast(StopReason, dict(stop)) for key, stop in cached_times.items()
-                              if isinstance(stop, dict) and stop.get("kind") == "interrupted"
+        interruption_times = {key: cast(StopReason, dict(stop)) for key, entry in cached_times.items()
+                              if isinstance(entry, dict) and (stop := entry.get("stop"))
                               and isinstance(stop.get("stopped_at"), str)}
+    interruption_observations: dict[str, str] = {}
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
                                                processes=processes, live_sessions=live_sessions,
-                                               interruption_times=interruption_times),
+                                               interruption_times=interruption_times,
+                                               interruption_observations=interruption_observations),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
-    if screens and interruption_times != (cached_times or {}):
-        save_interruption_times(interruption_path, cached_times if isinstance(cached_times, dict) else {},
-                                interruption_times)
+    if interruption_observations:
+        save_interruption_times(interruption_path, interruption_observations, interruption_times)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():

@@ -2072,6 +2072,7 @@ class ClassifyTests(unittest.TestCase):
             ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
             ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
             (["› Continue work", "• Working (1s)", message, "› "], 0, 1),
+            ([message, "› Continue work", message, "› Continue work", message, "› "], 0, 0),
             ([message, "› Continue work", "› "], 0, None),
         ):
             with self.subTest(quiet=quiet):
@@ -2085,7 +2086,7 @@ class ClassifyTests(unittest.TestCase):
                     self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 60 * stopped) * 1000))
                     self.assertEqual(stop["stopped_by"], "agent_state")
 
-    def test_codex_interruption_uses_the_rollout_event_time_even_when_a_redraw_is_newer(self) -> None:
+    def test_codex_interruption_uses_the_tab_state_time_even_when_a_redraw_is_newer(self) -> None:
         rollout = self.projects / "rollout.jsonl"
         stopped = scan.iso_time((NOW - 1800) * 1000)
         write_jsonl(rollout, [
@@ -2100,7 +2101,17 @@ class ClassifyTests(unittest.TestCase):
             [in_pane(terminal("/w/cut", "codex"), "tab1:leaf1")],
             self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
             screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
-        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "rollout"))
+        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "agent_state"))
+
+    def test_older_screen_cannot_bring_back_a_cleared_interruption(self) -> None:
+        path = self.projects / "stops.json"
+        key = '[null, "term_a"]'
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        new = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        stop = {"kind": "interrupted", "stopped_at": old}
+        scan.save_interruption_times(path, {key: new}, {})
+        scan.save_interruption_times(path, {key: old}, {key: stop})
+        self.assertIsNone(json.loads(path.read_text())[key]["stop"])
 
     def test_unmatched_rollout_does_not_hide_an_interruption_in_a_different_tab(self) -> None:
         path = "/w/cut"
