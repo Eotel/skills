@@ -528,6 +528,14 @@ def ask_answer_for_handoff(ref: tuple[str, frozenset[int]], answers: Mapping[str
     return parts[0] if len(parts) == 1 else {"answers": parts}
 
 
+def handoff_bindings(key: str, ask_id: str | None, entries: list[dict], questions: Iterable[dict]) -> list[str]:
+    if ask_id:
+        return [ask_id]
+    named = ask_state.reference(key, entries)
+    return [ref for question in questions if (ref := ask_state.registered_ask_id(question, key))
+            and (not named or ask_state.same_bound_ask(question, named[0]))]
+
+
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
                   workers: IssueWorkers, decisions: list[str] | None = None,
@@ -551,11 +559,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         decision = decision_for_handoff(answered[key].view() if key in answered else None, latest_id)
         answer = decision
         if answer is None:
-            bindings = [latest_id] if latest_id else []
-            if not bindings:
-                named_ref = ask_state.reference(key, ask_entries)
-                bindings = [ref for question in active if (ref := ask_state.registered_ask_id(question["record"], key))
-                            and (not named_ref or ask_state.same_bound_ask(question["record"], named_ref[0]))]
+            bindings = handoff_bindings(key, latest_id, ask_entries, (question["record"] for question in active))
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
                                       if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
             for ref in refs:
