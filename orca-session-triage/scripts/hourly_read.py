@@ -38,7 +38,7 @@ COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch")
 BACKLOG_ITEM = re.compile(r"^(?:返信|返信不要|担当確認|判定済み) [A-Z][A-Z0-9_]+-\d+\b")
 BACKLOG_ELAPSED = re.compile(r" \| (?:\d+時間)?\d+分 \| ")
 BACKLOG_PR_ELAPSED = re.compile(
-    r"( \| PR [\w.-]+/[\w.-]+#\d+ (?:レビュー待ち|下書き|承認済み|修正依頼|open)) \d+(?:日|時間)(?= →|$)")
+    r"( \| PR [\w.-]+/[\w.-]+#\d+ (?:レビュー待ち|下書き|承認済み|修正依頼|open)) \d+(?:日|時間)(?= →| \||$)")
 BACKLOG_CURSOR = Path("~/.cache/orca-briefs/backlog-watch/state.json")
 ASANA_PARTIAL = re.compile(r"^Eotel へのレビュー依頼: 未取得", re.MULTILINE)
 

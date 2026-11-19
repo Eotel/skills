@@ -8864,7 +8864,7 @@ class HourlyReadTests(unittest.TestCase):
             (old / "tracker-gaps.json").write_text(json.dumps(former))
             (old / "asana99-status.json").write_text(json.dumps([{"url": "https://example.test/pr/1"}]))
             (old / "backlog-watch.stdout").write_text(
-                "返信 OLD-1 Prior issue\n返信 DEMO-7 Same issue | comment-42 | 5分 | - | PR Eotel/skills#7 レビュー待ち 1時間 → priority\n")
+                "返信 OLD-1 Prior issue\n返信 DEMO-7 Same issue | comment-42 | 5分 | - | PR Eotel/skills#7 レビュー待ち 1時間 → priority\n返信 DEMO-8 Draft | PR Eotel/skills#8 下書き 1時間 | issue Eotel/skills#9 OPEN\n")
             old_results = [{"name": name, "exit_code": 0, "read_at": 100.0, "result": str(old / f"{name}.json"),
                             "stdout": str(old / f"{name}.stdout")}
                            for name in ("tracker-gaps", "asana99-status", "backlog-watch")]
@@ -8899,7 +8899,7 @@ class HourlyReadTests(unittest.TestCase):
                     result = [{"url": "https://example.test/pr/2"}]
                     Path(args[1]).write_text(json.dumps(result))
                 elif command == "backlog-watch":
-                    stdout.write("返信 NEW-1 New issue\n返信 DEMO-7 Same issue | comment-42 | 1時間05分 | - | PR Eotel/skills#7 レビュー待ち 2日 → priority\n")
+                    stdout.write("返信 NEW-1 New issue\n返信 DEMO-7 Same issue | comment-42 | 1時間05分 | - | PR Eotel/skills#7 レビュー待ち 2日 → priority\n返信 DEMO-8 Draft | PR Eotel/skills#8 下書き 2日 | issue Eotel/skills#9 OPEN\n")
                     return subprocess.CompletedProcess(args, 0)
                 else:
                     result = []
