@@ -258,14 +258,13 @@ def screen_blockers(term: dict, screen: dict) -> list[str]:
     if scan_sessions.has_draft(screen) and scan_sessions.composer_empty(screen) is not True:
         problems.append(f"unsent draft: draft_text={scan_sessions.draft_excerpt(screen)!r}, "
                         f"composer_empty={scan_sessions.composer_empty(screen)}")
-    tail = screen.get("tail") or []
-    lines = tail if isinstance(tail, list) else tail.splitlines()
+    lines = scan_sessions.screen_lines(screen)
     visible = "\n".join(lines[-15:])
     if any(marker in visible for marker in BUSY):
         problems.append("screen shows active input or work")
-    prompts = [line.strip()[1:].strip() for line in lines[-10:]
-               if line.strip().startswith(("❯", "›"))]
-    if not prompts or prompts[-1] not in ("", "Ask Codex to do anything"):
+    prompt = next((line.strip() for line in reversed(lines[-10:]) if line.lstrip().startswith(("❯", "›"))), "")
+    empty = scan_sessions.composer_empty(screen, "codex") if prompt.startswith("›") else prompt == "❯"
+    if empty is not True:
         problems.append("empty composer is not visible")
     return problems
 

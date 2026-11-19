@@ -1357,6 +1357,20 @@ class ClassifyTests(unittest.TestCase):
         screen["tail"][4:5] = ["❯", "  2 行目から書いた指示"]
         self.assertFalse(scan.composer_empty(screen))
 
+    def test_codex_footer_does_not_mark_a_finished_tab_as_having_a_draft(self) -> None:
+        lane = {**worktree("/w/d"), "agents": [done_agent("codex", "tab1:leaf1")]}
+        tab = in_pane(terminal("/w/d", "codex", "term_codex"), "tab1:leaf1")
+        for prompt, empty in (("› Ask Codex to do anything", True), ("› keep this draft", False)):
+            with self.subTest(prompt=prompt):
+                screen = {"source": "screen", "tail": [
+                    prompt, "  GPT-6.2-Sol xhigh · ~/orca/workspaces/app/composer",
+                    "  ← for agents · ? for shortcuts     ⚠ 1 warning · f2 to view"]}
+                [row] = scan.build_inventory([lane], [tab], self.projects, {}, "要判断", now=NOW,
+                                             judge=judging({}), screens={(None, "term_codex"): screen})
+                [card] = row["done_cards"]
+                self.assertEqual(card["composer_empty"], empty)
+                self.assertEqual(row.get("draft_tabs", []), [] if empty else ["term_codex"])
+
     def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self) -> None:
         # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
         remote: dict = {**worktree("/remote/lane-241", "working"), "_environment": "macbook-pro-16"}
@@ -9448,6 +9462,8 @@ class HourlyTabCleanupTests(unittest.TestCase):
                                                   ("stream", ["finished", "❯"], None, True),
                                                   ("screen", ["finished", "❯ draft reply"], None, True),
                                                   ("screen", ["finished"], None, True),
+                                                  ("screen", ["›", "  typed on the next line",
+                                                              "  ← for agents · ? for shortcuts"], None, True),
                                                   ("screen", ["Switch to gpt-6-luna?", "  2. Keep current model",
                                                               "  enter select · esc back",
                                                               "› Ask Codex to do anything"], None, True)):
