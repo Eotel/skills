@@ -185,9 +185,9 @@ def all_rows(events: Path, imports: Path) -> list[Event]:
 
 def project(rows: list[Event]) -> list[Proposal]:
     proposals: dict[str, Proposal] = {}
+    execution_ids: dict[str, str] = {}
     for row in rows:
         proposal_id = row["proposal_id"]
-        revocation = None
         if row["type"] == "proposal":
             if proposal_id in proposals:
                 raise ValueError(f"duplicate proposal: {proposal_id}")
@@ -209,7 +209,6 @@ def project(rows: list[Event]) -> list[Proposal]:
                 proposals[target][reverse].append(item["proposal_id"])
     for row in rows:
         proposal_id = row["proposal_id"]
-        revocation = None
         if row["type"] == "proposal":
             continue
         if row["type"] == "evidence":
@@ -242,7 +241,9 @@ def project(rows: list[Event]) -> list[Proposal]:
             item[DECISION_TIMES[decision]] = row["ts"]
             item["decisions"].append(row)
             item["latest_event_id"] = row["id"]
-            item["current_execution"] = None
+            if decision in {"adopt", "revoke"}:
+                execution_ids[proposal_id] = row["id"]
+                item["current_execution"] = None
         elif row["type"] == "execution":
             if proposal_id not in proposals:
                 raise ValueError(f"execution without proposal: {proposal_id}")
@@ -260,7 +261,7 @@ def project(rows: list[Event]) -> list[Proposal]:
                 raise ValueError(f"reversal without revocation: {proposal_id}")
             item["executions"].append(row)
             item["latest_event_id"] = row["id"]
-            if item["decisions"][-1]["id"] == decision["id"]:
+            if execution_ids.get(proposal_id) == decision["id"]:
                 if outcome == "applied":
                     item["implemented_at"] = row["ts"]
                 if outcome == "reverted":
@@ -287,7 +288,7 @@ def active_owner(item: Proposal, known: dict[str, Proposal], besides: str | None
 
 def consolidation_blocker(item: Proposal, known: dict[str, Proposal]) -> str | None:
     """Why a proposal cannot be merged or retired now; None when it is a consolidation candidate."""
-    if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"]:
+    if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"] and not item["reverted_at"]:
         return "is not open"
     owner = active_owner(item, known)
     return f"is already in open proposal {owner}" if owner else None

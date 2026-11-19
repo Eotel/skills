@@ -865,13 +865,21 @@ def rewritten_note(item: dict[str, Any], comment: str, claude: str = "claude") -
     return note
 
 
-def applied_note(item: dict[str, Any], data: dict[str, Any]) -> str:
-    """The note the last application wrote, which a comment may have rewritten from the proposal."""
-    receipts = [json.loads(execution["undo"]) for execution in item.get("executions", [])
-                if execution.get("outcome") == "applied" and execution.get("undo")]
-    token = receipts[-1] if receipts else data["applied_actions"].get(item["proposal_id"]) or {}
-    line, suffix = str(token.get("line") or ""), f" {MARKER}{item['proposal_id']} -->\n"
+def note_from_undo(item: dict[str, Any], token: dict[str, Any] | None) -> str:
+    line = str((token or {}).get("line") or "")
+    suffix = f" {MARKER}{item['proposal_id']} -->\n"
     return line[2:-len(suffix)] if line.startswith("- ") and line.endswith(suffix) else item["proposal"]
+
+
+def pending_reversal(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    reverted = {run["decision_id"] for run in item.get("executions", []) if run["outcome"] == "reverted"}
+    adoption_id = None
+    for decision in item["decisions"]:
+        if decision["decision"] == "adopt":
+            adoption_id = decision["id"]
+        elif decision["decision"] == "revoke" and adoption_id is not None and decision["id"] not in reverted:
+            return adoption_id, decision
+    return None
 
 
 def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, state: Path | None = None) -> int:
@@ -887,21 +895,28 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         _, _, skill, category = parts
         status = item["status"]
         proposal_id = item["proposal_id"]
-        if status in ("adopted", "revoked"):
-            decision = item["decisions"][-1]
-        elif status in ("held", "rejected") and item.get("revoked_at") and category not in SEPARATE_WORK:
-            decision = next((entry for entry in reversed(item["decisions"]) if entry["decision"] == "revoke"), None)
-            if decision is None:
-                continue
+        checkpoint = data["applied_actions"].get(proposal_id)
+        applications = {run["decision_id"]: run["undo"] for run in item.get("executions", [])
+                        if run["outcome"] == "applied" and run.get("undo") and run.get("actor") == "triage-retro"}
+        decision_ids = [entry["id"] for entry in item["decisions"]]
+        checkpoint_id = (checkpoint.get("decision_id") or next(
+            (entry["id"] for entry in reversed(item["decisions"]) if entry["decision"] == "adopt"), None)
+            if checkpoint else None)
+        reversal = pending_reversal(item) if category not in SEPARATE_WORK else None
+        if reversal is not None:
+            adoption_id, decision = reversal
             status = "revoked"
+        elif status == "adopted":
+            decision = item["decisions"][-1]
+            adoption_id = decision["id"]
         else:
             continue
         decision_id = decision["id"]
-        reverted = status == "revoked" and any(
-            receipt.get("decision_id") == decision_id and receipt.get("outcome") == "reverted"
-            for receipt in item.get("executions", []))
-        if (status == "adopted" and item.get("implemented_at")) or reverted:
-            data["applied_actions"].pop(proposal_id, None)
+        stored = {key: value for key, value in checkpoint.items() if key != "decision_id"} if (
+            checkpoint is not None and checkpoint_id == adoption_id) else None
+        if status == "adopted" and item.get("implemented_at"):
+            if stored is not None:
+                data["applied_actions"].pop(proposal_id, None)
             data["rewrites"].pop(decision_id, None)
             # Retries counted under an earlier decision no longer stand for a failure once the proposal settles.
             data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
@@ -910,7 +925,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         if status == "adopted" and (item.get("retires") or item.get("confirms")) and not item.get("merges"):
             # Adopting a retirement or a confirmation closes or settles other proposals; no note or lane is left.
             continue
-        action_key = f"{proposal_id}:{status}:{item.get(status + '_at')}"
+        action_key = f"{proposal_id}:{status}:{decision['ts']}"
         if category in SEPARATE_WORK:
             # A lane makes the tool fix or the upstream report; the board or the deciding person tells the lead.
             if status == "adopted" and not any(execution.get("outcome") == "handed_off"
@@ -922,7 +937,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                 data["action_attempts"].pop(action_key, None)
                 changed += 1
             continue
-        if data["action_attempts"].get(action_key, 0) >= 3 and proposal_id not in data["applied_actions"]:
+        if data["action_attempts"].get(action_key, 0) >= 3 and stored is None:
             continue
         proposal = {"id": proposal_id, "note": item["proposal"], "target_skill": skill}
         writing_completed = False
@@ -938,15 +953,20 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                     data["rewrites"].get(decision_id) or rewritten_note(item, comment))
                 if state is not None:
                     save(data, state)
-            elif status == "revoked":
-                proposal["note"] = applied_note(item, data)
+            token = None
+            newer_application = False
+            if status == "revoked":
+                receipt = applications.get(adoption_id)
+                token = json.loads(receipt) if receipt is not None else stored
+                proposal["note"] = note_from_undo(item, token)
+                later_decisions = decision_ids[decision_ids.index(decision_id) + 1:]
+                newer_application = any(later in applications or later == checkpoint_id for later in later_decisions)
             line = note_line(proposal)
             expected = {"target": str(reference.resolve()), "router": str(router.resolve()), "line": line}
             contents = reference.read_text(encoding="utf-8") if reference.is_file() else ""
-            if MARKER + proposal_id in contents and contents.count(line) != 1:
+            if not newer_application and MARKER + proposal_id in contents and contents.count(line) != 1:
                 raise ValueError("adopted line changed; review target before retry")
             if status == "adopted":
-                stored = data["applied_actions"].get(proposal_id)
                 if stored is not None and stored != expected:
                     raise ValueError("saved adoption target does not match the skill")
                 if stored is not None or (contents.count(line) == 1
@@ -964,7 +984,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                     if f"{MARKER}{proposal_id} -->" in data.get("revoked_notes", []):
                         data["revoked_notes"].remove(f"{MARKER}{proposal_id} -->")
                     remember_versions(data, router, path)
-                data["applied_actions"][proposal_id] = expected
+                data["applied_actions"][proposal_id] = {**expected, "decision_id": decision_id}
                 writing_completed = True
                 if state is not None:
                     save(data, state)
@@ -974,13 +994,10 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                                "actor": "triage-retro", "result": f"appended to {path}{rewrite}",
                                "undo": json.dumps(expected, ensure_ascii=False)})
             else:
-                # A confirmation's applied receipt carries no undo token: the worker wrote nothing for it.
-                applied = next((e for e in reversed(item.get("executions", []))
-                                if e.get("outcome") == "applied" and e.get("undo")), None)
-                token = (json.loads(applied["undo"]) if applied else
-                         data["applied_actions"].get(proposal_id))
-                if token is None and contents.count(line) == 1:
-                    token = expected  # The note was written before its execution receipt.
+                if newer_application:
+                    token = None
+                elif token is None and contents.count(line) == 1:
+                    token = expected
                 if token is not None:
                     if token != expected:
                         raise ValueError("undo target does not match the skill")
@@ -996,16 +1013,17 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                     # Main may already hold the note through a merge the checkout has not settled.
                     data.setdefault("revoked_notes", []).append(f"{MARKER}{proposal_id} -->")
                 else:
-                    result = "no skill line was applied"
+                    result = "superseded by a later application" if newer_application else "no skill line was applied"
                 writing_completed = True
                 if state is not None:
                     save(data, state)
                 ledger.record({"proposal_id": proposal_id, "decision_id": decision_id,
                                "outcome": "reverted",
                                "actor": "triage-retro", "result": result})
-            data["applied_actions"].pop(proposal_id, None)
+            if status == "adopted" or stored is not None:
+                data["applied_actions"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
-            data["rewrites"].pop(decision_id, None)
+            data["rewrites"].pop(adoption_id, None)
             changed += 1
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             if writing_completed:

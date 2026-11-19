@@ -294,21 +294,58 @@ class RetroTests(unittest.TestCase):
                                 "fact": "Tool produced unexpected output.", "proposal": f"Note for {next_decision}.",
                                 "reason": "The failure was observed.", "recommendation": "adopt", "priority": "normal",
                                 "target": "triage-retro:skill:orca-session-triage:fact"})
-                ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "human"})
+                adoption = ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "human"})
                 self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
                 facts = retro.facts_path(self.target)
                 self.assertIn(proposal_id, facts.read_text())
-                revoked = ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
-                ledger.decide({"proposal_id": proposal_id, "decision": next_decision, "actor": "human"})
+                decision = ledger.call("decide", {"proposal_id": proposal_id, "decision": next_decision,
+                                                  "actor": "human"}, "--expected-adoption-id", adoption["id"])
 
                 self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
                 item = next(row for row in ledger.list() if row["proposal_id"] == proposal_id)
                 self.assertEqual(item["status"], expected_status)
                 receipt = item["executions"][-1]
-                self.assertEqual(receipt["decision_id"], revoked["id"])
+                self.assertEqual(receipt["decision_id"], decision["after_id"])
+                self.assertEqual(item["current_execution"], receipt)
+                self.assertTrue(item["reverted_at"])
+                candidates = ledger.call("list", None, "--json", "--candidates")["items"]
+                self.assertEqual(any(row["proposal_id"] == proposal_id for row in candidates), next_decision == "hold")
                 self.assertEqual(receipt["outcome"], "reverted")
                 self.assertFalse(facts.exists())
                 self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 0)
+
+    def test_worker_uses_the_undo_for_the_adoption_being_revoked(self) -> None:
+        config = self.home / "hosts.json"
+        config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
+        ledger = retro.LedgerClient(
+            script=ROOT / "adoption-triage/scripts/ledger.py",
+            events=self.home / "events.jsonl", imports=self.home / "imports", decision_config=config)
+        item = ledger.propose({"source": {"session": self.sid, "worktree": str(self.root)},
+                               "fact": "Tool produced unexpected output.", "proposal": "Original note.",
+                               "reason": "The failure was observed.", "recommendation": "adopt", "priority": "normal",
+                               "target": "triage-retro:skill:orca-session-triage:fact"})
+        body = {"proposal_id": item["proposal_id"], "actor": "human"}
+        data = retro.load(self.state)
+        ledger.decide({**body, "decision": "adopt"})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        first_revoke = ledger.decide({**body, "decision": "revoke"})
+        second = ledger.decide({**body, "decision": "adopt", "reason": "Rewrite the note."})
+        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        self.assertEqual(ledger.list()[0]["executions"][-1]["decision_id"], first_revoke["id"])
+
+        with (mock.patch.object(retro, "run_claude", return_value={"note": "Rewritten note."}),
+              mock.patch.object(ledger, "record", side_effect=subprocess.TimeoutExpired("ledger record", 30)),
+              self.assertRaises(subprocess.TimeoutExpired)):
+            retro.sync_decisions(ledger, data, self.root, self.state)
+        facts = retro.facts_path(self.target)
+        self.assertIn("Rewritten note.", facts.read_text())
+        latest = ledger.call("decide", {**body, "decision": "hold"}, "--expected-adoption-id", second["id"])
+        self.assertEqual(retro.sync_decisions(ledger, retro.load(self.state), self.root, self.state), 1)
+        item = ledger.list()[0]
+        self.assertEqual(item["status"], "held")
+        self.assertEqual(item["executions"][-1]["decision_id"], latest["after_id"])
+        self.assertEqual(item["executions"][-1]["outcome"], "reverted")
+        self.assertFalse(facts.exists())
 
     def test_policy_change_waits_for_a_button(self) -> None:
         proposal = sample_candidate()
