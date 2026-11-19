@@ -458,7 +458,10 @@ until the lead observes that its recorded symptom is gone. Then:
   `review-pr <repo> <N> --wait`, which prints the result's path; the `.lock`
   file stays after the review ends, so never wait for it to disappear. If the
   row has no command, confirm the PR's source before starting. The independent
-  review is a draft; do not submit a GitHub review from this step. For
+  review is a draft; do not submit a GitHub review from this step. When
+  relaying the findings to the PR author, say to keep the Asana task in
+  「レビュー待ち」 until a human review arrives. A push that addresses only an
+  independent review or a bot review leaves that status in place. For
   「指摘対応担当」, start the lane in this run with `spawn-lane --topic <PR URL>`.
 - Record each new question as `references/hourly-state.md` says and ask with
   AskUserQuestion. Recording it sets the triage workspace's Orca comment to
