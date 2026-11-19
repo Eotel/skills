@@ -131,7 +131,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
 
 
 def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], numbers: dict[str, set[int]],
-                         state_dir: Path, orca: str) -> list[str]:
+                         unmatched: set[str], state_dir: Path, orca: str) -> list[str]:
     prompts = lane_input.direct_prompts(asks, orca)
     if not prompts:
         return []
@@ -146,7 +146,7 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
             for ask_id, inputs in prompts.items():
                 has_parts = bool(inbox_read.questions_of(asks[ask_id]))
                 refs = [f"{ask_id}:{number}" for number in sorted(numbers[ask_id])]
-                keys = refs or [f"{ask_id}:?" if has_parts else ask_id]
+                keys = refs + ([f"{ask_id}:?"] if ask_id in unmatched else []) or [ask_id]
                 seen = [shown.setdefault(key, []) for key in keys]
                 new_inputs = [(prompt, at) for prompt, at in inputs if any(at.isoformat() not in times for times in seen)]
                 if not new_inputs:
@@ -156,11 +156,14 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
                 questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
                 lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
                 ref = ",".join(refs) or (f"{ask_id}:<質問番号>" if has_parts else ask_id)
+                unknown = ("番号を特定できない問いは、元の ask で対応する質問番号を確認してください。"
+                           if ask_id in unmatched else "")
                 excerpts = "、".join(f"{at.astimezone():%m/%d %H:%M}「{prompt[:80]}」" for prompt, at in new_inputs)
                 reasons.append(f"{questions}（ask {ask_id}）の後、{lane} のタブに入力がありました（{excerpts}）。"
                                "三浦さんの回答なら、伺わずに担当へ "
                                f"`triage-notify --answered {ref} <答えの要約>` での記録を頼んでください。"
                                "複数の問いがある場合は、回答のあった番号だけを指定してください。"
+                               f"{unknown}"
                                "回答でなければ、同じ AskUserQuestion をもう一度呼ぶと通ります。")
             if reasons:
                 retro.atomic_text(path, json.dumps(shown, separators=(",", ":")))
@@ -180,6 +183,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
     uncovered: dict[str, dict] = {}
     labels: dict[str, list[str]] = {}
     asked_numbers: dict[str, set[int]] = {}
+    unmatched: set[str] = set()
     for question in questions:
         text, header = question.get("question") or "", question.get("header") or ""
         recorded = list(state.get("questions", {}).values())
@@ -236,6 +240,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 uncovered[ask_id] = ask
                 labels.setdefault(ask_id, []).append(text or header)
                 asked_numbers.setdefault(ask_id, set()).update(numbers)
+                if not numbers and inbox_read.questions_of(ask):
+                    unmatched.add(ask_id)
             parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
             candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
                           if parts else [claims.get(ask_id)])
@@ -254,7 +260,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
             if item["record"] in matched or related.intersection(item["keys"]) or overlap:
                 reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")
-    reasons.extend(direct_input_reasons(uncovered, labels, asked_numbers, state_dir, orca))
+    reasons.extend(direct_input_reasons(uncovered, labels, asked_numbers, unmatched, state_dir, orca))
     return deny(list(dict.fromkeys(reasons)))
 
 

@@ -18,6 +18,7 @@ import scan_sessions
 INJECTED = re.compile(r"<(?P<tag>task-notification|system-reminder|environment_context|image|local-command-stdout"
                       r"|local-command-caveat)\b[^>]*>.*?</(?P=tag)>", re.S)
 SENT_WITHIN = timedelta(minutes=2)
+QUEUED_WITHIN = timedelta(minutes=15)
 CLAUDE_SHIP = re.compile(r"\s*<command-message>ship</command-message>\s*<command-name>/ship</command-name>\s*"
                          r"<command-args>(.*?)</command-args>\s*", re.S)
 OPTION_CODE = re.compile(r"^([a-z0-9])\s*:\s*\S")
@@ -59,7 +60,8 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
     targets = {target for target in (handles.get(pane) or handle or lane,) if target}
     prompts = []
     for row in retro.transcript_rows(Path(path).expanduser()):
-        if not isinstance(row, dict) or not (at := scan_sessions.parse_time(row.get("timestamp"))) or at <= after:
+        if (not isinstance(row, dict) or not (at := scan_sessions.parse_time(row.get("timestamp")))
+                or at <= after - QUEUED_WITHIN):
             continue
         if prompt := user_prompt(row):
             prompts.append((prompt, at.astimezone(timezone.utc)))
@@ -109,13 +111,14 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
                 for targets, prompts in candidates.values():
                     if isinstance(recipient, str) and recipient in targets:
                         matches = [(abs(at - sent_at), index) for index, (prompt, at) in enumerate(prompts)
-                                   if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN or queued and at > sent_at)]
+                                   if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN
+                                                          or queued and timedelta() < at - sent_at <= QUEUED_WITHIN)]
                         if matches:
                             prompts.pop(min(matches)[1])
     except (OSError, RuntimeError):
         return {}
-    return {ask_id: sorted(prompts, key=lambda pair: pair[1])
-            for ask_id, (_, prompts) in candidates.items() if prompts}
+    return {ask_id: direct for ask_id, (_, prompts) in candidates.items()
+            if (direct := sorted((pair for pair in prompts if pair[1] > local[ask_id][1]), key=lambda pair: pair[1]))}
 
 
 def option_key(value: str) -> str:

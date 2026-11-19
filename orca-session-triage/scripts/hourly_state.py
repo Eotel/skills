@@ -642,13 +642,15 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     answered_ids = [answer.ask_id for answer in answers if answer.source in inbox_read.SUBSTANTIVE_ANSWERS
                     and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
-    handoff_refs = {item.decision: ask_state.reference(item.ask_id or item.decision, known_asks) for item in handed}
+    handoff_refs = {item.decision: ask_state.handoff_ref(item.ask_id, item.decision, known_asks) for item in handed}
     if answered_ids:
         handed = [item for item in handed if not ((ref := handoff_refs[item.decision])
                                                   and ask_state.covered(ref, answered_ids, known_asks))]
         pending = {key: item for key, item in state.get("questions", {}).items()
                    if not (refs := ask_state.references(item, known_asks))
-                   or not all(ask_state.covered(ref, answered_ids, known_asks) for ref in refs)}
+                   or not all(ask_state.covered(ref, answered_ids, known_asks) for ref in refs)
+                   or any(not ask_state.reference(cover, known_asks) and cover not in latest_decisions
+                          for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
     for row in rows:
         identity = scan_sessions.row_identity(row)

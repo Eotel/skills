@@ -39,6 +39,14 @@ def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset
     return list(dict.fromkeys(found))
 
 
+def handoff_ref(ask_id: str | None, key: str, entries: list[dict]) -> tuple[str, frozenset[int]] | None:
+    explicit = reference(ask_id, entries) if ask_id else None
+    named = reference(key, entries)
+    if explicit and not explicit[1] and named and explicit[0] == named[0]:
+        return named
+    return explicit or named
+
+
 def covered(ref: tuple[str, frozenset[int]], ids: list[str], entries: list[dict]) -> bool:
     """Whether the supplied answers cover this reference, including all numbered parts of a whole ask."""
     ask_id, numbers = ref

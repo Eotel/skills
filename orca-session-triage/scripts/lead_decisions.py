@@ -507,19 +507,21 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     last = {}
     for key in keys:
         item = history[key][-1] if key in history else None
-        answer = (answered[key].view() if key in answered else
-                  next((found for entry in reversed(history.get(key, []))
-                        if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
+        answer = answered[key].view() if key in answered else None
         if answer is None:
-            ref = ask_state.reference(key, ask_entries)
-            refs = [ref] if ref else list(dict.fromkeys(
-                ref for question in active if key in question["keys"]
-                for ref in ask_state.references(question["record"], ask_entries)))
-            parts = [ask_answer(ask_id, answers, asks)
-                     for ask, numbers in refs
-                     for ask_id in ([f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask])]
-            if parts and all(part is not None and genuine_answer(part) for part in parts):
-                answer = parts[0] if len(parts) == 1 else {"answers": parts}
+            bindings = [entry.ask_id for entry in reversed(history.get(key, [])) if entry.ask_id]
+            bindings.extend(question["record"]["ask_id"] for question in active
+                            if key == question["record"].get("decision") and question["record"].get("ask_id"))
+            refs = list(dict.fromkeys(ref for source in (bindings or [None])
+                                      if (ref := ask_state.handoff_ref(source, key, ask_entries))))
+            for ask, numbers in refs:
+                ids = [f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask]
+                parts = [ask_answer(ask_id, answers, asks) for ask_id in ids]
+                if all(part is not None and genuine_answer(part) for part in parts):
+                    answer = parts[0] if len(parts) == 1 else {"answers": parts}
+                    break
+            if not refs:
+                answer = next((found for source in bindings if source and (found := ask_answer(source, answers, asks))), None)
         delivered = answer is not None and (key in answered or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})

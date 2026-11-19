@@ -478,8 +478,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
             self.assertEqual(pending.returncode, 0, pending.stderr)
             self.assertEqual([item["decision"] for item in json.loads(pending.stdout)["unanswered"]],
                              [f"{self.KEY}:2"] if answered == 1 else [])
-            self.write_lines(self.handed, [{"decision": f"{self.KEY}:{number}", "handed_off_at": self.AT}
-                                          for number in (1, 2)])
+            self.write_lines(self.handed, [
+                {"decision": f"{self.KEY}:1", "ask_id": self.ASK, "handed_off_at": self.AT},
+                {"decision": f"{self.KEY}:2", "handed_off_at": self.AT},
+            ])
             stale = self.run_tool("hourly_state.py", "stale-asks", "--from", str(scan),
                                   "--verdicts", str(self.root / "no-verdicts"), "--claude-projects",
                                   str(self.root / "projects"), "--handed-off-file", str(self.handed))
@@ -493,6 +495,16 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertNotIn(questions[0]["question"], row["question"])
             else:
                 self.assertEqual(row["state"], "stopped_after_answer")
+
+    def test_lane_answer_does_not_settle_an_unrelated_decision_key(self) -> None:
+        unrelated = "remove:/w/other"
+        self.ask(covers=[self.KEY, unrelated])
+        self.write_lines(self.answers, [{"id": self.ASK, "ts": self.AT,
+                                         "how": "triage-notify --answered", "note": "待つ"}])
+        observed = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                 "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertIn(unrelated, [item["decision"] for item in json.loads(observed.stdout)["unanswered"]])
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
