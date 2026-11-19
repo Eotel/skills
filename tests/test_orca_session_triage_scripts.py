@@ -2047,6 +2047,84 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((row["stop"]["kind"], row["stop"]["action"]), ("connection", "wake"))
         self.assertFalse(row["closable"])
 
+    def test_codex_interruption_stops_only_the_last_turn(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        end = [message, "", "› ", "  ? for shortcuts"]
+        for tail, expected in ((end, "interrupted"), ([message, "Worked for 2s • 12:05", "› "], None)):
+            with self.subTest(expected=expected):
+                [row] = scan.build_inventory(
+                    [worktree("/w/cut", "working", agent="codex")],
+                    [terminal("/w/cut", "codex", quiet_minutes=5)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}})
+                self.assertEqual((row["stop"] or {}).get("kind"), expected)
+                if expected:
+                    self.assertEqual(row["class"], "stalled")
+                    self.assertEqual(row["stop"]["action"], "wake")
+                    self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
+    def test_codex_interruption_keeps_its_time_through_a_redraw_and_feedback(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        times: dict[str, scan.StopReason] = {}
+        path = "/w/cut"
+        for tail, quiet, stopped in (
+            ([message, "› "], 30, 30),
+            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
+            ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
+            (["› Continue work", "• Working (1s)", message, "› "], 0, 1),
+            ([message, "› Continue work", message, "› Continue work", message, "› "], 0, 0),
+            ([message, "› Continue work", "› "], 0, None),
+        ):
+            with self.subTest(quiet=quiet):
+                [row] = scan.build_inventory(
+                    [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=quiet)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}}, interruption_times=times)
+                stop = row["stop"]
+                self.assertEqual(bool(stop), stopped is not None)
+                if stop and stopped is not None:
+                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 60 * stopped) * 1000))
+                    self.assertEqual(stop["stopped_by"], "agent_state")
+
+    def test_codex_interruption_uses_the_tab_state_time_even_when_a_redraw_is_newer(self) -> None:
+        rollout = self.projects / "rollout.jsonl"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        write_jsonl(rollout, [
+            {"type": "session_meta", "payload": {"cwd": "/w/cut"}},
+            {"type": "event_msg", "timestamp": stopped,
+             "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ])
+        path, event = scan.summarize_rollout(rollout)
+        self.assertEqual(path, "/w/cut")
+        [row] = scan.build_inventory(
+            [{**worktree("/w/cut"), "agents": [done_agent("codex", "tab1:leaf1", minutes_ago=30, interrupted=True)]}],
+            [in_pane(terminal("/w/cut", "codex"), "tab1:leaf1")],
+            self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "agent_state"))
+
+    def test_older_screen_cannot_bring_back_a_cleared_interruption(self) -> None:
+        path = self.projects / "stops.json"
+        key = '[null, "term_a"]'
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        new = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        stop = {"kind": "interrupted", "stopped_at": old}
+        scan.save_interruption_times(path, {key: new}, {})
+        scan.save_interruption_times(path, {key: old}, {key: stop})
+        self.assertIsNone(json.loads(path.read_text())[key]["stop"])
+
+    def test_unmatched_rollout_does_not_hide_an_interruption_in_a_different_tab(self) -> None:
+        path = "/w/cut"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        rollout = {"rollout": "/tmp/closed-tab.jsonl", "interrupted_at": stopped,
+                   "turn_started_at": scan.iso_time((NOW - 120) * 1000), "pending_requests": []}
+        [row] = scan.build_inventory(
+            [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=5)],
+            self.projects, {path: [rollout]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual(row["class"], "stalled")
+        self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),
             assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",
@@ -2961,7 +3039,8 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "batch_has_preview", return_value=True),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
-                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
+                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity")),
+                         patch.object(scan, "CODEX_INTERRUPTIONS", self.dir / "codex-interruptions.json")):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
