@@ -294,15 +294,12 @@ def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, 
             frame = scan_sessions.rendered(frames.get(key))
             if frame is None:
                 return False, f"{handle}: KEPT -> 画面を確認できない"
-            codex_input = False
-            if "codex" in agents:
-                lines = [line.strip() for line in scan_sessions.screen_lines(frame)]
-                prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith("› ")]
-                if prompts:
-                    prompt = prompts[-1]
-                    codex_input = lines[prompt] != "›" and not scan_sessions.last_codex_activity(lines[prompt + 1:])
-            if scan_sessions.has_draft(frame) or scan_sessions.composer_empty(frame) is False or codex_input:
+            agent = "codex" if "codex" in agents else agents[0]
+            empty = scan_sessions.composer_empty(frame, agent)
+            if scan_sessions.has_draft(frame) or empty is False:
                 return False, f"{handle}: KEPT -> 未送信の入力"
+            if agent == "codex" and empty is None:
+                return False, f"{handle}: KEPT -> 入力欄を確認できない"
         if (row.get("environment"), handle) in scan_sessions.active_holds(datetime.now(timezone.utc)):
             return False, f"{handle}: KEPT -> 保留中のタブ"
         host.close(row.get("environment"), handle)
