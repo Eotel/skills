@@ -547,8 +547,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
         stale = ("hourly_state.py", "stale-asks", "--from", str(scan), "--verdicts", str(self.root / "no-verdicts"))
         rescan = self.run_tool(*stale)
         self.assertEqual(rescan.returncode, 0, rescan.stderr)
-        self.assertEqual([(item["name"], item["decisions"]) for item in json.loads(rescan.stdout)
-                          if item["state"] == "unanswered"], [("new-worker", [key])])
+        pending_rows = [item for item in json.loads(rescan.stdout) if item["state"] == "unanswered"]
+        self.assertEqual([(item["name"], item["decisions"]) for item in pending_rows], [("new-worker", [key])])
+        self.assertEqual(pending_rows[0]["ask"]["question_numbers"], [1])
+        self.assertEqual([item["row"] for item in pending_rows[0]["asking"]], ["/w/new-worker"])
         display = self.run_tool("hourly_state.py", "asking")
         self.assertEqual(display.returncode, 0, display.stderr)
         self.assertEqual([item["row"] for item in json.loads(display.stdout)], ["/w/new-worker"])

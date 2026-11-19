@@ -833,12 +833,15 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if not target and not any(ask_state.registered_ask_id(question, key) for question in registered):
             continue
         ask = ask_entries.get(ref[0] if ref else (target or "").partition(":")[0])
-        parts = sorted(ref[1]) if ref else []
+        remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask or {}), 1)
+                     if ref and (not ref[1] or number in ref[1])
+                     and not ask_state.covered((ref[0], frozenset((number,))), closed_ids, known_asks)]
         since = scan_sessions.parse_time(item.handed_off_at) or now
         found.append((since, {"row": None, "name": (ask or {}).get("worktree") or target or key,
                               "state": "unanswered", "since": item.handed_off_at, "decisions": [key],
-                              "question": excerpt((ask or {}).get("text") or key),
-                              "ask": {**report_view(ask), "question_numbers": parts} if ask else None,
+                              "question": excerpt("\n".join(question for _, question in remaining) or (ask or {}).get("text") or key),
+                              "ask": {**report_view(ask), "question_numbers": [number for number, _ in remaining]} if ask else None,
+                              "asking": ask_state.for_key(state, key, known_asks, bound_asks),
                               "answer": None}))
     for item in rejected or []:
         asked = "\n".join(str(question.get("question") or "") for question in item["questions"]
