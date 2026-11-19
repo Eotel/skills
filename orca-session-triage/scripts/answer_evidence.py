@@ -6,6 +6,7 @@ An answer is one of:
   hourly runs' triage workspace);
 - an answer `send --ask <id>[:<n>]` delivered, with or without --decision (`send --decision` or `send` in
   ask-answers.jsonl).
+- an explicit answer or correction `hourly_state.py answered` recorded under the linked ask id.
 
 Only an answer that came after the ask and names it is proof: one delivered to it, or for an ask without
 structured questions one naming its id (in full or its first 8 or more characters), and for an ask with them one
@@ -31,7 +32,7 @@ from pathlib import Path
 import re
 
 import lead_decisions
-from commitment_store import read_lines
+import inbox_read
 import scan_sessions
 
 # How ask-answers.jsonl records an answer send delivered to the ask, with and without --decision.
@@ -169,13 +170,8 @@ def decisions(log: Path) -> Iterator[Answer]:
 
 
 def delivered(log: Path) -> Iterator[Answer]:
-    for raw in "".join(read_lines(log)).splitlines():
-        try:
-            record = json.loads(raw)
-        except ValueError:
-            continue
-        if (isinstance(record, dict) and record.get("how") in DELIVERED and isinstance(record.get("id"), str)
-                and (at := scan_sessions.parse_time(record.get("ts"))) is not None):
+    for record in inbox_read.answer_entries(log):
+        if record.get("how") in DELIVERED and (at := scan_sessions.parse_time(record.get("ts"))) is not None:
             yield Answer(at, record["how"], str(record.get("note") or ""), record["id"])
 
 
@@ -294,5 +290,16 @@ def asking_worktrees(args: argparse.Namespace) -> list[Path]:
 
 
 def from_arguments(args: argparse.Namespace, answers_log: Path) -> list[Answer]:
-    return [*decisions(args.decisions_file.expanduser()), *delivered(answers_log),
+    import inbox_read
+
+    available = inbox_read.answer_records(answers_log)
+    deliveries = inbox_read.delivered_records(answers_log)
+    inbox_answers = [Answer(at, item["how"], str(item.get("note") or ""), key)
+                     for key, item in available.items()
+                     if item.get("how") in inbox_read.HOURLY_ANSWERS
+                     if (at := scan_sessions.parse_time(item.get("ts"))) is not None]
+    delivery_proof = [Answer(at, item["how"], str((available.get(key) or item).get("note") or ""), key)
+                      for key, item in deliveries.items()
+                      if (at := scan_sessions.parse_time(item.get("ts"))) is not None]
+    return [*decisions(args.decisions_file.expanduser()), *inbox_answers, *delivery_proof,
             *asked_user(transcripts_of(args.claude_projects.expanduser(), asking_worktrees(args)))]

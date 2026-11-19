@@ -44,7 +44,7 @@ the batch and lists them under `claimed`, so another tab does not ask them again
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -459,20 +459,60 @@ def inbox_entries(inbox: Path) -> list[dict]:
     return entries
 
 
-def answer_records(path: Path) -> dict[str, dict]:
-    """The first delivered answer per id, else its first mark; a later delivery can supply a note-only mark's answer."""
-    found: dict[str, dict] = {}
-    for line in "".join(read_lines(path)).splitlines():
+DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
+HOURLY_ANSWER = "hourly_state.py answered"
+HOURLY_CORRECTION = "hourly_state.py corrected"
+HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION))
+SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
+
+
+def answer_entries(path: Path) -> Iterator[dict]:
+    for line in "".join(read_lines(path)).split("\n"):
         try:
             record = json.loads(line)
         except ValueError:
             continue
         if isinstance(record, dict) and isinstance(record.get("id"), str):
-            previous = found.get(record["id"])
-            if previous is None or (previous.get("how") not in ("send", "send --decision")
-                                    and record.get("how") in ("send", "send --decision")):
-                found[record["id"]] = record
+            yield record
+
+
+def delivered_records(path: Path) -> dict[str, dict]:
+    return {record["id"]: record for record in answer_entries(path) if record.get("how") in DELIVERY_ANSWERS}
+
+
+def answer_records(path: Path) -> dict[str, dict]:
+    """Current answers in append order, independently of their delivery history."""
+    found: dict[str, dict] = {}
+    for record in answer_entries(path):
+        previous = found.get(record["id"])
+        how = record.get("how")
+        if (previous is None or how == HOURLY_CORRECTION
+                or previous.get("how") not in SUBSTANTIVE_ANSWERS and how in SUBSTANTIVE_ANSWERS):
+            found.pop(record["id"], None)
+            found[record["id"]] = record
     return found
+
+
+def answer_parts(ask_id: str, numbers: Iterable[int], answers: Mapping[str, dict]) -> list[dict]:
+    """Records for each requested part, falling back to the whole ask's answer."""
+    whole = answers.get(ask_id)
+    requested = sorted(numbers)
+    if not requested:
+        return [whole] if whole is not None else []
+    parts = []
+    for number in requested:
+        part_key = f"{ask_id}:{number}"
+        part = answers.get(part_key)
+        if part is None:
+            part = whole
+        elif whole and whole.get("how") == HOURLY_CORRECTION:
+            whole_at, part_at = datetime.fromisoformat(whole["ts"]), datetime.fromisoformat(part["ts"])
+            if whole_at > part_at or (whole_at == part_at and next(
+                    key for key in answers if key in (ask_id, part_key)) == part_key):
+                part = whole
+        if part is not None:
+            parts.append(part)
+    return parts
 
 
 def answered_ids(path: Path) -> frozenset[str]:
@@ -634,16 +674,20 @@ def answer_sender() -> dict[str, str | None]:
     return {"worktree": str(path), "session": session if isinstance(session, str) and session else None}
 
 
-def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None) -> None:
+def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
+                   sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
+                   answer_at: str | None = None) -> None:
     """Append one line per answered id with its source worktree/session; lock concurrent writers' lines whole.
 
     Both send and `answered` use this writer, so handoff can identify this run's own delivered answers.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = at or datetime.now().astimezone().isoformat(timespec="seconds")
-    sender = answer_sender()
-    lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": sender,
-                               **({"note": note} if note else {})},
+    source = answer_sender() if sender is None else sender
+    lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": source,
+                               **({"note": note} if note else {}),
+                               **({"sent_text": sent_text} if sent_text is not None else {}),
+                               **({"answer_at": answer_at} if answer_at is not None else {})},
                                ensure_ascii=False) + "\n" for answer in ids]
     with writing(path, lines=lines) as write_file:
         if write_file:

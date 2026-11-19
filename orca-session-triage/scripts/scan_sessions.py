@@ -2404,32 +2404,37 @@ def row_final_at(row: dict) -> str | None:
     return max(said, key=lambda at: parse_time(at) or datetime.min.replace(tzinfo=timezone.utc), default=None)
 
 
-def ask_answers(path: Path) -> dict[str, AnsweredAsk]:
-    """The latest answer to each ask id, or `<ask id>:<n>` question, that inbox_read.py recorded."""
+def ask_answers(path: Path, *, include_sources: bool = False) -> dict[str, dict]:
+    """Answers for the scan, with the current explicit wording and the latest relay time."""
     try:
-        records = []
-        for line in read_lines(path):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
+        records = list(inbox_read.answer_entries(path))
+        current = inbox_read.answer_records(path)
+        explicit = {key: item for key, item in current.items() if item.get("how") in inbox_read.HOURLY_ANSWERS}
     except (OSError, UnicodeDecodeError):
         return {}
     timed = sorted(((at, record) for record in records if isinstance(record.get("id"), str)
                     and (at := parse_time(record.get("ts"))) is not None), key=lambda item: item[0])
-    return {record["id"]: {"at": record["ts"], "note": record.get("note") or ""} for _, record in timed}
+    found = {}
+    for _, record in timed:
+        key = record["id"]
+        source = explicit.get(key, record)
+        found[key] = {"at": record["ts"], "note": source.get("note") or "",
+                      **({"ts": source["ts"], "how": source.get("how")} if include_sources else {})}
+    return {key: found[key] for key in current if key in found} if include_sources else found
 
 
-def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | None:
+def ask_answer(item: dict, answers: dict[str, dict]) -> AnsweredAsk | None:
     """The answer that settled an ask: its own, or the latest of its questions' once every one has one
     (inbox_read.open_asks's rule)."""
-    questions = [f"{item['id']}:{number}" for number in range(1, len(inbox_read.questions_of(item)) + 1)]
-    covering = ([item["id"]] if item["id"] in answers
-                else questions if questions and all(question in answers for question in questions) else [])
-    settled = [answers[key] for key in covering]
-    return max(settled, key=lambda answer: parse_time(answer["at"]) or EPOCH) if settled else None
+    ask_id = item["id"]
+    numbers = range(1, len(inbox_read.questions_of(item)) + 1)
+    whole = answers.get(ask_id)
+    settled = inbox_read.answer_parts(ask_id, numbers, answers)
+    if not settled or numbers and len(settled) != len(numbers):
+        return None
+    newest = max([*settled, *([whole] if whole else [])], key=lambda answer: parse_time(answer["at"]) or EPOCH)
+    note = "\n".join(dict.fromkeys(answer["note"] for answer in settled)) if whole else newest["note"]
+    return {"note": note, "at": newest["at"]}
 
 
 def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
@@ -2442,7 +2447,7 @@ def inbox_reports(path: Path, answers_file: Path | None = None) -> InboxReports:
         lines = path.read_bytes().splitlines()
     except OSError:
         return {}
-    answers = ask_answers(answers_file or inbox_read.answers_path().expanduser())
+    answers = ask_answers(answers_file or inbox_read.answers_path().expanduser(), include_sources=True)
     reports: InboxReports = {}
     for raw in lines:
         try:

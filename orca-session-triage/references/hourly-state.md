@@ -54,6 +54,16 @@ the full ID and number, and answer synchronization uses that selected part
 even when a decision key names the whole ask. An out-of-range number prevents
 the batch from recording any line.
 
+`answered` and `answered-many` also record the answer against the linked inbox
+ask or numbered parts. Use `answered-many --skip-recorded` to keep existing
+answers, report their line numbers, and record the rest of the batch.
+A time used in the hourly tab's name, such as 「23:00 の定時」, is excluded
+from the answer-time check. When the same session relays an answer with
+`send --ask`, the inbox records delivery and the hourly answer stays as recorded.
+For an answer saved before inbox synchronization was installed, run `answered`
+with its question ID and original answer before relaying it.
+An alternate `--state-file` keeps answer writes in the isolated state file.
+
 ## The triage workspace's comment
 
 The script writes the triage workspace's Orca comment from the state with

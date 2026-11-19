@@ -76,6 +76,7 @@ JST = timezone(timedelta(hours=9))
 # (13:03, or 12:1x for 12:10-12:19) must be within ANSWER_CLOCK_SLACK minutes of that time.
 ANSWERED_AT = "{answered_at}"
 CLOCK = re.compile(r"(?<![\d:+])([01]?\d|2[0-3]):([0-5])([\dx])(?!\d)")
+HOURLY_TAB_CLOCK = re.compile(r"[ \t]*の[ \t]*定時")
 ANSWER_CLOCK_SLACK = 10
 # A comment that starts with scan_sessions' decision marker makes the workspace a waiting row.
 DECISION_MARKER = "要判断"
@@ -1082,8 +1083,9 @@ def merged_after(asking: Asking, refs: list[dict]) -> list[dict]:
 
 def asked_under(data: dict, decision: str) -> str:
     """The id of the one open question asked under `decision`, else of the only question ever asked under it."""
-    named = {key: item for key, item in data["questions"].items() if item["decision"] == decision}
-    waiting = [key for key, item in named.items() if item["answer"] is None and not item.get("withdrawn_at")]
+    named = {key: item for key, item in data["questions"].items()
+             if item["decision"] == decision and not item.get("withdrawn_at")}
+    waiting = [key for key, item in named.items() if item["answer"] is None]
     found = waiting or list(named)
     if not found:
         raise ValueError(f"no question was asked under decision {decision}")
@@ -1104,6 +1106,8 @@ def stamped_answer(answer: str, answered_at: str) -> str:
     minute = at.hour * 60 + at.minute
     off = []
     for found in CLOCK.finditer(answer):
+        if HOURLY_TAB_CLOCK.match(answer, found.end()):
+            continue
         start = int(found[1]) * 60 + int(found[2]) * 10
         minutes = range(start, start + 10) if found[3] == "x" else (start + int(found[3]),)
         gap = min(min(abs(given - minute), 1440 - abs(given - minute)) for given in minutes)
@@ -1114,17 +1118,19 @@ def stamped_answer(answer: str, answered_at: str) -> str:
     return answer
 
 
-def record_answer(data: dict, answering: Answering) -> dict:
+def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = False, prechecked: bool = False) -> dict:
     key = answering.id if answering.id is not None else asked_under(data, str(answering.decision))
     if key not in data["questions"]:
         raise ValueError(f"unknown question id: {key}")
     question = data["questions"][key]
     if question.get("withdrawn_at"):
         return {"id": key, **question, "state": "withdrawn", "recorded": False}
+    if skip_recorded and question["answer"] is not None and not answering.replace_reason:
+        return {"id": key, **question, "state": "already_recorded", "recorded": False}
     # A recorded answer keeps its time, so recording the same text again changes nothing.
     when = (question["answered_at"] if question["answer"] is not None and not answering.replace_reason
             else recorded_at(answering.answered_at))
-    answer = stamped_answer(answering.answer, when)
+    answer = answering.answer if prechecked else stamped_answer(answering.answer, when)
     earlier = {name: question.get(name) for name in ("answer", "answered_at", "answered_in")}
     if answering.replace_reason and question["answer"] is not None and question["answer"] != answer:
         # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
@@ -1135,7 +1141,10 @@ def record_answer(data: dict, answering: Answering) -> dict:
         raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
     if question["answer"] is None:
         question.update(answer=answer, answered_at=when,
-                        answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
+                        answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()),
+                        answered_by=inbox_read.answer_sender())
+    elif not prechecked and not question.get("answered_by"):
+        question["answered_by"] = inbox_read.answer_sender()
     return {"id": key, **question}
 
 
@@ -1238,7 +1247,7 @@ def answering_line(raw: str) -> Answering:
 def checked_lines[T](text: str, parse: Callable[[str], T]) -> list[tuple[int, T | str]]:
     """Each non-blank line, numbered from 1, as what `parse` makes of it or the reason it cannot."""
     checked: list[tuple[int, T | str]] = []
-    for number, raw in enumerate(text.splitlines(), start=1):
+    for number, raw in enumerate(text.split("\n"), start=1):
         if not raw.strip():
             continue
         try:
@@ -1749,6 +1758,8 @@ def main(argv: list[str] | None = None) -> int:
                               'checked as answered --answer-file is; every line is checked first, and a wrong one '
                               'writes nothing')
     answered_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
+    answered_many.add_argument("--skip-recorded", action="store_true",
+                                help="report existing answers and record the other lines; explicit replacements still apply")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
@@ -1896,6 +1907,7 @@ def main(argv: list[str] | None = None) -> int:
             writes = args.action not in read_only or intake is not None
             fcntl.flock(lock, fcntl.LOCK_EX if writes else fcntl.LOCK_SH)
             data = read(path)
+            answer_positions: list[int | None] = [None]
             if intake is not None:
                 import_issues(data, intake)
             left_matches = False
@@ -1939,8 +1951,13 @@ def main(argv: list[str] | None = None) -> int:
                 notices.extend(unrecorded)
                 skipped = bool(unrecorded)
             elif args.action == "answered-many":
-                result = record_lines(checked_lines(given, answering_line),
-                                      lambda answering: record_answer(data, answering))
+                answerings = checked_lines(given, answering_line)
+                answer_positions = [number for number, _ in answerings]
+                result = record_lines(answerings, lambda answering: record_answer(
+                    data, answering, skip_recorded=args.skip_recorded))
+                notices.extend(f"行 {number} は回答済み {item['id']}: {item['answer']}"
+                               for (number, _), item in zip(answerings, result)
+                               if item.get("state") == "already_recorded")
             elif args.action == "comment":
                 entry = data["comments"].setdefault(here, {"run": None})
                 if args.result is not None:
@@ -1957,8 +1974,25 @@ def main(argv: list[str] | None = None) -> int:
                          if args.action in ("answered", "answered-many", "withdraw") else [here] if comment_here else [])
             for workspace in commented:
                 data["comments"].setdefault(workspace, {"run": None})
+            planned_answers = []
+            sync_answers = args.action in ("answered", "answered-many") and path.resolve() == Path(DEFAULT_STATE).expanduser().resolve()
+            if sync_answers:
+                import answer_sync
+                planned_answers = answer_sync.hourly_answers(list(zip(answer_positions, items, strict=True)))
             if writes:
                 save(path, data)
+            for answer in planned_answers:
+                try:
+                    inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer,
+                                              at=answer.at, sender=answer.sender)
+                except OSError as error:
+                    retry = "answered-many --skip-recorded" if args.action == "answered-many" else "answered"
+                    label = f"行 {answer.line}、" if answer.line is not None else ""
+                    raise ValueError(f"定時の state は保存済みです。inbox の {', '.join(answer.ids)} に追記できません。"
+                                     f"{label}質問 ID {answer.question} を指定し、hourly_state.py {retry} で再実行してください。"
+                                     f"{error}") from error
+            if sync_answers:
+                answer_sync.update_corrected_keys(items)
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":
