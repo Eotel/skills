@@ -499,12 +499,17 @@ assert writer is not None and writer.wait(timeout=10) == 0
     def test_lane_answer_does_not_settle_an_unrelated_decision_key(self) -> None:
         unrelated = "remove:/w/other"
         self.ask(covers=[self.KEY, unrelated])
-        self.write_lines(self.answers, [{"id": self.ASK, "ts": self.AT,
-                                         "how": "triage-notify --answered", "note": "待つ"}])
+        self.write_lines(self.handed, [{"decision": f"{self.KEY}:1", "ask_id": self.ASK, "handed_off_at": self.AT}])
+        self.write_lines(self.answers, [
+            {"id": f"{self.ASK}:1", "ts": self.AT, "how": "inbox_read.py answered", "note": "読んだ"},
+            {"id": self.ASK, "ts": self.AT, "how": "triage-notify --answered", "note": "待つ"},
+        ])
         observed = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
                                  "--handed-off-file", str(self.handed), "--state-file", str(self.state))
         self.assertEqual(observed.returncode, 0, observed.stderr)
-        self.assertIn(unrelated, [item["decision"] for item in json.loads(observed.stdout)["unanswered"]])
+        result = json.loads(observed.stdout)
+        self.assertIn(unrelated, [item["decision"] for item in result["unanswered"]])
+        self.assertIn(f"{self.KEY}:1", [item["decision"] for item in result["settled"]])
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"

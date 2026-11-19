@@ -506,8 +506,7 @@ def answer_parts(ask_id: str, numbers: Iterable[int], answers: Mapping[str, dict
     for number in requested:
         part_key = f"{ask_id}:{number}"
         part = answers.get(part_key)
-        if part is None or (whole and whole.get("how") in SUBSTANTIVE_ANSWERS
-                            and part.get("how") not in SUBSTANTIVE_ANSWERS):
+        if part is None:
             part = whole
         elif whole and whole.get("how") == HOURLY_CORRECTION:
             whole_at, part_at = datetime.fromisoformat(whole["ts"]), datetime.fromisoformat(part["ts"])

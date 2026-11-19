@@ -473,6 +473,7 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     ask), or one for every question of a structured ask."""
     whole_id, _, number = ask_id.partition(":")
     whole = answers.get(whole_id)
+    lane_answer = whole if whole and whole.get("how") in inbox_read.LANE_ANSWERS else None
     delivery = (whole.get("delivery") or whole) if whole else None
     if delivery and delivery.get("how") not in inbox_read.DELIVERY_ANSWERS:
         delivery = None
@@ -480,9 +481,13 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
         if not number.isdecimal():
             return None
         part = next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
+        if lane_answer and not genuine_answer(part or {}):
+            return lane_answer
         return {**part, "delivery": delivery} if part and delivery and not genuine_answer(part) else part
     numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
     parts = inbox_read.answer_parts(whole_id, numbers, answers)
+    if lane_answer:
+        parts = [part if genuine_answer(part) else lane_answer for part in parts]
     if not parts or numbers and len(parts) != len(numbers):
         return None
     if not numbers or all(part is whole for part in parts):
