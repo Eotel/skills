@@ -2065,12 +2065,13 @@ class ClassifyTests(unittest.TestCase):
 
     def test_codex_interruption_keeps_its_time_through_a_redraw_and_feedback(self) -> None:
         message = "■ Conversation interrupted - tell the model what to do differently."
-        times: dict[str, str] = {}
+        times: dict[str, scan.StopReason] = {}
         path = "/w/cut"
-        for tail, quiet, expected in (
-            ([message, "› "], 30, True),
-            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, True),
-            ([message, "› Continue work", "› "], 0, False),
+        for tail, quiet, stopped in (
+            ([message, "› "], 30, 30),
+            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
+            ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
+            ([message, "› Continue work", "› "], 0, None),
         ):
             with self.subTest(quiet=quiet):
                 [row] = scan.build_inventory(
@@ -2078,9 +2079,9 @@ class ClassifyTests(unittest.TestCase):
                     self.projects, {}, "要判断", now=NOW,
                     screens={(None, "term_1"): {"source": "screen", "tail": tail}}, interruption_times=times)
                 stop = row["stop"]
-                self.assertEqual(bool(stop), expected)
-                if stop:
-                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 1800) * 1000))
+                self.assertEqual(bool(stop), stopped is not None)
+                if stop and stopped is not None:
+                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 60 * stopped) * 1000))
                     self.assertEqual(stop["stopped_by"], "agent_state")
 
     def test_codex_interruption_uses_the_rollout_event_time_even_when_a_redraw_is_newer(self) -> None:

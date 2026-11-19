@@ -546,7 +546,7 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
     interrupted = stop["kind"] == "interrupted"
     if interrupted:
         at = parse(stop.get("stopped_at"))
-        if (not at or moved_since(act, at) or scan.codex_moved_since(row, at)
+        if (not at or scan.codex_moved_since(row, at, stop.get("rollout"))
                 or any(sent > at for sent in records.sends_by_handle.get(stop.get("tab"), ()))):
             return []
         act = Activity(at, stop.get("stopped_by", "agent_state"))
@@ -555,9 +555,12 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
     then = (f"。{PERSON_STEPS[stop['kind']]}" if stop["kind"] in PERSON_STEPS
             else recovery(row, records, now, STEPS[stop["kind"]]))
     cause = "中断" if interrupted else f"API エラー（{stop['kind']}）"
-    return [base_signal(row, act, records, "api_error_turn", f"{act.by}@{act.at:%Y%m%dT%H%M%S}",
+    where = (f"。タブ {stop['tab']}" + (f"（--environment {row['environment']}）" if row.get("environment") else "")
+             if interrupted and stop.get("tab") else "")
+    fingerprint = f"{stop.get('tab')}@{iso(act.at)}" if interrupted else f"{act.by}@{act.at:%Y%m%dT%H%M%S}"
+    return [base_signal(row, act, records, "api_error_turn", fingerprint,
                         f"最後の turn が {short(act.at)} に {cause}で終わった: "
-                        f"{stop['error'][:100]}{then}")]
+                        f"{stop['error'][:100]}{where}{then}")]
 
 
 def waits_explained(row: Mapping, verdict: Mapping | None, records: Records, now: float) -> bool:
@@ -891,6 +894,10 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
     codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS),
                             (now - CODEX_SINCE).timestamp())
     jobs = scan.worktree_processes(paths, CPU_FILE, now.timestamp())
+    interrupted_tabs = [{"handle": stop["tab"], "_environment": row.get("environment")}
+                        for row in rows if (stop := row.get("stop")) and stop.get("kind") == "interrupted"
+                        and stop.get("tab")]
+    screens = scan.read_screens(os.environ.get("ORCA_CLI_COMMAND", "orca"), interrupted_tabs)
     fresh = []
     for row in rows:
         if row in local:
@@ -898,6 +905,11 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
                    "codex": codex.get(row["path"]) or row.get("codex") or [],
                    "processes": jobs.get(row["path"], [])}
             row["stop"] = scan.stop_reason(row)
+        if isinstance(stop := row.get("stop"), Mapping) and stop.get("kind") == "interrupted":
+            screen = scan.rendered(screens.get((row.get("environment"), stop.get("tab"))))
+            seen = scan.current_interruption(screen) if screen else None
+            if not seen or seen[1] and seen[1] != stop.get("screen_turn"):
+                row = {**row, "stop": None}
         fresh.append(row)
     return fresh
 
@@ -925,7 +937,8 @@ def ask_text(signals: Sequence[Signal]) -> str:
         names = "・".join(SIGNALS[item.signal] for item in items)
         lines.append(f"{number}. {work}（{names}）")
         lines += [f"   - {item.reason}" for item in items]
-    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。新しい担当に渡したら"
+    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。"
+              "中断を再開するときは、表示したタブの handle を送信先に指定します。新しい担当に渡したら"
               " inbox_read.py answered <この ask の id> --note \"立て直し: <元の作業場> → <新しい作業場>\"（orca-session-triage の"
               " references/next-step.md の Recovering a stopped lane）。閉じる・待つ: inbox_read.py answered <この ask の id>"
               " --note \"理由\"。", "合図の記録: ~/.cache/orca-session-triage/work-checks.json"]
