@@ -4,7 +4,8 @@
 Each invocation creates a unique directory under --output-root and ends by printing
 the path of its results.json: a JSON array with one record per command, each with
 the keys name, command, exit_code, stdout and stderr (the paths of the command's
-output files), result (the path of its .json result, or null) and error (or null).
+output files), result (the path of its .json result, or null), error, retry,
+compared_to, and changes.
 The lines `<name>: exit N` before it list the same exit codes. Failed commands keep
 their stdout and stderr; only successful, parseable JSON is published as a .json
 result. Cleanup can close previous completed scheduled tabs under its existing
@@ -18,6 +19,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,8 +27,12 @@ import tempfile
 import hourly_runtime
 import hourly_state
 import json_output
+import lead_decisions
+from bash_timeout import LOAD_LIMIT
 
-RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error")
+RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes")
+LOAD_TIMEOUT_FACTOR = 2.5
+COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch")
 
 
 @dataclass(frozen=True)
@@ -37,11 +43,11 @@ class ReadTask:
     result_file: Path | None = None
 
 
-def read_task(task: ReadTask, directory: Path, timeout: float) -> dict:
-    stdout = directory / (task.name + ".stdout")
-    stderr = directory / (task.name + ".stderr")
-    result = {"name": task.name, "command": task.command, "exit_code": 0,
-              "stdout": str(stdout), "stderr": str(stderr), "result": None, "error": None}
+def read_task(task: ReadTask, directory: Path, timeout: float, *, retry: bool = False) -> dict:
+    stem = task.name + (".retry" if retry else "")
+    stdout, stderr = directory / (stem + ".stdout"), directory / (stem + ".stderr")
+    result = {**dict.fromkeys(RECORD_KEYS), "name": task.name, "command": task.command, "exit_code": 0,
+              "stdout": str(stdout), "stderr": str(stderr)}
     with stdout.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
         try:
             completed = subprocess.run(task.command, stdout=output, stderr=errors, text=True, timeout=timeout)
@@ -64,6 +70,105 @@ def read_task(task: ReadTask, directory: Path, timeout: float) -> dict:
             with stderr.open("a", encoding="utf-8") as errors:
                 errors.write(str(result["error"]) + "\n")
     return result
+
+
+def read_with_retry(task: ReadTask, directory: Path, timeout: float, loaded: bool) -> dict:
+    first = read_task(task, directory, timeout)
+    if not loaded or first["exit_code"] != 124:
+        return first
+    if task.result_file and task.result_file.is_file():
+        task.result_file.rename(task.result_file.with_suffix(".first-attempt.json"))
+    result = read_task(task, directory, timeout, retry=True)
+    result["retry"] = {"timeout": timeout, "exit_code": result["exit_code"],
+                       "first_exit_code": first["exit_code"], "first_stdout": first["stdout"],
+                       "first_stderr": first["stderr"], "first_error": first["error"]}
+    return result
+
+
+def earlier_reads(root: Path) -> list[tuple[Path, dict[str, dict]]]:
+    history = []
+    for path in sorted(root.glob("*/results.json"), key=lambda file: file.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, list):
+            history.append((path.parent, {item["name"]: item for item in data
+                                          if isinstance(item, dict) and item.get("name") in COMPARE
+                                          and item.get("exit_code") == 0}))
+    return history
+
+
+def comparison_data(path: Path, name: str) -> dict[str, dict | str]:
+    text = path.read_text(encoding="utf-8")
+    if name == "backlog-watch":
+        return {line: line for line in text.splitlines() if re.search(r"\b[A-Z][A-Z0-9_]+-\d+\b", line)}
+    data = json.loads(text)
+    rows = data.get("gaps", []) if isinstance(data, dict) else data
+    if name == "tracker-gaps":
+        return {row["key"]: row for row in rows}
+    return {str(row.get("url") or row.get("task")): row for row in rows}
+
+
+def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]]]) -> None:
+    for result in results:
+        name = result["name"]
+        if name not in COMPARE or result["exit_code"] != 0:
+            continue
+        field = "stdout" if name == "backlog-watch" else "result"
+        path = Path(result[field])
+        current = comparison_data(path, name)
+        previous = {}
+        for directory, records in history:
+            record = records.get(name, {})
+            if filename := record.get(field):
+                try:
+                    previous = comparison_data(directory / Path(filename).name, name)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                result["compared_to"] = str(directory)
+                break
+        new = sorted(current.keys() - previous.keys())
+        gone = sorted(previous.keys() - current.keys())
+        if name == "tracker-gaps":
+            log = Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or lead_decisions.DEFAULT_LOG).expanduser()
+            decisions = lead_decisions.latest(lead_decisions.records(log))
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document = document if isinstance(document, dict) else {"gaps": document}
+            for key, row in current.items():
+                decision = decisions.get(f"tracker:{key}")
+                if (isinstance(row, dict) and decision
+                        and re.match(r"\s*放置(?:[：:。\s]|$)", decision.answer)):
+                    row.update(ignored=True, ignore_decision={"answer": decision.answer, "decided_at": decision.decided_at})
+            document.update(gaps=list(current.values()), new=[current[key] for key in new],
+                            gone=[previous[key] for key in gone])
+            json_output.emit(document, path)
+        changed = (sorted(key for key in current.keys() & previous.keys() if current[key] != previous[key])
+                   if name == "asana99-status" else [])
+        result["changes"] = {"new": new, "gone": gone, "changed": changed}
+
+
+def print_read(result: dict, now: datetime) -> None:
+    name = result["name"]
+    print(f"{name}: exit {result['exit_code']}" + (f" | {result['error']}" if result.get("error") else ""))
+    if retry := result.get("retry"):
+        print(f"{name}: retry exit {retry['first_exit_code']} → {retry['exit_code']} (timeout {retry['timeout']:g}s)")
+    if changes := result.get("changes"):
+        print(f"{name}: compared to {result.get('compared_to') or '前回の成功記録なし'}")
+        for kind, rows in changes.items():
+            if rows:
+                print(f"  {kind} {len(rows)}: " + " | ".join(rows))
+    if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks"):
+        return
+    rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))
+    if name == "stale-asks":
+        if summary := hourly_state.summary(rows, now):
+            print(summary)
+    else:
+        for row in rows:
+            text = " ".join((row.get("text") or "").split())
+            print(f"{row.get('ts') or '-'} {row.get('source') or '-'} id={row['id']} {text[:160]}"
+                  + ("…" if len(text) > 160 else ""))
 
 
 def tasks_for(args: argparse.Namespace, directory: Path) -> list[ReadTask]:
@@ -111,24 +216,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = args.output_root.expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
-        directory = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-"), dir=root))
+        history = earlier_reads(root)
+        now = datetime.now(timezone.utc)
+        directory = Path(tempfile.mkdtemp(prefix=now.strftime("%Y%m%dT%H%M%SZ-"), dir=root))
         print(f"run: {directory}", flush=True)
+        try:
+            loaded = os.getloadavg()[0] > LOAD_LIMIT
+        except OSError:
+            loaded = False
+        timeout = args.timeout * LOAD_TIMEOUT_FACTOR if loaded else args.timeout
         tasks = tasks_for(args, directory)
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            results = list(pool.map(lambda task: read_task(task, directory, args.timeout), tasks))
+            results = list(pool.map(lambda task: read_with_retry(task, directory, timeout, loaded), tasks))
         scan = next(item for item in results if item["name"] == "scan")
         if scan["exit_code"] == 0:
             stale_file = directory / "stale-asks.partial.json"
             stale = ReadTask("stale-asks", [str(Path(__file__).with_name("hourly_state.py")),
                 "--state-file", str(args.state_file.expanduser()), "stale-asks", "--from", scan["result"],
                 "--orca", args.orca, "--out", str(stale_file)], True, stale_file)
-            results.append(read_task(stale, directory, args.timeout))
+            results.append(read_with_retry(stale, directory, timeout, loaded))
         else:
             results.append({**dict.fromkeys(RECORD_KEYS), "name": "stale-asks", "error": "skipped: scan failed"})
+        compare_reads(results, history)
         json_output.emit(results, directory / "results.json")
         for result in results:
-            print(f"{result['name']}: exit {result['exit_code']}"
-                  + (f" | {result['error']}" if result.get("error") else ""))
+            print_read(result, now)
         if scan["exit_code"] == 0:
             queue_path = directory / "review-queue.json"
             queue = json.loads(queue_path.read_text(encoding="utf-8"))
