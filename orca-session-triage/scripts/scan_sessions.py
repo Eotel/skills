@@ -25,7 +25,7 @@ import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import socket
@@ -2913,7 +2913,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             removal["allows_removal"] = removal_answer_approves(removal)
         selected = min(candidates, key=lambda removal: removal["allows_removal"])
         if len(candidates) > 1 and selected["allows_removal"]:
-            cleanup_terms = {(frozenset(removal.get("discard") or ()), removal.get("compose_down") is True)
+            cleanup_terms = {(frozenset(map(PurePosixPath, removal.get("discard") or ())),
+                              removal.get("compose_down") is True)
                              for removal in candidates}
             if len(cleanup_terms) > 1:
                 selected = {**selected, "allows_removal": False, "cleanup_conflict": True}

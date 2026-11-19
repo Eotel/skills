@@ -3590,7 +3590,7 @@ class ScanCommandTests(unittest.TestCase):
         cases = (
             ({}, {"compose_down": True}, (1, "")),
             ({"discard": [".env"]}, {"discard": [".env.local"]}, (1, "")),
-            ({"discard": [".env", ".env.local"]}, {"discard": [".env.local", ".env"]}, (0, f"{path} -\n")),
+            ({"discard": [".env", ".env.local"]}, {"discard": [".env.local", "./.env"]}, (0, f"{path} -\n")),
         )
         for first, second, expected in cases:
             with self.subTest(first=first, second=second):
