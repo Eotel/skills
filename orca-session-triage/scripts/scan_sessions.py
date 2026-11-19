@@ -1425,7 +1425,7 @@ def resumed_after_error(row: dict, claude_screens: list[dict]) -> ResumedTurn | 
     Claude tab shows a later turn, and none shows the notice as its last word. A lane resumed in another account
     writes a transcript elsewhere, so the one read here still ends at the error. A connection error needs
     a later reply/tool call and a running status line; a limit also accepts a completed later turn."""
-    stop = stop_reason(row)
+    stop = api_stop_reason(row)
     if not (stop and stop["kind"] in ("usage_limit", "connection") and stop["agent"] == "claude"):
         return None
     later = [(line, screen) for screen in claude_screens if (line := turn_after_error(screen, stop["error"]))
@@ -1886,8 +1886,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     continue
                 if not new_state:
                     state_at = None
-                    if last_stop and (parse_time(mtime) or EPOCH) <= last_stop:
-                        mtime = frame.get("_observed_at") or scanned_at
+                    if changed:
+                        mtime = frame.get("_observed_at") or mtime
             stopped_at = state_at or mtime
             stop: StopReason = {"kind": "interrupted", "action": "wake", "agent": "codex",
                                 "error": error, "resets": None, "tab": handle, "stopped_at": stopped_at,
@@ -3160,13 +3160,21 @@ def save_interruption_times(path: Path, observed: Mapping[str, str], stops: dict
         for key, observed_at in observed.items():
             entry = current.get(key, {})
             observed_before = entry.get("observed_at", "")
-            if observed_at > observed_before:
-                stop = stops.get(key)
-                if stop and observed_before and not entry.get("stop"):
-                    cleared_at, stopped_at = parse_time(observed_before), parse_time(stop["stopped_at"])
-                    if cleared_at and stopped_at and stopped_at <= cleared_at:
-                        stop["stopped_at"] = observed_at
-                current[key] = {"observed_at": observed_at, "stop": stop}
+            stop = stops.get(key)
+            saved = entry.get("stop")
+            if observed_at <= observed_before:
+                if saved is None:
+                    stops.pop(key, None)
+                else:
+                    stops[key] = saved
+                continue
+            if stop and observed_before:
+                stopped_at = parse_time(stop["stopped_at"])
+                if saved and stopped_at and (saved_at := parse_time(saved["stopped_at"])) and stopped_at < saved_at:
+                    stop["stopped_at"] = saved["stopped_at"]
+                elif not saved and stopped_at and (cleared_at := parse_time(observed_before)) and stopped_at <= cleared_at:
+                    stop["stopped_at"] = observed_at
+            current[key] = {"observed_at": observed_at, "stop": stop}
         write_json_atomically(path, {key: entry for key, entry in current.items()
                                      if entry.get("stop") or entry.get("observed_at", "") >= oldest})
 
@@ -4093,8 +4101,16 @@ def main(argv: list[str] | None = None) -> int:
     if interruption_observations:
         save_interruption_times(interruption_path, interruption_observations, interruption_times)
         for row in rows:
-            if (stop := row.get("stop")) and stop.get("kind") == "interrupted" and row.get("class") == "stalled":
-                row["reasons"][0] = stop_line(stop)
+            tabs = [json.dumps([row.get("environment"), tab["handle"]]) for tab in row["terminals"]]
+            if not any(key in interruption_observations for key in tabs):
+                continue
+            current = [interruption_times[key] for key in tabs if key in interruption_times]
+            previous = row.pop("codex_interruptions", None)
+            if current:
+                row["codex_interruptions"] = sorted(current, key=lambda stop: stop["stopped_at"], reverse=True)
+            if previous or current:
+                row["stop"] = stop_reason(row)
+                row["class"], row["reasons"] = classify(row, args.decision_marker)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():

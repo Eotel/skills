@@ -915,12 +915,13 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
         for stop in interruptions(row):
             screen = scan.rendered(screens.get((row.get("environment"), stop.get("tab"))))
             seen = scan.current_interruption(screen) if screen else None
-            if seen and not scan.changed_interruption(seen, stop):
+            if (screen and seen and not scan.changed_interruption(seen, stop)
+                    and not scan.codex_permission_prompt(screen, stop["tab"])):
                 surviving.append(stop)
         if interruptions(row):
             stop = row.get("stop") or {}
-            row = {**row, "codex_interruptions": surviving,
-                   "stop": stop if stop.get("kind") != "interrupted" and stop else next(iter(surviving), None)}
+            api_stop = scan.api_stop_reason(row) if stop.get("kind") == "interrupted" else stop or None
+            row = {**row, "codex_interruptions": surviving, "stop": next(iter(surviving), api_stop)}
         if not row.get("environment") and isinstance(path := row.get("path"), str):
             row = {**row, "claude": scan.read_claude(projects, path, live.get(path, [])),
                    "codex": codex.get(path) or row.get("codex") or [],
