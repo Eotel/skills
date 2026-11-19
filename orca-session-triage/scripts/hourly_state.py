@@ -652,12 +652,12 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
                          for item in handed}
     if closed_ids:
-        def cover_resolved(cover: str, item: dict, refs: list[tuple[str, frozenset[int]]]) -> bool:
+        def cover_resolved(cover: str, item: dict) -> bool:
             if ask_state.reference(cover, known_asks):
                 return True
             if cover in handoff_refs:
                 ref = handoff_refs[cover]
-                return ref is None or all(old[0] != ref[0] for old in refs) or ask_state.covered(ref, closed_ids, known_asks)
+                return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
             bound = ask_state.registered_ask_id(item, cover)
             ref = ask_state.handoff_ref(bound, cover, known_asks, [item]) if bound else None
             return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
@@ -667,7 +667,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         pending = {key: item for key, item in state.get("questions", {}).items()
                    if not (refs := ask_state.references(item, known_asks))
                    or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
-                   or any(not cover_resolved(cover, item, refs)
+                   or any(not cover_resolved(cover, item)
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
