@@ -493,6 +493,8 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
         lane_answer = None
 
     def with_lane_evidence(part: dict) -> dict:
+        if whole and whole.get("how") == "triage-notify --withdraws" and not genuine_answer(part):
+            return whole
         if not lane_answer or genuine_answer(part):
             return part
         if part.get("how") == inbox_read.HOURLY_CORRECTION:

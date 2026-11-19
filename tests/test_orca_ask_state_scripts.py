@@ -646,13 +646,15 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.write_lines(self.handed, [{"decision": f"{self.KEY}:1", "handed_off_at": self.AT},
                                       {"decision": f"{self.KEY}:2", "handed_off_at": self.AT}])
         part = {"id": f"{self.ASK}:1", "ts": self.AT}
-        self.write_lines(self.answers, [{**part, "how": "hourly_state.py answered", "note": "公開する"},
-                                        {**part, "how": "triage-notify --withdraws", "note": "取り下げ"}])
-        output = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered")
-        self.assertEqual(output.returncode, 0, output.stderr)
-        result = json.loads(output.stdout)
-        self.assertEqual([item["decision"] for item in result["unanswered"]], [f"{self.KEY}:2"])
-        self.assertEqual(result["settled"][0]["answer"]["how"], "triage-notify --withdraws")
+        for withdrawal, pending in ((part["id"], [f"{self.KEY}:2"]), (self.ASK, [])):
+            with self.subTest(withdrawal=withdrawal):
+                self.write_lines(self.answers, [{**part, "how": "hourly_state.py answered", "note": "公開する"},
+                                                {**part, "id": withdrawal, "how": "triage-notify --withdraws", "note": "取り下げ"}])
+                output = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered")
+                self.assertEqual(output.returncode, 0, output.stderr)
+                result = json.loads(output.stdout)
+                self.assertEqual([item["decision"] for item in result["unanswered"]], pending)
+                self.assertEqual(result["settled"][0]["answer"]["how"], "triage-notify --withdraws")
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
