@@ -705,13 +705,15 @@ def failure(row: dict) -> tuple[str, str | None] | None:
     message names no agent.
     """
     running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
+    awaiting_command = (row.get("prompt_waiting") or {}).get("question") == CODEX_PERMISSION
     codex = row["codex"][-1] if row["codex"] else {}
     orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
     found = [(None if running else row.get("codex_screen_error"), "codex"), (codex.get("api_error"), "codex"),
              ((row["claude"] or {}).get("api_error"), "claude"),
              (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None, None)]
     return next(((error, agent) for error, agent in found
-                 if error and not (agent and running and agent not in running)), None)
+                 if error and not (agent == "codex" and awaiting_command)
+                 and not (agent and running and agent not in running)), None)
 
 
 def cut_off(row: dict) -> str | None:
@@ -1014,7 +1016,11 @@ PERMISSION_QUESTION = "Do you want to"
 CODEX_PERMISSION = "Would you like to run the following command?"
 CODEX_PERMISSION_FOOTER = "press enter to confirm or esc to cancel"
 CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
+CODEX_CLIPPED = re.compile(r"\[… \d+ lines?\](?:\s.*)?")
 CODEX_BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
+CODEX_VALUE_FLAGS = frozenset(("-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env",
+                               "-i", "--image", "-m", "--model", "--local-provider", "-p", "--profile", "-s",
+                               "--sandbox", "-C", "--cd", "--add-dir", "-a", "--ask-for-approval"))
 CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
 FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 # What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
@@ -1073,18 +1079,39 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
 
 def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     lines = [line.strip() for line in screen_lines(screen) if line.strip()]
-    footer = next((index for index in range(len(lines) - 1, max(-1, len(lines) - 4), -1)
-                   if CODEX_PERMISSION_FOOTER in lines[index].casefold()), None)
+    footer = next((index for index in range(max(0, len(lines) - 5), len(lines))
+                   if " ".join(lines[index:]).casefold().rstrip(".") == CODEX_PERMISSION_FOOTER), None)
     if footer is None:
         return None
-    heading = max((index for index in range(footer) if lines[index] == CODEX_PERMISSION), default=-1)
-    body = lines[heading + 1:footer]
-    command = next((line for line in body if line.startswith("$ ")), None)
-    if heading < 0 or command is None:
+    choices: list[str] = []
+    end = footer
+    first = None
+    selected = False
+    for index in range(footer - 1, -1, -1):
+        if choice := CODEX_PERMISSION_CHOICE.fullmatch(lines[index]):
+            choices.append(" ".join([choice[1], *lines[index + 1:end]]))
+            selected = selected or lines[index].startswith(("›", "❯"))
+            end = index
+            if choice[1].startswith("1."):
+                first = index
+                break
+    if first is None or not selected or len(choices) < 2:
         return None
-    target = command[:COMMAND_HEAD] + ("…" if len(command) > COMMAND_HEAD else "")
-    choices = [choice[1] for line in body if (choice := CODEX_PERMISSION_CHOICE.fullmatch(line))]
-    return {"tab": tab, "question": lines[heading], "choices": choices, "target": target}
+    choices.reverse()
+    heading_end = next((end for end in range(first - 1, -1, -1)
+                        if any(" ".join(lines[start:end + 1]) == CODEX_PERMISSION
+                               for start in range(max(0, end - 3), end + 1))), None)
+    if heading_end is None and not (first and CODEX_CLIPPED.fullmatch(lines[first - 1])
+                                    and choices[0].startswith("1. Yes, proceed")):
+        return None
+    body = lines[heading_end + 1:first] if heading_end is not None else []
+    command = next((index for index, line in enumerate(body) if line.startswith("$ ")), None)
+    if command is None:
+        target = "command omitted from terminal view"
+    else:
+        shown = body[command]
+        target = shown[:COMMAND_HEAD] + ("…" if len(shown) > COMMAND_HEAD or command + 1 < len(body) else "")
+    return {"tab": tab, "question": CODEX_PERMISSION, "choices": choices, "target": target}
 
 
 def lost_background_waits(agents: list[dict], terms: list[dict], screens: Screens,
@@ -1770,10 +1797,23 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
     codex_processes = {}
     for pid, (_, command) in (rm_check.process_table() or {}).items():
         args = command.split()
-        if ("app-server" not in args and "exec" not in args
-                and any(Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")
-                        for token in args[:2])):
-            codex_processes[pid] = args
+        binary = next((index for index, token in enumerate(args[:2])
+                       if Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")), None)
+        if binary is None:
+            continue
+        options: set[str] = set()
+        arguments = iter(args[binary + 1:])
+        for token in arguments:
+            if token == "--" or not token.startswith("-"):
+                break
+            option, equal, _ = token.partition("=")
+            options.add(option)
+            if option in CODEX_VALUE_FLAGS and not equal:
+                next(arguments, None)
+        else:
+            token = ""
+        if token not in ("app-server", "exec", "e", "exec-server", "review"):
+            codex_processes[pid] = options
     for pid, handle in rm_check.process_handles(sorted(codex_processes)).items():
         if handle in waiting and CODEX_BYPASS_FLAGS.isdisjoint(codex_processes[pid]):
             waiting[handle]["reasons"].append(f"Codex process {pid} was started without the approvals bypass flag")
