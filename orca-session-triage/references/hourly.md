@@ -120,10 +120,18 @@ mention only the lane or its PR numbers: confirm each one, then mark it by id.
 When `send --ask` delivers an answer, it records the same answer and time in
 each hourly question whose `covers` names that ask and each known
 `answer:<lane>::<ask id>` decision key. Numbered answers settle only the
-questions they cover; a whole-ask question waits for every part.
+questions they cover; a whole-ask question waits for every part. A correction to one part
+updates that part even after the whole ask was delivered. The inbox keeps delivery history
+and reuses the recorded wording and time when the same session relays it.
 For a handoff with decision keys, `inbox_read.py answered` requires
 `--decision KEY=ANSWER` for every key and writes those answers to
-`lead_decisions.py`. Missing answers write nothing and print the keys.
+`lead_decisions.py`. New decision text is checked against its recording time.
+A replay of an identical decision uses its existing time. Missing answers write nothing and print the keys.
+
+For a decision from before delivery provenance was recorded, a matching `send --ask` entry
+with the same answer and timestamp identifies an automatic decision. If the logs do not establish
+that match, correct the decision explicitly with `lead_decisions.py record --decision KEY --answer-file FILE`.
+Check the original reply and the current decision before recording the correction.
 A note alone remains a candidate in `lead_decisions.py unanswered`; it does
 not settle a decision. Use `--handed-off-file`, `--handoffs-dir`, and
 `--state-file` when working with isolated records.

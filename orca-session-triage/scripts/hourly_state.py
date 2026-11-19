@@ -1212,7 +1212,7 @@ def answering_line(raw: str) -> Answering:
 def checked_lines[T](text: str, parse: Callable[[str], T]) -> list[tuple[int, T | str]]:
     """Each non-blank line, numbered from 1, as what `parse` makes of it or the reason it cannot."""
     checked: list[tuple[int, T | str]] = []
-    for number, raw in enumerate(text.splitlines(), start=1):
+    for number, raw in enumerate(text.split("\n"), start=1):
         if not raw.strip():
             continue
         try:

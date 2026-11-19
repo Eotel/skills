@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -60,6 +61,126 @@ class AskStateTests(unittest.TestCase):
         result = self.run_tool("hourly_state.py", "asked-many", "--no-comment", stdin=json.dumps(item))
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)[0]
+
+    def python(self, code: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run([sys.executable, "-c", code], cwd=SCRIPTS, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def relay(self, text: str, at: str) -> None:
+        self.python(f"import answer_sync; answer_sync.record([{self.ASK!r}], {text!r}, 'send', at={at!r})")
+
+    def test_unicode_line_separator_survives_batch_relay_and_decision_readers(self) -> None:
+        asked = self.ask()
+        answer = "前\u2028後"
+        result = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": asked["id"], "answer": answer, "answered_at": self.AT}, ensure_ascii=False))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.relay("中継しました", self.AT)
+        decided = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "show")
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        self.assertEqual(json.loads(decided.stdout)[0]["answer"], answer)
+        probe = self.python("import answer_evidence, inbox_read; "
+                            "print(len(list(answer_evidence.delivered(inbox_read.answers_path()))))")
+        self.assertEqual(probe.stdout.strip(), "1")
+
+    def test_part_correction_changes_the_automatic_whole_key_and_reader_wording(self) -> None:
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
+        self.ask()
+        first = self.ask(key=f"{self.KEY}:1", covers=[f"{self.KEY}:1"])
+        self.relay("両方公開する", self.AT)
+        corrected = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": first["id"], "answer": "第一案は中止", "replace_reason": "本人が訂正した", "answered_at": self.AT}))
+        self.assertEqual(corrected.returncode, 0, corrected.stderr)
+        decided = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "show")
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        keys = {item["decision"]: item["answer"] for item in json.loads(decided.stdout)}
+        self.assertEqual(keys[self.KEY], "第一案は中止\n両方公開する")
+        probe = self.python("import inbox_read, lead_decisions, scan_sessions, json; "
+                            "ask = inbox_read.inbox_entries(inbox_read.paths()[0])[0]; "
+                            "path = inbox_read.answers_path(); "
+                            "print(json.dumps([scan_sessions.ask_answer(ask, scan_sessions.ask_answers(path, include_sources=True)), "
+                            "lead_decisions.ask_answer(ask['id'], lead_decisions.ask_answers(path), {ask['id']: ask}), "
+                            "inbox_read.delivered_records(path)]))")
+        scanned, handoff, delivered = json.loads(probe.stdout)
+        self.assertIn("第一案は中止", scanned["note"])
+        self.assertEqual(handoff["answers"][0]["note"], "第一案は中止")
+        self.assertEqual(delivered[self.ASK]["note"], "両方公開する")
+
+    def test_legacy_automatic_decision_needs_delivery_provenance(self) -> None:
+        question = self.ask()
+        self.relay("公開する", self.AT)
+        old = json.loads(self.log.read_text())
+        old.pop("from_ask")
+        self.write_lines(self.log, [old])
+        correction = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": question["id"], "answer": "中止する", "replace_reason": "本人が訂正した", "answered_at": self.AT}))
+        self.assertEqual(correction.returncode, 0, correction.stderr)
+        updated = [json.loads(line) for line in self.log.read_text().split("\n") if line]
+        self.assertEqual([(item["answer"], item.get("from_ask")) for item in updated],
+                         [("公開する", None), ("中止する", True)])
+
+    def test_returning_to_an_earlier_answer_creates_a_new_delivery(self) -> None:
+        question = self.ask()
+        self.relay("公開する", self.AT)
+        for answer, when in (("中止する", "2026-11-15T09:01:00+00:00"), ("公開する", "2026-11-16T09:01:00+00:00")):
+            result = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+                {"id": question["id"], "answer": answer, "replace_reason": "本人が訂正した", "answered_at": when}))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.relay(answer, when)
+        journal = [json.loads(line) for line in self.answers.read_text().split("\n") if line]
+        self.assertEqual([item["note"] for item in journal if item["how"] == "send"], ["公開する", "中止する", "公開する"])
+
+    def test_parallel_explicit_decision_wins_over_an_automatic_correction(self) -> None:
+        asked = self.ask()
+        self.relay("公開する", self.AT)
+        answer = self.root / "manual.txt"
+        answer.write_text("来週まで保留")
+        explicit = [sys.executable, str(SCRIPTS / "lead_decisions.py"), "--decisions-file", str(self.log),
+                    "record", "--decision", self.KEY, "--answer-file", str(answer)]
+        correction = {"id": asked["id"], "answer": "中止する", "replace_reason": "本人が訂正した"}
+        self.python(f"""
+import io
+import subprocess
+import sys
+from unittest.mock import patch
+
+import hourly_state
+import lead_decisions
+
+records = lead_decisions.records
+writer = None
+
+def overlapping(path):
+    global writer
+    snapshot = list(records(path))
+    if writer is None:
+        writer = subprocess.Popen({explicit!r}, stdout=subprocess.DEVNULL)
+        try:
+            writer.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+    return iter(snapshot)
+
+with patch.object(lead_decisions, "records", overlapping), patch.object(sys, "stdin", io.StringIO({json.dumps(correction)!r})):
+    assert hourly_state.main(["answered-many"]) == 0
+assert writer is not None and writer.wait(timeout=10) == 0
+""")
+        entries = [json.loads(line) for line in self.log.read_text().split("\n") if line]
+        self.assertEqual(entries[-1]["answer"], "来週まで保留")
+        self.assertIs(entries[-1]["from_ask"], False)
+
+    def test_new_explicit_inbox_decision_validates_its_clock(self) -> None:
+        self.ask()
+        now = datetime.now(timezone(timedelta(hours=9)))
+        stale = (now - timedelta(hours=2)).strftime("%H:%M")
+        result = self.run_tool("inbox_read.py", "answered", self.ASK, "--note", "定時で回答",
+                               "--decision", f"{self.KEY}={stale} に回答")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("minutes from answered_at", result.stderr)
+        self.assertFalse(self.answers.exists())
+        self.assertFalse(self.log.exists())
 
     def test_waiting_report_and_needs_user_are_visible_without_misclassifying_another_wait(self) -> None:
         rows = [{"path": "/w/worker", "repo": "skills", "class": "stalled",

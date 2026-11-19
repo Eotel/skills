@@ -29,8 +29,8 @@ its answer at 160 characters and then says 「…（続きは --json）」, and 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -119,7 +119,7 @@ class Decision:
     decided_at: str
     value: str | bool | None = None  # what an answer on an Asana 99 item puts there (answer_value)
     removal: RemovalTerms | None = None  # a remove: answer's condition and cleanup
-    from_ask: bool = False
+    from_ask: bool | None = False
 
     @classmethod
     def parse(cls, raw: str, where: str) -> Decision:
@@ -127,12 +127,12 @@ class Decision:
             item = json.loads(raw)
             return cls(id=str(item["id"]), decision=str(item["decision"]), answer=str(item["answer"]),
                        decided_at=str(item["decided_at"]), value=item.get("value"),
-                       removal=RemovalTerms.stored(item.get("removal")), from_ask=item.get("from_ask") is True)
+                       removal=RemovalTerms.stored(item.get("removal")), from_ask=None if item.get("from_ask") is None else item["from_ask"] is True)
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
 
     def view(self) -> dict:
-        """The record as the log keeps it: an answer without removal terms has no `removal` key."""
+        """The decision view omits absent removal terms and nonautomatic provenance."""
         found = asdict(self)
         if self.removal is None:
             del found["removal"]
@@ -226,7 +226,7 @@ def lines(log: Path) -> Iterator[tuple[str, str]]:
     with log.open(encoding="utf-8") if log.exists() else nullcontext() as stream:
         if stream is not None:
             fcntl.flock(stream, fcntl.LOCK_SH)
-        read = "".join(read_lines(log)).splitlines()
+        read = "".join(read_lines(log)).split("\n")
     yield from ((raw, f"{log}:{number}") for number, raw in enumerate(read, start=1) if raw.strip())
 
 
@@ -272,16 +272,31 @@ def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]
     return warnings
 
 
-def append(log: Path, *entries: Decision | HandOff) -> None:
+@contextmanager
+def appending(log: Path) -> Generator[Callable[..., None], None, None]:
+    """Serialize decision updates so an explicit decision can supersede automatic answers."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps(entry.view() if isinstance(entry, Decision) else asdict(entry), ensure_ascii=False) + "\n"
-             for entry in entries]
-    with writing(log, lines=lines) as write_file:
-        if write_file:
-            with log.open("a", encoding="utf-8") as stream:
-                fcntl.flock(stream, fcntl.LOCK_EX)
-                stream.writelines(lines)
-                stream.flush()
+    canonical = log.resolve()
+    lock_path = canonical.with_name(canonical.name + ".lock")
+
+    def write(*entries: Decision | HandOff) -> None:
+        lines = [json.dumps({**entry.view(), "from_ask": entry.from_ask} if isinstance(entry, Decision) else asdict(entry),
+                            ensure_ascii=False) + "\n" for entry in entries]
+        with writing(log, lines=lines) as write_file:
+            if write_file:
+                with log.open("a", encoding="utf-8") as stream:
+                    fcntl.flock(stream, fcntl.LOCK_EX)
+                    stream.writelines(lines)
+                    stream.flush()
+
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield write
+
+
+def append(log: Path, *entries: Decision | HandOff) -> None:
+    with appending(log) as write:
+        write(*entries)
 
 
 def non_empty(path: Path) -> str:
@@ -338,7 +353,7 @@ def checked_line(number: int, raw: str) -> Decision | BadLine:
 
 def answers(text: str) -> tuple[list[Decision], list[BadLine]]:
     """The records JSON Lines give, and every line that cannot be one (blank lines are skipped)."""
-    checked = [checked_line(number, raw) for number, raw in enumerate(text.splitlines(), start=1) if raw.strip()]
+    checked = [checked_line(number, raw) for number, raw in enumerate(text.split("\n"), start=1) if raw.strip()]
     return ([item for item in checked if isinstance(item, Decision)],
             [item for item in checked if isinstance(item, BadLine)])
 
@@ -456,12 +471,19 @@ def ask_answers(path: Path) -> dict[str, dict]:
 def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
     """The answer covering an ask as open-asks reads it: a record for `<id>` (for `<id>:<n>`, also one for the whole
     ask), or one for every question of a structured ask."""
-    whole, _, number = ask_id.partition(":")
-    if found := answers.get(ask_id) or (answers.get(whole) if number else None):
-        return found
-    questions = inbox_read.questions_of(asks.get(ask_id) or {})
-    parts = [answers.get(f"{ask_id}:{index}") for index in range(1, len(questions) + 1)]
-    return {"id": ask_id, "answers": parts} if questions and all(parts) else None
+    whole_id, _, number = ask_id.partition(":")
+    if number:
+        if not number.isdecimal():
+            return None
+        return next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
+    whole = answers.get(whole_id)
+    numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
+    parts = inbox_read.answer_parts(whole_id, numbers, answers)
+    if not parts or numbers and len(parts) != len(numbers):
+        return None
+    if not numbers or all(part is whole for part in parts):
+        return whole
+    return {"id": ask_id, "answers": parts, **({"delivery": whole["delivery"]} if whole and whole.get("delivery") else {})}
 
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,

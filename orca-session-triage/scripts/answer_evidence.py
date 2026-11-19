@@ -32,7 +32,7 @@ from pathlib import Path
 import re
 
 import lead_decisions
-from commitment_store import read_lines
+import inbox_read
 import scan_sessions
 
 # How ask-answers.jsonl records an answer send delivered to the ask, with and without --decision.
@@ -170,13 +170,8 @@ def decisions(log: Path) -> Iterator[Answer]:
 
 
 def delivered(log: Path) -> Iterator[Answer]:
-    for raw in "".join(read_lines(log)).splitlines():
-        try:
-            record = json.loads(raw)
-        except ValueError:
-            continue
-        if (isinstance(record, dict) and record.get("how") in DELIVERED and isinstance(record.get("id"), str)
-                and (at := scan_sessions.parse_time(record.get("ts"))) is not None):
+    for record in inbox_read.answer_entries(log):
+        if record.get("how") in DELIVERED and (at := scan_sessions.parse_time(record.get("ts"))) is not None:
             yield Answer(at, record["how"], str(record.get("note") or ""), record["id"])
 
 

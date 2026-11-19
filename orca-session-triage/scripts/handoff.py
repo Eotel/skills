@@ -70,7 +70,7 @@ import sys
 from typing import NamedTuple, Protocol
 
 import answer_evidence
-from commitment_store import CommitmentWriteError, read_lines
+from commitment_store import CommitmentWriteError
 import inbox_read
 import hourly_state
 import json_output
@@ -196,9 +196,8 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
     named = {item["id"] for item in [*before, *after] if item.get("kind") == "ask" and isinstance(item.get("id"), str)
              and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
     read_at = read_time(before)
-    records = "".join(read_lines(answers)).splitlines()
     source = inbox_read.answer_sender()
-    for record in filter(None, map(inbox_read.entry, (line.encode() for line in records))):
+    for record in inbox_read.answer_entries(answers):
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
         if ask in named and (read_at is None or at is None or at > read_at):
             own = bool(source["session"] and record.get("sender") == source

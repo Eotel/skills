@@ -44,7 +44,7 @@ the batch and lists them under `claimed`, so another tab does not ask them again
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -490,6 +490,24 @@ def answer_records(path: Path) -> dict[str, dict]:
                 or previous.get("how") not in SUBSTANTIVE_ANSWERS and how in SUBSTANTIVE_ANSWERS):
             found[record["id"]] = record
     return found
+
+
+def answer_parts(ask_id: str, numbers: Iterable[int], answers: Mapping[str, dict]) -> list[dict]:
+    """Records for each requested part, falling back to the whole ask's answer."""
+    whole = answers.get(ask_id)
+    requested = sorted(numbers)
+    if not requested:
+        return [whole] if whole is not None else []
+    parts = []
+    for number in requested:
+        part = answers.get(f"{ask_id}:{number}")
+        if whole and (part is None or whole.get("how") == HOURLY_CORRECTION and (
+            datetime.fromisoformat(part["ts"]) <= datetime.fromisoformat(whole["ts"])
+        )):
+            part = whole
+        if part is not None:
+            parts.append(part)
+    return parts
 
 
 def answered_ids(path: Path) -> frozenset[str]:
