@@ -5416,8 +5416,14 @@ class RmCheckTests(unittest.TestCase):
         (self.main / ".git/info/exclude").write_text("logs/\n")
         logs = self.wt / "logs"
         logs.mkdir()
-        (logs / "server.log").write_text("fixture log\n")
+        server_log = logs / "server.log"
+        os.mkfifo(server_log)
         archive = Path(self.tmp.name) / "archive"
+        failed, result = self.run_main("--archive-path", "logs", "--archive-dir", str(archive))
+        self.assertEqual((failed, result["ok"]), (1, False))
+        self.assertTrue(logs.exists())
+        server_log.unlink()
+        server_log.write_text("fixture log\n")
         code, result = self.run_main("--archive-path", "logs", "--archive-dir", str(archive))
         self.assertEqual((code, result["ok"]), (0, True))
         [saved] = result["archived"]
@@ -5431,6 +5437,10 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main("--archive-path", "app.txt", "--archive-dir", str(self.wt.parent / "archive"))
         self.assertEqual((code, result["archived"]), (1, []))
         self.assertTrue(tracked.is_file())
+        if (self.wt / "APP.TXT").exists():
+            code, result = self.run_main("--archive-path", "APP.TXT", "--archive-dir", str(self.wt.parent / "archive"))
+            self.assertEqual((code, result["archived"]), (1, []))
+            self.assertTrue(tracked.is_file())
 
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")

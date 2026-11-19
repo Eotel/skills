@@ -1468,6 +1468,33 @@ def untracked_exec_plans(worktree: Path, base: str | None, pr: dict | None) -> t
                  and git(worktree, "cat-file", "-e", f"{base}:{rel}").returncode != 0)
 
 
+def named_archive_path(worktree: Path, requested: PurePosixPath) -> Path:
+    source = worktree
+    for part in requested.parts:
+        if source.is_symlink() or (source != worktree and (
+                (source / ".git").exists() or (source / "HEAD").is_file() and (source / "objects").is_dir())):
+            raise ValueError("symlink または別の Git リポジトリの内側です")
+        candidate = source / part
+        if not (candidate.exists() or candidate.is_symlink()):
+            raise ValueError("パスがありません")
+        for entry in source.iterdir():
+            if entry.name != part and entry.name.casefold() == part.casefold() and entry.samefile(candidate):
+                candidate = entry
+                break
+        source = candidate
+    rel = source.relative_to(worktree).as_posix()
+    tracked = [git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", rel),
+               git(worktree, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", rel)]
+    if any(item.returncode or item.stdout for item in tracked):
+        raise ValueError("追跡済みのファイルがあるか、確認できません")
+    if source.is_dir() and not source.is_symlink():
+        for folder, children, files in os.walk(source):
+            if ".git" in {name.casefold() for name in (*children, *files)} or (
+                    "HEAD" in files and "objects" in children and ("refs" in children or "config" in files)):
+                raise ValueError(f"Git リポジトリが含まれています（{Path(folder).relative_to(worktree)}）")
+    return source
+
+
 def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
                    besides_nested: bool = False, explicit: Sequence[str] = ()) -> list[Path]:
     """The paths of `movable` (scratch directories and --archive-path names) that alone keep the worktree: every
@@ -1714,8 +1741,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--archive-path", action="append", default=[], metavar="PATH",
                         help="a path inside the worktree, relative to it, such as .tmp/ when the lead's answer to "
                              "remove:<path> names it; repeat for more. Moved like --archive-scratch's folders, to "
-                             "<archive-dir>/<worktree>-<last name>-<YYYYMMDD>/, when the named paths (and with "
-                             "--archive-scratch, those folders) alone keep the worktree; an ignored directory holding "
+                             "<archive-dir>/<worktree>-<last name>-<YYYYMMDD>/, when the check passes or only those paths "
+                             "(and with --archive-scratch, those folders) keep the worktree; an ignored directory holding "
                              "nothing beyond a named path inside it counts as that path")
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
                         help="where --archive-scratch and --archive-path move them (default: %(default)s)")
@@ -1743,7 +1770,6 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if any(path.is_absolute() or not path.parts or ".." in path.parts
            or any(part.casefold() == ".git" for part in path.parts) for path in named):
         parser.error("--archive-path takes a path inside the worktree, relative to it")
-    movable = (*(SCRATCH_DIRS if args.archive_scratch else ()), *(str(path) for path in named))
     if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
         parser.error("PATH and --worktree name different worktrees")
     if not (args.path or args.worktree):
@@ -1841,16 +1867,18 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
     root = Path(worktree)
+    requested_archives: list[Path] = []
     for path in named:
-        source = root / path
-        if any((root / parent).is_symlink() for parent in path.parents):
-            decided.append(f"--archive-path の {path} は symlink 経由のパスです")
-            continue
-        indexed = git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", str(path))
-        if indexed.returncode or indexed.stdout:
-            decided.append(f"--archive-path の {path} に追跡済みのファイルがあるか、確認できません")
-        elif source.is_dir() and not source.is_symlink() and next(source.rglob(".git"), None) is not None:
-            decided.append(f"--archive-path の {path} に Git リポジトリが含まれています")
+        try:
+            requested_archives.append(named_archive_path(root, path))
+        except (OSError, ValueError) as error:
+            decided.append(f"--archive-path の {path}: {error}")
+    explicit = tuple(source.relative_to(root).as_posix() for source in requested_archives)
+    movable = (*(SCRATCH_DIRS if args.archive_scratch else ()), *explicit)
+    if pr_error and not args.pr_head:
+        decided.append("PR #%d lookup failed: %s" % (args.pr, pr_error))
+    if pr and args.pr_head and pr.get("headRefOid") != args.pr_head:
+        decided.append("--pr-head does not match PR #%d head" % args.pr)
     automation_blockers = []
     try:
         automations = hourly_runtime.existing_workspace_automations(args.orca).get(worktree, [])
@@ -1908,7 +1936,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if movable:
         day = datetime.now().strftime("%Y%m%d")
         archived = [archive(source, archive_target(args.archive_dir, Path(worktree), source, day), Path(worktree))
-                    for source in archive_movers(root, result, movable_now(result), explicit=tuple(map(str, named)))]
+                    for source in archive_movers(root, result, movable_now(result), explicit=explicit)]
         if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}
@@ -1930,21 +1958,22 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["archived"] = archived
         if args.archive_scratch:
             result["copied_to_main"] = copied
+    if named:
+        verified = [Path(item["from"]) for item in result.get("archived", []) if item["verified"]]
+        if any(not any(source.is_relative_to(parent) for parent in verified) for source in requested_archives):
+            result["blockers"].append("指定されたアーカイブの照合を確認できません")
+            result["ok"] = False
+        result.setdefault("archived", [])
     notes[:0] = result.pop("notes")
     elsewhere = merged_pr_head_command(worktree, args.pr) if args.pr else None
     if pr_error:
         if not args.pr_head:
-            result["blockers"].append("PR #%d lookup failed: %s" % (args.pr, pr_error))
-            result["ok"] = False
             notes.append("PR #%d lookup failed: %s; on a Mac where gh works, run `%s` and pass the arguments it "
                          "prints to rm_check.py" % (args.pr, pr_error, elsewhere) if elsewhere else
                          "PR #%d lookup failed: %s; confirm it is MERGED on a host with gh, then pass --pr-head <sha>"
                          % (args.pr, pr_error))
         else:
             notes.append("PR #%d lookup failed: %s; using the supplied merged PR head" % (args.pr, pr_error))
-    if pr and args.pr_head and pr.get("headRefOid") != args.pr_head:
-        result["blockers"].append("--pr-head does not match PR #%d head" % args.pr)
-        result["ok"] = False
     if args.fetch_failed:
         if args.pr_head:
             notes.append("git fetch failed; remote refs may be stale. Using the supplied merged PR head")
