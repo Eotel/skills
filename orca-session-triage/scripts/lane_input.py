@@ -18,7 +18,7 @@ import scan_sessions
 INJECTED = re.compile(r"<(?P<tag>task-notification|system-reminder|environment_context|image|local-command-stdout"
                       r"|local-command-caveat)\b[^>]*>.*?</(?P=tag)>", re.S)
 SENT_WITHIN = timedelta(minutes=2)
-QUEUED_WITHIN = timedelta(minutes=15)
+QUEUED_WITHIN = timedelta(hours=1)
 CLAUDE_SHIP = re.compile(r"\s*<command-message>ship</command-message>\s*<command-name>/ship</command-name>\s*"
                          r"<command-args>(.*?)</command-args>\s*", re.S)
 OPTION_CODE = re.compile(r"^([a-z0-9])\s*:\s*\S")
@@ -81,8 +81,8 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
     except (OSError, RuntimeError, orca_agent_status.AgentStatusError):
         return {}
     try:
-        terminals = scan_sessions.orca_result(orca, ["terminal", "list", "--environment", "local"],
-                                              "terminals", None, timeout=3)
+        terminals = scan_sessions.orca_result(orca, ["terminal", "list", "--environment", "local", "--limit", "10000"],
+                                              "terminals", None, timeout=5)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         terminals = []
     handles = {hourly_runtime.pane_key(term): term["handle"] for term in terminals if term.get("handle")}
@@ -140,22 +140,32 @@ def option_labels(question: dict) -> list[str]:
             if isinstance(option, dict) and isinstance(label := option.get("label"), str) and label.strip()]
 
 
-def inferred_answers(asks: list[inbox_read.OpenAsk], orca: str) -> dict[str, dict]:
-    pending = {ask.report["id"]: ask for ask in asks if ask.report.get("handle") and ask.open_questions}
-    prompts = direct_prompts({ask_id: ask.report for ask_id, ask in pending.items()}, orca, require_handle=True)
+def inferred_answers(entries: list[dict], answers: dict[str, dict], orca: str,
+                     wanted: set[str] | None = None) -> dict[str, dict]:
+    pending = {ask.report["id"]: ask for ask in inbox_read.open_asks(entries, frozenset(answers))
+               if ask.report.get("handle") and ask.open_questions and (wanted is None or ask.report["id"] in wanted)}
+    by_handle = {ask.report["handle"]: ask.report for ask in reversed(list(pending.values()))}
+    prompts = direct_prompts(by_handle, orca, require_handle=True)
     matches: dict[tuple[str, datetime, str], list[tuple[str, str]]] = {}
-    for ask_id, inputs in prompts.items():
-        ask = pending[ask_id]
+    for ask in inbox_read.open_asks(entries, frozenset()):
+        ask_id, handle = ask.report["id"], ask.report.get("handle")
+        if not ask.at or handle not in prompts or by_handle[handle]["host"] != ask.report.get("host"):
+            continue
         for number, question in enumerate(inbox_read.questions_of(ask.report), 1):
             if not isinstance(question, dict) or question.get("multiSelect"):
                 continue
+            answer_id = f"{ask_id}:{number}"
+            closed = min((at for key in (ask_id, answer_id) if (record := answers.get(key))
+                          and (at := inbox_read.asked_at(record))), default=None)
             labels = option_labels(question)
-            for prompt, at in inputs:
+            for prompt, at in prompts[handle]:
+                if at <= ask.at or (closed and closed < at):
+                    continue
                 choice = normalized(prompt.removeprefix("/ship "))
                 selected = [label for label in labels if normalized(label) == choice]
                 for label in (selected or [label for label in labels if option_key(label) == choice]):
-                    key = (ask.report["handle"], at, prompt)
-                    matches.setdefault(key, []).append((f"{ask_id}:{number}", label))
+                    key = (handle, at, prompt)
+                    matches.setdefault(key, []).append((answer_id, label))
     choices: dict[str, dict[str, datetime]] = {}
     available = {f"{ask_id}:{number}" for ask_id, ask in pending.items() for number in ask.open_questions}
     for (_, at, _), matches_for_input in matches.items():
@@ -170,7 +180,7 @@ def inferred_answers(asks: list[inbox_read.OpenAsk], orca: str) -> dict[str, dic
 
 
 def reconcile_answers(entries: list[dict], path: Path, orca: str) -> None:
-    write_inferred_answers(inferred_answers(inbox_read.open_asks(entries, inbox_read.answered_ids(path)), orca), path)
+    write_inferred_answers(inferred_answers(entries, inbox_read.answer_records(path), orca), path)
 
 
 def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:

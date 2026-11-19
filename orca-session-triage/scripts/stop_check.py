@@ -155,18 +155,12 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
                     times.extend(at.isoformat() for _, at in new_inputs if at.isoformat() not in times)
                 questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
                 lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
-                if len(refs) == 1 and ask_id not in unmatched:
-                    ref = refs[0]
-                else:
-                    ref = f"{ask_id}:<質問番号>" if has_parts else ask_id
-                unknown = ("番号を特定できない問いは、元の ask で対応する質問番号を確認してください。"
-                           if ask_id in unmatched else "")
+                ref = f"{ask_id}:<質問番号>" if has_parts else ask_id
                 excerpts = "、".join(f"{at.astimezone():%m/%d %H:%M}「{prompt[:80]}」" for prompt, at in new_inputs)
                 reasons.append(f"{questions}（ask {ask_id}）の後、{lane} のタブに入力がありました（{excerpts}）。"
                                "三浦さんの回答なら、伺わずに担当へ "
                                f"`triage-notify --answered {ref} <答えの要約>` での記録を頼んでください。"
-                               "複数の問いがある場合は、回答のあった番号だけを指定してください。"
-                               f"{unknown}"
+                               "元の ask で入力が答えている問いを確認し、対応する番号だけを指定してください。"
                                "回答でなければ、同じ AskUserQuestion をもう一度呼ぶと通ります。")
             if reasons:
                 retro.atomic_text(path, json.dumps(shown, separators=(",", ":")))
@@ -178,7 +172,7 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
     answers = inbox_read.answer_records(inbox_read.answers_path())
-    answers.update(lane_input.inferred_answers(inbox_read.open_asks(entries, frozenset(answers)), orca))
+    answers.update(lane_input.inferred_answers(entries, answers, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
@@ -204,7 +198,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             if len(bindings) > 1:
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
-        if not matched or any(not numbers for _, numbers in refs):
+        if not refs or any(not numbers for _, numbers in refs):
             originals = [(str(entry["id"]), number, original)
                          for entry in entries if entry.get("kind") == "ask" and entry.get("id")
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
@@ -220,7 +214,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                                  or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original))))]
                 if len(possible) == 1:
                     shown = possible
-            if matched:
+            if refs:
                 for index, (ask_id, numbers) in enumerate(refs):
                     candidates = [parts for original, parts in shown if original == ask_id]
                     if not numbers and len(candidates) == 1:

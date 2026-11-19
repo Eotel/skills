@@ -1190,10 +1190,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "lane-answers":
             import lane_input
-            wanted = set(args.ids)
-            asks = open_asks([item for item in inbox_entries(inbox) if item.get("id") in wanted], frozenset())
-            print(json.dumps(lane_input.inferred_answers(asks, os.environ.get("ORCA_CLI_COMMAND", "orca")),
-                             ensure_ascii=False))
+            records = lane_input.inferred_answers(inbox_entries(inbox), answer_records(answers_path()),
+                                                  os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
+            print(json.dumps(records, ensure_ascii=False))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)

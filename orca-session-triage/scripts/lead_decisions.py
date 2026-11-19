@@ -463,7 +463,8 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 def ask_answers(path: Path) -> dict[str, dict]:
     """A handoff's current answer and the last delivery when its wording differs."""
-    delivered = inbox_read.delivered_records(path)
+    delivered = {record["id"]: record for record in inbox_read.answer_entries(path)
+                 if record.get("how") in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS}
     return {key: {**answer, "delivery": delivered[key]} if key in delivered and answer != delivered[key] else answer
             for key, answer in inbox_read.answer_records(path).items()}
 
@@ -473,7 +474,9 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     ask), or one for every question of a structured ask."""
     whole_id, _, number = ask_id.partition(":")
     whole = answers.get(whole_id)
-    lane_answer = whole if whole and whole.get("how") in inbox_read.LANE_ANSWERS else None
+    lane_answer = (whole.get("delivery") or whole) if whole else None
+    if lane_answer and lane_answer.get("how") not in inbox_read.LANE_ANSWERS:
+        lane_answer = None
 
     def with_lane_evidence(part: dict) -> dict:
         if not lane_answer or genuine_answer(part):
