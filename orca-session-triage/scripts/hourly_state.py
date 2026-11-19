@@ -629,12 +629,18 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
                and not ask_state.registered_ask_id(item, key) and key not in bindings
                for key in item.get("covers") or []):
             continue
+        handed_refs = {target for key in (item["decision"], *(item.get("covers") or []))
+                       if (binding := bindings.get(key)) and ask_state.same_bound_ask(item, binding, key)
+                       and (target := ask_state.handoff_ref(binding.ask_id, key, entries, (item,)))}
         evidence = []
         for ref in refs:
             proof = lead_decisions.ask_answer_for_handoff(ref, answers, asks)
             issued = scan_sessions.parse_time(asks[ref[0]].get("ts"))
             parts = proof.get("answers", [proof]) if proof else []
-            parts = [part for part in parts if (at := scan_sessions.parse_time(part.get("ts"))) and (not issued or at >= issued)]
+            parts = [part for part in parts
+                     if (at := scan_sessions.parse_time(part.get("ts"))) and (not issued or at >= issued)
+                     and (part.get("how") != "triage-notify --withdraws"
+                          or any(ask_state.overlaps(ref, handed) for handed in handed_refs))]
             if not proof or len(parts) != len(proof.get("answers", [proof])):
                 break
             evidence.extend(lead_decisions.Decision(part["id"], item["decision"], part.get("note") or "回答済み",
