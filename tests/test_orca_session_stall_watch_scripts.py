@@ -401,6 +401,15 @@ class RecoveryTests(unittest.TestCase):
         lane["codex"] = [{"rollout": "bound.jsonl", "last_user_at": (stopped_at + timedelta(minutes=1)).isoformat()}]
         self.assertEqual(stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False), [])
 
+    def test_send_to_one_interrupted_tab_leaves_the_other_tab_for_recovery(self) -> None:
+        first_at, second_at = NOW - timedelta(minutes=40), NOW - timedelta(minutes=20)
+        first = {"kind": "interrupted", "tab": "term_a", "stopped_at": first_at.isoformat(), "error": "interrupted"}
+        second = {**first, "tab": "term_b", "stopped_at": second_at.isoformat()}
+        lane = row("cut", codex=[], stop=second, codex_interruptions=[first, second])
+        records = stall.Records(sends_by_handle={"term_b": (second_at + timedelta(minutes=1),)})
+        signals = stall.judge(lane, None, records, NOW, FakeProbe(), live=False)
+        self.assertEqual([item.stopped_at for item in signals], [first_at.isoformat()])
+
     def test_a_new_rollout_error_is_not_hidden_by_the_previous_approval_screen(self) -> None:
         earlier = NOW - timedelta(minutes=1)
         row = {"path": "/w/lane", "claude": None,

@@ -2071,6 +2071,7 @@ class ClassifyTests(unittest.TestCase):
             ([message, "› "], 30, 30),
             ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
             ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
+            (["› Continue work", "• Working (1s)", message, "› "], 0, 1),
             ([message, "› Continue work", "› "], 0, None),
         ):
             with self.subTest(quiet=quiet):
@@ -2095,10 +2096,23 @@ class ClassifyTests(unittest.TestCase):
         path, event = scan.summarize_rollout(rollout)
         self.assertEqual(path, "/w/cut")
         [row] = scan.build_inventory(
-            [worktree("/w/cut", "done", agent="codex")], [terminal("/w/cut", "codex")],
+            [{**worktree("/w/cut"), "agents": [done_agent("codex", "tab1:leaf1", minutes_ago=30, interrupted=True)]}],
+            [in_pane(terminal("/w/cut", "codex"), "tab1:leaf1")],
             self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
             screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
         self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "rollout"))
+
+    def test_unmatched_rollout_does_not_hide_an_interruption_in_a_different_tab(self) -> None:
+        path = "/w/cut"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        rollout = {"rollout": "/tmp/closed-tab.jsonl", "interrupted_at": stopped,
+                   "turn_started_at": scan.iso_time((NOW - 120) * 1000), "pending_requests": []}
+        [row] = scan.build_inventory(
+            [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=5)],
+            self.projects, {path: [rollout]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual(row["class"], "stalled")
+        self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
 
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),

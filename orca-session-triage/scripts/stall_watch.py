@@ -543,6 +543,10 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
     stop = row.get("stop")
     if not stop or stop.get("kind") not in STOP_KINDS:
         return []
+    if candidates := row.get("codex_interruptions"):
+        candidate_row = {key: value for key, value in row.items() if key != "codex_interruptions"}
+        return [signal for candidate in candidates
+                for signal in error_signals({**candidate_row, "stop": candidate}, act, records, now)]
     interrupted = stop["kind"] == "interrupted"
     if interrupted:
         at = parse(stop.get("stopped_at"))
@@ -894,22 +898,29 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
     codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS),
                             (now - CODEX_SINCE).timestamp())
     jobs = scan.worktree_processes(paths, CPU_FILE, now.timestamp())
+    def interruptions(row: dict) -> list[dict]:
+        if candidates := row.get("codex_interruptions"):
+            return candidates
+        return [stop] if (stop := row.get("stop")) and stop.get("kind") == "interrupted" else []
+
     interrupted_tabs = [{"handle": stop["tab"], "_environment": row.get("environment")}
-                        for row in rows if (stop := row.get("stop")) and stop.get("kind") == "interrupted"
-                        and stop.get("tab")]
+                        for row in rows for stop in interruptions(row) if stop.get("tab")]
     screens = scan.read_screens(os.environ.get("ORCA_CLI_COMMAND", "orca"), interrupted_tabs)
     fresh = []
     for row in rows:
-        if row in local:
-            row = {**row, "claude": scan.read_claude(projects, row["path"], live.get(row["path"], [])),
-                   "codex": codex.get(row["path"]) or row.get("codex") or [],
-                   "processes": jobs.get(row["path"], [])}
-            row["stop"] = scan.stop_reason(row)
-        if isinstance(stop := row.get("stop"), Mapping) and stop.get("kind") == "interrupted":
+        surviving = []
+        for stop in interruptions(row):
             screen = scan.rendered(screens.get((row.get("environment"), stop.get("tab"))))
             seen = scan.current_interruption(screen) if screen else None
-            if not seen or seen[1] and seen[1] != stop.get("screen_turn"):
-                row = {**row, "stop": None}
+            if seen and (not seen[1] or not stop.get("screen_turn") or seen[1] == stop["screen_turn"]):
+                surviving.append(stop)
+        if interruptions(row):
+            row = {**row, "codex_interruptions": surviving, "stop": next(iter(surviving), None)}
+        if not row.get("environment") and isinstance(path := row.get("path"), str):
+            row = {**row, "claude": scan.read_claude(projects, path, live.get(path, [])),
+                   "codex": codex.get(path) or row.get("codex") or [],
+                   "processes": jobs.get(path, [])}
+            row["stop"] = scan.stop_reason(row)
         fresh.append(row)
     return fresh
 

@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from functools import cache, partial
 from itertools import dropwhile, takewhile
+import fcntl
 import hashlib
 import http.client
 import json
@@ -801,11 +802,10 @@ def stop_reason(row: dict) -> StopReason | None:
     expired login a person has to renew, a full context window a new lane with a smaller scope gets past, or
     another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
-    interruption = row.get("codex_interruption")
     waiting_tab = (row.get("prompt_waiting") or {}).get("tab")
-    if interruption and interruption.get("tab") != waiting_tab and not row.get("screen_progress"):
-        at = parse_time(interruption["stopped_at"])
-        if at and not codex_moved_since(row, at, interruption.get("rollout")):
+    for interruption in row.get("codex_interruptions", ()):
+        if (interruption.get("tab") != waiting_tab and (at := parse_time(interruption["stopped_at"]))
+                and not codex_moved_since(row, at, interruption.get("rollout"))):
             return interruption
     if not (found := failure(row)):
         return None
@@ -1048,7 +1048,7 @@ def last_codex_activity(lines: list[str]) -> str | None:
                       or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
 
 
-def current_interruption(screen: dict) -> tuple[str, str] | None:
+def current_interruption(screen: dict) -> tuple[str, str, bool] | None:
     lines = [line.strip() for line in screen_lines(screen)]
     position = max((i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)), default=-1)
     if position < 0:
@@ -1061,8 +1061,8 @@ def current_interruption(screen: dict) -> tuple[str, str] | None:
         return None
     previous = max((i for i, line in enumerate(lines[:position]) if CODEX_INTERRUPTED.match(line)), default=-1)
     prompt = next((line for line in reversed(lines[previous + 1:position]) if line.startswith(CODEX_PROMPT)), "")
-    turn = hashlib.sha256(f"{previous >= 0}:{prompt}".encode()).hexdigest() if prompt else ""
-    return lines[position], turn
+    turn = hashlib.sha256(prompt.encode()).hexdigest() if prompt else ""
+    return lines[position], turn, previous >= 0 and bool(prompt)
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1841,8 +1841,6 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                or (not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
         interruptions: list[StopReason] = []
         lane_rollouts = [] if remote else codex_by_cwd.get(w["path"], [])
-        local_codex_tabs = sum(term.get("agentIdentity") == "codex" or term.get("handle") in codex_activity
-                               for term in terms)
         for term in terms:
             handle = term.get("handle")
             frame = rendered(screens.get((w.get("_environment"), handle)))
@@ -1854,22 +1852,33 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 interruption_times.pop(key, None)
                 continue
             agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
-            rollout = lane_rollouts[0] if local_codex_tabs == 1 and len(lane_rollouts) == 1 else {}
-            event_at = rollout.get("interrupted_at")
             state_at = iso_time(agent.get("stateStartedAt")) if agent.get("interrupted") else None
+            state_time = parse_time(state_at)
+            matches = [event for event in lane_rollouts
+                       if state_time is not None and (at := parse_time(event.get("interrupted_at")))
+                       and abs((at - state_time).total_seconds()) <= 2]
+            rollout = matches[0] if len(matches) == 1 else {}
+            event_at = rollout.get("interrupted_at")
             turn_key = event_at or state_at
-            error, screen_turn = interruption
+            error, screen_turn, intervening_turn = interruption
             previous = interruption_times.get(key)
-            if previous and not (
-                turn_key and previous.get("turn_key") and turn_key != previous["turn_key"]
-                or screen_turn and screen_turn != previous.get("screen_turn") and not turn_key
-            ):
-                if turn_key and not previous.get("turn_key"):
-                    previous["turn_key"] = turn_key
+            if previous:
+                last_stop = parse_time(previous["stopped_at"])
+                event_time = parse_time(turn_key)
+                new_turn = (event_time is not None and last_stop is not None
+                            and (event_time > last_stop or (previous.get("turn_key")
+                                 and turn_key != previous["turn_key"])))
+                old_screen_turn = previous.get("screen_turn")
+                new_prompt = screen_turn and screen_turn != old_screen_turn and (old_screen_turn or intervening_turn)
+                if not (new_turn or new_prompt):
+                    if screen_turn and not old_screen_turn:
+                        previous["screen_turn"] = screen_turn
+                    if turn_key:
+                        previous["turn_key"] = turn_key
                     if event_at and rollout.get("rollout"):
                         previous["rollout"] = rollout["rollout"]
-                interruptions.append(previous)
-                continue
+                    interruptions.append(previous)
+                    continue
             stopped_at = turn_key
             if not stopped_at:
                 stopped_at = iso_time(term.get("lastOutputAt")) or scanned_at
@@ -1926,7 +1935,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                            "title": t.get("title")} for t in terms],
             "codex_screen_error": screen_error[0],
             "codex_screen_error_tab": screen_error[1],
-            **({"codex_interruption": max(interruptions, key=lambda stop: stop["stopped_at"])}
+            **({"codex_interruptions": sorted(interruptions, key=lambda stop: stop["stopped_at"], reverse=True)}
                if interruptions else {}),
             **({"pane_errors": pane_errors} if pane_errors else {}),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
@@ -3139,6 +3148,23 @@ def write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
+def save_interruption_times(path: Path, before: Mapping, after: dict[str, StopReason]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        latest = read_json_file(path)
+        current = latest if isinstance(latest, dict) else {}
+        for key in before.keys() - after.keys():
+            if current.get(key) == before[key]:
+                current.pop(key, None)
+        for key, stop in after.items():
+            saved = current.get(key, {})
+            if stop != before.get(key) and (
+                    saved == before.get(key, {}) or stop["stopped_at"] >= saved.get("stopped_at", "")):
+                current[key] = stop
+        write_json_atomically(path, current)
+
+
 def load_verdicts(store_path: str | Path) -> dict[str, dict]:
     """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
     store = Path(store_path).expanduser()
@@ -4057,7 +4083,8 @@ def main(argv: list[str] | None = None) -> int:
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
     if screens and interruption_times != (cached_times or {}):
-        write_json_atomically(interruption_path, interruption_times)
+        save_interruption_times(interruption_path, cached_times if isinstance(cached_times, dict) else {},
+                                interruption_times)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():
