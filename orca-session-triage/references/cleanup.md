@@ -124,8 +124,13 @@ Run these per worktree, in order.
        remove, they move aside and the removal goes on without another
        question: run `rm_check.py` again with `--archive-scratch`.
      - `held` are settings (`setting`: `.env`, `*.local.*`), data (`data`:
-       SQLite, CSV, dumps), and anything else (`unknown`), each with `reason`
-       and the `decision` the user makes. Collect them and ask once. A `.env`
+       SQLite, CSV, dumps), Git clones (`clone`), and anything else (`unknown`).
+       Each has a `reason`, the `decision` the user makes, and a `content_summary`
+       with its disk usage and up to three entry names. General held clones include
+       the branch, commits absent from remote-tracking refs, uncommitted changes,
+       and stash. The check reports unknown when Git configuration prevents inspecting
+       changes and marks the live remote state unverified. The existing `local-deps`
+       check queries origin directly before marking a clone disposable. Collect them and ask once. A `.env`
        names the keys whose values its `.env.example` lacks, never the values:
        they may be the only copy of an API key.
 

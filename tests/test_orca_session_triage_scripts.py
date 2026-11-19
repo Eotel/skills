@@ -4742,6 +4742,83 @@ class FakeWorktreeNotes:
 
 
 class RmCheckTests(unittest.TestCase):
+    def test_held_directory_reports_clone_branches_changes_stash_and_size(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\ndata/\n")
+        sandbox = self.wt / "sandbox"
+        sandbox.mkdir()
+        for name in ("a-clone", "b-clone"):
+            clone = sandbox / name
+            git(self.main, "clone", "-q", str(self.main), str(clone))
+            git(clone, "config", "user.email", "t@example.com")
+            git(clone, "config", "user.name", "t")
+        changed = sandbox / "a-clone"
+        git(changed, "checkout", "-q", "-b", "draft")
+        git(changed, "commit", "-q", "--allow-empty", "-m", "local")
+        sha = git(changed, "rev-parse", "--short=12", "HEAD")
+        (changed / "app.txt").write_text("stash")
+        git(changed, "stash", "push", "-q")
+        tagged = sandbox / "b-clone"
+        git(tagged, "checkout", "-q", "--detach")
+        git(tagged, "commit", "-q", "--allow-empty", "-m", "retained by tag")
+        tag_commit = git(tagged, "rev-parse", "--short=12", "HEAD")
+        git(tagged, "tag", "keep-tag")
+        git(tagged, "checkout", "-q", "-")
+        (changed / ".git/info/exclude").write_text(".env\n")
+        (changed / "backend").mkdir()
+        (changed / "backend/.env").write_text("EXTRA=fixture")
+        for name in (".env.app.example", ".env.db.example", ".env.test.example"):
+            (changed / name).write_text("VARIABLE=")
+        outside = self.wt.parent / "external-linked"
+        git(tagged, "worktree", "add", "-q", "--detach", str(outside))
+        git(outside, "commit", "-q", "--allow-empty", "-m", "external detached commit")
+        linked_commit = git(outside, "rev-parse", "--short=12", "HEAD")
+        modules = changed / ".git/modules/stored"
+        modules.mkdir(parents=True)
+        git(modules, "init", "-q", "--bare")
+        (changed / "app.txt").write_text("dirty")
+        (sandbox / "c-note").write_text("note")
+        (sandbox / "d-note.local.json").write_text("a local setting")
+        (sandbox / "e-note").write_text("another note")
+        (self.wt / "data").mkdir()
+        (self.wt / "data" / "report.db").write_text("report")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        held = {item["kind"]: item for item in result["held"]}
+        reason = held["clone"]["reason"]
+        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています",
+                         tag_commit, linked_commit, str(outside)):
+            self.assertIn(expected, reason)
+        summary = held["clone"]["content_summary"]
+        self.assertIn("c-note", summary)
+        self.assertNotIn("e-note", summary)
+        self.assertNotIn("du 不明", summary)
+        self.assertIn("du ", held["data"]["content_summary"])
+        self.assertIn("report.db", held["data"]["content_summary"])
+        self.assertTrue(any(reason in line and summary in line for line in result["reasons"]))
+
+    def test_held_clone_with_external_git_settings_keeps_its_worktree(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\n")
+        clone = self.wt / "sandbox"
+        git(self.main, "clone", "-q", str(self.main), str(clone))
+        git(clone, "config", "filter.local.clean", "/does-not-exist")
+        tracked_status = rmcheck.git
+
+        def git_without_external_programs(cwd: str | Path, *args: str,
+                                          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == clone and ("status" in args or "ls-remote" in args):
+                self.fail(f"used clone configuration to run {args[0]}")
+            return tracked_status(cwd, *args, env=env)
+
+        empty = self.wt / "empty-git-config"
+        empty.write_text("")
+        with (patch.object(rmcheck, "git", side_effect=git_without_external_programs),
+              patch.dict(os.environ, {"GIT_CONFIG": str(empty)})):
+            held = rmcheck.held_file(clone, "sandbox", False, None)
+        self.assertEqual(held["kind"], "clone")
+        self.assertIn("未確認", held["reason"])
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         binary = Path(self.tmp.name) / "orca-bin/orca"
