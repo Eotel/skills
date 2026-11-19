@@ -106,6 +106,39 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual((state["answer"], recorded["note"], decision["answer"]), ("公開する",) * 3)
         self.assertEqual((state["answered_at"], recorded["ts"], decision["decided_at"]), (self.AT,) * 3)
 
+    def test_explicit_answers_close_only_bound_parts_and_can_be_relayed_from_the_same_tab(self) -> None:
+        self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
+        part = f"{self.ASK}:1"
+        first = self.ask(key=f"answer:worker::{part}", covers=[f"answer:worker::{part}"])
+        second = self.ask(key=f"answer:worker::{self.ASK}:2", covers=[f"answer:worker::{self.ASK}:2"])
+        answer = self.root / "answer.txt"
+        answer.write_text("公開する（23:00 の定時のタブで回答）")
+        recorded = self.run_tool("hourly_state.py", "answered", "--id", first["id"],
+                                 "--answer-file", str(answer), "--answered-at", self.AT)
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual(json.loads(self.answers.read_text())["id"], part)
+
+        command = f"import answer_sync; answer_sync.record([{part!r}], '公開する', 'send', at={self.AT!r})"
+        other = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS,
+                               env={**self.env, "ORCA_TERMINAL_HANDLE": "term_other"},
+                               capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("answer already recorded", other.stderr)
+        relay = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(relay.returncode, 0, relay.stderr)
+        self.assertFalse(self.log.exists())
+        self.assertEqual(json.loads(self.answers.read_text().splitlines()[-1])["how"], "send")
+
+        batch = self.run_tool("hourly_state.py", "answered-many", "--skip-recorded", stdin="\n".join(
+            json.dumps({"id": question["id"], "answer": "待つ", "answered_at": self.AT})
+            for question in (first, second)))
+        self.assertEqual(batch.returncode, 0, batch.stderr)
+        self.assertIn("行 1 は回答済み", batch.stderr)
+        self.assertEqual([item["answer"] for item in json.loads(batch.stdout)], [answer.read_text(), "待つ"])
+        self.assertEqual(json.loads(self.answers.read_text().splitlines()[-1])["id"], f"{self.ASK}:2")
+
     def test_numbered_deliveries_leave_other_questions_open_and_complete_a_whole_ask(self) -> None:
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
         whole = self.ask()

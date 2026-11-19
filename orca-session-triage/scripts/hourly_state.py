@@ -76,6 +76,7 @@ JST = timezone(timedelta(hours=9))
 # (13:03, or 12:1x for 12:10-12:19) must be within ANSWER_CLOCK_SLACK minutes of that time.
 ANSWERED_AT = "{answered_at}"
 CLOCK = re.compile(r"(?<![\d:+])([01]?\d|2[0-3]):([0-5])([\dx])(?!\d)")
+HOURLY_TAB_CLOCK = re.compile(r"[ \t]*の[ \t]*定時")
 ANSWER_CLOCK_SLACK = 10
 # A comment that starts with scan_sessions' decision marker makes the workspace a waiting row.
 DECISION_MARKER = "要判断"
@@ -1071,6 +1072,8 @@ def stamped_answer(answer: str, answered_at: str) -> str:
     minute = at.hour * 60 + at.minute
     off = []
     for found in CLOCK.finditer(answer):
+        if HOURLY_TAB_CLOCK.match(answer, found.end()):
+            continue
         start = int(found[1]) * 60 + int(found[2]) * 10
         minutes = range(start, start + 10) if found[3] == "x" else (start + int(found[3]),)
         gap = min(min(abs(given - minute), 1440 - abs(given - minute)) for given in minutes)
@@ -1081,13 +1084,15 @@ def stamped_answer(answer: str, answered_at: str) -> str:
     return answer
 
 
-def record_answer(data: dict, answering: Answering) -> dict:
+def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = False) -> dict:
     key = answering.id if answering.id is not None else asked_under(data, str(answering.decision))
     if key not in data["questions"]:
         raise ValueError(f"unknown question id: {key}")
     question = data["questions"][key]
     if question.get("withdrawn_at"):
         return {"id": key, **question, "state": "withdrawn", "recorded": False}
+    if skip_recorded and question["answer"] is not None and not answering.replace_reason:
+        return {"id": key, **question, "state": "already_recorded", "recorded": False}
     # A recorded answer keeps its time, so recording the same text again changes nothing.
     when = (question["answered_at"] if question["answer"] is not None and not answering.replace_reason
             else recorded_at(answering.answered_at))
@@ -1709,6 +1714,8 @@ def main(argv: list[str] | None = None) -> int:
                               'checked as answered --answer-file is; every line is checked first, and a wrong one '
                               'writes nothing')
     answered_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
+    answered_many.add_argument("--skip-recorded", action="store_true",
+                                help="report existing answers and record the other lines; explicit replacements still apply")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
     withdraw.add_argument("--id", required=True)
     withdraw.add_argument("--reason-file", required=True)
@@ -1888,8 +1895,12 @@ def main(argv: list[str] | None = None) -> int:
                 notices.extend(unrecorded)
                 skipped = bool(unrecorded)
             elif args.action == "answered-many":
-                result = record_lines(checked_lines(given, answering_line),
-                                      lambda answering: record_answer(data, answering))
+                answerings = checked_lines(given, answering_line)
+                result = record_lines(answerings, lambda answering: record_answer(
+                    data, answering, skip_recorded=args.skip_recorded))
+                notices.extend(f"行 {number} は回答済み {item['id']}: {item['answer']}"
+                               for (number, _), item in zip(answerings, result)
+                               if item.get("state") == "already_recorded")
             elif args.action == "comment":
                 entry = data["comments"].setdefault(here, {"run": None})
                 if args.result is not None:
@@ -1908,6 +1919,9 @@ def main(argv: list[str] | None = None) -> int:
                 data["comments"].setdefault(workspace, {"run": None})
             if writes:
                 save(path, data)
+            if args.action in ("answered", "answered-many"):
+                import answer_sync
+                answer_sync.record_hourly_answers(items)
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

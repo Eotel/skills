@@ -50,6 +50,28 @@ def answer_text(ref: tuple[str, frozenset[int]], records: dict[str, dict], entri
                                   for number in sorted(numbers)))
 
 
+def record_hourly_answers(items: list[dict]) -> None:
+    entries = hourly_state.inbox_entries()
+    if not entries:
+        return
+    answers = inbox_read.answers_path()
+    recorded = inbox_read.answered_ids(answers)
+    for item in items:
+        if item.get("withdrawn_at") or not item.get("answer"):
+            continue
+        ids = []
+        for ask_id, parts in ask_state.references(item, entries):
+            if ask_id in recorded:
+                continue
+            ids.extend([f"{ask_id}:{number}" for number in sorted(parts)] if parts else [ask_id])
+        missing = [key for key in dict.fromkeys(ids) if key not in recorded]
+        if missing:
+            missing = inbox_read.checked_answer_ids(",".join(missing), entries)
+            inbox_read.record_answers(answers, missing, "hourly_state.py answered", item["answer"],
+                                      at=item["answered_at"])
+            recorded = recorded.union(missing)
+
+
 def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
            decisions: Mapping[str, str] | None = None, state_file: Path | None = None,
            decisions_file: Path | None = None, handed_off_file: Path | None = None) -> dict:
@@ -94,6 +116,8 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                                                                 > datetime.fromisoformat(when)):
                 raise ValueError(f"{key} has a newer lead decision; the delivered answer was not replayed over it")
         changed = []
+        preserved: set[str] = set()
+        sender = os.environ.get("ORCA_TERMINAL_HANDLE")
         for key, item in data["questions"].items():
             if item.get("withdrawn_at"):
                 continue
@@ -106,6 +130,10 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 # Completing a whole-ask key must not replace a selected part with combined answers.
                 bindings = [value for value in bindings if (ref := ask_state.reference(value, entries)) is None
                             or ref[0] != source[0] or ref[1] and ref[1] <= source[1]]
+            if (covered and sender and sender == item.get("answered_in") and item.get("answer") is not None
+                    and how in ("send", "send --decision")):
+                preserved.update(bindings)
+                continue
             if bindings:
                 available = {value: latest[value].answer for value in bindings if value in latest
                              and (datetime.fromisoformat(latest[value].decided_at)
@@ -121,7 +149,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             text = "\n".join(parts) or answer
             changed.append(hourly_state.record_answer(data, hourly_state.Answering(id=key, answer=text, answered_at=when)))
         new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when)
-               for key, text in keys.items() if key not in latest or latest[key].answer != text]
+               for key, text in keys.items() if key not in preserved and (key not in latest or latest[key].answer != text)]
         if new:
             lead_decisions.append(decisions_file, *new)
         if changed:
