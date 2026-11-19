@@ -282,7 +282,8 @@ def worker_scope(entry: dict, rows: set[str], remote_hosts: dict, orca: str) -> 
     return False
 
 
-def registered_scope(question: dict, entries: list[dict], handoff_ids: dict[str, str]) -> list[tuple[str, frozenset[int]]]:
+def registered_scope(question: dict, entries: list[dict],
+                     handoff_ids: dict[str, ask_state.HandoffBinding]) -> list[tuple[str, frozenset[int]]]:
     scoped = []
     for ask_id, numbers in ask_state.references(question, entries, bindings=handoff_ids):
         if not numbers:
@@ -303,8 +304,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
     answers.update(lane_input.inferred_answers(inbox_read.paths()[0], path, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
     withdrawn = inbox_read.withdrawal_times(entries)
-    handoff_ids = {item.decision: item.ask_id for item in lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser())
-                   if item.ask_id}
+    handoff_ids = ask_state.handoff_bindings((item.decision, item.ask_id) for item in
+                                             lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser()) if item.ask_id)
     remote_config = Path(os.environ.get("TRIAGE_PULL_CONFIG") or "~/.cache/orca-briefs/remote-inboxes.json").expanduser()
     remote_data = read_json(remote_config)
     remote_hosts = remote_data.get("hosts", {}) if isinstance(remote_data, dict) else {}

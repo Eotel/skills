@@ -559,10 +559,11 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     questions = (state or {}).get("questions", {}).values()
     settled = []
     last = {}
-    bound_asks = {key: item.ask_id for key, items in history.items() for item in items if item.ask_id}
+    bound_asks = ask_state.handoff_bindings((key, item.ask_id) for key, items in history.items()
+                                           for item in items if item.ask_id)
     for key in keys:
         item = history[key][-1] if key in history else None
-        latest_id = bound_asks.get(key)
+        latest_id = binding.ask_id if (binding := bound_asks.get(key)) else None
         decision = decision_for_handoff(answered[key].view() if key in answered else None, item is not None)
         answer = decision
         if answer is None:

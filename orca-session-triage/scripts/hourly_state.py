@@ -601,17 +601,19 @@ def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decisio
             and asked_at and (at := scan_sessions.parse_time(decisions[key].decided_at)) is not None and at > asked_at]
 
 
-def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision], dict[str, str]]:
+def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision],
+                                                                       dict[str, ask_state.HandoffBinding]]:
     decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
     history = list(lead_decisions.handed_off(handoffs.expanduser()))
-    bindings = {item.decision: item.ask_id for item in history if item.ask_id}
+    bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id)
     derived = {item.decision for item in history if item.decision in decisions and decisions[item.decision].from_ask}
     if derived:
         asks = {item["id"]: item for item in inbox_entries() if item.get("id") and item.get("kind") == "ask"}
         answers = lead_decisions.ask_answers(inbox_read.answers_path())
         for key in derived:
             previous = decisions.pop(key)
-            if proof := lead_decisions.bound_handoff_answer(key, bindings.get(key), answers, asks, state["questions"].values()):
+            ask_id = binding.ask_id if (binding := bindings.get(key)) else None
+            if proof := lead_decisions.bound_handoff_answer(key, ask_id, answers, asks, state["questions"].values()):
                 parts = proof.get("answers", [proof])
                 times = [stamp for part in parts if (stamp := part.get("ts")) and scan_sessions.parse_time(stamp)]
                 notes = list(dict.fromkeys(note for part in parts if (note := part.get("note"))))
@@ -624,6 +626,7 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
                handed: list[lead_decisions.HandOff],
+               bindings: dict[str, ask_state.HandoffBinding] | None = None,
                claimed: dict[str, inbox_read.Claim] | None = None,
                decided: dict[str, list[lead_decisions.Decision]] | None = None,
                rejected: list[dict] | None = None,
@@ -670,7 +673,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     questions = state.get("questions", {}).values()
     handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions)
                     for item in handed}
-    bound_asks = {item.decision: item.ask_id for item in handed if item.ask_id}
+    bound_asks = bindings if bindings is not None else ask_state.handoff_bindings(
+        (item.decision, item.ask_id) for item in handed if item.ask_id)
     handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
                          for item in handed}
     if closed_ids:
@@ -1916,7 +1920,8 @@ def main(argv: list[str] | None = None) -> int:
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
             latest_handoffs: dict[str, lead_decisions.HandOff] = {}
-            for item in lead_decisions.handed_off(args.handed_off_file.expanduser()):
+            history = list(lead_decisions.handed_off(args.handed_off_file.expanduser()))
+            for item in history:
                 earlier = latest_handoffs.get(item.decision)
                 if not item.ask_id and earlier and earlier.ask_id:
                     item = lead_decisions.HandOff(item.decision, item.handed_off_at, earlier.ask_id)
@@ -1941,6 +1946,7 @@ def main(argv: list[str] | None = None) -> int:
                             args.claude_projects.expanduser(), [worktree]), since)]
             result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
                                 datetime.now(timezone.utc), state=data, handed=handed,
+                                bindings=ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id),
                                 claimed={ask.report["id"]: claim for ask in asks
                                          if (claim := inbox_read.ask_claim(ask, claims))},
                                 decided=decided, rejected=rejected,

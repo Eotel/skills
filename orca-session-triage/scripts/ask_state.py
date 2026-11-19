@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
@@ -11,6 +12,21 @@ import inbox_read
 
 
 ASK_KEY = re.compile(r"(?:ask|answer):.*::(?:ask-)?([^:]+)(?::(\d+(?:\+\d+)*))?$")
+
+
+@dataclass(frozen=True)
+class HandoffBinding:
+    ask_id: str
+    earlier: frozenset[str]
+
+
+def handoff_bindings(pairs: Iterable[tuple[str, str]]) -> dict[str, HandoffBinding]:
+    bindings: dict[str, HandoffBinding] = {}
+    for key, ask_id in pairs:
+        previous = bindings.get(key)
+        earlier = previous.earlier | {previous.ask_id} if previous else frozenset()
+        bindings[key] = HandoffBinding(ask_id, earlier - {ask_id})
+    return bindings
 
 
 def reference(value: str, entries: list[dict]) -> tuple[str, frozenset[int]] | None:
@@ -27,15 +43,15 @@ def reference(value: str, entries: list[dict]) -> tuple[str, frozenset[int]] | N
 
 
 def references(question: dict, entries: list[dict], *,
-               bindings: Mapping[str, str] | None = None) -> list[tuple[str, frozenset[int]]]:
+               bindings: Mapping[str, HandoffBinding] | None = None) -> list[tuple[str, frozenset[int]]]:
     values = [question.get("decision") or "", *(question.get("covers") or [])]
     # A whole source id leaves numbered decision keys responsible for narrowing it.
     found = []
     for value in values:
-        target = (bindings or {}).get(value)
-        if not same_bound_ask(question, target, value):
+        binding = (bindings or {}).get(value)
+        if not same_bound_ask(question, binding, value):
             continue
-        ref = handoff_ref(target, value, entries, (question,)) if target else reference(value, entries)
+        ref = handoff_ref(binding.ask_id, value, entries, (question,)) if binding else reference(value, entries)
         if ref:
             found.append(ref)
     source = reference(question.get("ask_id") or "", entries)
@@ -78,9 +94,10 @@ def matching_ref(target: str, source: str) -> bool:
     return same and (not new_part or not old_part or bool(set(new_part.split("+")) & set(old_part.split("+"))))
 
 
-def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
-    if not ask_id:
+def same_bound_ask(question: dict, target: HandoffBinding | str | None, key: str = "") -> bool:
+    if not target:
         return True
+    ask_id = target.ask_id if isinstance(target, HandoffBinding) else target
     registered = question.get("ask_id")
     named = ASK_KEY.fullmatch(key)
     if not named:
@@ -89,8 +106,11 @@ def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
     named_ref = f"{named_id}:{part}" if part else named_id
     if not registered or part and ":" not in registered and matching_ref(registered, named_id):
         return matching_ref(ask_id, named_ref)
-    return matching_ref(ask_id, registered) or (":" not in registered and question.get("decision") != key
-                                                and matching_ref(ask_id, named_ref))
+    if matching_ref(ask_id, registered):
+        return True
+    if isinstance(target, HandoffBinding) and any(matching_ref(old, registered) for old in target.earlier):
+        return False
+    return ":" not in registered and question.get("decision") != key and matching_ref(ask_id, named_ref)
 
 
 def handoff_target(key: str, ask_id: str | None, entries: list[dict],
@@ -135,17 +155,17 @@ def view(item: dict) -> dict:
     return {key: value for key, value in item.items() if key != "record"}
 
 
-def active_keys(item: dict, bindings: Mapping[str, str | None]) -> list[str]:
+def active_keys(item: dict, bindings: Mapping[str, HandoffBinding]) -> list[str]:
     return [key for key in item["keys"] if key and same_bound_ask(item["record"], bindings.get(key), key)]
 
 
-def asking(state: dict, decisions: Mapping[str, object] | None, bindings: Mapping[str, str | None], *,
+def asking(state: dict, decisions: Mapping[str, object] | None, bindings: Mapping[str, HandoffBinding], *,
            row: str | None = None) -> list[dict]:
     return [{**view(item), "keys": keys} for item in active(state, decisions)
             if (row is None or item["row"] == row) and (keys := active_keys(item, bindings))]
 
 
-def for_key(state: dict, key: str, entries: list[dict], bindings: Mapping[str, str | None]) -> list[dict]:
+def for_key(state: dict, key: str, entries: list[dict], bindings: Mapping[str, HandoffBinding]) -> list[dict]:
     ref = reference(key, entries)
     return [{**view(item), "keys": keys} for item in active(state)
             if (keys := active_keys(item, bindings)) and same_bound_ask(item["record"], bindings.get(key), key)

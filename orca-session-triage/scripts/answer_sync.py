@@ -84,8 +84,8 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
     if not entries:
         return []
     recorded = inbox_read.answer_records(inbox_read.answers_path())
-    bindings = {item.decision: item.ask_id for item in lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser())
-                if item.ask_id}
+    bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in
+                                          lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser()) if item.ask_id)
     planned = []
     for number, item in items:
         if item.get("withdrawn_at") or not item.get("answer"):
@@ -130,7 +130,7 @@ def update_corrected_keys(items: list[dict], questions: Iterable[dict]) -> None:
         return
     entries = hourly_state.inbox_entries()
     handoffs = list(lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser()))
-    bound = {item.decision: item.ask_id for item in handoffs if item.ask_id}
+    bound = ask_state.handoff_bindings((item.decision, item.ask_id) for item in handoffs if item.ask_id)
     handed_keys = {item.decision for item in handoffs}
     touched = [ref for item in corrected for ref in ask_state.references(item, entries, bindings=bound)]
     if not touched:
@@ -142,7 +142,8 @@ def update_corrected_keys(items: list[dict], questions: Iterable[dict]) -> None:
     with lead_decisions.appending(path) as append_decisions:
         updates = []
         for key, previous in lead_decisions.latest(lead_decisions.records(path)).items():
-            ref = (ask_state.handoff_target(key, bound.get(key), entries, questions)
+            ask_id = bound[key].ask_id if key in bound else None
+            ref = (ask_state.handoff_target(key, ask_id, entries, questions)
                    if key in handed_keys else ask_state.reference(key, entries))
             if (ref is None or not automatic(previous, ref, deliveries)
                     or not any(ask_state.overlaps(ref, given) for given in touched)
@@ -179,7 +180,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             data = hourly_state.read(state_file)
             questions = data["questions"].values()
             handoffs = list(lead_decisions.handed_off(handed_off_file))
-            bound = {item.decision: item.ask_id for item in handoffs if item.ask_id}
+            bound = ask_state.handoff_bindings((item.decision, item.ask_id) for item in handoffs if item.ask_id)
             log = inbox_read.answers_path()
             recorded = inbox_read.answer_records(log)
             histories: dict[str, list[dict]] = {}
@@ -248,7 +249,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             known.update(latest)
             known.update(key for item in questions
                          for key in [item.get("decision") or "", *(item.get("covers") or [])])
-            refs_by_key = {key: (ask_state.handoff_target(key, bound.get(key), entries, questions)
+            refs_by_key = {key: (ask_state.handoff_target(key, bound[key].ask_id if key in bound else None, entries, questions)
                                  if key in handed_keys else ask_state.reference(key, entries)) for key in known}
             answers_by_key = {key: answer_text(answer_parts(ref, records, entries)) for key, ref in refs_by_key.items()
                               if ref and ask_state.covered(ref, list(records), entries)}
