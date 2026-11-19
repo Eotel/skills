@@ -1917,11 +1917,14 @@ def main(argv: list[str] | None = None) -> int:
                          if args.action in ("answered", "answered-many", "withdraw") else [here] if comment_here else [])
             for workspace in commented:
                 data["comments"].setdefault(workspace, {"run": None})
+            planned_answers = []
+            if args.action in ("answered", "answered-many") and path.resolve() == Path(DEFAULT_STATE).expanduser().resolve():
+                import answer_sync
+                planned_answers = answer_sync.hourly_answers(items)
             if writes:
                 save(path, data)
-            if args.action in ("answered", "answered-many"):
-                import answer_sync
-                answer_sync.record_hourly_answers(items)
+            for answer in planned_answers:
+                inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer, at=answer.at)
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

@@ -55,6 +55,7 @@ answers, report their line numbers, and record the rest of the batch.
 A time used in the hourly tab's name, such as 「23:00 の定時」, is excluded
 from the answer-time check. When the same Orca tab relays an answer with
 `send --ask`, the inbox records delivery and the hourly answer stays as recorded.
+An alternate `--state-file` keeps answer writes in the isolated state file.
 
 ## The triage workspace's comment
 

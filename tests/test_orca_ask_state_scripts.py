@@ -159,6 +159,67 @@ class AskStateTests(unittest.TestCase):
         decisions = {item["decision"]: item for item in map(json.loads, self.log.read_text().splitlines())}
         self.assertEqual(decisions[self.KEY]["answer"], "公開する\n待つ")
 
+    def test_an_isolated_state_file_leaves_the_shared_ask_open(self) -> None:
+        question = self.ask()
+        copy = self.root / "copy.json"
+        copy.write_bytes(self.state.read_bytes())
+        answer = self.root / "answer.txt"
+        answer.write_text("公開する")
+        result = self.run_tool("hourly_state.py", "--state-file", str(copy), "answered",
+                               "--id", question["id"], "--answer-file", str(answer), "--answered-at", self.AT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(copy.read_text())["questions"][question["id"]]["answer"], "公開する")
+        self.assertIsNone(json.loads(self.state.read_text())["questions"][question["id"]]["answer"])
+        self.assertFalse(self.answers.exists())
+
+    def test_an_invalid_inbox_binding_rejects_the_batch_before_either_store_changes(self) -> None:
+        keys = [f"answer:worker::{self.ASK}:{number}" for number in (1, 2)]
+        questions = [self.ask(key=key, covers=[key]) for key in keys]
+        before = self.state.read_bytes()
+        result = self.run_tool("hourly_state.py", "answered-many", stdin="\n".join(
+            json.dumps({"id": question["id"], "answer": "公開する", "answered_at": self.AT})
+            for question in questions))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"no ask in the inbox has id {self.ASK}:2", result.stderr)
+        self.assertEqual(self.state.read_bytes(), before)
+        self.assertFalse(self.answers.exists())
+
+    def test_a_corrected_hourly_answer_counts_when_a_delivery_completes_the_ask(self) -> None:
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
+        whole = self.ask()
+        first = self.ask(key=f"answer:worker::{self.ASK}:1", covers=[f"answer:worker::{self.ASK}:1"])
+        args = ("answered-many", "--skip-recorded")
+        for note, extra in [("公開する", {}), ("待つ", {"replace_reason": "本人が訂正した"})]:
+            record = self.run_tool("hourly_state.py", *args, stdin=json.dumps(
+                {"id": first["id"], "answer": note, "answered_at": self.AT, **extra}))
+            self.assertEqual(record.returncode, 0, record.stderr)
+        self.assertEqual([item["note"] for item in map(json.loads, self.answers.read_text().splitlines())],
+                         ["公開する", "待つ"])
+        command = f"import answer_sync; answer_sync.record([{self.ASK + ':2'!r}], '戻す', 'send', at={self.AT!r})"
+        delivery = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(delivery.returncode, 0, delivery.stderr)
+        self.assertEqual(json.loads(self.state.read_text())["questions"][whole["id"]]["answer"], "待つ\n戻す")
+
+    def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
+        self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
+        other = "b1234567-1234-4567-8888-123456789abc"
+        self.write_lines(self.inbox, [{"id": ask_id, "kind": "ask"} for ask_id in (self.ASK, other)])
+        key = "keep:/w/current"
+        question = self.ask(covers=[self.KEY, f"answer:worker::{other}", key])
+        answer = "両方とも公開する"
+        self.assertEqual(self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": question["id"], "answer": answer, "answered_at": self.AT})).returncode, 0)
+        command = ("import answer_sync; "
+                   f"answer_sync.record([{other!r}], '公開する', 'send', at={self.AT!r}, "
+                   f"decisions={ {key: '維持する'}!r})")
+        delivery = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(delivery.returncode, 0, delivery.stderr)
+        self.assertEqual(json.loads(self.state.read_text())["questions"][question["id"]]["answer"], answer)
+        self.assertEqual({item["decision"]: item["answer"] for item in map(json.loads, self.log.read_text().splitlines())}
+                         [key], "維持する")
+
     def test_mixed_decisions_wait_for_every_cover_and_a_replay_preserves_a_newer_correction(self) -> None:
         question = self.ask(covers=[self.KEY, "remove:/w/other"])
         def deliver() -> subprocess.CompletedProcess[str]:

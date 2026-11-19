@@ -459,6 +459,12 @@ def inbox_entries(inbox: Path) -> list[dict]:
     return entries
 
 
+DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
+HOURLY_ANSWER = "hourly_state.py answered"
+HOURLY_CORRECTION = "hourly_state.py corrected"
+SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | {HOURLY_ANSWER, HOURLY_CORRECTION}
+
+
 def answer_records(path: Path) -> dict[str, dict]:
     """The first delivered answer per id, else its first mark; a later delivery can supply a note-only mark's answer."""
     found: dict[str, dict] = {}
@@ -469,8 +475,10 @@ def answer_records(path: Path) -> dict[str, dict]:
             continue
         if isinstance(record, dict) and isinstance(record.get("id"), str):
             previous = found.get(record["id"])
-            if previous is None or (previous.get("how") not in ("send", "send --decision")
-                                    and record.get("how") in ("send", "send --decision")):
+            how = record.get("how")
+            if (previous is None or how == HOURLY_CORRECTION
+                    or previous.get("how") not in DELIVERY_ANSWERS and how in DELIVERY_ANSWERS
+                    or previous.get("how") not in SUBSTANTIVE_ANSWERS and how == HOURLY_ANSWER):
                 found[record["id"]] = record
     return found
 
