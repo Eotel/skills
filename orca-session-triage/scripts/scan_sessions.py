@@ -1759,10 +1759,15 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         terms = by_worktree.get((w.get("_environment"), w.get("worktreeId")), [])
         ordered_agents = sorted(w.get("agents") or [], key=lambda agent: (
             agent.get("state") in ("working", "waiting"), agent.get("updatedAt") or 0))
-        agents_by_pane = {agent["paneKey"]: agent["agentType"] for agent in ordered_agents
+        agents_by_pane = {agent["paneKey"]: agent for agent in ordered_agents
                           if agent.get("paneKey") and agent.get("agentType")}
-        terms = [term if term.get("agentIdentity") else
-                 {**term, "agentIdentity": agents_by_pane.get(hourly_runtime.pane_key(term))} for term in terms]
+        identified = []
+        for term in terms:
+            agent = agents_by_pane.get(hourly_runtime.pane_key(term))
+            if agent and (agent.get("state") in ("working", "waiting") or not term.get("agentIdentity")):
+                term = {**term, "agentIdentity": agent["agentType"]}
+            identified.append(term)
+        terms = identified
         prompts = list(waiting_prompts(terms, screens, w.get("_environment")))
         waiting = prompts[0] if prompts else None
         codex_approvals = [prompt for prompt, _ in prompts if prompt["question"] in (CODEX_PERMISSION, CODEX_APPROVAL)]
@@ -1782,12 +1787,16 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                           if term.get("handle") and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
                           and (term.get("agentIdentity") == "codex"
                                or (approval_tabs and not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
-        screen_error = next(((error, term.get("handle")) for term in terms
-                             if (term.get("agentIdentity") == "codex" or term.get("handle") in codex_activity)
-                             and term.get("handle") not in approval_tabs
-                             if (error := api_failure(codex_activity.get(term.get("handle")) or
-                                                      last_codex_activity(str(term.get("preview") or "").splitlines())))),
-                            (None, None))
+        screen_error: tuple[str | None, str | None] = (None, None)
+        for term in terms:
+            handle = term.get("handle")
+            if handle in approval_tabs or (term.get("agentIdentity") != "codex" and handle not in codex_activity):
+                continue
+            activity = (codex_activity[handle] if handle in codex_activity
+                        else last_codex_activity(str(term.get("preview") or "").splitlines()))
+            if error := api_failure(activity):
+                screen_error = error, handle
+                break
 
         def pane_resumed(agent: dict, tab: str) -> bool:
             activity = codex_activity.get(tab)
@@ -1797,7 +1806,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             observed = parse_time(frame.get("_observed_at")) or datetime.fromtimestamp(now, timezone.utc)
             updated = parse_time(iso_time(agent.get("updatedAt")))
             return updated is None or updated <= observed
-        spoken = [agent for agent in w.get("agents") or [] if agent.get("lastAssistantMessage")]
+        spoken = [agent for agent in w.get("agents") or [] if agent.get("lastAssistantMessage")
+                  and (not approval_tabs or agents_by_pane.get(agent.get("paneKey"), agent) is agent)]
         pane_errors = []
         if approval_tabs:
             pane_errors = [

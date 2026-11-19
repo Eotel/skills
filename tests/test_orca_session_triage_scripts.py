@@ -3078,10 +3078,11 @@ class ScanCommandTests(unittest.TestCase):
         tree = worktree(lane, "working", agent="codex")
         tree["_environment"] = environment
         current = tree["agents"][0]
-        current["paneKey"] = "tab:other"
+        current.update(paneKey="tab:other", lastAssistantMessage="Checking the build.", updatedAt=NOW * 1000)
         prior = done_agent("claude", "tab:other", said="Earlier Claude reply")
         pending = in_pane(terminal(lane, "codex", "term_pending"), "tab:pending")
         other = in_pane(terminal(lane, None, "term_other"), "tab:other")
+        pending["_environment"] = other["_environment"] = environment
         screens = {
             (environment, pending["handle"]): {"source": "screen", "tail": [
                 scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
@@ -3089,14 +3090,22 @@ class ScanCommandTests(unittest.TestCase):
                 "⏺ Earlier Claude reply", "› check the build", "• Checking the build.",
                 "■ stream disconnected before completion"]},
         }
-        pending["_environment"] = other["_environment"] = environment
         for agents in ([current, prior], [prior, current]):
-            with self.subTest(agent_order=[agent["agentType"] for agent in agents]):
-                tree["agents"] = agents
-                row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
-                self.assertIsNotNone(row["stop"])
-                self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
-                self.assertEqual(row["stop"]["agent"], "codex")
+            for identity in (None, "claude"):
+                with self.subTest(agent_order=[agent["agentType"] for agent in agents], identity=identity):
+                    tree["agents"] = agents
+                    other["agentIdentity"] = identity
+                    row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+                    self.assertIsNotNone(row["stop"])
+                    self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
+                    self.assertEqual(row["stop"]["agent"], "codex")
+
+        tree["agents"] = [current, prior]
+        prior.update(lastAssistantMessage="API Error: connection error", updatedAt=(NOW - 600) * 1000)
+        other["preview"] = "■ stream disconnected before completion"
+        screens[(environment, other["handle"])]["tail"] = ["⏺ Earlier Claude reply", "› checking the build"]
+        row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["class"], row["stop"]), ("waiting", None))
 
     def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
         lane = str(self.dir / "shared")
