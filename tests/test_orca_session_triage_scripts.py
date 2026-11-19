@@ -944,6 +944,19 @@ class ClassifyTests(unittest.TestCase):
         prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
         self.assertEqual(prompt["target"], "$ git status --short")
 
+    def test_codex_approval_in_an_orca_screen_without_blank_rows(self) -> None:
+        body = ["  Would you like to run the following command?", "  Thread: worker", "  Environment: local",
+                "  Reason: Read status", "  Permission rule: filesystem access", "  $ git status",
+                "› 1. Yes, proceed (y)", "  2. No", "  Press f6 to confirm"]
+        screen = {"source": "screen", "tail": body,
+                  "tailRows": [{"wrapped": False, "trailingSpaces": 0} for _ in body]}
+        prompt = scan.codex_permission_prompt(screen, "term_codex")
+        self.assertEqual(prompt["target"], "$ git status")
+        self.assertEqual(prompt["choices"], ["1. Yes, proceed (y)", "2. No"])
+        ambiguous = {**screen, "tail": [*body[:5], "  $ quoted from reason", *body[5:]]}
+        self.assertEqual(scan.codex_permission_prompt(ambiguous, "term_codex")["target"],
+                         "command omitted from terminal view")
+
     def test_codex_approval_choices_exclude_numbered_command_lines(self) -> None:
         tail = ["Would you like to run the following command?", "$ cat <<'EOF'", "1. command output",
                 "2. more command output", "EOF", "› 1. Yes, proceed (y)", "2. No (esc)",
@@ -2941,6 +2954,48 @@ class ScanCommandTests(unittest.TestCase):
         row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
                                     screens={(environment, term["handle"]): screen})
         self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
+
+    def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
+        lane = str(self.dir / "shared")
+        with_agent = worktree(lane, "working", agent="codex")
+        original_id = with_agent["worktreeId"]
+        term = in_pane(terminal(lane, None, "term_approval"), "tab:leaf")
+        with_agent.update(worktreeId="other-registration", agents=[{
+            **with_agent["agents"][0], "paneKey": scan.hourly_runtime.pane_key(term),
+        }])
+        other = {**with_agent, "worktreeId": original_id, "agents": [], "createdAt": 10, "repo": "original"}
+        self.assertEqual(scan.screen_targets([with_agent, other], [term], {lane}), [term])
+
+    def test_remote_approvals_include_every_tab_and_do_not_hide_another_panes_failure(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = {**worktree(lane, "working", agent="codex"), "_environment": environment, "agents": []}
+        claude = {**terminal(lane, "claude", "term_claude"), "_environment": environment}
+        pending = {**in_pane(terminal(lane, None, "term_pending"), "tab:pending"), "_environment": environment}
+        other = {**in_pane(terminal(lane, "codex", "term_other"), "tab:other"), "_environment": environment}
+        screens = {
+            (environment, claude["handle"]): {"source": "screen", "tail": [
+                "Do you want to proceed?", "❯ 1. Yes", "2. No"]},
+            (environment, pending["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press f6 to confirm"]},
+            (environment, other["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git diff", "› 1. Yes", "2. No", "Press f7 to cancel"]},
+        }
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["tab"], claude["handle"])
+        self.assertEqual([prompt["target"] for prompt in row["codex_approvals"]], ["$ git status", "$ git diff"])
+        self.assertEqual(scan.review_queue([row], force=True)[0]["codex_approvals"], row["codex_approvals"])
+        view = scan.row_view(row)
+        self.assertIn("term_other:", view["question"])
+        self.assertEqual(view["codex_approvals"][1]["choices"], ["1. Yes", "2. No"])
+
+        tree["agents"] = [{"agentType": "codex", "state": "working", "paneKey": scan.hourly_runtime.pane_key(term),
+                            "lastAssistantMessage": "stream disconnected before completion", "updatedAt": timestamp}
+                           for term, timestamp in ((pending, 20), (other, 10))]
+        del screens[(environment, other["handle"])]
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual(row["stop"]["action"], "wake")
+        self.assertEqual(row["orca_message"]["tab"], other["handle"])
 
     def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
         # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
