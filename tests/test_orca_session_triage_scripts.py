@@ -2548,6 +2548,12 @@ class NextStepFactTests(unittest.TestCase):
                              {"branch": "main", "head": git(work, "rev-parse", "HEAD"),
                               "head_at": git(work, "log", "-1", "--format=%cI"),
                               "dirty": 1, "unpushed": 1, "github": "acme/app"})
+            git(work, "update-ref", "refs/remotes/origin/already-published", "HEAD")
+            self.assertEqual((scan.git_state(str(work)) or {})["unpushed"], 0)
+            git(work, "branch", "--unset-upstream")
+            git(work, "revert", "--no-edit", "HEAD")
+            reverted = scan.git_state(str(work)) or {}
+            self.assertEqual((reverted["unpushed"], reverted["unpushed_content"]), (1, 0))
             self.assertIsNone(scan.git_state(str(Path(tmp) / "missing")))
 
         self.assertEqual(scan.github_slug("https://github.com/spin-dd/taihei-report.git"), "spin-dd/taihei-report")
@@ -2885,6 +2891,59 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_saved_verdicts_recount_agent_tabs_and_apply_removal_specs(self) -> None:
+        saved = self.dir / "scan.json"
+        names = ("finished", "blocked", "waiting", "needs-user")
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{name}", "repo": "app", "class": "stalled",
+             "terminals": [{"handle": "term_agent", "agent": "codex"}, {"handle": "term_shell", "agent": None}],
+             "closable": ["term_shell"] if name in ("finished", "needs-user") else ["term_agent", "term_shell"],
+             "meaningful_tabs": ["term_agent"] if name in ("finished", "needs-user") else [],
+             "verdict": {"class": "finished" if name == "needs-user" else name, "needs_user": name == "needs-user"}}
+            for name in names]))
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/finished -"])
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        self.assertEqual([(row["closable"], row["meaningful_tabs"]) for row in json.loads(out.getvalue())],
+                         [(["term_shell", "term_agent"], []), *([(["term_shell"], ["term_agent"])] * 3)])
+
+    def test_removal_views_name_protected_worktrees_and_respect_newer_approval(self) -> None:
+        saved, state, decisions, inbox = (self.dir / name for name in ("scan.json", "state.json", "decisions", "inbox"))
+        names = ("lead", "structured", "owner", "cleared", "ask", "request", "held")
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{name}", "repo": "app", "class": "finished", "meaningful_tabs": [],
+             "agents": [{"structured_host_owned": True}] if name == "structured" else [],
+             "terminals": [{"handle": "term_held"}] if name == "held" else []} for name in names]))
+        state.write_text(json.dumps({"lead": {"worktree": "/w/app/lead"},
+                                     "requests": {"req1": {"owner": "/w/app/request", "closed_at": None}}}))
+        write_jsonl(inbox, [{"kind": "ask", "id": "ask1", "repo": "app", "worktree": "ask"}])
+        write_jsonl(decisions, [{"id": str(index), "decision": f"{kind}:/w/app/{name}", "answer": text,
+                                 "decided_at": f"2026-11-19T10:0{index}:00Z"}
+                                for index, (kind, name, text) in enumerate((
+                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで残す"),
+                                    ("owner", "cleared", "残す"), ("remove", "cleared", "消してよい")))])
+        holds = [{"handle": "term_held", "environment": None, "created_at": 0.0, "released_at": None,
+                  "status": "active", "condition_kind": "time", "condition_value": "2026-11-20T10:00:00Z",
+                  "instruction": "follow-up:check1"}]
+        base = ["--from", str(saved), "--state-file", str(state), "--decisions-file", str(decisions), "--inbox", str(inbox)]
+        with patch.object(scan, "hold_rows", return_value=holds):
+            for view in ("--rm-specs", "--summary", "--cards"):
+                with self.subTest(view=view), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(scan.main([*base, view]), 0)
+                if view == "--rm-specs":
+                    self.assertEqual(out.getvalue(), "/w/app/cleared -\n")
+                else:
+                    self.assertIn("/w/app/cleared", out.getvalue())
+                    self.assertNotIn("/w/app/held", out.getvalue())
+                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで残す",
+                               "開いた ask ask1", "未解決の request req1", "保留中", "follow-up:check1"):
+                    self.assertIn(reason, err.getvalue())
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main([*base, "--rows", "--class", "blocked"]), 0)
+            self.assertIn("held", out.getvalue())
+
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",
@@ -2969,6 +3028,7 @@ class ScanCommandTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         # A host's real Jev key and verdict store must never reach a test run.
         for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": "",
+                                                "TRIAGE_HOLDS": str(self.dir / "no-holds.sqlite"),
                                                 "TRIAGE_REVIEW_DIR": str(self.dir / "reviews"),
                                                 "TRIAGE_ASK_ANSWERS": str(self.dir / "no-answers.jsonl")}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),

@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hourly_runtime
 import inbox_read
-from commitment_store import read_document, read_lines
+from commitment_store import hold_rows, read_document, read_lines
 import retro_ledger
 import rm_check
 from worktree_notes import keep_note
@@ -1851,7 +1851,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "linked_issue": w.get("linkedIssue"), "linked_items": w.get("linkedItems") or [],
             "status": w.get("workspaceStatus"),
             "unread": bool(w.get("unread")),
-            "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a)}
+            "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a),
+                        **({"structured_host_owned": True} if a.get("structuredHostOwned") else {})}
                        for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"),
                            "agent": "codex" if t.get("handle") in approval_tabs else t.get("agentIdentity"),
@@ -1985,10 +1986,7 @@ def remote_git_hint(row: dict) -> dict:
 
 
 def git_state(path: str) -> dict | None:
-    """Branch, uncommitted paths, commits not pushed to the upstream, and the GitHub repo.
-
-    None outside a git checkout; `unpushed` is None without an upstream.
-    """
+    """Branch, uncommitted paths, commits missing from all remote refs, and the GitHub repo."""
     def run(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
 
@@ -1996,16 +1994,19 @@ def git_state(path: str) -> dict | None:
         status = run("status", "--porcelain")
         if status.returncode != 0:
             return None
-        ahead = run("rev-list", "--count", "@{u}..HEAD")
+        ahead = run("rev-list", "--count", "HEAD", "--not", "--remotes")
         branch = run("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or None
         head, _, head_at = run("log", "-1", "--format=%H %cI").stdout.strip().partition(" ")
         origin = run("remote", "get-url", "origin").stdout.strip()
+        main_tree = run("rev-parse", "--verify", "origin/main^{tree}")
+        same_tree = main_tree.returncode == 0 and main_tree.stdout == run("rev-parse", "HEAD^{tree}").stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     return {
         "branch": branch, "head": head or None, "head_at": head_at or None,
         "dirty": len(status.stdout.splitlines()),
         "unpushed": int(ahead.stdout) if ahead.returncode == 0 else None,
+        **({"unpushed_content": 0} if same_tree else {}),
         "github": github_slug(origin),
     }
 
@@ -2364,11 +2365,7 @@ def merged_with_nothing_left(row: dict, pr: dict) -> bool:
 
 
 def open_pr_with_no_local_work(row: dict, pr: dict, git: dict) -> bool:
-    """No current agent or local work remains beyond the published PR head.
-
-    `git.unpushed` is relative to the branch's upstream, which can be the PR's
-    base. An exact PR head match proves this HEAD was pushed to the PR.
-    """
+    """An exact PR head match proves this HEAD was pushed to the PR."""
     return (not row.get("agents")
             and not any(term.get("agent") for term in row.get("terminals", []))
             and pr.get("state") == "OPEN" and pr.get("head_matches") is True
@@ -2797,10 +2794,10 @@ def row_identity(row: Mapping) -> str:
 
 def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
     """Undelivered promises addressed to this row, read again before closing its tabs."""
-    document = read_document(state_file)
-    if document is None:
-        return []
-    data = json.loads(document)
+    return undelivered_handoffs(row, json.loads(read_document(state_file) or "{}"))
+
+
+def undelivered_handoffs(row: dict, data: dict) -> list[dict]:
     names = handoff_names(row)
     return [item for item in data.get("handoffs", {}).values()
             if item.get("delivered_at") is None and item.get("to") in names]
@@ -2851,7 +2848,8 @@ def not_before_label(item: Mapping) -> str:
 
 
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
-                             now: datetime | None = None) -> list[dict]:
+                             now: datetime | None = None, *,
+                             open_asks: Sequence[inbox_read.OpenAsk] = ()) -> list[dict]:
     """Keep the tabs and checkout of rows that a block, an undelivered promise, or a removal answer holds.
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
@@ -2867,15 +2865,55 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
     decisions = lead_decisions.latest(records)
     recorded_ids = {record.id for record in records}
     now = now or datetime.now(timezone.utc)
+    state = json.loads(read_document(state_file) or "{}")
+    lead = (state.get("lead") or {}).get("worktree")
+    requests = [(key, request.get("owner")) for key, request in state.get("requests", {}).items()
+                if request.get("closed_at") is None]
+    stamp = now.timestamp()
+    active_holds = {(hold.get("environment") or None, hold["handle"]): hold
+                    for hold in hold_rows(inbox_read.holds_path())
+                    if hold["created_at"] <= stamp
+                    and (hold["status"] == "active" if hold["released_at"] is None else hold["released_at"] > stamp)}
     removal_candidates: list[tuple[dict, list[dict]]] = []
 
     def moment(at: str) -> datetime:
         return lead_decisions.moment(at) or EPOCH
 
     for row in rows:
+        names = handoff_names(row)
+        if not row.get("environment"):
+            names.add(f"local::{row['path']}")
+        tabs = {term["handle"] for term in row.get("terminals") or [] if term.get("handle")}
+        blockers = []
+        if lead == row_identity(row):
+            blockers.append("指揮の作業場")
+        if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
+            blockers.append("structured-agent-session の agent がいる作業場")
+        blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner in names)
+        blockers.extend(f"開いた ask {ask.report['id']}" for ask in open_asks
+                        if ask.report.get("handle") in tabs
+                        or (ask.report.get("worktree") == Path(row["path"]).name
+                            and (ask.report.get("repo") or "") in row_repos(row)))
+        if before_hold := row.pop("class_before_hold", None):
+            row["class"] = before_hold
+        row["reasons"] = [reason for reason in row.get("reasons", []) if not reason.startswith("保留中: ")]
+        holds = [active_holds[(row.get("environment"), tab)] for tab in sorted(tabs)
+                 if (row.get("environment"), tab) in active_holds]
+        if holds:
+            row.update(class_before_hold=row["class"], open_pr_cleanup=False)
+            row["class"] = "blocked"
+            row.pop("verdict", None)
+            row["meaningful_tabs"] = list(dict.fromkeys([*(row.get("meaningful_tabs") or []),
+                                                       *(row.get("closable") or [])]))
+            row["closable"] = []
+            for hold in holds:
+                reason = f"保留中: {hold['condition_kind']}:{hold['condition_value']} {hold.get('instruction') or ''}".rstrip()
+                blockers.append(reason)
+                row["reasons"].append(reason)
+        row["cleanup_blockers"] = blockers
         if blocker := row.get("automation_blocker"):
             row.update(closable=[], open_pr_cleanup=False)
-        promises = pending_handoffs(row, state_file)
+        promises = undelivered_handoffs(row, state)
         due = [item for item in promises if promise_due(item, now)]
         if promises:
             row.update(pending_handoffs=promises, closable=[], open_pr_cleanup=False)
@@ -2907,8 +2945,10 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                     **({"after": answer.removal.after, "discard": list(answer.removal.discard),
                         "compose_down": answer.removal.compose_down} if answer.removal else {}),
                 }
+        removal_at = EPOCH
         if by_key:
             latest_at = max(moment(answer["decided_at"]) for answer in by_key.values())
+            removal_at = latest_at
             candidates = [by_key[key] for key in sorted(by_key) if moment(by_key[key]["decided_at"]) == latest_at]
             later = [item for key, item in decisions.items() if any(key.startswith(base + "::") for base in keys)
                      and moment(item.decided_at) > latest_at]
@@ -2919,10 +2959,12 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             removal_candidates.append((row, candidates))
         elif removal := row.get("removal_decision"):
             removal_candidates.append((row, [removal]))
-        names = {row["path"], row_identity(row), row_name(row),
-                 f"{row.get('repo')}/{Path(row['path']).name}"}
-        if not row.get("environment"):
-            names.update((Path(row["path"]).name, f"local::{row['path']}"))
+            removal_at = moment(removal["decided_at"])
+        owner = max((answer for name in names if (answer := decisions.get(f"owner:{name}"))),
+                    key=lambda answer: moment(answer.decided_at), default=None)
+        if (owner and moment(owner.decided_at) >= removal_at
+                and re.search(r"残す|残し|残して|保持(?!しない)|保留|\b(?:keep|retain)\b", owner.answer, re.IGNORECASE)):
+            blockers.append(f"owner の決定 {owner.decided_at} {owner.answer}")
         wake_keys = {f"wake:{name}" for name in names}
         answered = [answer for key, answer in decisions.items()
                     if any(key == prefix or key.startswith(prefix + "::") for prefix in wake_keys)]
@@ -2987,6 +3029,8 @@ def removal_answer_approves(decision: Mapping) -> bool:
 
 
 def removal_blocker(row: dict) -> str | None:
+    if blockers := row.get("cleanup_blockers"):
+        return "。".join(blockers)
     if blocker := row.get("automation_blocker"):
         return blocker
     if row.get("pending_handoffs"):
@@ -3130,12 +3174,27 @@ def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dic
 def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
-        # A prompt on the tab's screen is the state now, whatever a reader saved before.
         interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
-        verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES
-                   and not row.get("prompt_waiting") and not interrupted
-                   else None)
-        return {**row, "verdict": verdict} if verdict else row
+        if row.get("prompt_waiting") or interrupted:
+            return {key: value for key, value in row.items() if key != "verdict"}
+        fresh = current_verdict(row, verdicts) if row["class"] in READ_CLASSES or row["class"] == "finished" else None
+        verdict = fresh or row.get("verdict") or {}
+        if fresh:
+            row = {**row, "verdict": fresh}
+        shown = verdict.get("class")
+        if shown not in ("finished", "blocked", "waiting"):
+            return row
+        agents = dict.fromkeys(tab["handle"] for tab in [*(row.get("terminals") or []), *(row.get("done_cards") or [])]
+                               if tab.get("agent") and tab.get("handle"))
+        if not agents:
+            return row
+        closable = [handle for handle in row.get("closable") or [] if handle not in agents]
+        meaningful = [handle for handle in row.get("meaningful_tabs") or [] if handle not in agents]
+        if shown == "finished" and not verdict.get("needs_user") and not row.get("stop"):
+            closable.extend(agents)
+        else:
+            meaningful.extend(agents)
+        return {**row, "closable": closable, "meaningful_tabs": meaningful}
     return [marked(row) for row in rows]
 
 
@@ -3501,6 +3560,8 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
             print("    " + rm_check_command(row, scan_file))
             print("    " + rm_check_command(row, scan_file, remove_ok=True))
     for row in rows:
+        if blockers := row.get("cleanup_blockers"):
+            print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
         if blocker := row.get("automation_blocker"):
             print(f"{row_name(row)}: {blocker}")
         if answer := row.get("removal_decision"):
@@ -3919,6 +3980,15 @@ def print_row(rows: list[dict], key: str, transcripts: bool = False, inbox: Path
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    def constrain(rows: list[dict]) -> list[dict]:
+        inbox, answers = Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()
+        try:
+            entries = inbox_read.inbox_entries(inbox)
+        except FileNotFoundError:
+            entries = []
+        asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers))
+        return with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(), open_asks=asks)
+
     if args.from_file:
         try:
             rows = saved_rows(args.from_file)
@@ -3932,8 +4002,7 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as error:
                 print(error, file=sys.stderr)
                 return 1
-        rows = with_cleanup_constraints(with_verdicts(rows, verdicts), args.state_file.expanduser(),
-                                        args.decisions_file.expanduser())
+        rows = constrain(with_verdicts(rows, verdicts))
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -3996,7 +4065,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.ps_json:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
-    rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser())
+    rows = constrain(rows)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)
@@ -4149,7 +4218,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
             if blocker := removal_blocker(row):
-                if not row.get("pending_handoffs") or row.get("automation_blocker"):
+                if not row.get("pending_handoffs") or row.get("automation_blocker") or row.get("cleanup_blockers"):
                     print(f"{row_name(row)}: {blocker} | {removal_facts(row)}", file=sys.stderr)
                 continue
             if removal_approved(row) or row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
@@ -4170,6 +4239,8 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
     elif args.cards:
         scan_file = Path(args.from_file).expanduser().absolute() if args.from_file else None
         for row in rows:
+            if blockers := row.get("cleanup_blockers"):
+                print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
             for line in card_lines(row, scan_file):
                 print(line)
     elif args.summary:
