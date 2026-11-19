@@ -33,6 +33,9 @@ from bash_timeout import LOAD_LIMIT
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes")
 LOAD_TIMEOUT_FACTOR = 2.5
 COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch")
+BACKLOG_ITEM = re.compile(r"^(?:通知\[[^\]]+\]|返信|返信不要|担当確認|判定済み) [A-Z][A-Z0-9_]+-\d+\b")
+BACKLOG_ELAPSED = re.compile(r" \| (?:\d+時間)?\d+分 \| ")
+ASANA_PARTIAL = re.compile(r"^Eotel へのレビュー依頼: 未取得", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -102,12 +105,23 @@ def earlier_reads(root: Path) -> list[tuple[Path, dict[str, dict]]]:
 def comparison_data(path: Path, name: str) -> dict[str, dict | str]:
     text = path.read_text(encoding="utf-8")
     if name == "backlog-watch":
-        return {line: line for line in text.splitlines() if re.search(r"\b[A-Z][A-Z0-9_]+-\d+\b", line)}
+        return {BACKLOG_ELAPSED.sub(" | ", line, count=1): line
+                for line in text.splitlines() if BACKLOG_ITEM.match(line)}
     data = json.loads(text)
     rows = data.get("gaps", []) if isinstance(data, dict) else data
     if name == "tracker-gaps":
         return {row["key"]: row for row in rows}
     return {str(row.get("url") or row.get("task")): row for row in rows}
+
+
+def has_partial_asana_output(directory: Path, record: dict) -> bool:
+    name = record.get("stdout")
+    if not name:
+        return False
+    try:
+        return bool(ASANA_PARTIAL.search((directory / Path(name).name).read_text(encoding="utf-8")))
+    except OSError:
+        return False
 
 
 def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]]]) -> None:
@@ -117,14 +131,23 @@ def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]
             continue
         field = "stdout" if name == "backlog-watch" else "result"
         path = Path(result[field])
-        current = comparison_data(path, name)
+        try:
+            if name == "asana99-status" and has_partial_asana_output(path.parent, result):
+                result["error"] = "比較できません。レビュー依頼の取得が完了していません"
+                continue
+            current = comparison_data(path, name)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            result["error"] = f"比較データ: {error}"
+            continue
         previous = {}
         for directory, records in history:
             record = records.get(name, {})
             if filename := record.get(field):
+                if name == "asana99-status" and has_partial_asana_output(directory, record):
+                    continue
                 try:
                     previous = comparison_data(directory / Path(filename).name, name)
-                except (OSError, ValueError, KeyError, TypeError):
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
                     continue
                 result["compared_to"] = str(directory)
                 break
@@ -132,7 +155,11 @@ def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]
         gone = sorted(previous.keys() - current.keys())
         if name == "tracker-gaps":
             log = Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or lead_decisions.DEFAULT_LOG).expanduser()
-            decisions = lead_decisions.latest(lead_decisions.records(log))
+            try:
+                decisions = lead_decisions.latest(lead_decisions.records(log))
+            except (OSError, ValueError) as error:
+                result["error"] = f"tracker の決定を確認できません（{error}）"
+                decisions = {}
             document = json.loads(path.read_text(encoding="utf-8"))
             document = document if isinstance(document, dict) else {"gaps": document}
             for key, row in current.items():
@@ -146,6 +173,8 @@ def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]
         changed = (sorted(key for key in current.keys() & previous.keys() if current[key] != previous[key])
                    if name == "asana99-status" else [])
         result["changes"] = {"new": new, "gone": gone, "changed": changed}
+        if name == "backlog-watch":
+            result["changes"].update(new=[current[key] for key in new], gone=[previous[key] for key in gone])
 
 
 def print_read(result: dict, now: datetime) -> None:

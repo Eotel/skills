@@ -8841,7 +8841,8 @@ class HourlyReadTests(unittest.TestCase):
             former = {"gaps": [{"key": "backlog:OLD-1", "missing": ["due date"]}]}
             (old / "tracker-gaps.json").write_text(json.dumps(former))
             (old / "asana99-status.json").write_text(json.dumps([{"url": "https://example.test/pr/1"}]))
-            (old / "backlog-watch.stdout").write_text("返信 OLD-1 Prior issue\n")
+            (old / "backlog-watch.stdout").write_text(
+                "返信 OLD-1 Prior issue\n返信 DEMO-7 Same issue | comment-42 | 5分 | -\n")
             old_results = [{"name": name, "exit_code": 0, "result": str(old / f"{name}.json"),
                             "stdout": str(old / f"{name}.stdout")}
                            for name in ("tracker-gaps", "asana99-status", "backlog-watch")]
@@ -8872,7 +8873,7 @@ class HourlyReadTests(unittest.TestCase):
                     result = [{"url": "https://example.test/pr/2"}]
                     Path(args[1]).write_text(json.dumps(result))
                 elif command == "backlog-watch":
-                    stdout.write("返信 NEW-1 New issue\n")
+                    stdout.write("返信 NEW-1 New issue\n返信 DEMO-7 Same issue | comment-42 | 1時間05分 | -\n")
                     return subprocess.CompletedProcess(args, 0)
                 else:
                     result = []
@@ -8893,6 +8894,8 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual(results["stale-asks"]["exit_code"], 0)
             for name in ("tracker-gaps", "asana99-status", "backlog-watch"):
                 self.assertEqual(results[name]["compared_to"], str(old.resolve()))
+            self.assertEqual(results["backlog-watch"]["changes"]["new"], ["返信 NEW-1 New issue"])
+            self.assertEqual(results["backlog-watch"]["changes"]["gone"], ["返信 OLD-1 Prior issue"])
             gaps = json.loads((current / "tracker-gaps.json").read_text())
             self.assertTrue(gaps["gaps"][0]["ignored"])
             self.assertTrue(gaps["new"][0]["ignored"])
@@ -8926,7 +8929,8 @@ class HourlyReadTests(unittest.TestCase):
                 if "--review-out" in args:
                     Path(args[args.index("--review-out") + 1]).write_text(json.dumps({"rows": [{"path": "/w/a"}]}))
                 return subprocess.CompletedProcess(args, 0)
-            with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()) as out:
+            with (patch("subprocess.run", side_effect=run), patch.object(os, "getloadavg", return_value=(1, 0, 0)),
+                  redirect_stdout(io.StringIO()) as out):
                 code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
             self.assertEqual(code, 1)
             [run_dir] = directory.iterdir()

@@ -282,8 +282,11 @@ workspace has no agent, goes to the lead.
 `new` and `gone` compare gap keys with the most recent successful tracker-gaps
 read under the same output root. A current `tracker:<key>` decision starting
 with `放置:` marks a gap `ignored` and preserves the decision text and time.
+Leave marked items with their recorded decision.
 Asana status and Backlog Watch compare with the most recent successful read of
-their own command in the same directory history.
+their own command in the same directory history. Backlog compares issue
+output without elapsed wait times. Asana skips comparisons when review
+requests were only partially retrieved.
 
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
