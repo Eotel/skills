@@ -4615,7 +4615,12 @@ class RmCheckTests(unittest.TestCase):
         tag_commit = git(tagged, "rev-parse", "--short=12", "HEAD")
         git(tagged, "tag", "keep-tag")
         git(tagged, "checkout", "-q", "-")
-        (changed / ".env").write_text("EXTRA=fixture")
+        (changed / ".git/info/exclude").write_text(".env\n")
+        (changed / "backend").mkdir()
+        (changed / "backend/.env").write_text("EXTRA=fixture")
+        modules = changed / ".git/modules/stored"
+        modules.mkdir(parents=True)
+        git(modules, "init", "-q", "--bare")
         (changed / "app.txt").write_text("dirty")
         (sandbox / "c-note").write_text("note")
         (sandbox / "d-note.local.json").write_text("a local setting")
@@ -4628,7 +4633,7 @@ class RmCheckTests(unittest.TestCase):
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
         for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
-                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: .env", tag_commit):
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています", tag_commit):
             self.assertIn(expected, reason)
         summary = held["clone"]["content_summary"]
         self.assertIn("c-note", summary)
@@ -4651,7 +4656,10 @@ class RmCheckTests(unittest.TestCase):
                 self.fail(f"used clone configuration to run {args[0]}")
             return tracked_status(cwd, *args, env=env)
 
-        with patch.object(rmcheck, "git", side_effect=git_without_external_programs):
+        empty = self.wt / "empty-git-config"
+        empty.write_text("")
+        with (patch.object(rmcheck, "git", side_effect=git_without_external_programs),
+              patch.dict(os.environ, {"GIT_CONFIG": str(empty)})):
             held = rmcheck.held_file(clone, "sandbox", False, None)
         self.assertEqual(held["kind"], "clone")
         self.assertIn("未確認", held["reason"])

@@ -504,24 +504,31 @@ def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> 
     """A setting, data, or unknown path that keeps the worktree, with why and what the lead decides; a .env
     names the keys its .env.example lacks, never their values."""
     where = "main と内容が違います" if in_main else "main にありません"
-    clones: set[Path] = set()
+    clones: dict[Path, Path] = {}
+    settings_by_clone: dict[Path, list[str]] = {}
     files: list[Path] = []
     if source.is_dir() and not source.is_symlink():
         for folder, children, names in os.walk(source):
             directory = Path(folder)
             if ".git" in children:
                 children.remove(".git")
-            if git_directories(directory):
-                clones.add(directory)
-            if not any(parent in clones for parent in (directory, *directory.parents)):
+            if (directories := git_directories(directory)) and directories[0] == directories[1]:
+                clones[directory] = directories[0]
+            clone = next((parent for parent in (directory, *directory.parents) if parent in clones), None)
+            if clone is None:
                 files.extend(directory / name for name in names)
                 files.extend(directory / name for name in children if (directory / name).is_symlink())
+            else:
+                settings_by_clone.setdefault(clone, []).extend(
+                    (directory / name).relative_to(clone).as_posix()
+                    for name in names if name.startswith(".env") and name != ".env.example")
     else:
         files.append(source)
     if clones:
         kind = "clone"
         reason = "。".join(
-            f"{PurePosixPath(rel) / clone.relative_to(source)}: {', '.join(held_clone_details(clone))}"
+            f"{PurePosixPath(rel) / clone.relative_to(source)}: "
+            f"{', '.join(held_clone_details(clone, clones[clone], settings_by_clone.get(clone, [])))}"
             for clone in sorted(clones))
         decision = "変更、未 push の commit、stash の保存先を確かめてください"
         if files:
@@ -554,7 +561,7 @@ def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> 
             "content_summary": content}
 
 
-def held_clone_details(clone: Path) -> list[str]:
+def held_clone_details(clone: Path, gitdir: Path, settings: list[str]) -> list[str]:
     local_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_CONFIG")}
     local_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_NO_LAZY_FETCH="1")
     branch = git(clone, "symbolic-ref", "--short", "-q", "HEAD", env=local_env).stdout.strip()
@@ -568,13 +575,16 @@ def held_clone_details(clone: Path) -> list[str]:
                      "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all", env=local_env)
         details.append("uncommitted changes or git status failed" if status.returncode or status.stdout.strip()
                        else "uncommitted changes: none")
-    if settings := sorted(name.name for name in clone.glob(".env*") if name.name != ".env.example"):
-        details.append("clone 内の設定: " + ", ".join(settings[:3]))
+    if settings:
+        details.append("clone 内の設定: " + ", ".join(sorted(settings)[:3]))
     index = git(clone, "ls-files", "--stage", "-z", env=local_env)
     submodules = [name for entry in index.stdout.split("\0") if entry.startswith("160000 ")
                   and (name := entry.partition("\t")[2]) and (clone / name / ".git").exists()]
     if submodules or index.returncode:
         details.append("submodule は未確認" + (": " + ", ".join(submodules[:3]) if submodules else ""))
+    modules = gitdir / "modules"
+    if modules.is_dir() and any(modules.iterdir()):
+        details.append("submodule のリポジトリが残っています")
     stash = git(clone, "rev-parse", "--verify", "--quiet", "refs/stash", env=local_env)
     details.append("stash remains" if stash.returncode == 0 else "stash: none" if stash.returncode == 1
                    else "stash: 未確認")
