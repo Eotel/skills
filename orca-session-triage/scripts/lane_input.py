@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -251,23 +252,42 @@ def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
 
 
 def export_candidates(inbox: Path, path: Path, orca: str, wanted: set[str]) -> dict[str, list[dict]]:
+    def scopes() -> dict[str, str]:
+        entries = inbox_read.inbox_entries(inbox) if inbox.is_file() else []
+        asks = [row for row in entries if row.get("kind") == "ask" and row.get("id")]
+        signatures = {}
+        for ask in asks:
+            if ask["id"] not in wanted:
+                continue
+            lane = (ask.get("host"), ask.get("handle"))
+            nearby = [row for row in asks if (row.get("host"), row.get("handle")) == lane]
+            ids = {row["id"] for row in nearby}
+            updates = [row for row in entries if any(isinstance(ref, str) and ref.partition(":")[0] in ids
+                                                      for ref in row.get("withdraws") or [])]
+            signatures[ask["id"]] = sha256(json.dumps([nearby, updates], sort_keys=True).encode()).hexdigest()
+        return signatures
+
     cache = path.resolve().with_name(path.name + ".lane-candidates.json")
     with retro.locked(cache.with_suffix(".lock")):
-        version = list(inbox_version(inbox) or ())
+        versions = scopes()
         detected = candidate_answers(inbox, path, orca, wanted)
-        if version != list(inbox_version(inbox) or ()):
+        if versions != scopes():
             return {}
         try:
             data = json.loads(cache.read_text(encoding="utf-8"))
         except FileNotFoundError:
             data = {}
-        saved: dict[str, list[dict]] = data.get("candidates", {}) if data.get("version") == version else {}
+        saved: dict[str, list[dict]] = data.get("candidates", {})
+        stored_versions: dict[str, str] = data.get("versions", {})
+        saved = {key: rows for key, rows in saved.items()
+                 if (ask := key.partition(":")[0]) not in wanted or stored_versions.get(ask) == versions.get(ask)}
         for answer_id, records in detected.items():
             combined = {(row["ts"], row["input"]): row for row in [*saved.get(answer_id, ()), *records]}
             saved[answer_id] = list(combined.values())
         if detected:
-            retro.atomic_text(cache, json.dumps({"version": version, "candidates": saved}, ensure_ascii=False) + "\n")
-        return {answer_id: records for answer_id, records in saved.items() if answer_id.partition(":")[0] in wanted}
+            retro.atomic_text(cache, json.dumps({"versions": stored_versions | versions, "candidates": saved},
+                                                ensure_ascii=False) + "\n")
+        return {answer_id: records for answer_id, records in saved.items() if answer_id.partition(":")[0] in versions}
 
 
 def inferred_answers(inbox: Path, path: Path, orca: str, wanted: set[str] | None = None) -> dict[str, dict]:

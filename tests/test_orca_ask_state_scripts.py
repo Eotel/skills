@@ -820,6 +820,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertEqual(json.loads(first_export.stdout)[f"{self.ASK}:1"][0]["note"], "A")
                 self.assertFalse(self.answers.read_text().strip())
                 transcript.write_text("")
+                self.write_lines(self.inbox, [ask, {"kind": "done", "id": "another-worktree-report",
+                                                    "worktree": "another-worktree", "ts": self.AT}])
                 repeat_export = self.run_tool("inbox_read.py", "lane-answers", self.ASK, "--candidates")
                 self.assertEqual(repeat_export.returncode, 0, repeat_export.stderr)
                 self.assertEqual(json.loads(repeat_export.stdout), json.loads(first_export.stdout))
@@ -923,6 +925,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertIn(key, settled)
                 self.assertIn(self.KEY, settled)
                 self.assertIn("待つ", json.dumps(settled, ensure_ascii=False))
+        reason = json.loads(self.hook().stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("回答「待つ」", reason)
+        self.assertNotIn("回答「公開する」", reason)
 
     def test_descriptive_handoff_key_keeps_its_numbered_question_scope(self) -> None:
         key = "publish-first"

@@ -609,11 +609,12 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     asks = {row["id"]: row for row in inbox_read.inbox_entries(inbox)
             if row.get("kind") == "ask" and row.get("id")} if bound else {}
     choices = lead_decisions.ask_answers(inbox_read.answers_path()) if asks else {}
+    questions = hourly_state.read(Path(hourly_state.DEFAULT_STATE).expanduser())["questions"].values() if asks else ()
     settled = []
     for key in keys:
         if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), bound.get(key)):
             settled.append(f"{key}: {answered[key].answer}")
-        elif key in bound and (ref := ask_state.handoff_ref(bound[key], key, list(asks.values()))) \
+        elif key in bound and (ref := ask_state.handoff_ref(bound[key], key, list(asks.values()), questions)) \
                 and lead_decisions.ask_answer_for_handoff(ref, choices, asks):
             settled.append(f"{key}: ask {bound[key]} の回答を記録済みです")
     if settled:

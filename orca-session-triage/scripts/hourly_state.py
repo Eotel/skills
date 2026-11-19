@@ -656,7 +656,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         pending = {key: item for key, item in state.get("questions", {}).items()
                    if not (refs := ask_state.references(item, known_asks))
                    or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
-                   or any(not ask_state.reference(cover, known_asks)
+                   or any(not (ask_state.reference(cover, known_asks)
+                               or ((ref := handoff_refs.get(cover)) and ask_state.covered(ref, closed_ids, known_asks)))
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
@@ -1858,9 +1859,16 @@ def main(argv: list[str] | None = None) -> int:
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
             latest_handoffs = {item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())}
+            presented_decisions = {key: items[-1] for key, items in decided.items()}
+            known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
+            evidence = lead_decisions.ask_answers(answers_log) if decided.keys() & latest_handoffs.keys() else {}
             for key in decided.keys() & latest_handoffs.keys():
                 if lead_decisions.decision_for_handoff(decided[key][-1].view(), latest_handoffs[key].ask_id) is None:
                     del decided[key]
+                    ref = ask_state.handoff_ref(latest_handoffs[key].ask_id, key, list(known.values()),
+                                                data["questions"].values())
+                    if not ref or not lead_decisions.ask_answer_for_handoff(ref, evidence, known):
+                        del presented_decisions[key]
             handed = [item for key, item in latest_handoffs.items() if key not in decided]
             since = handoff.last_sent_at(args.handoffs_dir.expanduser())
             rejected = [{**item, "worktree": worktree.name} for worktree in answer_evidence.asking_worktrees(args)
@@ -1874,7 +1882,7 @@ def main(argv: list[str] | None = None) -> int:
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
-                data, {key: items[-1] for key, items in decided.items() if items}, datetime.now(timezone.utc),
+                data, presented_decisions, datetime.now(timezone.utc),
                 entries)], key=lambda item: -item["age_minutes"])
             unseen: set[str] = set()
             if lead := appointed_lead(data):

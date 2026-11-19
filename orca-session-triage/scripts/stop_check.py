@@ -176,14 +176,17 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
                                  r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
-                                 r"|\d{1,2}:\d{2}|承認を得(?:てから|た後|る前)"
+                                 r"|\d{1,2}:\d{2}|\d{1,2}/\d{1,2}|承認を得(?:てから|た後|る前|た場合|なかった場合)"
+                                 r"|jst|utc|再起動|稼働を続け"
                                  r"|本番|検証環境|ステージング|(?<![a-z])(?:production|prod|staging|stg)(?![a-z])"
                                  r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
 ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
-ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![\w-])", re.I)
-BARE_ASK_CITATION = re.compile(r"(?<![\w-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?::[1-9]\d*)?(?![\w-])", re.I)
+ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![a-z0-9_-])", re.I)
+BARE_ASK_CITATION = re.compile(r"(?<![a-z0-9_-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"
+                               r"(?::[1-9]\d*)?(?![a-z0-9_-])", re.I)
 SAME_CONDITION = {"本日": "今日", "production": "本番", "prod": "本番",
                   "staging": "ステージング", "stg": "ステージング"}
+DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
 
 
 def question_conditions(value: str) -> list[str]:
@@ -198,7 +201,13 @@ def question_scope_agrees(original: dict, current: dict) -> bool:
     if annotations:
         text = text.removeprefix(annotations)
     text = BARE_ASK_CITATION.sub("", ASK_CITATION.sub("", text))
-    return question_conditions(original_text) == question_conditions(text) and all(
+    old_conditions, new_conditions = question_conditions(original_text), question_conditions(text)
+    described_targets = {term for option in current.get("options") or [] for term in question_conditions(
+        f"{option.get('label', '')} {option.get('description', '')}") if term in DEPLOYMENT_TARGETS}
+    old_targets = DEPLOYMENT_TARGETS.intersection(old_conditions)
+    if "この環境" in text and len(old_targets) == 1 and described_targets == old_targets:
+        old_conditions = [term for term in old_conditions if term not in old_targets]
+    return old_conditions == new_conditions and all(
         not current.get(key) or question_conditions(original.get(key) or "") == question_conditions(current[key])
         for key in ("context", "impact"))
 
@@ -380,12 +389,12 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             ask_id, numbers = ref
             ask = next(entry for entry in entries if entry.get("id") == ask_id)
             if ask_state.covered(ref, list(answers), entries):
-                part_ids = {f"{ask_id}:{number}" for number in numbers}
-                covered = [record for key, record in answers.items()
-                           if key == ask_id or key in part_ids or (not numbers and key.startswith(ask_id + ":"))]
+                parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
+                covered = inbox_read.answer_parts(ask_id, parts, answers)
                 facts = [f"{ask.get('worktree') or ask_id} の回答「{record['note']}」"
-                         if record.get("how") in inbox_read.LANE_ANSWERS and record.get("note")
+                         if record.get("how") in inbox_read.LANE_ANSWERS | {inbox_read.HOURLY_CORRECTION} and record.get("note")
                          else record.get("ts") or "時刻不明" for record in covered]
+                facts = list(dict.fromkeys(facts))
                 reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{'、'.join(facts)}）。"
                                "記録された回答を確認してください。")
             else:
