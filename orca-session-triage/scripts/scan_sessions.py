@@ -3937,7 +3937,8 @@ def row_line(view: dict) -> str:
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
-RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
+RM_CHECK_BATCH = Path(os.environ.get("ORCA_BRIEFS_BIN") or
+                      Path.home() / ".local/share/eotel-harness/current/bin") / "rm-check-batch"
 REMOTE_CHECK_RELEASE = "Remote checks require the same harness release on both Macs."
 
 
