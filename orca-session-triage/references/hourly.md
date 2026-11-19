@@ -459,9 +459,10 @@ until the lead observes that its recorded symptom is gone. Then:
   file stays after the review ends, so never wait for it to disappear. If the
   row has no command, confirm the PR's source before starting. The independent
   review is a draft; do not submit a GitHub review from this step. When
-  relaying findings, include the review status from the Asana sync. Before the
-  first human review or human comment in the PR conversation or diff, keep
-  「レビュー待ち」 after handling independent or bot findings. When the author has
+  relaying findings, include the review status from the Asana sync. Keep
+  「レビュー待ち」 until a person other than the PR author submits a review or posts
+  a comment in the PR conversation or diff. The author's replies, independent
+  or bot findings, and unsubmitted reviews leave that state in place. When the author has
   addressed all human findings and requested re-review, use 「指摘対応済み（未承認）」
   if the sync confirms it. For 「要確認」, read the review and comment bodies
   and check for outstanding findings before relaying the status.
