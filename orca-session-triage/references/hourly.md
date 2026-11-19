@@ -199,12 +199,18 @@ and writes `results.json` there; its last line prints that path and shape.
 `results.json` is a JSON array (not an object) with one record per command,
 each with the keys `name`, `command`, `exit_code`, `stdout` and `stderr` (paths
 of the command's output files), `result` (the path of its JSON result, or
-null) and `error` (or null). The `<name>: exit N` lines printed before it list
-the same exit codes. Read the files directly, including when the
-command ran in the background; terminal completion messages are not JSON.
-An error or timeout in one command leaves the other reads available. A failed
-scan skips stale-asks. Inspect every nonzero or skipped exit status before
-using the results. `--help` lists workspace, output, and timeout options.
+null), `error`, `retry`, `compared_to`, `changes`, and `read_at` (Unix seconds). Standard output lists
+the exit codes, one line per open ask, the stale-asks summary, and the read
+directories used for comparison. Both ask results retain their JSON files.
+At a one-minute load above 300, each command gets 2.5 times its normal timeout.
+A command that exits 124 at that load runs once more with that timeout.
+Backlog Watch keeps exit 124 when its notification cursor advanced or could
+not be checked. Its initial output remains available.
+The record retains the original and retry output and exit codes. A successful
+scan, including a successful retry, runs stale-asks. Inspect every nonzero or
+skipped exit status before using the results.
+If Claude Code moves the command to the background, wait for its final
+`results:` line before consuming the read.
 
 For an individual read, `inbox_read.py open-asks --out FILE`,
 `handoff.py lead-state --out FILE`, and `hourly_state.py stale-asks --from
@@ -276,6 +282,16 @@ it; `fix` is the command that fills it. The workspace fixes its own item,
 counting the user's own time as the shared rule says: never route a row to the
 user. A row whose `workspace` is null, or whose send fails because the
 workspace has no agent, goes to the lead.
+
+`new` and `gone` compare gap keys with the most recent successful tracker-gaps
+read under the same output root. A current `tracker:<key>` decision starting
+with `放置:` marks a gap `ignored` and preserves the decision text and time.
+Leave marked items with their recorded decision.
+Asana status and Backlog Watch compare with the most recent successful read of
+their own command in the same directory history, ordered by command read time.
+Backlog compares issue rows without elapsed wait times. New notifications
+remain in the command's output. Asana skips comparisons when review
+requests were only partially retrieved.
 
 When another tab has explicitly been appointed lead, read the open requests in
 the shared hourly state, then scan and review the rows. Run
