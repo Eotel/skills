@@ -107,6 +107,8 @@ board's done cards; close what the user approves.
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
+  Local `git.unpushed` counts commits absent from every remote-tracking ref.
+  `git.unpushed_content: 0` means HEAD has the same tree as `origin/main`.
   A tab whose output or screen shows a hook Claude Code could not run for a
   missing file (`hook error … No such file or directory`) puts it in the row's
   `hook_errors` (`host`, `path`, `tab`) and reasons, on any Mac. The screen
@@ -140,7 +142,12 @@ board's done cards; close what the user approves.
   instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
   `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
-  commands). `--rm-specs --row NAME` (repeatable) prints only the named rows,
+  commands). A saved `finished` verdict without `needs_user` makes its agent
+  tabs closable. Saved `blocked` and `waiting` verdicts keep their agent tabs.
+  Removal views report the appointed lead, structured sessions, a current
+  owner decision, open asks and requests, and active holds on stderr.
+  Active holds make the row `blocked` and name the release condition and
+  follow-up. `--rm-specs --row NAME` (repeatable) prints only the named rows,
   a finished one also while its tabs remain. An explicit removal approval in
   `removal_decision` also permits a check; retain or defer answers keep the row.
   An answer recorded with `--after pr-merged:<PR URL>` permits it once that PR

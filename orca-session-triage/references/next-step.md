@@ -17,11 +17,11 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 | Reason "final message says work continues, yet no agent runs" | read its screen: a helper, background job, or CI still running means it is working, so leave it; otherwise the lane continues or says where it stopped |
 | Reason 「裏の作業が止まっている」 | wake it now: send the lane one line naming the PID and command, saying the job has added no CPU time for an hour or lost its connection, and asking it to check and restart or end it; report it after |
 | Reason "final message waits on someone else" | blocker: name who it waits on, no question |
-| Reason "no agent session in this worktree" | 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」 Use `open_pr_cleanup: true` and `cleanup.md` without asking, unless the Orca comment contains 「消さない」 or 「残す」; `rm_check.py` then holds it until the lead answers `remove:<path>`. HEAD matching the PR head proves the push even if `git.unpushed` counts commits beyond the upstream base. On a remote row, check the same facts on its host. Otherwise report its PR state and ask before removal |
+| Reason "no agent session in this worktree" | 「agent がいなくて、手元の内容が PR と同じ（未 push・未変更が無い）作業場は、PR が Open でも聞かずに消す。」 Use `open_pr_cleanup: true` and `cleanup.md` without asking unless the Orca comment contains 「消さない」 or 「残す」. `rm_check.py` holds those rows until the lead answers `remove:<path>`. HEAD matching the PR head proves the push even when local remote-tracking refs are stale. On a remote row, check the same facts on its host. Otherwise report its PR state and ask before removal |
 | Reason "final message says done" | the work is done but not merged or closed: the rows below pick the step |
 | `git` is null | the checkout is missing or unreadable: look at the path first |
 | `pr.head_matches` is false | the PR found is not this checkout's HEAD (a reused branch name): confirm the PR before using its state |
-| `git.dirty` or `git.unpushed` above 0 | the lane commits and pushes, or discards; an exact match to the PR head already proves HEAD was pushed to that PR, even when the branch's upstream is behind |
+| `git.dirty` or `git.unpushed` above 0 | the lane commits and pushes, or discards. An exact PR head match already proves HEAD was pushed to that PR, even when local remote-tracking refs are stale. |
 | No PR, commits beyond the base | the lane opens a PR |
 | Open PR with `pr.reply_after_last_commit` true | the lane reads the new human review, PR comment, or line comment and responds; `waits_on: self` names the next actor |
 | `pr.review` is `APPROVED` and checks pass | merge |
