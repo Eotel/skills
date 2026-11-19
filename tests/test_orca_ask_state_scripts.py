@@ -526,6 +526,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual(pending.returncode, 0, pending.stderr)
         self.assertEqual(json.loads(pending.stdout)[0]["ask"]["question_numbers"], [2])
         self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT,
+                                        "how": "inbox_read.py answered", "note": "確認済み"},
+                                       {"id": f"{self.ASK}:1", "ts": self.AT,
                                         "how": "triage-notify --withdraws", "note": "第一問を取り下げます"},
                                        {"id": f"{self.ASK}:2", "ts": self.AT,
                                         "how": "triage-notify --answered", "note": "本社"}])
@@ -538,6 +540,15 @@ assert writer is not None and writer.wait(timeout=10) == 0
                                 "--handed-off-file", str(self.handed), "--state-file", str(self.state))
         self.assertEqual(handoff.returncode, 0, handoff.stderr)
         self.assertEqual({row["decision"] for row in json.loads(handoff.stdout)["settled"]}, {self.KEY, f"{self.KEY}:1"})
+        new = {**ask, "id": "c1234567-1234-4567-8888-123456789abc", "ts": "2026-11-14T09:02:00+00:00"}
+        with self.inbox.open("a") as stream:
+            stream.write(json.dumps(new) + "\n")
+        with self.handed.open("a") as stream:
+            stream.write(json.dumps({"decision": self.KEY, "ask_id": new["id"], "handed_off_at": new["ts"]}) + "\n")
+        reopened = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                  "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+        self.assertEqual(reopened.returncode, 0, reopened.stderr)
+        self.assertEqual([row["decision"] for row in json.loads(reopened.stdout)["unanswered"]], [self.KEY])
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
@@ -922,6 +933,26 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.state.write_text(json.dumps(state))
         self.question = {**self.question, "question": "次の公開を進めますか？", "header": "次の公開"}
         self.assertEqual(self.hook().stdout, "")
+
+    def test_guard_rejects_a_paraphrase_but_allows_a_changed_deployment_target(self) -> None:
+        question = {**self.question, "context": "比較 https://example.test/options"}
+        answer = {"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript"}
+        prefix = "PR と CI を確認してから担当の端末でデプロイ条件を確認し、"
+        for old, current, blocked in (
+                ({"label": "A: 設定を追加", "description": "既存の管理画面の配置を維持し、音声入力の設定だけを追加します。"},
+                 {"label": "A: 設定を追加", "description": "管理画面の配置はそのままで、音声入力の設定のみを追加します。"}, True),
+                ({"label": "A", "description": prefix + "staging にデプロイする"},
+                 {"label": "A: デプロイ", "description": prefix + "production にデプロイする"}, False),
+        ):
+            with self.subTest(label=old["label"]):
+                pause = {"label": "B", "description": "保留する"}
+                self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "worktree": "worker",
+                                               "questions": [{**question, "options": [old, pause]}]}])
+                self.write_lines(self.answers, [{**answer, "note": old["label"]}])
+                self.question = {**question, "question": "このまま進めますか？", "options": [current, pause]}
+                guarded = self.hook()
+                self.assertEqual(guarded.returncode, 0, guarded.stderr)
+                self.assertEqual("worker の回答" in guarded.stdout, blocked)
 
     def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
         self.ask(key="remove:/w/old", covers=[])

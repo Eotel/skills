@@ -463,10 +463,16 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 def ask_answers(path: Path) -> dict[str, dict]:
     """A handoff's current answer and the last delivery when its wording differs."""
-    delivered = {record["id"]: record for record in inbox_read.answer_entries(path)
-                 if record.get("how") in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS}
+    current = inbox_read.answer_records(path)
+    delivered = {}
+    for record in inbox_read.answer_entries(path):
+        key, how = record["id"], record.get("how")
+        if how in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
+            delivered[key] = record
+        if how == "triage-notify --withdraws" and current.get(key, {}).get("how") not in inbox_read.SUBSTANTIVE_ANSWERS:
+            current[key] = record
     return {key: {**answer, "delivery": delivered[key]} if key in delivered and answer != delivered[key] else answer
-            for key, answer in inbox_read.answer_records(path).items()}
+            for key, answer in current.items()}
 
 
 def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
@@ -532,9 +538,9 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         item = history[key][-1] if key in history else None
         answer = answered[key].view() if key in answered else None
         if answer is None:
-            bindings = [entry.ask_id for entry in reversed(history.get(key, [])) if entry.ask_id]
-            bindings.extend(question["record"]["ask_id"] for question in active
-                            if key == question["record"].get("decision") and question["record"].get("ask_id"))
+            latest_id = next((entry.ask_id for entry in reversed(history.get(key, [])) if entry.ask_id), None)
+            bindings = [latest_id] if latest_id else [question["record"]["ask_id"] for question in active
+                        if key == question["record"].get("decision") and question["record"].get("ask_id")]
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
                                       if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
             for ask, numbers in refs:
