@@ -472,18 +472,22 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     """The answer covering an ask as open-asks reads it: a record for `<id>` (for `<id>:<n>`, also one for the whole
     ask), or one for every question of a structured ask."""
     whole_id, _, number = ask_id.partition(":")
+    whole = answers.get(whole_id)
+    delivery = (whole.get("delivery") or whole) if whole else None
+    if delivery and delivery.get("how") not in inbox_read.DELIVERY_ANSWERS:
+        delivery = None
     if number:
         if not number.isdecimal():
             return None
-        return next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
-    whole = answers.get(whole_id)
+        part = next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
+        return {**part, "delivery": delivery} if part and delivery and not genuine_answer(part) else part
     numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
     parts = inbox_read.answer_parts(whole_id, numbers, answers)
     if not parts or numbers and len(parts) != len(numbers):
         return None
     if not numbers or all(part is whole for part in parts):
         return whole
-    return {"id": ask_id, "answers": parts, **({"delivery": whole["delivery"]} if whole and whole.get("delivery") else {})}
+    return {"id": ask_id, "answers": parts, **({"delivery": delivery} if delivery else {})}
 
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
@@ -539,9 +543,10 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
 
 def genuine_answer(answer: dict) -> bool:
     """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
+    if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS:
+        return True
     parts = answer.get("answers")
-    return (all(genuine_answer(part) for part in parts) if isinstance(parts, list)
-            else (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS)
+    return isinstance(parts, list) and bool(parts) and all(genuine_answer(part) for part in parts)
 
 
 @dataclass(frozen=True)

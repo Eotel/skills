@@ -89,6 +89,9 @@ class AskStateTests(unittest.TestCase):
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
         self.ask()
         first = self.ask(key=f"{self.KEY}:1", covers=[f"{self.KEY}:1"])
+        leaf = self.ASK + ":1"
+        self.write_lines(self.handed, [{"decision": "publish:whole", "ask_id": self.ASK, "handed_off_at": self.AT},
+                                      {"decision": "publish:first", "ask_id": leaf, "handed_off_at": self.AT}])
         self.relay("両方公開する", self.AT)
         corrected = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
             {"id": first["id"], "answer": "第一案は中止", "replace_reason": "本人が訂正した", "answered_at": self.AT}))
@@ -107,6 +110,15 @@ class AskStateTests(unittest.TestCase):
         self.assertIn("第一案は中止", scanned["note"])
         self.assertEqual(handoff["answers"][0]["note"], "第一案は中止")
         self.assertEqual(delivered[self.ASK]["note"], "両方公開する")
+        pending = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        result = json.loads(pending.stdout)
+        self.assertEqual(result["unanswered"], [])
+        by_key = {item["decision"]: item["answer"] for item in result["settled"]}
+        self.assertEqual(by_key["publish:whole"]["delivery"]["note"], "両方公開する")
+        self.assertEqual(by_key["publish:first"]["note"], "第一案は中止")
+        self.assertEqual(by_key["publish:first"]["delivery"]["id"], self.ASK)
 
     def test_same_second_part_and_whole_corrections_follow_append_order(self) -> None:
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
