@@ -2802,6 +2802,38 @@ class ScanCommandTests(unittest.TestCase):
         self.assertNotIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
         self.assertNotIn("rm-check-batch", out.getvalue())
 
+    def test_remote_cleanup_hides_commands_for_keep_and_pending_handoff(self) -> None:
+        saved = self.dir / "scan.json"
+        base = {"path": "/w/app/remote", "repo": "app", "class": "finished", "terminals": [],
+                "environment": "mbp16", "open_pr_cleanup": True}
+        for absent in (
+            {"removal_decision": {"answer": "残す", "decided_at": "2026-11-19T10:00:00+09:00"}},
+            {"pending_handoffs": [{"after": "2026-11-19T16:00:00+09:00"}]},
+        ):
+            row = {**base, **absent}
+            with self.subTest(absent=absent), redirect_stdout(io.StringIO()) as out:
+                scan.print_summary([row], {}, scan_file=saved)
+            for display in (out.getvalue(), "\n".join(scan.card_lines(row, saved))):
+                self.assertNotIn(scan.REMOTE_CHECK_RELEASE, display)
+                self.assertNotIn("rm-check-batch", display)
+
+    def test_old_batch_rm_specs_omit_unsupported_paths_from_stdout_and_command(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([
+            {"path": "/w/app/standard", "repo": "app", "class": "finished"},
+            {"path": "/w/app/with two spaces", "repo": "app", "class": "finished"},
+        ]))
+        opts = ["--from", str(saved), "--rm-specs"]
+        for selected in ([], ["--row=standard", "--row=with two spaces"]):
+            with (self.subTest(selected=selected), patch.object(scan, "batch_has_preview", return_value=False),
+                  redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+                self.assertEqual(scan.main([*opts, *selected]), int(bool(selected)))
+            self.assertEqual(out.getvalue().splitlines(), ["/w/app/standard -"])
+            warning, command = err.getvalue().splitlines()
+            self.assertIn("require the harness release with --preview", warning)
+            self.assertNotIn("with two spaces", command)
+            self.assertEqual(shlex.split(command)[-1], "/w/app/standard -")
+
     def test_the_existing_harness_can_check_local_and_remote_paths_it_accepts(self) -> None:
         saved = self.dir / "scan.json"
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
