@@ -523,11 +523,13 @@ assert writer is not None and writer.wait(timeout=10) == 0
         rows = [{"path": f"/w/{report['worktree']}", "repo": "", "class": "waiting",
                  "claude": {"final_text": report["text"], "final_at": report["ts"]}} for report in (original, new)]
         scan.write_text(json.dumps(rows))
+        registrations = []
         for report in (original, new):
             registered = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
                                        stdin=json.dumps({"ask": report["id"], "decision": key, "question": report["text"],
                                                          "asked_at": self.AT}))
             self.assertEqual(registered.returncode, 0, registered.stderr)
+            registrations.append(json.loads(registered.stdout)[0]["id"])
         old_answer = {"id": self.ASK, "ts": self.AT, "how": "triage-notify --answered", "note": "待つ"}
         self.write_lines(self.answers, [old_answer])
         handoff = {"decision": key, "handed_off_at": self.AT}
@@ -537,6 +539,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual(pending.returncode, 0, pending.stderr)
         self.assertEqual([item["decision"] for item in json.loads(pending.stdout)["unanswered"]], [key])
 
+        recorded = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": registrations[0], "answer": "待つ", "answered_at": self.AT}))
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
         self.write_lines(self.handed, [handoff, {**handoff, "ask_id": new["id"]}])
         scan.write_text(json.dumps(rows[:1]))
         stale = ("hourly_state.py", "stale-asks", "--from", str(scan), "--verdicts", str(self.root / "no-verdicts"))

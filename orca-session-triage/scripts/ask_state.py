@@ -63,26 +63,31 @@ def registered_ask_id(question: dict, key: str) -> str | None:
     return None
 
 
-def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
-    registered = question.get("ask_id")
-    if (named := ASK_KEY.fullmatch(key)) and (not registered or question.get("decision") != key):
-        named_id, part = named.groups()
-        if not registered or not same_bound_ask(question, named_id):
-            registered = f"{named_id}:{part}" if part else named_id
-        elif part and ":" not in registered:
-            registered = f"{named_id}:{part}"
-    if not ask_id or not registered:
-        return True
-    new, _, new_part = ask_id.partition(":")
-    old, _, old_part = registered.partition(":")
+def matching_ref(target: str, source: str) -> bool:
+    new, _, new_part = target.partition(":")
+    old, _, old_part = source.partition(":")
     same = inbox_read.names(new, old) or inbox_read.names(old, new)
     return same and (not new_part or not old_part or bool(set(new_part.split("+")) & set(old_part.split("+"))))
 
 
-def handoff_target(key: str, ask_id: str | None, entries: list[dict], questions: Iterable[dict], *,
-                   registered: Iterable[dict]) -> tuple[str, frozenset[int]] | None:
+def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
+    if not ask_id:
+        return True
+    registered = question.get("ask_id")
+    named = ASK_KEY.fullmatch(key)
+    if not named:
+        return not registered or matching_ref(ask_id, registered)
+    named_id, part = named.groups()
+    named_ref = f"{named_id}:{part}" if part else named_id
+    if not registered or part and ":" not in registered and matching_ref(registered, named_id):
+        return matching_ref(ask_id, named_ref)
+    return matching_ref(ask_id, registered) or (question.get("decision") != key and matching_ref(ask_id, named_ref))
+
+
+def handoff_target(key: str, ask_id: str | None, entries: list[dict],
+                   questions: Iterable[dict]) -> tuple[str, frozenset[int]] | None:
     named = reference(key, entries)
-    bindings = {ask_id} if ask_id else {source for question in registered
+    bindings = {ask_id} if ask_id else {source for question in questions if not question.get("withdrawn_at")
                                         if (source := registered_ask_id(question, key))
                                         and (not named or same_bound_ask(question, named[0]))}
     refs = {handoff_ref(source, key, entries, questions) for source in (bindings or {None})}

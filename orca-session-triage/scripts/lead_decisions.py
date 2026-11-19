@@ -529,8 +529,8 @@ def ask_answer_for_handoff(ref: tuple[str, frozenset[int]], answers: Mapping[str
 
 
 def bound_handoff_answer(key: str, ask_id: str | None, answers: Mapping[str, dict], asks: Mapping[str, dict],
-                         questions: Iterable[dict], *, registered: Iterable[dict]) -> dict | None:
-    if ref := ask_state.handoff_target(key, ask_id, list(asks.values()), questions, registered=registered):
+                         questions: Iterable[dict]) -> dict | None:
+    if ref := ask_state.handoff_target(key, ask_id, list(asks.values()), questions):
         return ask_answer_for_handoff(ref, answers, asks)
     return ask_answer(ask_id, answers, asks) if ask_id else None
 
@@ -555,11 +555,10 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     for key in keys:
         item = history[key][-1] if key in history else None
         latest_id = bound_asks.get(key)
-        decision = decision_for_handoff(answered[key].view() if key in answered else None, latest_id)
+        decision = decision_for_handoff(answered[key].view() if key in answered else None, item is not None)
         answer = decision
         if answer is None:
-            answer = bound_handoff_answer(key, latest_id, answers, asks, questions,
-                                          registered=(question["record"] for question in active))
+            answer = bound_handoff_answer(key, latest_id, answers, asks, questions)
         delivered = answer is not None and (answer is decision or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})
@@ -593,8 +592,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     return {"unanswered": unanswered, "settled": settled}
 
 
-def decision_for_handoff(answer: dict | None, ask_id: str | None) -> dict | None:
-    return None if answer and answer.get("from_ask") and ask_id else answer
+def decision_for_handoff(answer: dict | None, handed_off: bool) -> dict | None:
+    return None if answer and answer.get("from_ask") and handed_off else answer
 
 
 def genuine_answer(answer: dict) -> bool:
@@ -693,7 +692,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
         "unanswered", help="print unanswered keys with hand-off history and PR facts, and settled keys with answers; "
                            "without --decision, include every handed-off key")
     unanswered.add_argument("--decision", action="append", help="repeat once per question")
-    unanswered.add_argument("--state-file", type=Path, default=Path("~/.cache/orca-session-triage/hourly-state.json"),
+    unanswered.add_argument("--state-file", type=Path, default=Path(handoff.hourly_state.DEFAULT_STATE),
                             help="hourly questions being asked, with workspace and time")
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")

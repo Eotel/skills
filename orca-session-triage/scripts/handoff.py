@@ -612,7 +612,7 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     questions = hourly_state.read(args.state_file.expanduser())["questions"].values() if asks else ()
     settled = []
     for key in keys:
-        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), bound.get(key)):
+        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), key in bound):
             settled.append(f"{key}: {answered[key].answer}")
         elif key in bound and (ref := ask_state.handoff_ref(bound[key], key, list(asks.values()), questions)) \
                 and lead_decisions.ask_answer_for_handoff(ref, choices, asks):

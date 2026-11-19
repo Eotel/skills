@@ -648,9 +648,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
     closed_ids = [*answered_ids, *withdrawn]
     questions = state.get("questions", {}).values()
-    registered = [item["record"] for item in ask_state.active(state, latest_decisions)]
-    handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions,
-                                                          registered=registered) for item in handed}
+    handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions)
+                    for item in handed}
     bound_asks = {item.decision: item.ask_id for item in handed if item.ask_id}
     handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
                          for item in handed}
@@ -822,19 +821,25 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                               "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
     listed = {key for _, item in found for key in item.get("decisions", [])}
+    registered = [question for question in questions if not question.get("withdrawn_at")]
     for item in handed:
         key, target = item.decision, item.ask_id
-        if not target or key in listed or not any(
-            key in (question.get("decision"), *(question.get("covers") or []))
-            and not ask_state.same_bound_ask(question, target, key) for question in registered
-        ):
+        ref = handoff_refs[key]
+        if key in listed:
             continue
-        ask = ask_entries.get((handoff_refs[key] or (target.partition(":")[0], ()))[0])
+        if target and not any(key in (question.get("decision"), *(question.get("covers") or []))
+                              for question in registered):
+            continue
+        if not target and not any(ask_state.registered_ask_id(question, key) for question in registered):
+            continue
+        ask = ask_entries.get(ref[0] if ref else (target or "").partition(":")[0])
+        parts = sorted(ref[1]) if ref else []
         since = scan_sessions.parse_time(item.handed_off_at) or now
-        found.append((since, {"row": None, "name": (ask or {}).get("worktree") or target,
+        found.append((since, {"row": None, "name": (ask or {}).get("worktree") or target or key,
                               "state": "unanswered", "since": item.handed_off_at, "decisions": [key],
                               "question": excerpt((ask or {}).get("text") or key),
-                              "ask": report_view(ask) if ask else None, "answer": None}))
+                              "ask": {**report_view(ask), "question_numbers": parts} if ask else None,
+                              "answer": None}))
     for item in rejected or []:
         asked = "\n".join(str(question.get("question") or "") for question in item["questions"]
                           if isinstance(question, dict))
@@ -1894,7 +1899,7 @@ def main(argv: list[str] | None = None) -> int:
                     item = lead_decisions.HandOff(item.decision, item.handed_off_at, earlier.ask_id)
                 latest_handoffs[item.decision] = item
             for key in decided.keys() & latest_handoffs.keys():
-                if lead_decisions.decision_for_handoff(decided[key][-1].view(), latest_handoffs[key].ask_id) is None:
+                if lead_decisions.decision_for_handoff(decided[key][-1].view(), True) is None:
                     del decided[key]
             known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
             evidence = lead_decisions.ask_answers(answers_log) if data["presented"] else {}
