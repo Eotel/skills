@@ -872,32 +872,37 @@ def note_from_undo(item: dict[str, Any], token: dict[str, Any] | None) -> str:
     return line[2:-len(suffix)] if line.startswith("- ") and line.endswith(suffix) else item["proposal"]
 
 
-def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_id: str | None) -> tuple[str, dict[str, Any]] | None:
+def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_id: str | None,
+                     applications: dict[str, str]) -> tuple[str, dict[str, Any], str] | None:
     reverted = {run["decision_id"] for run in item.get("executions", []) if run["outcome"] == "reverted"}
+    last_decision = item["decisions"][-1]["id"] if item["decisions"] else None
     adoption_id = None
     for decision in item["decisions"]:
         if decision["decision"] == "adopt":
             adoption_id = decision["id"]
         elif decision["decision"] == "revoke" and adoption_id is not None and decision["id"] not in reverted:
             action_key = f"{item['proposal_id']}:revoked:{decision['ts']}"
+            if attempts.get(action_key, 0) >= 3 and adoption_id in applications and decision["id"] != last_decision:
+                action_key = f"{action_key}:{last_decision}"
             if attempts.get(action_key, 0) < 3 or checkpoint_id == adoption_id:
-                return adoption_id, decision
+                return adoption_id, decision, action_key
     return None
 
 
 def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
-                        rewrites: dict[str, str], recorded_id: str | None) -> str | None:
+                        rewrites: dict[str, str], recorded: dict[str, str] | None,
+                        applications: dict[str, str]) -> str | None:
     if checkpoint is None:
         return None
-    if recorded_id is not None:
-        return recorded_id
+    if recorded and recorded["line_hash"] == hashlib.sha256(checkpoint["line"].encode()).hexdigest():
+        return recorded["decision_id"]
     proposal_id = item["proposal_id"]
     adoptions = [entry["id"] for entry in item["decisions"] if entry["decision"] == "adopt"]
     for decision_id in reversed(adoptions):
         if (note := rewrites.get(decision_id)) and note_line({"id": proposal_id, "note": note}) == checkpoint["line"]:
             return decision_id
-    if pending := pending_reversal(item, {}, None):
-        return pending[0]
+        if decision_id in applications and json.loads(applications[decision_id]) == checkpoint:
+            return decision_id
     return adoptions[-1] if adoptions else None
 
 
@@ -919,15 +924,16 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                         if run["outcome"] == "applied" and run.get("undo") and run.get("actor") == "triage-retro"}
         decision_ids = [entry["id"] for entry in item["decisions"]]
         checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"],
-                                             data["applied_action_ids"].get(proposal_id))
-        reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id)
+                                             data["applied_action_ids"].get(proposal_id), applications)
+        reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id, applications)
                     if category not in SEPARATE_WORK else None)
         if reversal is not None:
-            adoption_id, decision = reversal
+            adoption_id, decision, action_key = reversal
             status = "revoked"
         elif status == "adopted":
             decision = item["decisions"][-1]
             adoption_id = decision["id"]
+            action_key = f"{proposal_id}:{status}:{decision['ts']}"
         else:
             continue
         decision_id = decision["id"]
@@ -944,7 +950,6 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         if status == "adopted" and (item.get("retires") or item.get("confirms")) and not item.get("merges"):
             # Adopting a retirement or a confirmation closes or settles other proposals; no note or lane is left.
             continue
-        action_key = f"{proposal_id}:{status}:{decision['ts']}"
         if category in SEPARATE_WORK:
             # A lane makes the tool fix or the upstream report; the board or the deciding person tells the lead.
             if status == "adopted" and not any(execution.get("outcome") == "handed_off"
@@ -1004,7 +1009,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                         data["revoked_notes"].remove(f"{MARKER}{proposal_id} -->")
                     remember_versions(data, router, path)
                 data["applied_actions"][proposal_id] = expected
-                data["applied_action_ids"][proposal_id] = decision_id
+                data["applied_action_ids"][proposal_id] = {"decision_id": decision_id,
+                                                           "line_hash": hashlib.sha256(line.encode()).hexdigest()}
                 writing_completed = True
                 if state is not None:
                     save(data, state)
