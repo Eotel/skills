@@ -712,14 +712,17 @@ def failure(row: dict) -> tuple[str, str | None, str | None] | None:
     claude_tabs = [term["handle"] for term in row.get("terminals", [])
                    if term.get("agent") == "claude" and term.get("handle")]
     claude_tab = claude_tabs[0] if approval_tabs and len(claude_tabs) == 1 else None
-    codex = row["codex"][-1] if row["codex"] else {}
+    rollouts = row["codex"]
+    codex_failures = (sorted((item for item in rollouts if item.get("api_error")),
+                             key=lambda item: parse_time(item.get("api_error_at")) or EPOCH, reverse=True)
+                      if approval_tabs else rollouts[-1:])
     message = row.get("orca_message") or {}
     orca = " ".join((message.get("text") or "").split())
     screen_tab = row.get("codex_screen_error_tab")
     found = [*row.get("pane_errors", []),
              (row.get("codex_screen_error") if not running or approval_tabs and screen_tab else None,
               "codex", screen_tab, None),
-             (codex.get("api_error"), "codex", None, codex.get("api_error_at")),
+             *((item.get("api_error"), "codex", None, item.get("api_error_at")) for item in codex_failures),
              ((row["claude"] or {}).get("api_error"), "claude", claude_tab, None),
              (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None,
               message.get("agent"), message.get("tab"), message.get("at"))]
@@ -1756,6 +1759,10 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         waiting = prompts[0] if prompts else None
         codex_approvals = [prompt for prompt, _ in prompts if prompt["question"] in (CODEX_PERMISSION, CODEX_APPROVAL)]
         approval_tabs = {prompt["tab"] for prompt in codex_approvals}
+        approval_observed = min((observed_at for tab in approval_tabs
+                                 if (screen := screens.get((w.get("_environment"), tab)))
+                                 and isinstance(observed_at := screen.get("_observed_at"), str)),
+                                default=datetime.fromtimestamp(now, timezone.utc).isoformat())
         pane_handles = {key: term["handle"] for term in terms
                         if term.get("handle") and (key := hourly_runtime.pane_key(term))}
         screen_error = next(((error, term.get("handle")) for term in terms if term.get("agentIdentity") == "codex"
@@ -1787,7 +1794,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
             **({"codex_approvals": codex_approvals,
-                "approval_observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
+                "approval_observed_at": approval_observed}
                if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
@@ -1870,6 +1877,8 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
         if binary is None:
             continue
         options = args[binary + 1:]
+        if "--" in options:
+            options = options[:options.index("--")]
         if not options or options[0] not in ("app-server", "exec", "e", "exec-server", "review"):
             codex_processes[pid] = options
     for pid, handle in rm_check.process_handles(sorted(codex_processes)).items():
@@ -3155,7 +3164,8 @@ def read_screens(orca: str, terms: list[dict]) -> Screens:
         where = ["--environment", term["_environment"]] if term.get("_environment") else []
         try:
             result = orca_payload(orca, ["terminal", "read", "--terminal", term["handle"], "--screen", *where])
-            return result.get("terminal") or result
+            screen = result.get("terminal") or result
+            return {**screen, "_observed_at": datetime.now(timezone.utc).isoformat()} if isinstance(screen, dict) else None
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
             return None
 

@@ -906,7 +906,7 @@ class ClassifyTests(unittest.TestCase):
                                                        "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
         self.assertIn("Codex process 13 shows no approvals bypass flag in its process command", rows[0]["reasons"])
         self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
-                         [f"Codex process {pid} shows no approvals bypass flag in its process command" for pid in (13, 18)])
+                         [f"Codex process {pid} shows no approvals bypass flag in its process command" for pid in (13, 17, 18, 21)])
         self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
             *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
 
@@ -2952,14 +2952,16 @@ class ScanCommandTests(unittest.TestCase):
         tree = worktree(lane, "working", agent="codex")
         pending = terminal(lane, "codex", "term_pending")
         other = terminal(lane, "codex", "term_other")
-        screen = {"source": "screen", "tail": [scan.CODEX_PERMISSION, "$ git status",
+        screen = {"source": "screen", "_observed_at": datetime.fromtimestamp(NOW, timezone.utc).isoformat(),
+                  "tail": [scan.CODEX_PERMISSION, "$ git status",
                                                 "› 1. Yes", "2. No", "Press f6 to confirm"]}
         screens = {(None, pending["handle"]): screen}
         failure = {"pending_requests": [], "api_error": "stream disconnected before completion"}
         for offset, action in ((-60, None), (60, "wake")):
             rollout = {**failure, "api_error_at": datetime.fromtimestamp(NOW + offset, timezone.utc).isoformat()}
-            row, = scan.build_inventory([tree], [pending, other], self.dir, {lane: [rollout]}, "要判断",
-                                        now=NOW, screens=screens)
+            row, = scan.build_inventory([tree], [pending, other], self.dir,
+                                        {lane: [rollout, {"pending_requests": []}]}, "要判断",
+                                        now=NOW + 120, screens=screens)
             self.assertEqual((row["stop"] or {}).get("action"), action)
 
         claude = terminal(lane, "claude", "term_claude")
@@ -3775,11 +3777,14 @@ class ScanCommandTests(unittest.TestCase):
                 {"result": {"terminal": {"source": "screen", "tail": [cmd[cmd.index("--terminal") + 1]]}}}))
 
         terms = [{"handle": "term_l"}, {"handle": "term_r", "_environment": "macbook-pro-16"}]
-        with patch.object(scan.subprocess, "run", side_effect=orca):
+        observed = datetime.fromtimestamp(NOW, timezone.utc)
+        with patch.object(scan.subprocess, "run", side_effect=orca), patch.object(scan, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = observed
             screens = scan.read_screens("orca", terms)
 
-        self.assertEqual(screens, {(None, "term_l"): {"source": "screen", "tail": ["term_l"]},
-                                   ("macbook-pro-16", "term_r"): {"source": "screen", "tail": ["term_r"]}})
+        self.assertEqual(screens, {(None, "term_l"): {"source": "screen", "tail": ["term_l"], "_observed_at": observed.isoformat()},
+                                   ("macbook-pro-16", "term_r"): {"source": "screen", "tail": ["term_r"],
+                                                                "_observed_at": observed.isoformat()}})
         self.assertIn(["orca", "terminal", "read", "--terminal", "term_r", "--screen", "--environment",
                        "macbook-pro-16", "--json"], calls)
 
