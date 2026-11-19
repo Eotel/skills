@@ -297,9 +297,14 @@ def asking_worktrees(args: argparse.Namespace) -> list[Path]:
 def from_arguments(args: argparse.Namespace, answers_log: Path) -> list[Answer]:
     import inbox_read
 
-    inbox_answers = [Answer(at, item["how"], str(item.get("note") or ""), item["id"])
-                     for item in inbox_read.answer_records(answers_log).values()
-                     if item.get("how") in inbox_read.SUBSTANTIVE_ANSWERS
+    available = inbox_read.answer_records(answers_log)
+    deliveries = inbox_read.delivered_records(answers_log)
+    inbox_answers = [Answer(at, item["how"], str(item.get("note") or ""), key)
+                     for key, item in available.items()
+                     if item.get("how") in inbox_read.HOURLY_ANSWERS
                      if (at := scan_sessions.parse_time(item.get("ts"))) is not None]
-    return [*decisions(args.decisions_file.expanduser()), *inbox_answers,
+    delivery_proof = [Answer(at, item["how"], str((available.get(key) or item).get("note") or ""), key)
+                      for key, item in deliveries.items()
+                      if (at := scan_sessions.parse_time(item.get("ts"))) is not None]
+    return [*decisions(args.decisions_file.expanduser()), *inbox_answers, *delivery_proof,
             *asked_user(transcripts_of(args.claude_projects.expanduser(), asking_worktrees(args)))]

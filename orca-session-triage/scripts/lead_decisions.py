@@ -119,6 +119,7 @@ class Decision:
     decided_at: str
     value: str | bool | None = None  # what an answer on an Asana 99 item puts there (answer_value)
     removal: RemovalTerms | None = None  # a remove: answer's condition and cleanup
+    from_ask: bool = False
 
     @classmethod
     def parse(cls, raw: str, where: str) -> Decision:
@@ -126,7 +127,7 @@ class Decision:
             item = json.loads(raw)
             return cls(id=str(item["id"]), decision=str(item["decision"]), answer=str(item["answer"]),
                        decided_at=str(item["decided_at"]), value=item.get("value"),
-                       removal=RemovalTerms.stored(item.get("removal")))
+                       removal=RemovalTerms.stored(item.get("removal")), from_ask=item.get("from_ask") is True)
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
 
@@ -135,6 +136,8 @@ class Decision:
         found = asdict(self)
         if self.removal is None:
             del found["removal"]
+        if not self.from_ask:
+            del found["from_ask"]
         return found
 
 

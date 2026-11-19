@@ -53,8 +53,10 @@ the batch from recording any line.
 ask or numbered parts. Use `answered-many --skip-recorded` to keep existing
 answers, report their line numbers, and record the rest of the batch.
 A time used in the hourly tab's name, such as 「23:00 の定時」, is excluded
-from the answer-time check. When the same Orca tab relays an answer with
+from the answer-time check. When the same session relays an answer with
 `send --ask`, the inbox records delivery and the hourly answer stays as recorded.
+For an answer saved before inbox synchronization was installed, run `answered`
+with its question ID and original answer before relaying it.
 An alternate `--state-file` keeps answer writes in the isolated state file.
 
 ## The triage workspace's comment

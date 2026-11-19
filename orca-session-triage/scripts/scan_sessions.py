@@ -2405,21 +2405,17 @@ def row_final_at(row: dict) -> str | None:
 
 
 def ask_answers(path: Path) -> dict[str, AnsweredAsk]:
-    """The latest answer to each ask id, or `<ask id>:<n>` question, that inbox_read.py recorded."""
+    """Answers for the scan, with the current explicit wording and the latest relay time."""
     try:
-        records = []
-        for line in read_lines(path):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
+        records = list(inbox_read.answer_entries(path))
+        explicit = {key: item for key, item in inbox_read.answer_records(path).items()
+                    if item.get("how") in inbox_read.HOURLY_ANSWERS}
     except (OSError, UnicodeDecodeError):
         return {}
     timed = sorted(((at, record) for record in records if isinstance(record.get("id"), str)
                     and (at := parse_time(record.get("ts"))) is not None), key=lambda item: item[0])
-    return {record["id"]: {"at": record["ts"], "note": record.get("note") or ""} for _, record in timed}
+    return {record["id"]: {"at": record["ts"], "note": explicit.get(record["id"], record).get("note") or ""}
+            for _, record in timed}
 
 
 def ask_answer(item: dict, answers: dict[str, AnsweredAsk]) -> AnsweredAsk | None:

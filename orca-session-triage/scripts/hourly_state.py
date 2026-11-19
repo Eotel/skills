@@ -1050,8 +1050,9 @@ def merged_after(asking: Asking, refs: list[dict]) -> list[dict]:
 
 def asked_under(data: dict, decision: str) -> str:
     """The id of the one open question asked under `decision`, else of the only question ever asked under it."""
-    named = {key: item for key, item in data["questions"].items() if item["decision"] == decision}
-    waiting = [key for key, item in named.items() if item["answer"] is None and not item.get("withdrawn_at")]
+    named = {key: item for key, item in data["questions"].items()
+             if item["decision"] == decision and not item.get("withdrawn_at")}
+    waiting = [key for key, item in named.items() if item["answer"] is None]
     found = waiting or list(named)
     if not found:
         raise ValueError(f"no question was asked under decision {decision}")
@@ -1109,6 +1110,8 @@ def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = Fal
         question.update(answer=answer, answered_at=when,
                         answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()),
                         answered_by=inbox_read.answer_sender())
+    elif not prechecked and not question.get("answered_by"):
+        question["answered_by"] = inbox_read.answer_sender()
     return {"id": key, **question}
 
 
@@ -1921,18 +1924,24 @@ def main(argv: list[str] | None = None) -> int:
             for workspace in commented:
                 data["comments"].setdefault(workspace, {"run": None})
             planned_answers = []
-            if args.action in ("answered", "answered-many") and path.resolve() == Path(DEFAULT_STATE).expanduser().resolve():
+            sync_answers = args.action in ("answered", "answered-many") and path.resolve() == Path(DEFAULT_STATE).expanduser().resolve()
+            if sync_answers:
                 import answer_sync
                 planned_answers = answer_sync.hourly_answers(list(zip(answer_positions, items, strict=True)))
             if writes:
                 save(path, data)
             for answer in planned_answers:
                 try:
-                    inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer, at=answer.at)
+                    inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer,
+                                              at=answer.at, sender=answer.sender)
                 except OSError as error:
                     retry = "answered-many --skip-recorded" if args.action == "answered-many" else "answered"
+                    label = f"行 {answer.line}、" if answer.line is not None else ""
                     raise ValueError(f"定時の state は保存済みです。inbox の {', '.join(answer.ids)} に追記できません。"
-                                     f"原因を解消して同じ入力を hourly_state.py {retry} で再実行してください。{error}") from error
+                                     f"{label}質問 ID {answer.question} を指定し、hourly_state.py {retry} で再実行してください。"
+                                     f"{error}") from error
+            if sync_answers:
+                answer_sync.update_corrected_keys(items)
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

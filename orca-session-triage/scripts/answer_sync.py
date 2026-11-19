@@ -40,15 +40,26 @@ def handoff_keys(ids: list[str], entries: list[dict], handed_off: Path, saved: P
     return keys
 
 
-def answer_text(ref: tuple[str, frozenset[int]], records: dict[str, dict], entries: list[dict]) -> str:
+def answer_parts(ref: tuple[str, frozenset[int]], records: dict[str, dict], entries: list[dict]) -> list[dict]:
     ask_id, numbers = ref
-    if ask_id in records:
-        return str(records[ask_id].get("note") or "")
     if not numbers:
         ask = next(item for item in entries if item.get("id") == ask_id)
         numbers = frozenset(range(1, len(inbox_read.questions_of(ask)) + 1))
-    return "\n".join(dict.fromkeys(str(records[f"{ask_id}:{number}"].get("note") or "")
-                                  for number in sorted(numbers)))
+    whole = records.get(ask_id)
+    if not numbers or (whole and whole.get("how") == inbox_read.HOURLY_CORRECTION
+                       and all((part := records.get(f"{ask_id}:{number}")) is None
+                               or datetime.fromisoformat(part["ts"]) <= datetime.fromisoformat(whole["ts"])
+                               for number in numbers)):
+        return [whole] if whole is not None else []
+    return [part for number in sorted(numbers) if (part := records.get(f"{ask_id}:{number}", whole)) is not None]
+
+
+def answer_text(parts: list[dict]) -> str:
+    notes = []
+    for part in parts:
+        note = str(part.get("note") or "")
+        notes.append(hourly_state.stamped_answer(note, part["ts"]) if hourly_state.ANSWERED_AT in note else note)
+    return "\n".join(dict.fromkeys(notes))
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,9 @@ class InboxAnswer:
     how: str
     answer: str
     at: str
+    question: str
+    line: int | None
+    sender: Mapping[str, str | None]
 
 
 def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
@@ -92,8 +106,37 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
                 continue
             grouped.setdefault((how, at), []).append(key)
             recorded[key] = {"note": item["answer"], "how": how, "ts": at}
-        planned.extend(InboxAnswer(keys, how, item["answer"], at) for (how, at), keys in grouped.items())
+        sender = item.get("answered_by") or {"worktree": None, "session": None}
+        planned.extend(InboxAnswer(keys, how, item["answer"], at, item["id"], number, sender)
+                       for (how, at), keys in grouped.items())
     return planned
+
+
+def update_corrected_keys(items: list[dict]) -> None:
+    corrected = [item for item in items if item.get("replaced") and not item.get("withdrawn_at")]
+    if not corrected:
+        return
+    entries = hourly_state.inbox_entries()
+    touched = [ref for item in corrected for ref in ask_state.references(item, entries)]
+    if not touched:
+        return
+    records = {key: value for key, value in inbox_read.answer_records(inbox_read.answers_path()).items()
+               if value.get("how") in inbox_read.SUBSTANTIVE_ANSWERS}
+    path = Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or lead_decisions.DEFAULT_LOG).expanduser()
+    updates = []
+    for key, previous in lead_decisions.latest(lead_decisions.records(path)).items():
+        ref = ask_state.reference(key, entries)
+        if (not previous.from_ask or ref is None or not any(ask_state.overlaps(ref, given) for given in touched)
+                or not ask_state.covered(ref, list(records), entries)):
+            continue
+        parts = answer_parts(ref, records, entries)
+        newest = max((part["ts"] for part in parts if part.get("how") == inbox_read.HOURLY_CORRECTION),
+                     key=datetime.fromisoformat, default=None)
+        answer = answer_text(parts)
+        if newest and datetime.fromisoformat(newest) >= datetime.fromisoformat(previous.decided_at) and answer != previous.answer:
+            updates.append(lead_decisions.Decision(uuid.uuid4().hex, key, answer, newest, from_ask=True))
+    if updates:
+        lead_decisions.append(path, *updates)
 
 
 def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
@@ -116,35 +159,59 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
         data = hourly_state.read(state_file)
         log = inbox_read.answers_path()
         recorded = inbox_read.answer_records(log)
-        delivered = inbox_read.delivered_records(log)
+        histories: dict[str, list[dict]] = {}
+        for entry in inbox_read.answer_entries(log):
+            if entry.get("how") in inbox_read.DELIVERY_ANSWERS:
+                histories.setdefault(entry["id"], []).append(entry)
         records = {key: value for key, value in recorded.items() if value.get("how") in inbox_read.SUBSTANTIVE_ANSWERS}
         sender = inbox_read.answer_sender()
-        new_delivery = []
-        for key in ids:
-            previous = delivered.get(key)
-            saved = records.get(key, {})
-            corrected = saved.get("how") == inbox_read.HOURLY_CORRECTION
-            if previous and previous.get("note") == answer:
-                continue
-            if previous and not (corrected and saved.get("note") == answer):
-                raise ValueError(f"ask {key} already has a different delivered answer; inspect it before replacing it")
-            new_delivery.append(key)
-        if ids and not new_delivery:
-            when = max((delivered[key]["ts"] for key in ids), key=datetime.fromisoformat)
-            if any(records.get(key, {}).get("how") == inbox_read.HOURLY_CORRECTION
-                   and records[key].get("note") != answer for key in ids):
-                return {"questions": [], "decisions": [], "at": when}
-        if how in inbox_read.DELIVERY_ANSWERS:
-            incoming = [key for key in new_delivery if records.get(key, {}).get("how") != inbox_read.HOURLY_CORRECTION
-                        and not (sender["session"] and records.get(key, {}).get("sender") == sender)]
-            incoming_refs = [ref for key in incoming if (ref := ask_state.reference(key, entries))]
-            relevant = any(ask_state.overlaps(ref, given) for item in data["questions"].values()
-                           if not item.get("withdrawn_at") for ref in ask_state.references(item, entries)
-                           for given in incoming_refs)
-            text = hourly_state.stamped_answer(answer, when) if relevant else answer
-            records.update({key: {"id": key, "note": text, "ts": when} for key in incoming})
         touched = [ref for value in ids if (ref := ask_state.reference(value, entries))]
-        keys = dict(decisions or {})
+        is_delivery = how in inbox_read.DELIVERY_ANSWERS
+        relevant = any(ask_state.overlaps(ref, given) for item in data["questions"].values()
+                       if not item.get("withdrawn_at") for ref in ask_state.references(item, entries)
+                       for given in touched)
+        new_delivery: dict[str, tuple[str, str | None]] = {}
+        retries = []
+        obsolete = False
+        for key in ids:
+            if not is_delivery:
+                new_delivery[key] = (answer, None)
+                continue
+            history = histories.get(key) or []
+            ref = ask_state.reference(key, entries)
+            parts = answer_parts(ref, records, entries) if ref else []
+            manual = [part for part in parts if part.get("how") in inbox_read.HOURLY_ANSWERS]
+            source_at = max((part["ts"] for part in manual), key=datetime.fromisoformat, default=None)
+            prior = next((item for item in reversed(history) if item.get("sent_text", item.get("note")) == answer), None)
+            if prior is not None:
+                retries.append(prior["ts"])
+                obsolete |= bool(source_at and source_at != prior.get("answer_at")
+                                 and any(item.get("how") == inbox_read.HOURLY_CORRECTION for item in manual))
+                continue
+            previous = history[-1] if history else None
+            corrected = any(item.get("how") == inbox_read.HOURLY_CORRECTION for item in manual)
+            original = answer_text(parts) if manual and ref and ask_state.covered(ref, list(records), entries) else None
+            if manual:
+                same_session = sender["session"] and all(item.get("sender") == sender for item in manual)
+                if not same_session and original != answer:
+                    raise ValueError(f"ask {key}: answer already recorded by another session")
+            if previous and corrected and source_at == previous.get("answer_at"):
+                retries.append(previous["ts"])
+                continue
+            if previous and not corrected:
+                raise ValueError(f"ask {key} already has a different delivered answer; inspect it before replacing it")
+            text = original if original is not None else (
+                hourly_state.stamped_answer(answer, when) if relevant or hourly_state.ANSWERED_AT in answer else answer)
+            new_delivery[key] = (text, source_at)
+            if records.get(key, {}).get("how") not in inbox_read.HOURLY_ANSWERS:
+                records[key] = {"id": key, "note": text, "ts": when, "how": how}
+        if retries and not new_delivery:
+            when = max(retries, key=datetime.fromisoformat)
+            if obsolete:
+                return {"questions": [], "decisions": [], "at": when}
+        explicit = {key: hourly_state.stamped_answer(text, when) if hourly_state.ANSWERED_AT in text else text
+                    for key, text in (decisions or {}).items()}
+        keys = dict(explicit)
         known = {item.decision for item in lead_decisions.handed_off(handed_off_file)}
         latest = lead_decisions.latest(lead_decisions.records(decisions_file))
         known.update(latest)
@@ -153,7 +220,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
         for key in known:
             if ((ref := ask_state.reference(key, entries)) and any(ask_state.overlaps(ref, given) for given in touched)
                     and ask_state.covered(ref, list(records), entries)):
-                keys.setdefault(key, answer_text(ref, records, entries))
+                keys.setdefault(key, answer_text(answer_parts(ref, records, entries)))
         for key, text in keys.items():
             if key in latest and latest[key].answer != text and (datetime.fromisoformat(latest[key].decided_at)
                                                                 > datetime.fromisoformat(when)):
@@ -183,18 +250,21 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                     continue
                 parts = list(dict.fromkeys(available[value] for value in bindings))
             elif covered:
-                parts = list(dict.fromkeys(answer_text(ref, records, entries) for ref in refs))
+                parts = list(dict.fromkeys(answer_text(answer_parts(ref, records, entries)) for ref in refs))
             else:
                 continue
             text = "\n".join(parts) or answer
             changed.append(hourly_state.record_answer(data, hourly_state.Answering(id=key, answer=text, answered_at=when),
                                                       prechecked=bool(refs)))
-        new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when)
-               for key, text in keys.items() if key not in latest or latest[key].answer != text]
+        new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when, from_ask=key not in explicit)
+               for key, text in keys.items() if key not in latest
+               or (key in explicit and (latest[key].answer != text or latest[key].from_ask))
+               or (latest[key].from_ask and latest[key].answer != text)]
         if new:
             lead_decisions.append(decisions_file, *new)
         if changed:
             hourly_state.save(state_file, data)
-        if new_delivery:
-            inbox_read.record_answers(log, new_delivery, how, answer, at=when)
+        for key, (text, source_at) in new_delivery.items():
+            inbox_read.record_answers(log, [key], how, text, at=when, sender=sender, answer_at=source_at,
+                                      sent_text=answer if answer != text else None)
     return {"questions": [item["id"] for item in changed], "decisions": list(keys), "at": when}

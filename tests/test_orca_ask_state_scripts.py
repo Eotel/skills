@@ -151,15 +151,15 @@ class AskStateTests(unittest.TestCase):
             result = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-        deliver(1, "公開する")
+        deliver(1, "公開する（{answered_at}）")
         questions = json.loads(self.state.read_text())["questions"]
-        self.assertEqual(questions[first["id"]]["answer"], "公開する")
+        self.assertEqual(questions[first["id"]]["answer"], "公開する（18:01）")
         self.assertIsNone(questions[whole["id"]]["answer"])
         deliver(2, "待つ")
         questions = json.loads(self.state.read_text())["questions"]
-        self.assertEqual(questions[whole["id"]]["answer"], "公開する\n待つ")
+        self.assertEqual(questions[whole["id"]]["answer"], "公開する（18:01）\n待つ")
         decisions = {item["decision"]: item for item in map(json.loads, self.log.read_text().splitlines())}
-        self.assertEqual(decisions[self.KEY]["answer"], "公開する\n待つ")
+        self.assertEqual(decisions[self.KEY]["answer"], "公開する（18:01）\n待つ")
 
     def test_an_isolated_state_file_leaves_the_shared_ask_open(self) -> None:
         question = self.ask()
@@ -225,6 +225,46 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual(deliveries[self.ASK]["note"], "公開しない")
         self.assertEqual(deliveries[self.ASK]["delivery"]["note"], "公開する")
         self.assertEqual(len(self.answers.read_text().splitlines()), 2)
+        self.assertEqual(json.loads(self.log.read_text().splitlines()[-1])["answer"], "公開しない")
+        for text in ("公開しません", "公開しない", "公開する"):
+            relay = (f"import answer_sync; answer_sync.record([{self.ASK!r}], {text!r}, 'send', "
+                     "at='2026-11-14T12:01:00+00:00')")
+            result = subprocess.run([sys.executable, "-c", relay], cwd=SCRIPTS, env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.answers.read_text().splitlines()), 3)
+        self.assertEqual(json.loads(self.log.read_text().splitlines()[-1])["answer"], "公開しない")
+
+    def test_a_whole_ask_relay_keeps_numbered_answers_under_their_own_keys(self) -> None:
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
+        self.ask()
+        answers = {f"{self.KEY}:1": "第一案を公開する", f"{self.KEY}:2": "第二案は見送る"}
+        items = [{"id": self.ask(key=key, covers=[key])["id"], "answer": text, "answered_at": self.AT}
+                 for key, text in answers.items()]
+        recorded = self.run_tool("hourly_state.py", "answered-many", stdin="\n".join(map(json.dumps, items)))
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        command = f"import answer_sync; answer_sync.record([{self.ASK!r}], '第一案だけ公開してください。', 'send', at={self.AT!r})"
+        result = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decisions = {item["decision"]: item["answer"] for item in map(json.loads, self.log.read_text().splitlines())}
+        self.assertEqual(decisions, {**answers, self.KEY: "\n".join(answers.values())})
+
+    def test_an_inbox_append_retry_keeps_the_original_answering_session(self) -> None:
+        question = self.ask()
+        line = json.dumps({"id": question["id"], "answer": "公開する", "answered_at": self.AT})
+        failure = ("import sys, hourly_state, inbox_read; from unittest.mock import patch; "
+                   "patch.object(inbox_read, 'record_answers', side_effect=OSError('fixture append error')).start(); "
+                   "sys.exit(hourly_state.main(['answered-many']))")
+        result = subprocess.run([sys.executable, "-c", failure], cwd=SCRIPTS, env=self.env, input=line,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("行 1、質問 ID " + question["id"], result.stderr)
+        origin = self.env["CLAUDE_CODE_SESSION_ID"]
+        self.env["CLAUDE_CODE_SESSION_ID"] = "other-session"
+        result = self.run_tool("hourly_state.py", "answered-many", "--skip-recorded", stdin=line)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.answers.read_text())["sender"]["session"], origin)
 
     def test_a_direct_ask_and_separate_cover_have_evidence_for_stale_asks(self) -> None:
         another = "b1234567-1234-4567-8888-123456789abc"
