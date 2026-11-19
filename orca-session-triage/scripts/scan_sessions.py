@@ -2847,6 +2847,21 @@ def not_before_label(item: Mapping) -> str:
     return f"期限前（{day.month}/{day.day}）"
 
 
+HOLD_FIELDS = ("class", "closable", "meaningful_tabs", "open_pr_cleanup", "verdict")
+KEEP_DECISION = re.compile(r"残す|残し|残して|保持(?!しない)|保留|削除(?:しない|せず|するな)|"
+                           r"消さ(?:ない|ず)|\b(?:keep|retain|do not remove|don't remove)\b", re.IGNORECASE)
+
+
+def restore_held_row(row: dict) -> dict:
+    before = row.pop("cleanup_before_hold", None)
+    if before is not None:
+        for field in HOLD_FIELDS:
+            row.pop(field, None)
+        row.update(before)
+        row["reasons"] = [reason for reason in row.get("reasons", []) if not reason.startswith("保留中: ")]
+    return row
+
+
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
                              now: datetime | None = None, *,
                              open_asks: Sequence[inbox_read.OpenAsk] = ()) -> list[dict]:
@@ -2869,17 +2884,20 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
     lead = (state.get("lead") or {}).get("worktree")
     requests = [(key, request.get("owner")) for key, request in state.get("requests", {}).items()
                 if request.get("closed_at") is None]
+    tabs_in_scan = {term["handle"] for row in rows for term in row.get("terminals") or [] if term.get("handle")}
     stamp = now.timestamp()
     active_holds = {(hold.get("environment") or None, hold["handle"]): hold
                     for hold in hold_rows(inbox_read.holds_path())
                     if hold["created_at"] <= stamp
-                    and (hold["status"] == "active" if hold["released_at"] is None else hold["released_at"] > stamp)}
+                    and (hold["status"] in ("active", "releasing")
+                         if hold["released_at"] is None else hold["released_at"] > stamp)}
     removal_candidates: list[tuple[dict, list[dict]]] = []
 
     def moment(at: str) -> datetime:
         return lead_decisions.moment(at) or EPOCH
 
     for row in rows:
+        restore_held_row(row)
         names = handoff_names(row)
         if not row.get("environment"):
             names.add(f"local::{row['path']}")
@@ -2889,18 +2907,18 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             blockers.append("指揮の作業場")
         if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
             blockers.append("structured-agent-session の agent がいる作業場")
-        blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner in names)
+        blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner == row_identity(row))
         blockers.extend(f"開いた ask {ask.report['id']}" for ask in open_asks
                         if ask.report.get("handle") in tabs
-                        or (ask.report.get("worktree") == Path(row["path"]).name
+                        or (ask.report.get("handle") not in tabs_in_scan
+                            and ask.report.get("worktree") == Path(row["path"]).name
                             and (ask.report.get("repo") or "") in row_repos(row)))
-        if before_hold := row.pop("class_before_hold", None):
-            row["class"] = before_hold
-        row["reasons"] = [reason for reason in row.get("reasons", []) if not reason.startswith("保留中: ")]
         holds = [active_holds[(row.get("environment"), tab)] for tab in sorted(tabs)
                  if (row.get("environment"), tab) in active_holds]
         if holds:
-            row.update(class_before_hold=row["class"], open_pr_cleanup=False)
+            row["cleanup_before_hold"] = {field: row[field] for field in HOLD_FIELDS if field in row}
+            row["reasons"] = list(row.get("reasons") or [])
+            row["open_pr_cleanup"] = False
             row["class"] = "blocked"
             row.pop("verdict", None)
             row["meaningful_tabs"] = list(dict.fromkeys([*(row.get("meaningful_tabs") or []),
@@ -2962,8 +2980,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             removal_at = moment(removal["decided_at"])
         owner = max((answer for name in names if (answer := decisions.get(f"owner:{name}"))),
                     key=lambda answer: moment(answer.decided_at), default=None)
-        if (owner and moment(owner.decided_at) >= removal_at
-                and re.search(r"残す|残し|残して|保持(?!しない)|保留|\b(?:keep|retain)\b", owner.answer, re.IGNORECASE)):
+        if owner and moment(owner.decided_at) >= removal_at and KEEP_DECISION.search(owner.answer):
             blockers.append(f"owner の決定 {owner.decided_at} {owner.answer}")
         wake_keys = {f"wake:{name}" for name in names}
         answered = [answer for key, answer in decisions.items()
@@ -3174,6 +3191,7 @@ def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dic
 def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
+        row = restore_held_row(row)
         interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
         if row.get("prompt_waiting") or interrupted:
             return {key: value for key, value in row.items() if key != "verdict"}
@@ -3190,10 +3208,15 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
             return row
         closable = [handle for handle in row.get("closable") or [] if handle not in agents]
         meaningful = [handle for handle in row.get("meaningful_tabs") or [] if handle not in agents]
-        if shown == "finished" and not verdict.get("needs_user") and not row.get("stop"):
-            closable.extend(agents)
-        else:
-            meaningful.extend(agents)
+        pending = (row.get("stop") or row.get("unread_mail") or row.get("screen_progress")
+                   or any(agent.get("state") == "waiting" or agent.get("state") == "working" and agent.get("turn") != "done"
+                          for agent in row.get("agents") or []))
+        drafts = {card.get("handle") for card in row.get("done_cards") or []
+                  if card.get("draft") or card.get("composer_empty") is False}
+        eligible = [handle for handle in agents if shown == "finished"
+                    and not verdict.get("needs_user") and not pending and handle not in drafts]
+        closable.extend(eligible)
+        meaningful.extend(handle for handle in agents if handle not in eligible)
         return {**row, "closable": closable, "meaningful_tabs": meaningful}
     return [marked(row) for row in rows]
 

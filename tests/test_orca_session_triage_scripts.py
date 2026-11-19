@@ -2891,6 +2891,35 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_a_saved_finished_verdict_does_not_close_waiting_or_draft_tabs(self) -> None:
+        saved = self.dir / "scan.json"
+        cases = [
+            {"agents": [{"type": "codex", "state": "waiting"}]},
+            {"unread_mail": [{"from": "worker"}]},
+            {"done_cards": [{"handle": "term", "agent": "codex", "draft": True}]},
+        ]
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{index}", "repo": "app", "class": "stalled",
+             "terminals": [{"handle": "term", "agent": "codex"}], "meaningful_tabs": ["term"],
+             "verdict": {"class": "finished"}, **case} for index, case in enumerate(cases)]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_hold_releasing_retains_checkout_and_release_restores_saved_tab_counts(self) -> None:
+        state, log = self.dir / "state.json", self.dir / "decisions"
+        row = {"path": "/w/app/held", "repo": "app", "class": "finished",
+               "terminals": [{"handle": "term"}], "closable": ["term"], "meaningful_tabs": []}
+        hold = {"handle": "term", "created_at": 0.0, "released_at": None, "status": "releasing",
+                "condition_kind": "signal", "condition_value": "term_lead", "instruction": "follow-up"}
+        with patch.object(scan, "hold_rows", return_value=[hold]):
+            [held] = scan.with_cleanup_constraints([row], state, log)
+        self.assertEqual((held["class"], held["closable"]), ("blocked", []))
+        with patch.object(scan, "hold_rows", return_value=[]):
+            [released] = scan.with_cleanup_constraints([held], state, log)
+        self.assertEqual((released["class"], released["closable"], released["meaningful_tabs"]),
+                         ("finished", ["term"], []))
+
     def test_saved_verdicts_recount_agent_tabs_and_apply_removal_specs(self) -> None:
         saved = self.dir / "scan.json"
         names = ("finished", "blocked", "waiting", "needs-user")
@@ -2922,7 +2951,7 @@ class ScanCommandTests(unittest.TestCase):
         write_jsonl(decisions, [{"id": str(index), "decision": f"{kind}:/w/app/{name}", "answer": text,
                                  "decided_at": f"2026-11-19T10:0{index}:00Z"}
                                 for index, (kind, name, text) in enumerate((
-                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで残す"),
+                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで削除しない"),
                                     ("owner", "cleared", "残す"), ("remove", "cleared", "消してよい")))])
         holds = [{"handle": "term_held", "environment": None, "created_at": 0.0, "released_at": None,
                   "status": "active", "condition_kind": "time", "condition_value": "2026-11-20T10:00:00Z",
@@ -2937,7 +2966,7 @@ class ScanCommandTests(unittest.TestCase):
                 else:
                     self.assertIn("/w/app/cleared", out.getvalue())
                     self.assertNotIn("/w/app/held", out.getvalue())
-                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで残す",
+                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで削除しない",
                                "開いた ask ask1", "未解決の request req1", "保留中", "follow-up:check1"):
                     self.assertIn(reason, err.getvalue())
             with redirect_stdout(io.StringIO()) as out:
