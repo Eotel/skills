@@ -639,7 +639,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
     ask_entries = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
     known_asks = list(ask_entries.values())
-    withdrawn = inbox_read.withdrawal_times(entries)
+    withdrawn = {ref for ref in inbox_read.withdrawal_times(entries) if ":" in ref}
     retained_questions = {key: [number for number in range(1, len(questions) + 1) if f"{key}:{number}" not in withdrawn]
                           for key, ask in ask_entries.items() if (questions := inbox_read.questions_of(ask))}
     answered_ids = [answer.ask_id for answer in answers if answer.source in inbox_read.SUBSTANTIVE_ANSWERS
@@ -703,7 +703,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         counted = [(at, item, answer_evidence.answers_to(item, answers, retained_questions.get(item["id"]), shared))
                    for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
-                   and item["id"] not in withdrawn and retained_questions.get(item["id"]) != []
+                   and retained_questions.get(item["id"]) != []
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
         # The ledger settles only the proposals the lane waited on, not a question it is asking now.
         if settled and not (row.get("prompt_waiting") or (row.get("claude") or {}).get("pending_questions")
