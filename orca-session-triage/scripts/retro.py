@@ -871,15 +871,33 @@ def note_from_undo(item: dict[str, Any], token: dict[str, Any] | None) -> str:
     return line[2:-len(suffix)] if line.startswith("- ") and line.endswith(suffix) else item["proposal"]
 
 
-def pending_reversal(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_id: str | None) -> tuple[str, dict[str, Any]] | None:
     reverted = {run["decision_id"] for run in item.get("executions", []) if run["outcome"] == "reverted"}
     adoption_id = None
     for decision in item["decisions"]:
         if decision["decision"] == "adopt":
             adoption_id = decision["id"]
         elif decision["decision"] == "revoke" and adoption_id is not None and decision["id"] not in reverted:
-            return adoption_id, decision
+            action_key = f"{item['proposal_id']}:revoked:{decision['ts']}"
+            if attempts.get(action_key, 0) < 3 or checkpoint_id == adoption_id:
+                return adoption_id, decision
     return None
+
+
+def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
+                        rewrites: dict[str, str]) -> str | None:
+    if checkpoint is None:
+        return None
+    if decision_id := checkpoint.get("decision_id"):
+        return decision_id
+    proposal_id = item["proposal_id"]
+    adoptions = [entry["id"] for entry in item["decisions"] if entry["decision"] == "adopt"]
+    for decision_id in reversed(adoptions):
+        if (note := rewrites.get(decision_id)) and note_line({"id": proposal_id, "note": note}) == checkpoint["line"]:
+            return decision_id
+    if pending := pending_reversal(item, {}, None):
+        return pending[0]
+    return adoptions[-1] if adoptions else None
 
 
 def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, state: Path | None = None) -> int:
@@ -899,10 +917,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         applications = {run["decision_id"]: run["undo"] for run in item.get("executions", [])
                         if run["outcome"] == "applied" and run.get("undo") and run.get("actor") == "triage-retro"}
         decision_ids = [entry["id"] for entry in item["decisions"]]
-        checkpoint_id = (checkpoint.get("decision_id") or next(
-            (entry["id"] for entry in reversed(item["decisions"]) if entry["decision"] == "adopt"), None)
-            if checkpoint else None)
-        reversal = pending_reversal(item) if category not in SEPARATE_WORK else None
+        checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"])
+        reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id)
+                    if category not in SEPARATE_WORK else None)
         if reversal is not None:
             adoption_id, decision = reversal
             status = "revoked"
