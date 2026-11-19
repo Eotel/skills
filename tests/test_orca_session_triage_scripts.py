@@ -2795,6 +2795,20 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(args[args.index("--from") + 1], str(saved))
         self.assertIn("/w/app/finished 10", args)
 
+    def test_the_existing_harness_can_check_local_and_remote_paths_it_accepts(self) -> None:
+        saved = self.dir / "scan.json"
+        row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
+               "open_pr_cleanup": True, "pr": {"number": 10}}
+        with patch.object(scan, "batch_has_preview", return_value=False):
+            local = shlex.split(scan.rm_check_command(row, saved))
+            remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
+            spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
+        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
+        self.assertEqual(remote[-1], "/w/app/案件 10")
+        self.assertNotIn("--preview", remote)
+        self.assertNotIn("--detach-nested", remote)
+        self.assertIn("require the harness release with --preview", spaced)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
@@ -2805,6 +2819,7 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
                          patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
+                         patch.object(scan, "batch_has_preview", return_value=True),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
                          patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
@@ -4880,6 +4895,13 @@ class RmCheckTests(unittest.TestCase):
         with patch.object(rmcheck, "compose_projects", return_value=projects), redirect_stdout(io.StringIO()) as out:
             self.assertEqual(rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--summary"]), 0)
         self.assertIn("Compose app-wt running(2)", out.getvalue())
+
+    def test_summary_keeps_spaces_in_the_paths_it_reports(self) -> None:
+        with redirect_stdout(io.StringIO()) as out:
+            rmcheck.print_check({"worktree": str(self.wt), "ok": False,
+                                 "reasons": ["open 'notes  draft.md'\nthen check again"]}, summary=True)
+        self.assertEqual(len(out.getvalue().splitlines()), 1)
+        self.assertIn("'notes  draft.md' then check again", out.getvalue())
 
     def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:
         real_run = subprocess.run

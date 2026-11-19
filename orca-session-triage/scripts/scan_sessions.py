@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-from functools import partial
+from functools import cache, partial
 from itertools import dropwhile, takewhile
 import hashlib
 import http.client
@@ -3511,7 +3511,19 @@ def pr_number(row: dict) -> int | None:
 
 
 def rm_spec(row: dict) -> str:
-    return shlex.join([row["path"], str(pr_number(row) or "-")])
+    path = row["path"]
+    name = shlex.quote(path) if any(char.isspace() for char in path) else path
+    return f"{name} {pr_number(row) or '-'}"
+
+
+@cache
+def batch_has_preview() -> bool:
+    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+    try:
+        help_text = subprocess.run([str(RM_CHECK_BATCH), "--help"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return help_text.returncode == 0 and re.search(r"(?<!\S)--preview\s", help_text.stdout) is not None
 
 
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
@@ -3519,11 +3531,14 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
     options = [*from_scan, "--summary"]
-    if not remove_ok and not (row.get("open_pr_cleanup") and scan_file) and not environment:
+    plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
+    if not remove_ok and not plan_cleanup and not environment:
         return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
+    if any(char.isspace() for char in row["path"]) and not batch_has_preview():
+        return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
     if remove_ok:
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
-    elif row.get("open_pr_cleanup") and scan_file:
+    elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
     return shlex.join([str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
 

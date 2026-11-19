@@ -1519,7 +1519,7 @@ def print_check(result: dict, summary: bool) -> None:
         details = [*result["reasons"], *result.get("notes", []),
                    *(f"Compose {item['project']} {item['status']}" for item in result.get("containers", []))]
         print(f"{result['worktree']} | ok={str(result['ok']).lower()} | "
-              + (" | ".join(" ".join(detail.split()) for detail in details) or "-"))
+              + (" | ".join(" ".join(detail.splitlines()) for detail in details) or "-"))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
