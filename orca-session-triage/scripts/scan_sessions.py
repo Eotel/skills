@@ -3197,6 +3197,9 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"review queue: {len(queue)}")
     for row in queue:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
+    if any(row.get("environment") and (row.get("open_pr_cleanup")
+           or (row.get("verdict") or {}).get("class", row["class"]) == "finished") for row in rows) and batch_has_preview():
+        print(REMOTE_CHECK_RELEASE)
     finished = [row for row in rows if ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"]
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
@@ -3504,6 +3507,7 @@ def row_line(view: dict) -> str:
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
 RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
+REMOTE_CHECK_RELEASE = "Remote checks require the same harness release on both Macs."
 
 
 def pr_number(row: dict) -> int | None:
@@ -3536,6 +3540,8 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
         return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
     if any(char.isspace() for char in row["path"]) and not batch_has_preview():
         return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
+    if environment and not remove_ok and not batch_has_preview():
+        options.remove("--summary")
     if remove_ok:
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
@@ -3576,6 +3582,8 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
                                                       *row["closable"]]))
     if not row.get("automation_blocker") and (row.get("open_pr_cleanup") or (
             (row.get("verdict") or {}).get("class") or row["class"]) == "finished"):
+        if row.get("environment") and batch_has_preview():
+            lines.append(f"{lead} | {REMOTE_CHECK_RELEASE}")
         lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
     return lines
 

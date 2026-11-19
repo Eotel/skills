@@ -2807,6 +2807,7 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(remote[-1], "/w/app/案件 10")
         self.assertNotIn("--preview", remote)
         self.assertNotIn("--detach-nested", remote)
+        self.assertNotIn("--summary", remote)
         self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
@@ -3407,6 +3408,7 @@ class ScanCommandTests(unittest.TestCase):
         for view in ("--summary", "--cards"):
             with self.subTest(view=view), redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
+                self.assertIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
                     options = ["--from", str(saved.absolute()), "--summary"]
