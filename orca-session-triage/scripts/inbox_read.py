@@ -1207,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "lane-answers":
             import lane_input
-            candidates = lane_input.candidate_answers(inbox, answers_path(),
+            candidates = lane_input.export_candidates(inbox, answers_path(),
                                                        os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
             records = candidates if args.candidates else lane_input.unambiguous_answers(candidates)
             print(json.dumps(records, ensure_ascii=False))

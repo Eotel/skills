@@ -540,6 +540,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
                                 "--handed-off-file", str(self.handed), "--state-file", str(self.state))
         self.assertEqual(handoff.returncode, 0, handoff.stderr)
         self.assertEqual({row["decision"] for row in json.loads(handoff.stdout)["settled"]}, {self.KEY, f"{self.KEY}:1"})
+        self.write_lines(self.log, [{"id": "old-answer", "decision": self.KEY, "answer": "本社へ中継済み",
+                                     "decided_at": self.AT, "from_ask": True}])
         new = {**ask, "id": "c1234567-1234-4567-8888-123456789abc", "ts": "2026-11-14T09:02:00+00:00"}
         with self.handed.open("a") as stream:
             stream.write(json.dumps({"decision": self.KEY, "ask_id": new["id"], "handed_off_at": new["ts"]}) + "\n")
@@ -788,6 +790,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
                   "content": [{"type": "input_text", "text": "A"}]}})):
             with self.subTest(provider=provider):
                 self.answers.write_text("")
+                self.answers.with_name(self.answers.name + ".lane-candidates.json").unlink(missing_ok=True)
                 self.write_lines(self.inbox, [ask])
                 self.write_lines(transcript, [{**row, "timestamp": self.AT}])
                 self.write_lines(events, [{"type": "send", "ts": self.AT, "to": "term_worker",
@@ -812,6 +815,15 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
                 self.assertIn("worker の回答「A」", reason)
                 self.assertFalse(self.answers.read_text().strip())
+                first_export = self.run_tool("inbox_read.py", "lane-answers", self.ASK, "--candidates")
+                self.assertEqual(first_export.returncode, 0, first_export.stderr)
+                self.assertEqual(json.loads(first_export.stdout)[f"{self.ASK}:1"][0]["note"], "A")
+                self.assertFalse(self.answers.read_text().strip())
+                transcript.write_text("")
+                repeat_export = self.run_tool("inbox_read.py", "lane-answers", self.ASK, "--candidates")
+                self.assertEqual(repeat_export.returncode, 0, repeat_export.stderr)
+                self.assertEqual(json.loads(repeat_export.stdout), json.loads(first_export.stdout))
+                self.write_lines(transcript, [{**row, "timestamp": self.AT}])
                 opened = self.run_tool("inbox_read.py", "open-asks", "--json")
                 self.assertEqual(opened.returncode, 0, opened.stderr)
                 self.assertEqual(json.loads(opened.stdout), [])
@@ -978,9 +990,12 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "A"}])
                 self.question = {**question, "question": current,
                                  "options": [{"label": "A", "description": updated_approval}, pause]}
-                result = self.hook()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual("worker の回答" in result.stdout, blocked)
+                for ref in (None, self.ASK, f"{self.ASK}:1", "b1234567-1234-4567-8888-123456789abc"):
+                    self.question["question"] = current + (f"（ask {ref}）" if ref else "")
+                    result = self.hook()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual("worker の回答" in result.stdout,
+                                     blocked and (ref is None or ref.startswith(self.ASK)))
 
     def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
         self.ask(key="remove:/w/old", covers=[])

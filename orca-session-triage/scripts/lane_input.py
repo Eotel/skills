@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -249,22 +250,29 @@ def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
             for answer_id, records in choices.items() if len({record["note"] for record in records}) == 1}
 
 
+def export_candidates(inbox: Path, path: Path, orca: str, wanted: set[str]) -> dict[str, list[dict]]:
+    detected = candidate_answers(inbox, path, orca, wanted)
+    cache = path.resolve().with_name(path.name + ".lane-candidates.json")
+    with retro.locked(cache.with_suffix(".lock")):
+        try:
+            saved: dict[str, list[dict]] = json.loads(cache.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            saved = {}
+        for answer_id, records in detected.items():
+            combined = {(row["ts"], row["input"]): row for row in [*saved.get(answer_id, ()), *records]}
+            saved[answer_id] = list(combined.values())
+        if detected:
+            retro.atomic_text(cache, json.dumps(saved, ensure_ascii=False) + "\n")
+        return {answer_id: records for answer_id, records in saved.items() if answer_id.partition(":")[0] in wanted}
+
+
 def inferred_answers(inbox: Path, path: Path, orca: str, wanted: set[str] | None = None) -> dict[str, dict]:
     return unambiguous_answers(candidate_answers(inbox, path, orca, wanted))
 
 
 def reconcile_answers(inbox: Path, path: Path, orca: str) -> None:
-    events = inbox_read.events_path()
-    inputs = (inbox, events, events.with_name(events.name + ".delivery"))
-    versions = tuple(map(inbox_version, inputs))
-    previous = list(inbox_read.answer_entries(path))
-    if detected := inferred_answers(inbox, path, orca):
-        def unchanged() -> dict[str, dict]:
-            if tuple(map(inbox_version, inputs)) != versions or list(inbox_read.answer_entries(path)) != previous:
-                return {}
-            return detected
-
-        write_inferred_answers(unchanged, path)
+    if inferred_answers(inbox, path, orca):
+        write_inferred_answers(lambda: inferred_answers(inbox, path, orca), path)
 
 
 def write_inferred_answers(detected: dict[str, dict] | Callable[[], dict[str, dict]], path: Path) -> None:

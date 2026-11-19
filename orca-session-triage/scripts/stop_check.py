@@ -175,7 +175,10 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 
 QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
-                                 r"|\d+(?:年|月|日|時|分|週)|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
+                                 r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
+                                 r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
+ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
+ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![\w-])", re.I)
 
 
 def question_conditions(value: str) -> list[str]:
@@ -306,11 +309,20 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 refs.remove((ask_id, numbers))
                 matched = [item for item in matched if (ask_id, numbers) not in ask_state.references(item, entries)]
         presented = answer_evidence.shown_question(question)
-        named = [ref for token in re.findall(r"(?<![\w-])[0-9a-f-]{8,36}(?::[1-9]\d*)?(?![\w-])", presented)
-                 if (ref := ask_state.reference(token, entries))]
+        cited = [token.lower() for token in ASK_CITATION.findall(presented)]
+        tokens = cited or re.findall(rf"(?<![\w-]){ASK_REFERENCE}(?![\w-])", presented)
+        named = [ref for token in tokens if (ref := ask_state.reference(token, entries))]
+        if cited and len(cited) != len(named):
+            continue
         numbered = [ref for ref in named if ref[1] and (entry := next(e for e in entries if e.get("id") == ref[0]))
                     and max(ref[1]) <= len(inbox_read.questions_of(entry))]
         if len(set(numbered)) == 1:
+            ask_id, numbers = numbered[0]
+            original_parts = inbox_read.questions_of(next(e for e in entries if e.get("id") == ask_id))
+            if any(isinstance(part := original_parts[number - 1], dict)
+                   and (not question_options_agree(part, question)
+                        or question_conditions(part.get("question") or "") != question_conditions(text)) for number in numbers):
+                continue
             refs = numbered[:1]
         elif named or not refs or any(not numbers for _, numbers in refs):
             workers = {row for item in matched if (row := item.get("row"))}
@@ -319,19 +331,21 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          for entry in entries if entry.get("kind") == "ask" and entry.get("id")
                          and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts, orca))
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
-                         if isinstance(original, dict) and (not header or original.get("header") == header)
+                         if isinstance(original, dict) and (named_ids or not header or original.get("header") == header)
                          and question_options_agree(original, question)
+                         and question_conditions(original.get("question") or "") == question_conditions(text)
                          and (named_ids or entry["id"] not in withdrawn and f"{entry['id']}:{number}" not in withdrawn)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
             if not shown and header:
                 links = set(QUESTION_URL.findall(presented))
                 shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
-                         if named_ids or (links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))
-                                          and question_conditions(original.get("question") or "") == question_conditions(text))]
+                         if named_ids or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))]
             if named_ids and len(shown) == 1:
                 refs = shown
             elif len(named_ids) == 1:
+                if not originals and any(inbox_read.questions_of(entry) for entry in entries if entry.get("id") in named_ids):
+                    continue
                 refs = [(next(iter(named_ids)), frozenset())]
             elif refs:
                 for index, (ask_id, numbers) in enumerate(refs):

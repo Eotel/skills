@@ -536,9 +536,11 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     last = {}
     for key in keys:
         item = history[key][-1] if key in history else None
-        answer = answered[key].view() if key in answered else None
+        bound = next((entry for entry in reversed(history.get(key, [])) if entry.ask_id), None)
+        decision = decision_for_handoff(answered[key].view() if key in answered else None, bound, asks)
+        answer = decision
         if answer is None:
-            latest_id = next((entry.ask_id for entry in reversed(history.get(key, [])) if entry.ask_id), None)
+            latest_id = bound.ask_id if bound else None
             bindings = [latest_id] if latest_id else [question["record"]["ask_id"] for question in active
                         if key == question["record"].get("decision") and question["record"].get("ask_id")]
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
@@ -551,7 +553,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
                     break
             if not refs:
                 answer = next((found for source in bindings if source and (found := ask_answer(source, answers, asks))), None)
-        delivered = answer is not None and (key in answered or genuine_answer(answer))
+        delivered = answer is not None and (answer is decision or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})
         else:
@@ -582,6 +584,15 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
             row["reports"] = decision_reports(key, named[key], at, entries)
         unanswered.append(row)
     return {"unanswered": unanswered, "settled": settled}
+
+
+def decision_for_handoff(answer: dict | None, handoff: HandOff | None, asks: Mapping[str, dict]) -> dict | None:
+    if not answer or not answer.get("from_ask") or not handoff or not handoff.ask_id:
+        return answer
+    ref, _, _ = handoff.ask_id.partition(":")
+    opened = moment(asks.get(ref, {}).get("ts")) or moment(handoff.handed_off_at)
+    answered_at = moment(answer.get("decided_at"))
+    return answer if opened is None or answered_at is not None and answered_at >= opened else None
 
 
 def genuine_answer(answer: dict) -> bool:
