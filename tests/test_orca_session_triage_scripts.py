@@ -3027,6 +3027,22 @@ class ScanCommandTests(unittest.TestCase):
                                     screens={(environment, term["handle"]): screen})
         self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
 
+    def test_remote_codex_approval_with_earlier_claude_output(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        term = {**terminal(lane, None, "term_reused"), "_environment": environment}
+        screen = {"source": "screen", "tail": [
+            "⏺ Earlier Claude reply", "✻ Worked for 3m", "› check status", "• Checking status.",
+            scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel",
+        ]}
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+        self.assertEqual(row["terminals"][0]["agent"], "codex")
+        self.assertEqual(row["orca_message"]["text"], "Checking status.")
+
     def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
         lane = str(self.dir / "shared")
         with_agent = worktree(lane, "working", agent="codex")

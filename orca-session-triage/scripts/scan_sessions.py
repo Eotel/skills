@@ -1266,14 +1266,14 @@ def codex_screen_message(lines: list[str]) -> str:
     return "\n".join(line[2:] if line.startswith("  ") else line.strip() for line in block).strip()
 
 
-def screen_message(screen: dict) -> str:
+def screen_message(screen: dict, *, agent: str | None = None) -> str:
     """The agent's last reply on the screen: Claude's last ⏺ block, its indented continuation lines unindented, or
     Codex's (codex_screen_message).
 
     A reply whose ⏺ line scrolled off the top is read from the indented lines above the last turn-end line.
     """
     lines = screen_lines(screen)
-    if screen_agent(screen) == "codex":
+    if (agent or screen_agent(screen)) == "codex":
         return codex_screen_message(lines)
     def tool_call(index: int) -> bool:
         following = lines[index + 1].strip() if index + 1 < len(lines) else ""
@@ -1475,16 +1475,16 @@ def orca_said(worktree: dict) -> bool:
     return any(agent.get("lastAssistantMessage") for agent in worktree.get("agents") or [])
 
 
-def with_screen_agents(terms: list[dict], screens: Screens, environment: str | None) -> tuple[list[dict], str]:
+def with_screen_agents(terms: list[dict], screens: Screens, environment: str | None,
+                       approval_tabs: Collection[str]) -> tuple[list[dict], str]:
     """(terms, message): the tabs, each without an agent given the one its screen shows, and the last
     Claude or Codex reply read on them. Another Mac's terminal list names a tab's agent on some reads only."""
     found, message = [], ""
     for term in terms:
         screen = rendered(screens.get((environment, term.get("handle"))))
-        agent = screen_agent(screen) if screen else None
-        if screen and agent:
+        if screen and (agent := "codex" if term.get("handle") in approval_tabs else screen_agent(screen)):
             found.append(term if term.get("agentIdentity") else {**term, "agentIdentity": agent})
-            message = screen_message(screen) or message
+            message = screen_message(screen, agent=agent) or message
         else:
             found.append(term)
     return found, message
@@ -1758,13 +1758,13 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                           if agent.get("paneKey")}
         terms = [term if term.get("agentIdentity") else
                  {**term, "agentIdentity": agents_by_pane.get(hourly_runtime.pane_key(term))} for term in terms]
-        screen_said = ""
-        if remote and not orca_said(w):
-            terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"))
         prompts = list(waiting_prompts(terms, screens, w.get("_environment")))
         waiting = prompts[0] if prompts else None
         codex_approvals = [prompt for prompt, _ in prompts if prompt["question"] in (CODEX_PERMISSION, CODEX_APPROVAL)]
         approval_tabs = {prompt["tab"] for prompt in codex_approvals}
+        screen_said = ""
+        if remote and not orca_said(w):
+            terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"), approval_tabs)
         approval_observed = min((observed_at for tab in approval_tabs
                                  if (screen := screens.get((w.get("_environment"), tab)))
                                  and isinstance(observed_at := screen.get("_observed_at"), str)),
