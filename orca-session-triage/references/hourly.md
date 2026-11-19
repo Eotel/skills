@@ -117,6 +117,8 @@ or an AskUserQuestion answer (in the transcripts of the current directory's
 worktree and each `--asked-in` worktree) that names the ask's id or quotes each
 open question, or a delivered answer. It names the rest with the answers that
 mention only the lane or its PR numbers: confirm each one, then mark it by id.
+When rephrasing a lane's question for AskUserQuestion, include its ask ID in the
+question. Use `<ask id>:<number>` for a specific question in a multi-question ask.
 When `send --ask` delivers an answer, it records the same answer and time in
 each hourly question whose `covers` names that ask and each known
 `answer:<lane>::<ask id>` decision key. Numbered answers settle only the

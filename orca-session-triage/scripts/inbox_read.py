@@ -1190,16 +1190,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "lane-answers":
             import lane_input
-            records = lane_input.inferred_answers(inbox_entries(inbox), answers_path(),
+            records = lane_input.inferred_answers(inbox, answers_path(),
                                                   os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
             print(json.dumps(records, ensure_ascii=False))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
-            entries = inbox_entries(inbox)
             if args.action in ("open-asks", "questions"):
                 import lane_input
-                lane_input.reconcile_answers(entries, answers_path(), getattr(args, "orca", None)
+                lane_input.reconcile_answers(inbox, answers_path(), getattr(args, "orca", None)
                                              or os.environ.get("ORCA_CLI_COMMAND", "orca"))
+            entries = inbox_entries(inbox)
             asks = open_asks(entries, answered_ids(answers_path()))
             open_keys = frozenset(key for ask in asks for key in (
                 ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))

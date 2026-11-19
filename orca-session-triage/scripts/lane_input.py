@@ -140,12 +140,23 @@ def option_labels(question: dict) -> list[str]:
             if isinstance(option, dict) and isinstance(label := option.get("label"), str) and label.strip()]
 
 
-def inferred_answers(entries: list[dict], path: Path, orca: str,
+def inbox_version(path: Path) -> tuple[int, int, int] | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def inferred_answers(inbox: Path, path: Path, orca: str,
                      wanted: set[str] | None = None) -> dict[str, dict]:
     closed_at: dict[str, datetime | None] = {}
+    version = inbox_version(inbox)
+    entries = inbox_read.inbox_entries(inbox) if version is not None else []
     history = inbox_read.open_asks(entries, frozenset())
     by_id = {ask.report["id"]: ask for ask in history}
-    for record in inbox_read.answer_entries(path):
+    answer_history = list(inbox_read.answer_entries(path))
+    for record in answer_history:
         previous = closed_at.setdefault(record["id"], None)
         if (at := inbox_read.asked_at(record)) and (previous is None or at < previous):
             closed_at[record["id"]] = at
@@ -163,14 +174,17 @@ def inferred_answers(entries: list[dict], path: Path, orca: str,
     by_handle = {ask.report["handle"]: ask.report for ask in reversed(list(pending.values()))}
     prompts = direct_prompts(by_handle, orca, require_handle=True)
     matches: dict[tuple[str, datetime, str], list[tuple[str, str]]] = {}
+    multi_select = set()
     for ask in history:
         ask_id, handle = ask.report["id"], ask.report.get("handle")
         if not ask.at or handle not in prompts or by_handle[handle]["host"] != ask.report.get("host"):
             continue
         for number, question in enumerate(inbox_read.questions_of(ask.report), 1):
-            if not isinstance(question, dict) or question.get("multiSelect"):
+            if not isinstance(question, dict):
                 continue
             answer_id = f"{ask_id}:{number}"
+            if question.get("multiSelect"):
+                multi_select.add(answer_id)
             closed = min((at for key in (ask_id, answer_id) if (at := closed_at.get(key))), default=None)
             labels = option_labels(question)
             for prompt, at in prompts[handle]:
@@ -186,16 +200,18 @@ def inferred_answers(entries: list[dict], path: Path, orca: str,
     for (_, at, _), matches_for_input in matches.items():
         if len(matches_for_input) == 1:
             answer_id, label = matches_for_input[0]
-            if answer_id in available:
+            if answer_id in available and answer_id not in multi_select:
                 choices.setdefault(answer_id, {}).setdefault(label, at)
+    if choices and (version != inbox_version(inbox) or answer_history != list(inbox_read.answer_entries(path))):
+        return {}
     return {answer_id: {"id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER,
                         "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
                         "note": label}
             for answer_id, selected in choices.items() if len(selected) == 1 for label, at in selected.items()}
 
 
-def reconcile_answers(entries: list[dict], path: Path, orca: str) -> None:
-    write_inferred_answers(inferred_answers(entries, path, orca), path)
+def reconcile_answers(inbox: Path, path: Path, orca: str) -> None:
+    write_inferred_answers(inferred_answers(inbox, path, orca), path)
 
 
 def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:

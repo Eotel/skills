@@ -780,11 +780,11 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.state.write_text(json.dumps(state))
         self.assertEqual(self.hook().stdout, "")
         old = {**ask, "id": "b1234567-1234-4567-8888-123456789abc"}
-        self.write_lines(self.inbox, [old, ask])
+        self.write_lines(self.inbox, [old, {**ask, "questions": [original, original]}])
         state["questions"] = {}
         self.state.write_text(json.dumps(state))
         unnamed = self.question
-        self.question = {**unnamed, "question": f"{unnamed['question']}（ask {self.ASK}）"}
+        self.question = {**unnamed, "question": f"{unnamed['question']}（ask {self.ASK}:1）"}
         self.assertIn("worker の回答「A」", self.hook().stdout)
         self.question = unnamed
         distinct = {**original, "options": [{**option, "label": f"{option['label']}: 公開案"}
@@ -815,6 +815,21 @@ assert writer is not None and writer.wait(timeout=10) == 0
         evidence = self.run_tool("inbox_read.py", "lane-answers", another)
         self.assertEqual(evidence.returncode, 0, evidence.stderr)
         self.assertEqual(list(json.loads(evidence.stdout)), [f"{another}:1"])
+        self.write_lines(self.inbox, [{**ask, "questions": [original, {**second, "multiSelect": True}]}])
+        opened = self.run_tool("inbox_read.py", "open-asks", "--json")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual([item["number"] for item in json.loads(opened.stdout)[0]["open_questions"]], [1, 2])
+
+        self.write_lines(self.inbox, [ask])
+        incoming = self.root / "incoming.jsonl"
+        self.write_lines(incoming, [{**ask, "id": another, "questions": [second]}])
+        fake = orca.read_text()
+        self.env.update(INCOMING_ASK=str(incoming))
+        orca.write_text(fake.replace("#!/bin/sh\n", '#!/bin/sh\ncat "$INCOMING_ASK" >> "$TRIAGE_INBOX"\n'))
+        opened = self.run_tool("inbox_read.py", "open-asks", "--json")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual([item["id"] for item in json.loads(opened.stdout)], [self.ASK, another])
+        self.assertFalse(self.answers.read_text().strip())
 
     def test_correction_keeps_the_evidence_that_a_numbered_answer_was_delivered(self) -> None:
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
@@ -844,17 +859,19 @@ assert writer is not None and writer.wait(timeout=10) == 0
         key = "publish-first"
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
         ask = json.loads(self.inbox.read_text())
-        self.write_lines(self.inbox, [{**ask, "questions": [self.question, second]}])
-        self.ask(key=key, covers=[f"{self.KEY}:1"])
+        third = {**self.question, "header": "通知", "question": "通知方法を選びますか？"}
+        self.write_lines(self.inbox, [{**ask, "questions": [self.question, second, third]}])
+        self.ask(key=key, covers=[f"{self.KEY}:1", f"{self.KEY}:2"])
         self.write_lines(self.handed, [{"decision": key, "ask_id": self.ASK, "handed_off_at": self.AT}])
-        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "公開する"}])
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "公開する"},
+                                        {"id": f"{self.ASK}:2", "ts": self.AT, "how": "send", "note": "本社"}])
         result = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
                                "--handed-off-file", str(self.handed), "--state-file", str(self.state))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(key, [item["decision"] for item in json.loads(result.stdout)["settled"]])
         opened = self.run_tool("inbox_read.py", "open-asks", "--json")
         self.assertEqual(opened.returncode, 0, opened.stderr)
-        self.assertEqual([item["number"] for item in json.loads(opened.stdout)[0]["open_questions"]], [2])
+        self.assertEqual([item["number"] for item in json.loads(opened.stdout)[0]["open_questions"]], [3])
 
     def test_guard_allows_different_numbered_questions_from_the_same_worker(self) -> None:
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [

@@ -27,11 +27,13 @@ names each answered question whose inbox ask a later ask of the same lane withdr
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 import json
 import os
 from pathlib import Path
 import re
 import runpy
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -169,12 +171,56 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
     return reasons
 
 
+def question_options_agree(left: dict, right: dict) -> bool:
+    def choices(question: dict) -> dict[str, tuple[str, str]]:
+        return {lane_input.option_key(option["label"]): (
+                    lane_input.normalized(option["label"]).removesuffix("(推奨)").removesuffix("(recommended)").strip(),
+                    lane_input.normalized(str(option.get("description") or "")))
+                for option in question.get("options") or [] if isinstance(option, dict) and option.get("label")}
+
+    first, second = choices(left), choices(right)
+    if not first or not second:
+        return True
+    if first.keys() != second.keys() or bool(left.get("multiSelect")) != bool(right.get("multiSelect")):
+        return False
+    for key, (label, description) in first.items():
+        other_label, other_description = second[key]
+        if label == other_label:
+            continue
+        if key not in (label, other_label) or not description or not other_description:
+            return False
+        if (description != other_description and SequenceMatcher(None, description, other_description,
+                                                                 autojunk=False).find_longest_match().size < 10):
+            return False
+    return True
+
+
+def worker_scope(entry: dict, rows: set[str], remote_hosts: dict) -> bool:
+    if not rows:
+        return True
+    local = os.environ.get("TRIAGE_HOST") or socket.gethostname()
+    for row in rows:
+        environment, _, workspace = row.rpartition("::")
+        location = Path(workspace)
+        if location.name != entry.get("worktree"):
+            continue
+        if (environment or location.parent.parent.name == "workspaces") and entry.get("repo") not in (None, location.parent.name):
+            continue
+        host = (remote_hosts.get(environment) or {}).get("report_host") if environment else local
+        if host and entry.get("host") in (None, host):
+            return True
+    return False
+
+
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
     path = inbox_read.answers_path()
     answers = inbox_read.answer_records(path)
-    answers.update(lane_input.inferred_answers(entries, path, orca))
+    answers.update(lane_input.inferred_answers(inbox_read.paths()[0], path, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
+    remote_config = Path(os.environ.get("TRIAGE_PULL_CONFIG") or "~/.cache/orca-briefs/remote-inboxes.json").expanduser()
+    remote_data = read_json(remote_config)
+    remote_hosts = remote_data.get("hosts", {}) if isinstance(remote_data, dict) else {}
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
     reasons = []
@@ -199,34 +245,31 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             if len(bindings) > 1:
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
-        if not refs or any(not numbers for _, numbers in refs):
-            workers = {Path(row).name for item in matched if (row := item.get("row"))}
+        presented = answer_evidence.shown_question(question)
+        named = [ref for token in re.findall(r"(?<![\w-])[0-9a-f-]{8,36}(?::[1-9]\d*)?(?![\w-])", presented)
+                 if (ref := ask_state.reference(token, entries))]
+        numbered = [ref for ref in named if ref[1] and (entry := next(e for e in entries if e.get("id") == ref[0]))
+                    and max(ref[1]) <= len(inbox_read.questions_of(entry))]
+        if len(set(numbered)) == 1:
+            refs = numbered[:1]
+        elif named or not refs or any(not numbers for _, numbers in refs):
+            workers = {row for item in matched if (row := item.get("row"))}
+            named_ids = {ref[0] for ref in named}
             originals = [(str(entry["id"]), number, original)
                          for entry in entries if entry.get("kind") == "ask" and entry.get("id")
-                         and (not workers or entry.get("worktree") in workers)
+                         and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts))
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
-                         if isinstance(original, dict) and (not header or original.get("header") == header)]
+                         if isinstance(original, dict) and (not header or original.get("header") == header)
+                         and question_options_agree(original, question)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
-            if not shown and header and (current_options := lane_input.option_labels(question)):
-                current_labels = {lane_input.option_key(value): lane_input.normalized(value) for value in current_options}
-                presented = answer_evidence.shown_question(question)
+            if not shown and header:
                 links = set(QUESTION_URL.findall(presented))
-                explicit, linked = [], []
-                for ask_id, number, original in originals:
-                    choice = (ask_id, frozenset((number,)))
-                    original_labels = {lane_input.option_key(value): lane_input.normalized(value)
-                                       for value in lane_input.option_labels(original)}
-                    if original_labels.keys() != current_labels.keys():
-                        continue
-                    if answer_evidence.names_id(presented, ask_id):
-                        explicit.append(choice)
-                    elif (links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))
-                          and all(original_labels[key] in (key, current_labels[key]) or current_labels[key] == key
-                                  for key in original_labels)):
-                        linked.append(choice)
-                shown = explicit or linked
-            if refs:
+                shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
+                         if named_ids or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))]
+            if named_ids and len(shown) == 1:
+                refs = shown
+            elif refs:
                 for index, (ask_id, numbers) in enumerate(refs):
                     candidates = [parts for original, parts in shown if original == ask_id]
                     if not numbers and len(candidates) == 1:

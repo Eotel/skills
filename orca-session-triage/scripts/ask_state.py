@@ -46,10 +46,11 @@ def handoff_ref(ask_id: str | None, key: str, entries: list[dict],
     if explicit and not explicit[1]:
         if named and explicit[0] == named[0]:
             return named
-        matched = {ref for item in questions if item.get("decision") == key and not item.get("withdrawn_at")
-                   for ref in references(item, entries) if ref[0] == explicit[0] and ref[1]}
+        matched = {numbers for item in questions if item.get("decision") == key and not item.get("withdrawn_at")
+                   if (numbers := frozenset(number for ref in references(item, entries) if ref[0] == explicit[0]
+                                            for number in ref[1]))}
         if len(matched) == 1:
-            return matched.pop()
+            return explicit[0], matched.pop()
     return explicit or named
 
 
