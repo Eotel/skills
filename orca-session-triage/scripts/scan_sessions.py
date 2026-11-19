@@ -2944,6 +2944,9 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                     "record_id": answer.id,
                     **({"after": answer.removal.after, "discard": list(answer.removal.discard),
                         "compose_down": answer.removal.compose_down} if answer.removal else {}),
+                        **({"archive_path": list(answer.removal.archive_path)}
+                           if answer.removal and answer.removal.archive_path else {}),
+                        **({"approve": True} if answer.removal and answer.removal.approve else {}),
                 }
         removal_at = EPOCH
         if by_key:
@@ -2987,6 +2990,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         selected = min(candidates, key=lambda removal: removal["allows_removal"])
         if len(candidates) > 1 and selected["allows_removal"]:
             cleanup_terms = {(frozenset(map(PurePosixPath, removal.get("discard") or ())),
+                              frozenset(map(PurePosixPath, removal.get("archive_path") or ())),
                               removal.get("compose_down") is True)
                              for removal in candidates}
             if len(cleanup_terms) > 1:
@@ -3011,7 +3015,7 @@ def removal_answer_approves(decision: Mapping) -> bool:
         return False
     if decision.get("after"):
         return decision.get("after_state") == "MERGED"
-    if decision.get("discard") or decision.get("compose_down"):
+    if decision.get("approve") is True or decision.get("discard") or decision.get("compose_down") or decision.get("archive_path"):
         return True
     text = str(decision.get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
@@ -4149,7 +4153,19 @@ def wake_line(row: dict, stop: StopReason) -> str:
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 
 
-def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
+def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
+    answer = row.get("removal_decision") or {}
+    if (not answer.get("decision") or not answer.get("answer") or removal_approved(row)
+            or answer.get("after") or answer.get("cleanup_conflict") or row.get("cleanup_blockers")):
+        return
+    command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), "--decisions-file",
+                          str(decisions_file.expanduser()), "record", "--decision", answer["decision"],
+                          "--answer-file", "/dev/stdin", "--approve"])
+    text = shlex.join(["printf", "%s\n", answer["answer"]])
+    print(f"{row_name(row)}: 条件も後始末も不要と判断して削除を承認する場合は {text} | {command}", file=sys.stderr)
+
+
+def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path, decisions_file: Path) -> int:
     """Print `<path> <PR|->` for each named row a removal check may take: an open PR cleanup row, or a finished one
     even while its tabs remain (rm_check.py names the tabs to close). Every other row is named on stderr with why,
     and makes the exit status 1; an unknown name prints nothing."""
@@ -4178,6 +4194,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
+        print_removal_approval_hint(row, decisions_file)
     if remote_preview:
         print(REMOTE_CHECK_RELEASE, file=sys.stderr)
     print_rm_specs(specs, scan_file)
@@ -4196,7 +4213,7 @@ def print_rm_specs(specs: list[str], scan_file: Path) -> None:
 
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
     if args.row and args.rm_specs:
-        return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute())
+        return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute(), args.decisions_file)
     if args.row and args.cards:
         try:
             rows = list({id(row): row for row in (select_row(rows, name) for name in args.row)}.values())
@@ -4220,6 +4237,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
             if blocker := removal_blocker(row):
                 if not row.get("pending_handoffs") or row.get("automation_blocker") or row.get("cleanup_blockers"):
                     print(f"{row_name(row)}: {blocker} | {removal_facts(row)}", file=sys.stderr)
+                    print_removal_approval_hint(row, args.decisions_file)
                 continue
             if removal_approved(row) or row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
                 if requirement := batch_requirement(row):

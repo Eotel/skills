@@ -151,8 +151,8 @@ board's done cards; close what the user approves.
   a finished one also while its tabs remain. An explicit removal approval in
   `removal_decision` also permits a check; retain or defer answers keep the row.
   An answer recorded with `--after pr-merged:<PR URL>` permits it once that PR
-  merged, and one with only cleanup values (`--discard`, `--compose-down`) at
-  once, whatever its words (`references/cleanup.md`).
+  merged. One with cleanup values (`--discard`, `--compose-down`, `--archive-path`)
+  or explicit `--approve` permits a check at once (`references/cleanup.md`).
   Only the row's own `remove:` keys decide it; a newer answer to one of their
   `::` sub-keys (`remove:local::PATH::db-down`) is shown as its `newest`
   (`decision`, `answer`, `decided_at`), and `--summary` adds it after the answer.

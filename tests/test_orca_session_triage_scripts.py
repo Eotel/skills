@@ -2944,6 +2944,20 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main([*base, "--rows", "--class", "blocked"]), 0)
             self.assertIn("held", out.getvalue())
 
+    def test_removal_specs_use_structured_approval_even_with_meaningful_tabs(self) -> None:
+        saved, decisions = self.dir / "scan.json", self.dir / "decisions"
+        saved.write_text(json.dumps([{"path": f"/w/app/{name}", "class": "stalled", "repo": "app",
+                                      "meaningful_tabs": ["term"]} for name in ("approve", "archive", "legacy")]))
+        records = (("approve", {"approve": True}), ("archive", {"archive_path": ["work notes"]}), ("legacy", None))
+        write_jsonl(decisions, [{"id": name, "decision": f"remove:/w/app/{name}", "answer": "閉じる。",
+                                 "decided_at": "2026-11-19T12:00:00Z", "removal": terms} for name, terms in records])
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -", "/w/app/archive -"])
+        self.assertIn("lead_decisions.py", err.getvalue())
+        self.assertIn("--decision remove:/w/app/legacy", err.getvalue())
+        self.assertIn("--approve", err.getvalue())
+
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",

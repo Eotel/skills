@@ -57,15 +57,15 @@ shell's environment, so `rm_check.py` names no `tab` for an empty one: as many s
 removal. A live tab left without one keeps the row.
 Record a removal answer's condition and cleanup as values, not only in its words. `lead_decisions.py record --decision
 remove:… --after pr-merged:<PR URL>` approves the row once the scan reads that PR as merged, whatever conditions the
-words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` (repeatable, relative to the
-worktree, such as a `.env` pointing only at localhost) or `--compose-down`, the scan approves the row whatever the
-words give, and `rm-check-batch --from SCAN_JSON --remove-ok` closes the row's scanned tabs without the idle-tab
-check, runs `docker compose -p <project> down -v` for each project the check lists, deletes those files, and checks
-again before it removes the worktree. It refuses such a row on another Mac (`--host`): clean up there by hand. An
-answer without those values is checked as above.
+words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` or `--archive-path PATH`
+(both repeatable, relative to the worktree) or `--compose-down`, the scan approves the row whatever the
+words give. `rm-check-batch --from SCAN_JSON --remove-ok` closes the scanned tabs, runs the recorded cleanup,
+verifies any requested archives, and checks again before removal. Run that cleanup on the worktree's Mac.
+Use `--approve` for an explicit approval without conditions or cleanup. If an answer has no structured values,
+the scan reads its text and prints a command to record an explicit approval when the text is insufficient.
 
 When the latest answers under different removal keys share a timestamp, keep the worktree
-unless every answer approves removal and specifies the same files to discard and Compose cleanup.
+unless every answer approves removal and specifies the same archive, discard, and Compose cleanup.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`

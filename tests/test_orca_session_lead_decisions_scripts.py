@@ -31,6 +31,20 @@ print(json.dumps({{"data": {{"repository": {{
 
 
 class LeadDecisionsTests(unittest.TestCase):
+    def test_recording_explicit_removal_approval_and_archive_paths(self) -> None:
+        answer = self.root / "answer.txt"
+        answer.write_text("閉じる。", encoding="utf-8")
+        result = self.run_tool("record", "--decision", "remove:/w/clean", "--answer-file", str(answer), "--approve")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIs(json.loads(result.stdout)["removal"]["approve"], True)
+        archives = {"decision": "remove:/w/notes", "answer": "記録を保管", "archive_path": [".notes", "logs/data"]}
+        result = self.run_tool("record-many", stdin=json.dumps(archives) + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[0]["removal"]["archive_path"], [".notes", "logs/data"])
+        for path in ("../outside", ".git/index"):
+            rejected = self.run_tool("record-many", stdin=json.dumps({**archives, "archive_path": [path]}) + "\n")
+            self.assertNotEqual(rejected.returncode, 0)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
