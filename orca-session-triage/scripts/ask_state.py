@@ -89,7 +89,8 @@ def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
     named_ref = f"{named_id}:{part}" if part else named_id
     if not registered or part and ":" not in registered and matching_ref(registered, named_id):
         return matching_ref(ask_id, named_ref)
-    return matching_ref(ask_id, registered) or (question.get("decision") != key and matching_ref(ask_id, named_ref))
+    return matching_ref(ask_id, registered) or (":" not in registered and question.get("decision") != key
+                                                and matching_ref(ask_id, named_ref))
 
 
 def handoff_target(key: str, ask_id: str | None, entries: list[dict],
