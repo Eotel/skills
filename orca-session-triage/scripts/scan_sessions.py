@@ -1054,17 +1054,19 @@ def draft_excerpt(screen: dict) -> str:
 
 def composer_empty(screen: dict, agent: str | None = None) -> bool | None:
     """Whether the visible input is empty. None means the composer was not visible."""
-    lines = [line.strip() for line in screen_lines(screen)]
+    shown = screen_lines(screen)
+    lines = [line.strip() for line in shown]
     if agent == "codex":
         prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith(CODEX_PROMPT)]
         if not prompts:
             return None
-        prompt = prompts[-1]
+        prompt = min(prompts, key=lambda index: (len(shown[index]) - len(shown[index].lstrip()), -index))
         trailing = lines[prompt + 1:]
         if last_codex_activity(trailing):
             return None
         return (lines[prompt] in ("›", "› Ask Codex to do anything") and
                 not any(line and line != "? for shortcuts" and not RULE.fullmatch(line)
+                        and not re.fullmatch(r"(?:gpt|codex)-[\w.-]+(?: \w+)? · (?:[~/].*)", line, re.IGNORECASE)
                         for line in trailing))
     rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
     for top, bottom in reversed(list(zip(rules, rules[1:]))):
@@ -2938,6 +2940,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             blockers.append("指揮の作業場")
         if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
             blockers.append("structured-agent-session の agent がいる作業場")
+        if row.get("scanned_at") and not row.get("agent_ownership_observed"):
+            blockers.append("構造化セッションの情報がない走査です。再走査してください")
         blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner == row_identity(row))
         row_hosts = {hostname(value) for value in
                      (environment or local_hostname, row.get("host_id"), *([socket.gethostname()] if not environment else []))
@@ -3002,8 +3006,14 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         else:
             keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
                     f"remove:local::{row['path']}"}
-        by_key = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
+        by_key: dict[str, dict] = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
                   if candidate["decision"] in keys}
+        if primary:
+            saved = row.get("removal_decision") or {}
+            if isinstance(saved_key := saved.get("decision"), str) and saved_key in keys and saved_key != primary:
+                by_key.setdefault(saved_key, saved)
+            by_key = {key: ({**candidate, "legacy_retain": True} if key != primary else candidate)
+                      for key, candidate in by_key.items()}
         for key in keys:
             if answer := decisions.get(key):
                 if ((saved := by_key.get(key)) and saved.get("record_id") not in recorded_ids
@@ -3274,8 +3284,7 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict], *,
                    or (row.get("claude") or {}).get("pending_questions")
                    or any(not request.get("answered_in_chat_later") for session in row.get("codex") or []
                           for request in session.get("pending_requests") or [])
-                   or any(agent.get("state") == "waiting" or agent.get("state") == "working" and agent.get("turn") != "done"
-                          for agent in row.get("agents") or []))
+                   or any(agent.get("state") in ("waiting", "working") for agent in row.get("agents") or []))
         drafts = {*row.get("draft_tabs", []), *(card.get("handle") for card in row.get("done_cards") or []
                                                if card.get("draft") or card.get("composer_empty") is False)}
         if None in drafts:
@@ -4152,7 +4161,7 @@ def main(argv: list[str] | None = None) -> int:
         print(line)
         print(line, file=sys.stderr)
         return NETWORK_DOWN_EXIT
-    rows = [{**row, "scanned_at": scanned_at}
+    rows = [{**row, "scanned_at": scanned_at, "agent_ownership_observed": True}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
     try:
         rows = with_reported_times(rows, inbox_read.inbox_entries(Path(args.inbox).expanduser()))

@@ -91,8 +91,9 @@ class CloseTabsTests(unittest.TestCase):
             (None, False),
             ({"source": "screen", "tail": ["› unsent text", "? for shortcuts"]}, False),
             ({"source": "screen", "tail": ["›", "typed on the next line", "? for shortcuts"]}, False),
+            ({"source": "screen", "tail": ["› keep this draft", "  ›"]}, False),
             ({"source": "screen", "tail": ["• final answer", "Worked for 2s • 12:00"]}, False),
-            ({"source": "screen", "tail": ["› Ask Codex to do anything", "? for shortcuts"]}, True),
+            ({"source": "screen", "tail": ["› Ask Codex to do anything", "  GPT-6.1-Sol xhigh · ~/orca/workspaces/app/fix"]}, True),
         ]
         for screen, expected in frames:
             with (self.subTest(screen=screen), patch.object(tabs, "agent_changes", return_value=[]),

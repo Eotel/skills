@@ -2895,6 +2895,7 @@ class ScanCommandTests(unittest.TestCase):
         saved = self.dir / "scan.json"
         cases = [
             {"agents": [{"type": "codex", "state": "waiting"}]},
+            {"agents": [{"type": "codex", "state": "working", "turn": "done"}]},
             {"unread_mail": [{"from": "worker"}]},
             {"codex": [{"pending_requests": [{"answered_in_chat_later": False}]}]},
             {"done_cards": [{"handle": "term", "agent": "codex", "draft": True}]},
