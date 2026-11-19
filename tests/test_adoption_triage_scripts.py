@@ -375,6 +375,8 @@ class AdoptionLedgerTests(unittest.TestCase):
         done = owner()
         self.assertEqual(done[:4], [proposal_id, "adopted", "担当 next-lane", "指示書 なし"])
         self.assertRegex(done[4], r"^実施 済 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        record("failed", "triage-retro", "target skill is missing")
+        self.assertEqual(owner()[4], done[4])
         held = self.run_ledger(["decide", "--expected-adoption-id", adoption], {
             "proposal_id": proposal_id, "decision": "hold", "actor": "Eotel"})
         self.assertEqual(held.returncode, 0, held.stderr)
