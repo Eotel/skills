@@ -868,13 +868,21 @@ def owner_name(value: str) -> str:
     return owner
 
 
+def same_environment_rows(rows: list[dict], value: str) -> list[dict]:
+    environment, separator, _ = value.partition("::")
+    return [row for row in rows if row.get("environment") == (environment if separator else None)]
+
+
 def selected_worktree(value: str, rows: list[dict] | None, option: str) -> str:
-    if rows is not None:
-        return owner_name(scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option)))
-    try:
-        return owner_name(value)
-    except ValueError as error:
-        raise ValueError(f"{option} {value}: use --from SCAN_JSON to resolve a worktree name") from error
+    wanted = value.strip()
+    if rows is None:
+        return wanted if option == "--row" else owner_name(wanted)
+    path = wanted.split("::", 1)[-1]
+    if Path(path).is_absolute():
+        if option == "--row" and not scan_sessions.matching_rows(rows, wanted):
+            return owner_name(wanted)
+        rows = same_environment_rows(rows, wanted)
+    return owner_name(scan_sessions.row_identity(scan_sessions.select_row(rows, wanted, option)))
 
 
 def repository_names(owner: str) -> frozenset[str]:
@@ -1003,7 +1011,7 @@ class Answering:
 
 def current_question(data: dict, asking: Asking) -> str | None:
     return next((key for key, item in reversed(list(data["questions"].items()))
-                 if item["row"] == asking.row and item["decision"] == asking.decision
+                 if asking.row in (item["row"], item.get("row_alias")) and item["decision"] == asking.decision
                  and not item.get("withdrawn_at")), None)
 
 
@@ -1015,13 +1023,12 @@ def reuse_question_rows(data: dict, askings: list[Asking], rows: list[dict]) -> 
             if item["decision"] != asking.decision or item.get("withdrawn_at"):
                 continue
             old = item["row"]
-            environment, separator, path = old.partition("::")
-            if Path(path if separator else old).is_absolute():
-                continue
-            matches = scan_sessions.matching_rows(rows, old)
-            if (len(matches) == 1 and matches[0].get("environment") == (environment if separator else None)
-                    and scan_sessions.row_identity(matches[0]) == asking.row):
+            scoped = same_environment_rows(rows, old)
+            matches = scan_sessions.matching_rows(scoped, old)
+            if any(scan_sessions.row_identity(row) == asking.row for row in matches):
+                scan_sessions.select_row(scoped, old)
                 item["row"] = asking.row
+                item["row_alias"] = old
                 break
 
 
@@ -1052,7 +1059,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, asking.row),
+    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, data["questions"][key]["row"]),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1202,10 +1209,7 @@ def asking_line(raw: str, inbox: Inbox) -> Asking:
     row, message, ask = (inbox.lane(line_text(item, "ask")) if "ask" in item
                          else (line_text(item, "row"), line_text(item, "final_message"), {}))
     if "row" in item and inbox.scan is not None:
-        try:
-            row = owner_name(row)
-        except ValueError:
-            row = selected_worktree(row, inbox.rows, "row")
+        row = selected_worktree(row, inbox.rows, "--row")
     covers = item.get("covers", [])
     if not isinstance(covers, list) or not all(isinstance(key, str) and key.strip() for key in covers):
         raise ValueError("covers must be a list of lead decision keys")

@@ -6711,19 +6711,22 @@ class HourlyStateTests(unittest.TestCase):
         message = self.source("message.txt", "Ready.")
         args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
         _, original = self.call("asked", "--row", "/w/app/lane", *args)
+        self.call("answered", "--id", original["id"], "--answer-file", message)
         previous = json.loads(self.state.read_text())
         old_id = hourly_state.identifier("app/lane", "publish")
         previous["questions"][old_id] = {**previous["questions"].pop(original["id"]), "row": "app/lane"}
-        self.state.write_text(json.dumps(previous))
-        saved = self.source("scan.json", json.dumps([{"path": "/w/app/lane", "repo": "app"}]))
-
-        _, asked = self.call("asked", "--row", "app/lane", "--from", saved, *args)
-
-        self.assertEqual((asked["id"], asked["row"]), (old_id, "/w/app/lane"))
-        batch = self.source("asked.jsonl", json.dumps({"row": "app/lane", "decision": "publish",
+        row = {"path": "/w/app/lane", "repo": "app"}
+        saved = self.source("scan.json", json.dumps([row, {**row, "environment": "mac-b"}]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/w/app/lane", "decision": "publish",
                                                         "final_message": "Ready.", "question": "Ready."}))
-        _, asked_batch = self.call("asked-many", "--from", saved, "--file", batch, "--no-comment")
-        self.assertEqual(asked_batch[0]["id"], old_id)
+        for command in (("asked", "--row", "/w/app/lane", "--from", saved, *args),
+                        ("asked-many", "--from", saved, "--file", batch, "--no-comment")):
+            with self.subTest(command=command[0]):
+                self.state.write_text(json.dumps(previous))
+                _, result = self.call(*command)
+                asked = result[0] if isinstance(result, list) else result
+                self.assertEqual((asked["id"], asked["row"], asked["answer"]), (old_id, "/w/app/lane", "Ready."))
+        self.assertEqual(self.call("asked", "--row", "app/lane", *args)[1]["id"], old_id)
         result, answer = self.call("answered", "--decision", "publish", "--answer-file", message)
         self.assertEqual((result, answer["id"]), (0, old_id))
 
@@ -6739,6 +6742,23 @@ class HourlyStateTests(unittest.TestCase):
         self.assertNotEqual(remote["id"], local["id"])
         self.assertIsNone(remote["answer"])
         self.assertEqual(self.call("get", local["id"])[1]["row"], "/w/app/lane")
+        state = self.state.read_bytes()
+        for command in (("asked", "--row", "/w/app/lane", *args),
+                        ("presented", "--owner", "/w/app/lane", "--key", "user:publish", "--text-file", message,
+                         "--since", "2026-11-19T00:00:00Z")):
+            with self.subTest(command=command[0]), redirect_stderr(io.StringIO()):
+                self.assertEqual(hourly_state.main(["--state-file", str(self.state), *command, "--from", saved]), 1)
+        self.assertEqual(self.state.read_bytes(), state)
+
+    def test_asked_many_resolves_the_same_no_repo_alias_as_asked(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": "/w/second", "repo": None}]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/second", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        _, recorded = self.call("asked-many", "--from", saved, "--file", batch, "--no-comment")
+        message = self.source("message.txt", "Ready.")
+        _, asked = self.call("asked", "--row", "/second", "--decision", "publish", "--from", saved, "--no-comment",
+                             "--final-message-file", message, "--question-file", message)
+        self.assertEqual((asked["id"], asked["row"]), (recorded[0]["id"], "/w/second"))
 
     def test_a_relative_path_in_a_saved_scan_cannot_be_recorded_as_owner(self) -> None:
         saved = self.source("scan.json", json.dumps([{"path": "lane", "repo": "app"}]))
