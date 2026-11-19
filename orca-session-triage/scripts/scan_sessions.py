@@ -1915,7 +1915,8 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
     for pid, (_, command) in (rm_check.process_table() or {}).items():
         args = command.split()
         binary = next((index for index, token in enumerate(args[:2])
-                       if Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")), None)
+                       if Path(token).name in ("codex", "codex.js")
+                       or Path(token).name.startswith(("codex-aarch64-", "codex-x86_64-"))), None)
         if binary is None:
             continue
         options = args[binary + 1:]

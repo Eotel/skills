@@ -895,7 +895,10 @@ class ClassifyTests(unittest.TestCase):
                      16: (1, "codex app-server"), 17: (1, "codex -- --yolo"), 18: (1, "codex Inspect exec code"),
                      19: (1, "codex resume --dangerously-bypass-approvals-and-sandbox --last"),
                      20: (1, "codex fork --last --yolo"), 21: (1, "codex resume --last -- --yolo"),
-                     22: (1, "codex resume prior-session --yolo")}
+                     22: (1, "codex resume prior-session --yolo"),
+                     23: (1, "/opt/codex/codex-aarch64-apple-darwin resume --last"),
+                     24: (1, "/opt/codex/codex-x86_64-apple-darwin resume --last"),
+                     25: (1, "/opt/codex/codex-x86_64-apple-darwin resume --last --yolo")}
         handles = {pid: "term_other" if pid == 14 else "term_codex" for pid in processes}
         with patch.object(scan.rm_check, "process_table", return_value=processes), \
              patch.object(scan.rm_check, "process_handles", side_effect=lambda pids: {pid: handles[pid] for pid in pids}):
@@ -906,7 +909,8 @@ class ClassifyTests(unittest.TestCase):
                                                        "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
         self.assertIn("Codex process 13 shows no approvals bypass flag in its process command", rows[0]["reasons"])
         self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
-                         [f"Codex process {pid} shows no approvals bypass flag in its process command" for pid in (13, 17, 18, 21)])
+                         [f"Codex process {pid} shows no approvals bypass flag in its process command"
+                          for pid in (13, 17, 18, 21, 23, 24)])
         self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
             *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
 
