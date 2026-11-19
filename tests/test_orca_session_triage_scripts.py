@@ -2971,6 +2971,27 @@ class ScanCommandTests(unittest.TestCase):
             row, = scan.build_inventory([tree], [pending, claude], self.dir, {}, "要判断", now=NOW, screens=screens)
         self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", claude["handle"]))
 
+    def test_an_approval_does_not_make_a_resumed_panes_old_preview_a_stop(self) -> None:
+        lane = str(self.dir / "local")
+        pending = in_pane(terminal(lane, "codex", "term_pending"), "tab:pending")
+        old = "■ stream disconnected before completion"
+        resumed = in_pane(terminal(lane, "codex", "term_resumed", preview=old), "tab:resumed")
+        tree = worktree(lane, "working", agent="codex")
+        tree["agents"].append({"agentType": "codex", "state": "working", "paneKey": scan.hourly_runtime.pane_key(resumed),
+                               "updatedAt": (NOW - 100) * 1000, "lastAssistantMessage": old})
+        approval = {"source": "screen", "tail": [scan.CODEX_PERMISSION, "$ git status",
+                                                  "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel"]}
+        current = {"source": "screen", "tail": [old, "› try again", "• Retrying the build."]}
+        screens = {(None, pending["handle"]): approval, (None, resumed["handle"]): current}
+        row, = scan.build_inventory([tree], [pending, resumed], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["class"], row["stop"]), ("waiting", None))
+
+        new_error = {"pending_requests": [], "api_error": old,
+                     "api_error_at": datetime.fromtimestamp(NOW + 1, timezone.utc).isoformat()}
+        row, = scan.build_inventory([tree], [pending, resumed], self.dir, {lane: [new_error]}, "要判断",
+                                    now=NOW, screens=screens)
+        self.assertEqual(row["stop"]["action"], "wake")
+
     def test_a_remote_codex_pane_with_an_old_error_is_read_for_approval(self) -> None:
         lane, environment = str(self.dir / "remote"), "mbp16"
         tree = worktree(lane, "working", agent="codex")

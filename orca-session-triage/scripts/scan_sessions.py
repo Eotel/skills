@@ -724,7 +724,7 @@ def failure(row: dict) -> tuple[str, str | None, str | None] | None:
               "codex", screen_tab, None),
              *((item.get("api_error"), "codex", None, item.get("api_error_at")) for item in codex_failures),
              ((row["claude"] or {}).get("api_error"), "claude", claude_tab, None),
-             (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None,
+             (orca if not (row["claude"] or row["codex"] or message.get("resumed")) and API_ENDED.match(orca) else None,
               message.get("agent"), message.get("tab"), message.get("at"))]
     observed = parse_time(row.get("approval_observed_at") or row.get("scanned_at"))
     for error, agent, tab, at in found:
@@ -1005,6 +1005,12 @@ CODEX_PROMPT = "› "
 def screen_lines(screen: dict) -> list[str]:
     tail = screen.get("tail") or []
     return tail if isinstance(tail, list) else tail.splitlines()
+
+
+def last_codex_activity(lines: list[str]) -> str | None:
+    """The last Codex reply, action, or error in a terminal excerpt."""
+    return next((line for raw in reversed(lines) if (line := raw.strip())
+                 and (line.startswith(CODEX_REPLY) or api_failure(line))), None)
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1765,9 +1771,23 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                 default=datetime.fromtimestamp(now, timezone.utc).isoformat())
         pane_handles = {key: term["handle"] for term in terms
                         if term.get("handle") and (key := hourly_runtime.pane_key(term))}
+        codex_activity = {term["handle"]: last_codex_activity(screen_lines(frame)) for term in terms
+                          if term.get("agentIdentity") == "codex" and term.get("handle")
+                          and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))}
         screen_error = next(((error, term.get("handle")) for term in terms if term.get("agentIdentity") == "codex"
-                             and term.get("handle") not in approval_tabs if (error := api_failure(term.get("preview")))),
+                             and term.get("handle") not in approval_tabs
+                             if (error := api_failure(codex_activity.get(term.get("handle")) or
+                                                      last_codex_activity(str(term.get("preview") or "").splitlines())))),
                             (None, None))
+
+        def pane_resumed(agent: dict, tab: str) -> bool:
+            activity = codex_activity.get(tab)
+            if not activity or api_failure(activity):
+                return False
+            frame = screens.get((w.get("_environment"), tab)) or {}
+            observed = parse_time(frame.get("_observed_at")) or datetime.fromtimestamp(now, timezone.utc)
+            updated = parse_time(iso_time(agent.get("updatedAt")))
+            return updated is None or updated <= observed
         spoken = [agent for agent in w.get("agents") or [] if agent.get("lastAssistantMessage")]
         pane_errors = []
         if approval_tabs:
@@ -1775,7 +1795,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 (error, agent.get("agentType"), tab, iso_time(agent.get("updatedAt")))
                 for agent in sorted(spoken, key=lambda item: item.get("updatedAt") or 0, reverse=True)
                 if (tab := pane_handles.get(agent.get("paneKey")))
-                and API_ENDED.match(error := " ".join(agent["lastAssistantMessage"].split()))]
+                and API_ENDED.match(error := " ".join(agent["lastAssistantMessage"].split()))
+                and not pane_resumed(agent, tab)]
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
@@ -1813,12 +1834,15 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     return (agent.get("agentType") == "codex" and pane_handles.get(agent.get("paneKey")) in approval_tabs
                             and bool(API_ENDED.match(" ".join(agent["lastAssistantMessage"].split()))))
 
-                current = [agent for agent in spoken if not approval_error(agent)]
+                current = [agent for agent in spoken if not approval_error(agent)
+                           and not (API_ENDED.match(" ".join(agent["lastAssistantMessage"].split()))
+                                    and (tab := pane_handles.get(agent.get("paneKey"))) and pane_resumed(agent, tab))]
                 newest = max(current or spoken, key=lambda a: a.get("updatedAt") or 0)
                 row["orca_message"] = {"text": newest["lastAssistantMessage"],
                                        "at": iso_time(newest.get("updatedAt")),
                                        **({"tab": tab} if (tab := pane_handles.get(newest.get("paneKey"))) else {}),
-                                       **({"agent": newest["agentType"]} if newest.get("agentType") else {})}
+                                       **({"agent": newest["agentType"]} if newest.get("agentType") else {}),
+                                       **({"resumed": True} if tab and pane_resumed(newest, tab) else {})}
             elif screen_said:
                 row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
         elif not row["codex"] and (codex_said := codex_tab_message(terms, screens))[0]:
