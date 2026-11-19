@@ -3394,13 +3394,13 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
-                    options = ["--summary", "--from", str(saved.absolute())]
+                    options = ["--from", str(saved.absolute()), "--summary"]
                     host = ["--host", row["environment"]] if row.get("environment") else []
                     if row.get("open_pr_cleanup"):
                         options.extend(("--preview", "--detach-nested"))
                     spec = f"{row['path']} {number or '-'}"
                     if row.get("open_pr_cleanup") or host:
-                        expected = [str(scan.RM_CHECK_BATCH), *options, *host, spec]
+                        expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
                     else:
                         expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
@@ -4877,8 +4877,8 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["containers"], [{"project": "app-wt", "status": "running(2)"}])
-        with redirect_stdout(io.StringIO()) as out:
-            rmcheck.print_check(result, summary=True)
+        with patch.object(rmcheck, "compose_projects", return_value=projects), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--summary"]), 0)
         self.assertIn("Compose app-wt running(2)", out.getvalue())
 
     def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:

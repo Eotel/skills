@@ -3518,14 +3518,14 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     """A one-line check for this row, using the saved scan's timestamp when available."""
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
-    options = ["--summary", *from_scan]
+    options = [*from_scan, "--summary"]
     if not remove_ok and not (row.get("open_pr_cleanup") and scan_file) and not environment:
         return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
     if remove_ok:
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif row.get("open_pr_cleanup") and scan_file:
         options.extend(("--preview", "--detach-nested"))
-    return shlex.join([str(RM_CHECK_BATCH), *options, *(["--host", environment] if environment else []), rm_spec(row)])
+    return shlex.join([str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
