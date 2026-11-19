@@ -32,6 +32,7 @@ OrcaTabs implements it with the Orca CLI, so another host needs one more TabHost
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -270,18 +271,42 @@ def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, 
     if row is None:
         return False, f"{handle}: KEPT -> not a tab of any row in the scan"
     try:
+        if (row.get("environment"), handle) in scan_sessions.active_holds(datetime.now(timezone.utc)):
+            return False, f"{handle}: KEPT -> 保留中のタブ"
+        if handle in (row.get("draft_tabs") or []):
+            return False, f"{handle}: KEPT -> 未送信の入力"
         if scan_sessions.pending_handoffs(row, state_file.expanduser()):
             return False, f"{handle}: KEPT -> 未配信の約束の送り先"
         moved = moved_after_scan(row, host, projects, inbox, caller)
-    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
+    except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: KEPT -> {error}"
     if moved:
         last = moved[-1]
         return False, (f"{handle}: KEPT -> 走査の後に動いた（{last.at.astimezone().strftime('%H:%M:%S')} {last.what}"
                        + (f" ほか {len(moved) - 1} 件" if len(moved) > 1 else "") + "）")
     try:
+        agents = [tab.get("agent") for source in ("terminals", "done_cards") for tab in row.get(source) or []
+                  if tab.get("handle") == handle and tab.get("agent")]
+        if isinstance(host, OrcaTabs) and agents:
+            environment = row.get("environment")
+            key = environment, handle
+            frames = scan_sessions.read_screens(host.orca, [{"_environment": environment, "handle": handle}])
+            frame = scan_sessions.rendered(frames.get(key))
+            if frame is None:
+                return False, f"{handle}: KEPT -> 画面を確認できない"
+            codex_input = False
+            if "codex" in agents:
+                lines = [line.strip() for line in scan_sessions.screen_lines(frame)]
+                prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith("› ")]
+                if prompts:
+                    prompt = prompts[-1]
+                    codex_input = lines[prompt] != "›" and not scan_sessions.last_codex_activity(lines[prompt + 1:])
+            if scan_sessions.has_draft(frame) or scan_sessions.composer_empty(frame) is False or codex_input:
+                return False, f"{handle}: KEPT -> 未送信の入力"
+        if (row.get("environment"), handle) in scan_sessions.active_holds(datetime.now(timezone.utc)):
+            return False, f"{handle}: KEPT -> 保留中のタブ"
         host.close(row.get("environment"), handle)
-    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
+    except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: NOT CLOSED -> {error}"
     return True, f"{handle}: CLOSED"
 

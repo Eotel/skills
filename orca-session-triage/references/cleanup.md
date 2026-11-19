@@ -10,8 +10,8 @@ comment contains 「消さない」 or 「残す」: its reasons quote the comme
 A HEAD commit or review-pr log (`~/.cache/orca-briefs/review/out/<owner>-<repo>-<PR>.log`) under
 thirty minutes old also keeps it, with the reason 「別の担当が使用中（時刻）」: another lane works there
 without an agent in its tabs.
-HEAD matching the PR head proves it was pushed to that PR; `git.unpushed` may
-still be positive when the branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
+HEAD matching the PR head proves it was pushed to that PR even when local
+remote-tracking refs are stale. Remove these checkouts after `rm_check.py` clears
 them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
