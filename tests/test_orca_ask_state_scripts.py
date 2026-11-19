@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -576,6 +578,44 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertIn("回答済み", guarded.stdout)
         self.assertIn(self.ASK, guarded.stdout)
         self.answers.write_text("")
+        self.assertEqual(self.hook().stdout, "")
+
+    def test_guard_flags_input_in_the_asking_lane_once_and_ignores_sent_text(self) -> None:
+        status = self.root / "last-status.db"
+        transcript = self.root / "worker.jsonl"
+        events = self.root / "events.jsonl"
+        self.env.update(TRIAGE_HOST="mac-a", TRIAGE_AGENT_STATUS_FILE=str(status), ORCA_BOARD_EVENTS=str(events),
+                        ORCA_CLI_COMMAND="false")
+        ask = {"id": self.ASK, "ts": "2026-11-14T09:00:00Z", "kind": "ask",
+               "host": "mac-a", "worktree": "worker", "handle": "term_worker", "questions": [self.question]}
+        self.write_lines(self.inbox, [ask])
+        self.answers.write_text("")
+        self.claims.write_text("")
+        events.write_text("")
+        with closing(sqlite3.connect(status)) as db, db:
+            db.execute("CREATE TABLE rows(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, value TEXT NOT NULL)")
+            db.execute("INSERT INTO rows VALUES (?, ?, ?)", ("entry\0worker:leaf", 1, json.dumps({
+                "worktreeId": "repo::/w/worker", "providerSession": {"transcriptPath": str(transcript)},
+            })))
+        prompt = "公開は明日まで待ってください。"
+        typed = {"type": "user", "timestamp": self.AT, "message": {"role": "user", "content": prompt}}
+        self.write_lines(transcript, [typed])
+
+        guarded = self.hook()
+        self.assertEqual(guarded.returncode, 0, guarded.stderr)
+        self.assertTrue(guarded.stdout, "Expected a denial for input in the asking lane")
+        decision = json.loads(guarded.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn(prompt, decision["permissionDecisionReason"])
+        self.assertIn(self.ASK, decision["permissionDecisionReason"])
+        self.assertEqual(self.hook().stdout, "")
+
+        sent = {"type": "user", "timestamp": "2026-11-14T09:02:00Z",
+                "message": {"role": "user", "content": "状況を確認して\n  報告してください。"}}
+        self.write_lines(self.inbox, [{**ask, "id": "b1234567-1234-4567-8888-123456789abc"}])
+        self.write_lines(transcript, [sent])
+        self.write_lines(events, [{"type": "send", "ts": sent["timestamp"], "to": "term_worker",
+                                   "text": "状況を確認して 報告してください。"}])
         self.assertEqual(self.hook().stdout, "")
 
     def test_guard_matches_a_reworded_question_by_its_cover_and_allows_an_unrelated_reused_header(self) -> None:

@@ -462,7 +462,8 @@ def inbox_entries(inbox: Path) -> list[dict]:
 DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
 HOURLY_ANSWER = "hourly_state.py answered"
 HOURLY_CORRECTION = "hourly_state.py corrected"
-HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION))
+LANE_ANSWER = "triage-notify --answered"
+HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION, LANE_ANSWER))
 SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
 
 

@@ -44,6 +44,7 @@ import handoff
 import hourly_state
 import inbox_read
 import hourly_runtime
+import lane_input
 import retro
 
 STATE_DIR = os.environ.get("TRIAGE_STATE_DIR", "~/.cache/orca-session-triage")
@@ -89,7 +90,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     state = read_json(state_dir / "hourly-state.json")
     lead = (state.get("lead") or {}).get("worktree") if isinstance(state, dict) else None
     if isinstance(state, dict) and lead and ask_state.same_workspace(lead, workspace):
-        return duplicate_question(hook_input, state)
+        return duplicate_question(hook_input, state, state_dir, orca)
     try:
         if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
                    for automation in triage_automations(orca, workspace)):
@@ -102,7 +103,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     reasons = []
-    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}):
+    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca):
         reasons.append(duplicated["hookSpecificOutput"]["permissionDecisionReason"])
     if not all(in_japanese(question) for question in questions):
         reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
@@ -128,14 +129,45 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     return deny(reasons)
 
 
-def duplicate_question(hook_input: dict, state: dict) -> dict | None:
-    """Name an answered ask or a question another tab has claimed or is already asking."""
+def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], state_dir: Path, orca: str) -> list[str]:
+    prompts = lane_input.latest(asks, orca)
+    if not prompts:
+        return []
+    path = state_dir / "ask-lane-input-shown.json"
+    reasons = []
+    try:
+        with retro.locked(path.with_suffix(".lock")):
+            try:
+                shown = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                shown = {}
+            for ask_id, (prompt, at) in prompts.items():
+                times = shown.setdefault(ask_id, [])
+                if at.isoformat() in times:
+                    continue
+                times.append(at.isoformat())
+                questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
+                lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
+                reasons.append(f"{questions}（ask {ask_id}）の後、{at.astimezone():%m/%d %H:%M} に {lane} のタブへ"
+                               f"入力がありました:「{prompt[:80]}」。三浦さんの回答なら "
+                               f"`inbox_read.py answered {ask_id} --note 担当のタブで回答` で記録し、伺わないでください。"
+                               "回答でなければ、同じ AskUserQuestion をもう一度呼ぶと通ります。")
+            if reasons:
+                retro.atomic_text(path, json.dumps(shown, separators=(",", ":")))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    return reasons
+
+
+def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
     answers = inbox_read.answer_records(inbox_read.answers_path())
     claims = inbox_read.read_claims(inbox_read.claims_path())
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
     reasons = []
+    uncovered: dict[str, dict] = {}
+    labels: dict[str, list[str]] = {}
     for question in questions:
         text, header = question.get("question") or "", question.get("header") or ""
         recorded = list(state.get("questions", {}).values())
@@ -163,12 +195,15 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
                 refs.extend(shown)
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
+            ask = next(entry for entry in entries if entry.get("id") == ask_id)
             if ask_state.covered(ref, list(answers), entries):
                 times = [record.get("ts") or "時刻不明" for key, record in answers.items()
                          if key == ask_id or key.startswith(ask_id + ":")
                          and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
                 reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
-            ask = next(entry for entry in entries if entry.get("id") == ask_id)
+            else:
+                uncovered[ask_id] = ask
+                labels.setdefault(ask_id, []).append(text or header)
             parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
             candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
                           if parts else [claims.get(ask_id)])
@@ -187,6 +222,7 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
             overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
             if item["record"] in matched or related.intersection(item["keys"]) or overlap:
                 reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")
+    reasons.extend(direct_input_reasons(uncovered, labels, state_dir, orca))
     return deny(list(dict.fromkeys(reasons)))
 
 
