@@ -726,15 +726,17 @@ def failure(row: dict) -> tuple[str, str | None, str | None] | None:
              ((row["claude"] or {}).get("api_error"), "claude", claude_tab, None),
              (orca if not (row["claude"] or row["codex"] or message.get("resumed")) and API_ENDED.match(orca) else None,
               message.get("agent"), message.get("tab"), message.get("at"))]
-    observed = parse_time(row.get("approval_observed_at") or row.get("scanned_at"))
+    approval_observed = row.get("approval_observed_at") or row.get("scanned_at")
+    approval_captures = row.get("approval_capture_by_tab") or {}
     for error, agent, tab, at in found:
         if not error:
             continue
         # Legacy rollout entries have no terminal handle. Pane evidence is preferred; an unbound
         # Codex error from before the current approval screen does not identify a pane to wake.
-        may_precede_approval = agent == "codex" and (tab in approval_tabs if tab else bool(approval_tabs))
-        if may_precede_approval and (not observed or (parse_time(at) or EPOCH) <= observed):
-            continue
+        if tab in approval_tabs or not tab and agent == "codex" and approval_tabs:
+            observed = parse_time(approval_captures.get(tab, approval_observed))
+            if not observed or (parse_time(at) or EPOCH) <= observed:
+                continue
         if agent and running and agent not in running and not (tab and approval_tabs):
             continue
         return error, agent, tab
@@ -1213,7 +1215,8 @@ def waiting_prompts(terms: list[dict], screens: Screens,
     for term in terms:
         if not term.get("handle") or not (screen := rendered(screens.get((environment, term["handle"])))):
             continue
-        if term.get("agentIdentity") in (None, "codex") and (prompt := codex_permission_prompt(screen, term["handle"])):
+        if (prompt := codex_permission_prompt(screen, term["handle"])) and (
+                prompt["question"] == CODEX_PERMISSION or term.get("agentIdentity") in (None, "codex")):
             yield prompt, None
         elif prompt := permission_prompt(screen, term["handle"]):
             yield prompt, "pending_call_at"
@@ -1765,10 +1768,12 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         screen_said = ""
         if remote and not orca_said(w):
             terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"), approval_tabs)
-        approval_observed = min((observed_at for tab in approval_tabs
-                                 if (screen := screens.get((w.get("_environment"), tab)))
-                                 and isinstance(observed_at := screen.get("_observed_at"), str)),
-                                default=datetime.fromtimestamp(now, timezone.utc).isoformat())
+        scanned_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        approval_captures = {}
+        for tab in approval_tabs:
+            observed_at = screens[(w.get("_environment"), tab)].get("_observed_at")
+            approval_captures[tab] = observed_at if isinstance(observed_at, str) and observed_at else scanned_at
+        approval_observed = min(approval_captures.values(), default=scanned_at)
         pane_handles = {key: term["handle"] for term in terms
                         if term.get("handle") and (key := hourly_runtime.pane_key(term))}
         codex_activity = {term["handle"]: last_codex_activity(screen_lines(frame)) for term in terms
@@ -1817,7 +1822,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
             **({"codex_approvals": codex_approvals,
-                "approval_observed_at": approval_observed}
+                "approval_observed_at": approval_observed, "approval_capture_by_tab": approval_captures}
                if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),

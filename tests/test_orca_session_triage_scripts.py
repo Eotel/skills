@@ -3031,7 +3031,8 @@ class ScanCommandTests(unittest.TestCase):
         lane, environment = str(self.dir / "remote"), "mbp16"
         tree = worktree(lane, "working", agent="codex")
         tree["_environment"] = environment
-        term = {**terminal(lane, None, "term_reused"), "_environment": environment}
+        term = in_pane(terminal(lane, None, "term_reused"), "tab:leaf")
+        term["_environment"] = environment
         screen = {"source": "screen", "tail": [
             "⏺ Earlier Claude reply", "✻ Worked for 3m", "› check status", "• Checking status.",
             scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel",
@@ -3042,6 +3043,35 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
         self.assertEqual(row["terminals"][0]["agent"], "codex")
         self.assertEqual(row["orca_message"]["text"], "Checking status.")
+        tree["agents"][0]["paneKey"] = "tab:leaf"
+        tree["agents"].append(done_agent("claude", "tab:leaf", said="Earlier Claude reply"))
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+        self.assertEqual(row["terminals"][0]["agent"], "codex")
+
+    def test_stale_codex_error_uses_its_own_approval_capture_time(self) -> None:
+        lane = str(self.dir / "local")
+        tree = worktree(lane, "working", agent="codex")
+        first = in_pane(terminal(lane, "codex", "term_first"), "tab:first")
+        second = in_pane(terminal(lane, "codex", "term_second"), "tab:second")
+        old = "stream disconnected before completion"
+        screens = {
+            (None, term["handle"]): {
+                "source": "screen", "_observed_at": datetime.fromtimestamp(captured, timezone.utc).isoformat(),
+                "tail": [scan.CODEX_PERMISSION, command, "› 1. Yes", "2. No", "Press enter to confirm"],
+            }
+            for term, captured, command in ((first, NOW - 10, "$ git status"), (second, NOW, "$ git diff"))
+        }
+        for offset in (-5, 5):
+            with self.subTest(offset=offset):
+                tree["agents"][0].update(paneKey="tab:second", lastAssistantMessage=old, updatedAt=(NOW + offset) * 1000)
+                row, = scan.build_inventory([tree], [first, second], self.dir, {}, "要判断", now=NOW + 10, screens=screens)
+                if offset < 0:
+                    self.assertEqual((row["class"], row["stop"]), ("waiting", None))
+                else:
+                    self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", second["handle"]))
 
     def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
         lane = str(self.dir / "shared")
