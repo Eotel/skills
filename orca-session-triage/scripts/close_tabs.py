@@ -32,6 +32,7 @@ OrcaTabs implements it with the Orca CLI, so another host needs one more TabHost
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -270,16 +271,28 @@ def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, 
     if row is None:
         return False, f"{handle}: KEPT -> not a tab of any row in the scan"
     try:
+        if (row.get("environment"), handle) in scan_sessions.active_holds(datetime.now(timezone.utc)):
+            return False, f"{handle}: KEPT -> 保留中のタブ"
+        if handle in (row.get("draft_tabs") or []):
+            return False, f"{handle}: KEPT -> 未送信の入力"
         if scan_sessions.pending_handoffs(row, state_file.expanduser()):
             return False, f"{handle}: KEPT -> 未配信の約束の送り先"
         moved = moved_after_scan(row, host, projects, inbox, caller)
-    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
+    except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: KEPT -> {error}"
     if moved:
         last = moved[-1]
         return False, (f"{handle}: KEPT -> 走査の後に動いた（{last.at.astimezone().strftime('%H:%M:%S')} {last.what}"
                        + (f" ほか {len(moved) - 1} 件" if len(moved) > 1 else "") + "）")
     try:
+        if isinstance(host, OrcaTabs) and any(tab.get("handle") == handle and tab.get("agent")
+                                             for tab in row.get("terminals") or []):
+            environment = row.get("environment")
+            key = environment, handle
+            frames = scan_sessions.read_screens(host.orca, [{"_environment": environment, "handle": handle}])
+            if (frame := scan_sessions.rendered(frames.get(key))) and (
+                    scan_sessions.has_draft(frame) or scan_sessions.composer_empty(frame) is False):
+                return False, f"{handle}: KEPT -> 未送信の入力"
         host.close(row.get("environment"), handle)
     except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: NOT CLOSED -> {error}"

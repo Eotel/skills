@@ -2914,6 +2914,12 @@ class ScanCommandTests(unittest.TestCase):
                 "condition_kind": "signal", "condition_value": "term_lead", "instruction": "follow-up"}
         with patch.object(scan, "hold_rows", return_value=[hold]):
             [held] = scan.with_cleanup_constraints([row], state, log)
+            with patch.object(close_tabs, "moved_after_scan", side_effect=AssertionError("protected tab was checked")):
+                closed, message = close_tabs.close_one(
+                    [held], "term", close_tabs.OrcaTabs("unused"), self.dir, self.dir / "inbox",
+                    close_tabs.Caller.from_environment(), state)
+                self.assertFalse(closed)
+                self.assertIn("保留中のタブ", message)
         self.assertEqual((held["class"], held["closable"]), ("blocked", []))
         with patch.object(scan, "hold_rows", return_value=[]):
             [released] = scan.with_cleanup_constraints([held], state, log)

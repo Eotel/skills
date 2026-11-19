@@ -1931,7 +1931,13 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["reasons"].extend(f"予約が消えた: {job['cron']} {job['prompt'][:100]}" for job in row["lost_schedules"])
             if row["class"] in ("finished", "unstarted", "unsure"):
                 row["class"] = "stalled"
-        row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
+        drafts = [term["handle"] for term in terms if term.get("handle")
+                  and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
+                  and (has_draft(frame) or composer_empty(frame) is False)]
+        if drafts:
+            row["draft_tabs"] = drafts
+        row["closable"] = [handle for handle in closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
+                           if handle not in drafts]
         row["meaningful_tabs"] = [t.get("handle") or NO_HANDLE + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
@@ -2848,7 +2854,7 @@ def not_before_label(item: Mapping) -> str:
 
 
 HOLD_FIELDS = ("class", "closable", "meaningful_tabs", "open_pr_cleanup", "verdict")
-KEEP_DECISION = re.compile(r"残す|残し|残して|保持(?!しない)|保留|削除(?:しない|せず|するな)|"
+KEEP_DECISION = re.compile(r"残す|残し|残して|保持(?!しない)|保留|削除(?:しない|せず|するな|禁止)|"
                            r"消さ(?:ない|ず)|\b(?:keep|retain|do not remove|don't remove)\b", re.IGNORECASE)
 
 
@@ -2862,9 +2868,19 @@ def restore_held_row(row: dict) -> dict:
     return row
 
 
+def active_holds(now: datetime) -> dict[tuple[str | None, str], dict]:
+    stamp = now.timestamp()
+    return {(hold.get("environment") or None, hold["handle"]): hold
+            for hold in hold_rows(inbox_read.holds_path())
+            if hold["created_at"] <= stamp
+            and (hold["status"] in ("active", "releasing")
+                 if hold["released_at"] is None else hold["released_at"] > stamp)}
+
+
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
                              now: datetime | None = None, *,
-                             open_asks: Sequence[inbox_read.OpenAsk] = ()) -> list[dict]:
+                             open_asks: Sequence[inbox_read.OpenAsk] = (),
+                             known_tabs: Collection[str] = ()) -> list[dict]:
     """Keep the tabs and checkout of rows that a block, an undelivered promise, or a removal answer holds.
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
@@ -2884,13 +2900,9 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
     lead = (state.get("lead") or {}).get("worktree")
     requests = [(key, request.get("owner")) for key, request in state.get("requests", {}).items()
                 if request.get("closed_at") is None]
-    tabs_in_scan = {term["handle"] for row in rows for term in row.get("terminals") or [] if term.get("handle")}
-    stamp = now.timestamp()
-    active_holds = {(hold.get("environment") or None, hold["handle"]): hold
-                    for hold in hold_rows(inbox_read.holds_path())
-                    if hold["created_at"] <= stamp
-                    and (hold["status"] in ("active", "releasing")
-                         if hold["released_at"] is None else hold["released_at"] > stamp)}
+    tabs_in_scan = {*known_tabs, *(term["handle"] for row in rows for term in row.get("terminals") or []
+                                   if term.get("handle"))}
+    current_holds = active_holds(now)
     removal_candidates: list[tuple[dict, list[dict]]] = []
 
     def moment(at: str) -> datetime:
@@ -2898,8 +2910,11 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
 
     for row in rows:
         restore_held_row(row)
-        names = handoff_names(row)
-        if not row.get("environment"):
+        environment = row.get("environment")
+        if environment:
+            names = {row_identity(row), row_name(row), f"{environment}::{row.get('repo')}/{Path(row['path']).name}"}
+        else:
+            names = handoff_names(row)
             names.add(f"local::{row['path']}")
         tabs = {term["handle"] for term in row.get("terminals") or [] if term.get("handle")}
         blockers = []
@@ -2912,9 +2927,10 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                         if ask.report.get("handle") in tabs
                         or (ask.report.get("handle") not in tabs_in_scan
                             and ask.report.get("worktree") == Path(row["path"]).name
+                            and (not ask.report.get("host") or str(ask.report["host"]).lower().removesuffix(".local")
+                                 == (environment or socket.gethostname()).lower().removesuffix(".local"))
                             and (ask.report.get("repo") or "") in row_repos(row)))
-        holds = [active_holds[(row.get("environment"), tab)] for tab in sorted(tabs)
-                 if (row.get("environment"), tab) in active_holds]
+        holds = [current_holds[(environment, tab)] for tab in sorted(tabs) if (environment, tab) in current_holds]
         if holds:
             row["cleanup_before_hold"] = {field: row[field] for field in HOLD_FIELDS if field in row}
             row["reasons"] = list(row.get("reasons") or [])
@@ -2946,10 +2962,9 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                  *(f"{not_before_label(item)}の約束の送り先: {promise_task(item)}" for item in early)]
         row["reasons"] = [*row.get("reasons", []), *dict.fromkeys(reason for reason in added
                                                                   if reason not in row.get("reasons", []))]
-        keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}",
-                f"remove:{row['path']}", f"remove:{row_identity(row)}"}
-        if not row.get("environment"):
-            keys.add(f"remove:local::{row['path']}")
+        keys = ({f"remove:{name}" for name in names} if environment else
+                {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
+                 f"remove:local::{row['path']}"})
         by_key = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
                   if candidate["decision"] in keys}
         for key in keys:
@@ -2975,9 +2990,12 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                     candidate["newest"] = {"decision": newest.decision, "answer": newest.answer,
                                            "decided_at": newest.decided_at}
             removal_candidates.append((row, candidates))
-        elif removal := row.get("removal_decision"):
+        elif (removal := row.get("removal_decision")) and (
+                not environment or not removal.get("decision") or removal["decision"] in keys):
             removal_candidates.append((row, [removal]))
             removal_at = moment(removal["decided_at"])
+        else:
+            row.pop("removal_decision", None)
         owner = max((answer for name in names if (answer := decisions.get(f"owner:{name}"))),
                     key=lambda answer: moment(answer.decided_at), default=None)
         if owner and moment(owner.decided_at) >= removal_at and KEEP_DECISION.search(owner.answer):
@@ -3192,6 +3210,8 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
         row = restore_held_row(row)
+        original = row.get("scan_tab_counts") or {}
+        row = {**row, **original}
         interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
         if row.get("prompt_waiting") or interrupted:
             return {key: value for key, value in row.items() if key != "verdict"}
@@ -3200,7 +3220,7 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
         if fresh:
             row = {**row, "verdict": fresh}
         shown = verdict.get("class")
-        if shown not in ("finished", "blocked", "waiting"):
+        if shown not in ("finished", "blocked", "waiting", "in_progress"):
             return row
         agents = dict.fromkeys(tab["handle"] for tab in [*(row.get("terminals") or []), *(row.get("done_cards") or [])]
                                if tab.get("agent") and tab.get("handle"))
@@ -3211,13 +3231,16 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
         pending = (row.get("stop") or row.get("unread_mail") or row.get("screen_progress")
                    or any(agent.get("state") == "waiting" or agent.get("state") == "working" and agent.get("turn") != "done"
                           for agent in row.get("agents") or []))
-        drafts = {card.get("handle") for card in row.get("done_cards") or []
-                  if card.get("draft") or card.get("composer_empty") is False}
+        drafts = {*row.get("draft_tabs", []), *(card.get("handle") for card in row.get("done_cards") or []
+                                               if card.get("draft") or card.get("composer_empty") is False)}
+        if None in drafts:
+            drafts.update(agents)
         eligible = [handle for handle in agents if shown == "finished"
                     and not verdict.get("needs_user") and not pending and handle not in drafts]
         closable.extend(eligible)
         meaningful.extend(handle for handle in agents if handle not in eligible)
-        return {**row, "closable": closable, "meaningful_tabs": meaningful}
+        original = {name: row.get(name, []) for name in ("closable", "meaningful_tabs")}
+        return {**row, "closable": closable, "meaningful_tabs": meaningful, "scan_tab_counts": original}
     return [marked(row) for row in rows]
 
 
@@ -4003,14 +4026,15 @@ def print_row(rows: list[dict], key: str, transcripts: bool = False, inbox: Path
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    def constrain(rows: list[dict]) -> list[dict]:
+    def constrain(rows: list[dict], known_tabs: Collection[str]) -> list[dict]:
         inbox, answers = Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()
         try:
             entries = inbox_read.inbox_entries(inbox)
         except FileNotFoundError:
             entries = []
         asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers))
-        return with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(), open_asks=asks)
+        return with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(),
+                                        open_asks=asks, known_tabs=known_tabs)
 
     if args.from_file:
         try:
@@ -4019,17 +4043,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"--from: {error}", file=sys.stderr)
             return 1
         verdicts = absorb_verdicts(args.verdicts, write=False)
+        known_tabs = {term["handle"] for row in rows for term in row.get("terminals") or [] if term.get("handle")}
         if args.only:
             try:
                 rows = [select_row(rows, args.only, "--only")]
             except ValueError as error:
                 print(error, file=sys.stderr)
                 return 1
-        rows = constrain(with_verdicts(rows, verdicts))
+        rows = constrain(with_verdicts(rows, verdicts), known_tabs)
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
+    known_tabs = {term["handle"] for term in terminals if term.get("handle")}
     if args.only:
         worktrees, terminals = one_per_path(worktrees, terminals)
         choices = [{"path": w["path"], "repo": w.get("repo"), "environment": w.get("_environment"),
@@ -4088,7 +4114,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.ps_json:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
-    rows = constrain(rows)
+    rows = constrain(rows, known_tabs)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)
