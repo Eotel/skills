@@ -39,6 +39,7 @@ class AskStateTests(unittest.TestCase):
                     "TRIAGE_HANDED_OFF": str(self.handed), "ORCA_SESSION_TRIAGE_SCRIPTS": str(SCRIPTS),
                     "ORCA_WORKTREE_PATH": "/w/hourly", "ORCA_WORKTREE_ID": "repo::/w/hourly",
                     "ORCA_PANE_KEY": "", "CLAUDE_CODE_SESSION_ID": "hourly-session"}
+        self.env.pop("CODEX_THREAD_ID", None)
         self.question = {"question": "公開しますか？", "header": "公開", "multiSelect": False,
                          "options": [{"label": "公開する", "description": "公開する"},
                                      {"label": "待つ", "description": "待つ"}]}
@@ -106,7 +107,7 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual((state["answer"], recorded["note"], decision["answer"]), ("公開する",) * 3)
         self.assertEqual((state["answered_at"], recorded["ts"], decision["decided_at"]), (self.AT,) * 3)
 
-    def test_explicit_answers_close_only_bound_parts_and_can_be_relayed_from_the_same_tab(self) -> None:
+    def test_explicit_answers_close_only_bound_parts_and_can_be_relayed_from_the_same_session(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
         part = f"{self.ASK}:1"
@@ -121,14 +122,15 @@ class AskStateTests(unittest.TestCase):
 
         command = f"import answer_sync; answer_sync.record([{part!r}], '公開する', 'send', at={self.AT!r})"
         other = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS,
-                               env={**self.env, "ORCA_TERMINAL_HANDLE": "term_other"},
+                               env={**self.env, "CLAUDE_CODE_SESSION_ID": "another-session"},
                                capture_output=True, text=True, timeout=30)
         self.assertNotEqual(other.returncode, 0)
         self.assertIn("answer already recorded", other.stderr)
-        relay = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+        relay = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS,
+                               env={key: value for key, value in self.env.items() if key != "ORCA_TERMINAL_HANDLE"},
                                capture_output=True, text=True, timeout=30)
         self.assertEqual(relay.returncode, 0, relay.stderr)
-        self.assertFalse(self.log.exists())
+        self.assertEqual(json.loads(self.log.read_text())["answer"], answer.read_text())
         self.assertEqual(json.loads(self.answers.read_text().splitlines()[-1])["how"], "send")
 
         batch = self.run_tool("hourly_state.py", "answered-many", "--skip-recorded", stdin="\n".join(
@@ -181,6 +183,7 @@ class AskStateTests(unittest.TestCase):
             for question in questions))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"no ask in the inbox has id {self.ASK}:2", result.stderr)
+        self.assertIn("line 2", result.stderr)
         self.assertEqual(self.state.read_bytes(), before)
         self.assertFalse(self.answers.exists())
 
@@ -189,17 +192,61 @@ class AskStateTests(unittest.TestCase):
         whole = self.ask()
         first = self.ask(key=f"answer:worker::{self.ASK}:1", covers=[f"answer:worker::{self.ASK}:1"])
         args = ("answered-many", "--skip-recorded")
-        for note, extra in [("公開する", {}), ("待つ", {"replace_reason": "本人が訂正した"})]:
+        for note, extra in [("公開する", {}), ("待つ（{answered_at}）", {"replace_reason": "本人が訂正した"})]:
             record = self.run_tool("hourly_state.py", *args, stdin=json.dumps(
                 {"id": first["id"], "answer": note, "answered_at": self.AT, **extra}))
             self.assertEqual(record.returncode, 0, record.stderr)
         self.assertEqual([item["note"] for item in map(json.loads, self.answers.read_text().splitlines())],
-                         ["公開する", "待つ"])
-        command = f"import answer_sync; answer_sync.record([{self.ASK + ':2'!r}], '戻す', 'send', at={self.AT!r})"
+                         ["公開する", "待つ（18:01）"])
+        command = ("import answer_sync; "
+                   f"answer_sync.record([{self.ASK + ':2'!r}], '戻す', 'send', at='2026-11-14T11:01:00+00:00')")
         delivery = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual(delivery.returncode, 0, delivery.stderr)
-        self.assertEqual(json.loads(self.state.read_text())["questions"][whole["id"]]["answer"], "待つ\n戻す")
+        self.assertEqual(json.loads(self.state.read_text())["questions"][whole["id"]]["answer"], "待つ（18:01）\n戻す")
+
+    def test_relay_retry_keeps_the_correction_and_existing_delivery(self) -> None:
+        question = self.ask()
+        command = f"import answer_sync; answer_sync.record([{self.ASK!r}], '公開する', 'send', at={self.AT!r})"
+        for replay in (False, True):
+            result = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if not replay:
+                self.assertEqual(self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+                    {"id": question["id"], "answer": "公開しない", "replace_reason": "本人が訂正した",
+                     "answered_at": "2026-11-14T11:01:00+00:00"})).returncode, 0)
+        probe = ("import inbox_read, lead_decisions, json; path = inbox_read.answers_path(); "
+                 "print(json.dumps([inbox_read.answer_records(path), lead_decisions.ask_answers(path)]))")
+        result = subprocess.run([sys.executable, "-c", probe], cwd=SCRIPTS, env=self.env,
+                                capture_output=True, text=True, timeout=30, check=True)
+        answers, deliveries = json.loads(result.stdout)
+        self.assertEqual(answers[self.ASK]["note"], "公開しない")
+        self.assertEqual(deliveries[self.ASK]["note"], "公開しない")
+        self.assertEqual(deliveries[self.ASK]["delivery"]["note"], "公開する")
+        self.assertEqual(len(self.answers.read_text().splitlines()), 2)
+
+    def test_a_direct_ask_and_separate_cover_have_evidence_for_stale_asks(self) -> None:
+        another = "b1234567-1234-4567-8888-123456789abc"
+        with self.inbox.open("a") as stream:
+            stream.write(json.dumps({"id": another, "kind": "ask"}) + "\n")
+        scan = self.root / "scan.json"
+        scan.write_text(json.dumps([{"path": "/w/worker", "repo": "", "class": "waiting",
+                                     "claude": {"final_text": "公開しますか？", "final_at": "2026-11-14T09:00:00Z"}}]))
+        asked = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
+                              stdin=json.dumps({"ask": self.ASK, "decision": "publish", "question": "公開しますか？",
+                                                "covers": [f"answer:other::{another}"], "asked_at": self.AT}))
+        self.assertEqual(asked.returncode, 0, asked.stderr)
+        recorded = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+            {"id": json.loads(asked.stdout)[0]["id"], "answer": "待つ", "answered_at": self.AT}))
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        self.assertEqual({item["id"] for item in map(json.loads, self.answers.read_text().splitlines())},
+                         {self.ASK, another})
+        result = self.run_tool("hourly_state.py", "stale-asks", "--from", str(scan),
+                               "--verdicts", str(self.root / "no-verdicts"), "--claude-projects", str(self.root / "projects"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)[0]
+        self.assertEqual((row["state"], row["answer"]["text"]), ("stopped_after_answer", "待つ"))
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"

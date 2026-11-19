@@ -1084,7 +1084,7 @@ def stamped_answer(answer: str, answered_at: str) -> str:
     return answer
 
 
-def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = False) -> dict:
+def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = False, prechecked: bool = False) -> dict:
     key = answering.id if answering.id is not None else asked_under(data, str(answering.decision))
     if key not in data["questions"]:
         raise ValueError(f"unknown question id: {key}")
@@ -1096,7 +1096,7 @@ def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = Fal
     # A recorded answer keeps its time, so recording the same text again changes nothing.
     when = (question["answered_at"] if question["answer"] is not None and not answering.replace_reason
             else recorded_at(answering.answered_at))
-    answer = stamped_answer(answering.answer, when)
+    answer = answering.answer if prechecked else stamped_answer(answering.answer, when)
     earlier = {name: question.get(name) for name in ("answer", "answered_at", "answered_in")}
     if answering.replace_reason and question["answer"] is not None and question["answer"] != answer:
         # A checked reading replaces the answer; the one it replaces stays beside it with the reason.
@@ -1107,7 +1107,8 @@ def record_answer(data: dict, answering: Answering, *, skip_recorded: bool = Fal
         raise ValueError("answer already recorded: " + json.dumps(earlier, ensure_ascii=False))
     if question["answer"] is None:
         question.update(answer=answer, answered_at=when,
-                        answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()))
+                        answered_in=os.environ.get("ORCA_TERMINAL_HANDLE") or str(worktree()),
+                        answered_by=inbox_read.answer_sender())
     return {"id": key, **question}
 
 
@@ -1856,6 +1857,7 @@ def main(argv: list[str] | None = None) -> int:
             writes = args.action not in read_only or intake is not None
             fcntl.flock(lock, fcntl.LOCK_EX if writes else fcntl.LOCK_SH)
             data = read(path)
+            answer_positions: list[int | None] = [None]
             if intake is not None:
                 import_issues(data, intake)
             left_matches = False
@@ -1896,6 +1898,7 @@ def main(argv: list[str] | None = None) -> int:
                 skipped = bool(unrecorded)
             elif args.action == "answered-many":
                 answerings = checked_lines(given, answering_line)
+                answer_positions = [number for number, _ in answerings]
                 result = record_lines(answerings, lambda answering: record_answer(
                     data, answering, skip_recorded=args.skip_recorded))
                 notices.extend(f"行 {number} は回答済み {item['id']}: {item['answer']}"
@@ -1920,11 +1923,16 @@ def main(argv: list[str] | None = None) -> int:
             planned_answers = []
             if args.action in ("answered", "answered-many") and path.resolve() == Path(DEFAULT_STATE).expanduser().resolve():
                 import answer_sync
-                planned_answers = answer_sync.hourly_answers(items)
+                planned_answers = answer_sync.hourly_answers(list(zip(answer_positions, items, strict=True)))
             if writes:
                 save(path, data)
             for answer in planned_answers:
-                inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer, at=answer.at)
+                try:
+                    inbox_read.record_answers(inbox_read.answers_path(), answer.ids, answer.how, answer.answer, at=answer.at)
+                except OSError as error:
+                    retry = "answered-many --skip-recorded" if args.action == "answered-many" else "answered"
+                    raise ValueError(f"定時の state は保存済みです。inbox の {', '.join(answer.ids)} に追記できません。"
+                                     f"原因を解消して同じ入力を hourly_state.py {retry} で再実行してください。{error}") from error
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

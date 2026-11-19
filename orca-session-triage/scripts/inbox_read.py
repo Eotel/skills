@@ -44,7 +44,7 @@ the batch and lists them under `claimed`, so another tab does not ask them again
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -462,24 +462,33 @@ def inbox_entries(inbox: Path) -> list[dict]:
 DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
 HOURLY_ANSWER = "hourly_state.py answered"
 HOURLY_CORRECTION = "hourly_state.py corrected"
-SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | {HOURLY_ANSWER, HOURLY_CORRECTION}
+HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION))
+SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
 
 
-def answer_records(path: Path) -> dict[str, dict]:
-    """The first delivered answer per id, else its first mark; a later delivery can supply a note-only mark's answer."""
-    found: dict[str, dict] = {}
+def answer_entries(path: Path) -> Iterator[dict]:
     for line in "".join(read_lines(path)).splitlines():
         try:
             record = json.loads(line)
         except ValueError:
             continue
         if isinstance(record, dict) and isinstance(record.get("id"), str):
-            previous = found.get(record["id"])
-            how = record.get("how")
-            if (previous is None or how == HOURLY_CORRECTION
-                    or previous.get("how") not in DELIVERY_ANSWERS and how in DELIVERY_ANSWERS
-                    or previous.get("how") not in SUBSTANTIVE_ANSWERS and how == HOURLY_ANSWER):
-                found[record["id"]] = record
+            yield record
+
+
+def delivered_records(path: Path) -> dict[str, dict]:
+    return {record["id"]: record for record in answer_entries(path) if record.get("how") in DELIVERY_ANSWERS}
+
+
+def answer_records(path: Path) -> dict[str, dict]:
+    """The answer and its corrections, independent of the text relayed or whether delivery succeeded."""
+    found: dict[str, dict] = {}
+    for record in answer_entries(path):
+        previous = found.get(record["id"])
+        how = record.get("how")
+        if (previous is None or how == HOURLY_CORRECTION
+                or previous.get("how") not in SUBSTANTIVE_ANSWERS and how in SUBSTANTIVE_ANSWERS):
+            found[record["id"]] = record
     return found
 
 

@@ -34,7 +34,7 @@ def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset
     if source and source[1]:
         # A whole-ask key would widen an explicit part back to every question.
         found = [source, *(ref for ref in found if ref[0] != source[0])]
-    elif not found and source:
+    elif source and not any(ref[0] == source[0] for ref in found):
         found.append(source)
     return list(dict.fromkeys(found))
 

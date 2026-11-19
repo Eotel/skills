@@ -444,8 +444,10 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 
 def ask_answers(path: Path) -> dict[str, dict]:
-    """The same answered ids open-asks uses, with their complete answer records."""
-    return inbox_read.answer_records(path)
+    """A handoff's current answer and the last delivery when its wording differs."""
+    delivered = inbox_read.delivered_records(path)
+    return {key: {**answer, "delivery": delivered[key]} if key in delivered and answer != delivered[key] else answer
+            for key, answer in inbox_read.answer_records(path).items()}
 
 
 def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
@@ -514,7 +516,7 @@ def genuine_answer(answer: dict) -> bool:
     """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
     parts = answer.get("answers")
     return (all(genuine_answer(part) for part in parts) if isinstance(parts, list)
-            else answer.get("how") in ("send", "send --decision"))
+            else (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS)
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,7 @@ An answer is one of:
   hourly runs' triage workspace);
 - an answer `send --ask <id>[:<n>]` delivered, with or without --decision (`send --decision` or `send` in
   ask-answers.jsonl).
+- an explicit answer or correction `hourly_state.py answered` recorded under the linked ask id.
 
 Only an answer that came after the ask and names it is proof: one delivered to it, or for an ask without
 structured questions one naming its id (in full or its first 8 or more characters), and for an ask with them one
@@ -294,5 +295,11 @@ def asking_worktrees(args: argparse.Namespace) -> list[Path]:
 
 
 def from_arguments(args: argparse.Namespace, answers_log: Path) -> list[Answer]:
-    return [*decisions(args.decisions_file.expanduser()), *delivered(answers_log),
+    import inbox_read
+
+    inbox_answers = [Answer(at, item["how"], str(item.get("note") or ""), item["id"])
+                     for item in inbox_read.answer_records(answers_log).values()
+                     if item.get("how") in inbox_read.SUBSTANTIVE_ANSWERS
+                     if (at := scan_sessions.parse_time(item.get("ts"))) is not None]
+    return [*decisions(args.decisions_file.expanduser()), *inbox_answers,
             *asked_user(transcripts_of(args.claude_projects.expanduser(), asking_worktrees(args)))]
