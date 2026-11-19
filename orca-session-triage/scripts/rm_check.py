@@ -1469,7 +1469,7 @@ def untracked_exec_plans(worktree: Path, base: str | None, pr: dict | None) -> t
 
 
 def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
-                   besides_nested: bool = False) -> list[Path]:
+                   besides_nested: bool = False, explicit: Sequence[str] = ()) -> list[Path]:
     """The paths of `movable` (scratch directories and --archive-path names) that alone keep the worktree: every
     blocker is an uncommitted change, and every change and path to review lies in one of them or is a directory
     holding nothing outside them. Empty when anything else keeps it.
@@ -1478,11 +1478,11 @@ def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
     paths = [*result["uncommitted"], *(entry.rpartition(" (")[0] for entry in result["review"])]
     others = [blocker for blocker in result["blockers"] if not re.fullmatch(r"\d+ uncommitted changes", blocker)
               and not (besides_nested and blocker.startswith(NESTED_READY))]
-    if others or not paths:
+    if others or not (paths or explicit):
         return []
     # Only what is on disk moves: a deleted tracked file named here keeps the worktree as a change.
     present = [named for named in movable if (worktree / named).exists() or (worktree / named).is_symlink()]
-    movers: set[str] = set()
+    movers = set(explicit).intersection(present)
     for rel in paths:
         found = {named for named in present if within(rel, named)}
         holder = worktree / rel
@@ -1740,7 +1740,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if args.head_ahead_of_pr is not None and (not args.pr_head or args.head_ahead_of_pr < 0):
         parser.error("--head-ahead-of-pr needs --pr-head and a non-negative ahead_by")
     named = [PurePosixPath(rel) for rel in args.archive_path]
-    if any(path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git" for path in named):
+    if any(path.is_absolute() or not path.parts or ".." in path.parts
+           or any(part.casefold() == ".git" for part in path.parts) for path in named):
         parser.error("--archive-path takes a path inside the worktree, relative to it")
     movable = (*(SCRATCH_DIRS if args.archive_scratch else ()), *(str(path) for path in named))
     if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
@@ -1839,6 +1840,17 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    root = Path(worktree)
+    for path in named:
+        source = root / path
+        if any((root / parent).is_symlink() for parent in path.parents):
+            decided.append(f"--archive-path の {path} は symlink 経由のパスです")
+            continue
+        indexed = git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", str(path))
+        if indexed.returncode or indexed.stdout:
+            decided.append(f"--archive-path の {path} に追跡済みのファイルがあるか、確認できません")
+        elif source.is_dir() and not source.is_symlink() and next(source.rglob(".git"), None) is not None:
+            decided.append(f"--archive-path の {path} に Git リポジトリが含まれています")
     automation_blockers = []
     try:
         automations = hourly_runtime.existing_workspace_automations(args.orca).get(worktree, [])
@@ -1896,7 +1908,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if movable:
         day = datetime.now().strftime("%Y%m%d")
         archived = [archive(source, archive_target(args.archive_dir, Path(worktree), source, day), Path(worktree))
-                    for source in archive_movers(Path(worktree), result, movable_now(result))]
+                    for source in archive_movers(root, result, movable_now(result), explicit=tuple(map(str, named)))]
         if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}
