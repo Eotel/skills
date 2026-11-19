@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 import hourly_runtime
 import hourly_state
@@ -30,11 +31,13 @@ import json_output
 import lead_decisions
 from bash_timeout import LOAD_LIMIT
 
-RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes")
+RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
+               "read_at")
 LOAD_TIMEOUT_FACTOR = 2.5
 COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch")
-BACKLOG_ITEM = re.compile(r"^(?:通知\[[^\]]+\]|返信|返信不要|担当確認|判定済み) [A-Z][A-Z0-9_]+-\d+\b")
+BACKLOG_ITEM = re.compile(r"^(?:返信|返信不要|担当確認|判定済み) [A-Z][A-Z0-9_]+-\d+\b")
 BACKLOG_ELAPSED = re.compile(r" \| (?:\d+時間)?\d+分 \| ")
+BACKLOG_CURSOR = Path("~/.cache/orca-briefs/backlog-watch/state.json")
 ASANA_PARTIAL = re.compile(r"^Eotel へのレビュー依頼: 未取得", re.MULTILINE)
 
 
@@ -61,6 +64,7 @@ def read_task(task: ReadTask, directory: Path, timeout: float, *, retry: bool = 
         except OSError as error:
             result.update(exit_code=127, error=str(error))
             errors.write(str(error) + "\n")
+    result["read_at"] = time.time()
     if result["exit_code"] == 0 and task.json_result:
         try:
             source = task.result_file or stdout
@@ -75,9 +79,23 @@ def read_task(task: ReadTask, directory: Path, timeout: float, *, retry: bool = 
     return result
 
 
+def backlog_cursor() -> bytes | None:
+    try:
+        return BACKLOG_CURSOR.expanduser().read_bytes()
+    except FileNotFoundError:
+        return b""
+    except OSError:
+        return None
+
+
 def read_with_retry(task: ReadTask, directory: Path, timeout: float, loaded: bool) -> dict:
+    backlog = loaded and task.name == "backlog-watch"
+    before = backlog_cursor() if backlog else None
     first = read_task(task, directory, timeout)
     if not loaded or first["exit_code"] != 124:
+        return first
+    if backlog and (before is None or backlog_cursor() != before):
+        first["error"] = "通知カーソルが更新済みか確認できないため、終了コード 124 を維持します"
         return first
     if task.result_file and task.result_file.is_file():
         task.result_file.rename(task.result_file.with_suffix(".first-attempt.json"))
@@ -90,7 +108,7 @@ def read_with_retry(task: ReadTask, directory: Path, timeout: float, loaded: boo
 
 def earlier_reads(root: Path) -> list[tuple[Path, dict[str, dict]]]:
     history = []
-    for path in sorted(root.glob("*/results.json"), key=lambda file: file.stat().st_mtime, reverse=True):
+    for path in root.glob("*/results.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -100,6 +118,25 @@ def earlier_reads(root: Path) -> list[tuple[Path, dict[str, dict]]]:
                                           if isinstance(item, dict) and item.get("name") in COMPARE
                                           and item.get("exit_code") == 0}))
     return history
+
+
+def earlier_artifacts(history: list[tuple[Path, dict[str, dict]]], name: str,
+                      field: str) -> list[tuple[Path, dict, Path]]:
+    candidates = []
+    for directory, records in history:
+        record = records.get(name, {})
+        if not (filename := record.get(field)):
+            continue
+        artifact = directory / Path(filename).name
+        stamp = record.get("read_at")
+        if not isinstance(stamp, (float, int)):
+            try:
+                stamp = (directory / Path(record.get("stdout") or filename).name).stat().st_mtime
+            except OSError:
+                continue
+        candidates.append((stamp, directory, record, artifact))
+    return [(directory, record, artifact) for _, directory, record, artifact in
+            sorted(candidates, key=lambda item: item[0], reverse=True)]
 
 
 def comparison_data(path: Path, name: str) -> dict[str, dict | str]:
@@ -140,17 +177,15 @@ def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]
             result["error"] = f"比較データ: {error}"
             continue
         previous = {}
-        for directory, records in history:
-            record = records.get(name, {})
-            if filename := record.get(field):
-                if name == "asana99-status" and has_partial_asana_output(directory, record):
-                    continue
-                try:
-                    previous = comparison_data(directory / Path(filename).name, name)
-                except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                    continue
-                result["compared_to"] = str(directory)
-                break
+        for directory, record, artifact in earlier_artifacts(history, name, field):
+            if name == "asana99-status" and has_partial_asana_output(directory, record):
+                continue
+            try:
+                previous = comparison_data(artifact, name)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+            result["compared_to"] = str(directory)
+            break
         new = sorted(current.keys() - previous.keys())
         gone = sorted(previous.keys() - current.keys())
         if name == "tracker-gaps":

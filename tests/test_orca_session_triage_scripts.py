@@ -8831,23 +8831,49 @@ class HourlyCleanupCommandTests(unittest.TestCase):
 
 
 class HourlyReadTests(unittest.TestCase):
+    def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            cursor = directory / "backlog-cursor.json"
+            cursor.write_text('{"last_notification_id": 1}')
+
+            def advance(args: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                cursor.write_text('{"last_notification_id": 2}')
+                return subprocess.CompletedProcess(args, 124)
+
+            with (patch.object(hourly, "BACKLOG_CURSOR", cursor),
+                  patch("subprocess.run", side_effect=advance) as run):
+                result = hourly.read_with_retry(hourly.ReadTask("backlog-watch", ["backlog-watch"]),
+                                                directory, 100, True)
+            self.assertEqual(result["exit_code"], 124)
+            self.assertIsNone(result["retry"])
+            self.assertIn("通知カーソル", result["error"])
+            run.assert_called_once()
+
     def test_high_load_retries_the_scan_and_compares_each_successful_read(self) -> None:
         hourly = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
             parent = Path(root)
-            old, failed = parent / "20261118T030000Z-first", parent / "20261118T040000Z-next"
+            old, failed, earlier = (parent / name for name in (
+                "20261118T030000Z-first", "20261118T040000Z-next", "20261118T050000Z-slow"))
             old.mkdir()
             failed.mkdir()
+            earlier.mkdir()
             former = {"gaps": [{"key": "backlog:OLD-1", "missing": ["due date"]}]}
             (old / "tracker-gaps.json").write_text(json.dumps(former))
             (old / "asana99-status.json").write_text(json.dumps([{"url": "https://example.test/pr/1"}]))
             (old / "backlog-watch.stdout").write_text(
                 "返信 OLD-1 Prior issue\n返信 DEMO-7 Same issue | comment-42 | 5分 | -\n")
-            old_results = [{"name": name, "exit_code": 0, "result": str(old / f"{name}.json"),
+            old_results = [{"name": name, "exit_code": 0, "read_at": 100.0, "result": str(old / f"{name}.json"),
                             "stdout": str(old / f"{name}.stdout")}
                            for name in ("tracker-gaps", "asana99-status", "backlog-watch")]
             (old / "results.json").write_text(json.dumps(old_results))
             (failed / "results.json").write_text(json.dumps([{"name": "tracker-gaps", "exit_code": 124}]))
+            (earlier / "tracker-gaps.json").write_text(json.dumps({"gaps": []}))
+            (earlier / "results.json").write_text(json.dumps([
+                {"name": "tracker-gaps", "exit_code": 0, "read_at": 50.0,
+                 "result": str(earlier / "tracker-gaps.json")}]))
             decisions = parent / "decisions.jsonl"
             write_jsonl(decisions, [{"id": "d", "decision": "tracker:backlog:NEW-1",
                                      "answer": "放置: 次回の着手時に登録", "decided_at": "2026-11-18T03:30:00Z"}])
@@ -8886,7 +8912,7 @@ class HourlyReadTests(unittest.TestCase):
             with (patch("subprocess.run", side_effect=run), patch.object(os, "getloadavg", return_value=(301, 0, 0)),
                   patch.dict(os.environ, {"TRIAGE_LEAD_DECISIONS": str(decisions)}), redirect_stdout(io.StringIO()) as out):
                 hourly.main(["--workspace", "/w/triage", "--output-root", root, "--timeout", "40"])
-            [current] = [path for path in parent.iterdir() if path.is_dir() and path not in (old, failed)]
+            [current] = [path for path in parent.iterdir() if path.is_dir() and path not in (old, failed, earlier)]
             results = {item["name"]: item for item in json.loads((current / "results.json").read_text())}
             self.assertEqual([timeout for name, timeout in calls if name == "scan_sessions.py"], [100, 100])
             self.assertEqual(sum(name == "topic" for name, _ in calls), 1)
@@ -8951,7 +8977,7 @@ class HourlyReadTests(unittest.TestCase):
                           out.getvalue())
             self.assertEqual(out.getvalue().splitlines()[-1],
                              f"results: {run_dir.resolve() / 'results.json'}（命令ごとの記録の配列。各記録の鍵: "
-                             "name・command・exit_code・stdout・stderr・result・error・retry・compared_to・changes）")
+                             "name・command・exit_code・stdout・stderr・result・error・retry・compared_to・changes・read_at）")
 
     def test_a_skipped_stale_asks_record_has_every_key_of_a_run_record(self) -> None:
         hourly_read = load_script("hourly_read")
@@ -8965,7 +8991,7 @@ class HourlyReadTests(unittest.TestCase):
             result = json.loads((run_dir / "results.json").read_text())
             self.assertEqual({tuple(item) for item in result},
                              {("name", "command", "exit_code", "stdout", "stderr", "result", "error",
-                               "retry", "compared_to", "changes")})
+                               "retry", "compared_to", "changes", "read_at")})
             self.assertEqual(result[-1]["error"], "skipped: scan failed")
 
 
