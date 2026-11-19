@@ -521,7 +521,7 @@ def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> 
             else:
                 settings_by_clone.setdefault(clone, []).extend(
                     (directory / name).relative_to(clone).as_posix()
-                    for name in names if name.startswith(".env") and name != ".env.example")
+                    for name in names if name.startswith(".env") and not name.endswith(".example"))
     else:
         files.append(source)
     if clones:
@@ -573,10 +573,13 @@ def held_clone_details(clone: Path, gitdir: Path, settings: list[str]) -> list[s
     else:
         status = git(clone, "-c", "core.fsmonitor=false", "--no-optional-locks",
                      "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all", env=local_env)
-        details.append("uncommitted changes or git status failed" if status.returncode or status.stdout.strip()
-                       else "uncommitted changes: none")
+        staged = git(clone, "diff", "--cached", "--raw", "--ignore-submodules=none", "--no-ext-diff",
+                     "--no-textconv", env=local_env)
+        dirty = status.returncode or staged.returncode or status.stdout.strip() or staged.stdout.strip()
+        details.append("uncommitted changes or git status failed" if dirty else "uncommitted changes: none")
     if settings:
-        details.append("clone 内の設定: " + ", ".join(sorted(settings)[:3]))
+        details.append("clone 内の設定: " + ", ".join(sorted(settings)[:3])
+                       + (f" ほか {len(settings) - 3} 件" if len(settings) > 3 else ""))
     index = git(clone, "ls-files", "--stage", "-z", env=local_env)
     submodules = [name for entry in index.stdout.split("\0") if entry.startswith("160000 ")
                   and (name := entry.partition("\t")[2]) and (clone / name / ".git").exists()]
@@ -588,7 +591,21 @@ def held_clone_details(clone: Path, gitdir: Path, settings: list[str]) -> list[s
     stash = git(clone, "rev-parse", "--verify", "--quiet", "refs/stash", env=local_env)
     details.append("stash remains" if stash.returncode == 0 else "stash: none" if stash.returncode == 1
                    else "stash: 未確認")
-    commits = git(clone, "rev-list", "--max-count=11", "HEAD", "--branches", "--tags", "--not", "--remotes", env=local_env)
+    worktrees = git(clone, "worktree", "list", "--porcelain", "-z", env=local_env)
+    linked = []
+    for entry in worktrees.stdout.split("\0\0"):
+        fields = entry.split("\0")
+        if not fields or not fields[0].startswith("worktree "):
+            continue
+        path = fields[0].removeprefix("worktree ")
+        if Path(path).resolve() != clone.resolve():
+            linked.append((path, next((line.removeprefix("HEAD ") for line in fields if line.startswith("HEAD ")), "")))
+    if linked:
+        details.append("linked worktrees: " + ", ".join(path for path, _ in linked))
+    elif worktrees.returncode:
+        details.append("linked worktree は未確認")
+    commits = git(clone, "rev-list", "--max-count=11", "HEAD", "--branches", "--tags",
+                  *(oid for _, oid in linked if oid), "--not", "--remotes", env=local_env)
     short = [sha[:12] for sha in commits.stdout.splitlines()]
     unsaved = ", ".join(short[:10] + (["…"] if len(short) > 10 else []))
     details.append("remote-tracking refs に無い commit: " +

@@ -4618,6 +4618,12 @@ class RmCheckTests(unittest.TestCase):
         (changed / ".git/info/exclude").write_text(".env\n")
         (changed / "backend").mkdir()
         (changed / "backend/.env").write_text("EXTRA=fixture")
+        for name in (".env.app.example", ".env.db.example", ".env.test.example"):
+            (changed / name).write_text("VARIABLE=")
+        outside = self.wt.parent / "external-linked"
+        git(tagged, "worktree", "add", "-q", "--detach", str(outside))
+        git(outside, "commit", "-q", "--allow-empty", "-m", "external detached commit")
+        linked_commit = git(outside, "rev-parse", "--short=12", "HEAD")
         modules = changed / ".git/modules/stored"
         modules.mkdir(parents=True)
         git(modules, "init", "-q", "--bare")
@@ -4633,7 +4639,8 @@ class RmCheckTests(unittest.TestCase):
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
         for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
-                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています", tag_commit):
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています",
+                         tag_commit, linked_commit, str(outside)):
             self.assertIn(expected, reason)
         summary = held["clone"]["content_summary"]
         self.assertIn("c-note", summary)
