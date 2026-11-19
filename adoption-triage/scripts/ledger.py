@@ -46,6 +46,7 @@ class Event(TypedDict, total=False):
     outcome: str
     closed: list[Event]
     confirmed: list[Event]
+    revoked: bool
 
 
 class Proposal(Event):
@@ -186,6 +187,7 @@ def project(rows: list[Event]) -> list[Proposal]:
     proposals: dict[str, Proposal] = {}
     for row in rows:
         proposal_id = row["proposal_id"]
+        revocation = None
         if row["type"] == "proposal":
             if proposal_id in proposals:
                 raise ValueError(f"duplicate proposal: {proposal_id}")
@@ -207,6 +209,7 @@ def project(rows: list[Event]) -> list[Proposal]:
                 proposals[target][reverse].append(item["proposal_id"])
     for row in rows:
         proposal_id = row["proposal_id"]
+        revocation = None
         if row["type"] == "proposal":
             continue
         if row["type"] == "evidence":
@@ -460,7 +463,7 @@ def validate_evidence(body: object) -> Event:
     return {**envelope("evidence", proposal_id), "source": source, "evidence": evidence}
 
 
-def append(events: Path, imports: Path, row: Event) -> Event:
+def append(events: Path, imports: Path, row: Event, *, expected_adoption_id: str | None = None) -> Event:
     events.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(events, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -468,6 +471,7 @@ def append(events: Path, imports: Path, row: Event) -> Event:
         items = project(all_rows(events, imports))
         known = {item["proposal_id"]: item for item in items}
         proposal_id = row["proposal_id"]
+        revocation = None
         if row["type"] == "proposal":
             if proposal_id in known:
                 raise ValueError(f"proposal already exists: {proposal_id}")
@@ -487,11 +491,22 @@ def append(events: Path, imports: Path, row: Event) -> Event:
         elif row["type"] == "decision":
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
-            previous = known[proposal_id]["status"]
+            item = known[proposal_id]
+            previous = item["status"]
             decision = row["decision"]
-            if decision == "revoke" and previous != "adopted":
+            if expected_adoption_id is not None:
+                if decision == "adopt":
+                    raise ValueError("expected adoption ID requires revoke, reject, or hold")
+                if previous != "adopted" or item["decisions"][-1]["id"] != expected_adoption_id:
+                    raise ValueError("expected adoption is no longer current")
+                if decision != "revoke":
+                    revocation = {key: row[key] for key in ("actor", "reason") if key in row}
+                    revocation.update({**envelope("decision", proposal_id), "decision": "revoke",
+                                       "after_id": item["latest_event_id"]})
+                    row.update(envelope("decision", proposal_id))
+            elif decision == "revoke" and previous != "adopted":
                 raise ValueError("only adopted proposals can be revoked")
-            if previous == "adopted" and decision in {"adopt", "reject", "hold"}:
+            elif previous == "adopted" and decision in {"adopt", "reject", "hold"}:
                 raise ValueError("revoke adoption before another decision")
             if decision in {"adopt", "hold"}:
                 # A rejected consolidation may come back only while no other one has taken its targets.
@@ -516,18 +531,22 @@ def append(events: Path, imports: Path, row: Event) -> Event:
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
         if row["type"] != "proposal":
-            row["after_id"] = known[proposal_id]["latest_event_id"]
+            row["after_id"] = revocation["id"] if revocation else known[proposal_id]["latest_event_id"]
         adopted = row["type"] == "decision" and row["decision"] == "adopt"
         closed = closing_decisions(known[proposal_id], known, row["actor"]) if adopted else []
         confirmed = confirming_executions(known[proposal_id], known, row["actor"]) if adopted else []
-        # One write keeps the adoption and the targets it closes or confirms together.
+        batch = (revocation, row) if revocation else (row, *closed, *confirmed)
         data = b"".join((json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-                        for event in (row, *closed, *confirmed))
+                        for event in batch)
+        previous_size = os.fstat(fd).st_size
         if os.write(fd, data) != len(data):
+            os.ftruncate(fd, previous_size)
             raise OSError("partial event write")
         os.fsync(fd)
     finally:
         os.close(fd)
+    if revocation:
+        return {**row, "revoked": True}
     return {**row, "closed": closed, "confirmed": confirmed} if adopted else row
 
 
@@ -674,7 +693,9 @@ def main() -> int:
     parser.add_argument("--decision-config", type=Path, default=DEFAULT_HOSTS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("propose", help="append one proposal from stdin JSON")
-    commands.add_parser("decide", help="append one decision from stdin JSON")
+    deciding = commands.add_parser("decide", help="append a decision from stdin JSON")
+    deciding.add_argument("--expected-adoption-id",
+                          help="require this current adoption; revoke it before a reject or hold")
     commands.add_parser("record", help="append one execution result from stdin JSON")
     commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
     listing = commands.add_parser("list", help="read current proposals",
@@ -706,7 +727,11 @@ def main() -> int:
             print(json.dumps(append(args.events, args.imports, validate_proposal(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "decide":
             require_decision_writer(args.decision_config)
-            print(json.dumps(append(args.events, args.imports, validate_decision(json.load(sys.stdin))), ensure_ascii=False))
+            if args.expected_adoption_id is not None:
+                uuid.UUID(args.expected_adoption_id)
+            row = append(args.events, args.imports, validate_decision(json.load(sys.stdin)),
+                         expected_adoption_id=args.expected_adoption_id)
+            print(json.dumps(row, ensure_ascii=False))
         elif args.command == "record":
             print(json.dumps(append(args.events, args.imports, validate_execution(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "support":

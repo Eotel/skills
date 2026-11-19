@@ -277,6 +277,39 @@ class RetroTests(unittest.TestCase):
         self.assertFalse(retro.facts_path(self.target).exists())
         self.assertNotIn(retro.ROUTER_SECTION, self.target.read_text())
 
+    def test_worker_reverts_an_application_after_a_later_hold_or_reject(self) -> None:
+        config = self.home / "hosts.json"
+        config.write_text(json.dumps({"name": "board", "decision_writer": True, "hosts": []}))
+        ledger = retro.LedgerClient(
+            script=ROOT / "adoption-triage/scripts/ledger.py",
+            events=self.home / "events.jsonl", imports=self.home / "imports",
+            decision_config=config)
+        data = retro.load(self.state)
+
+        for next_decision, expected_status in (("hold", "held"), ("reject", "rejected")):
+            with self.subTest(decision=next_decision):
+                proposal_id = str(uuid.uuid4())
+                ledger.propose({"proposal_id": proposal_id,
+                                "source": {"session": self.sid, "worktree": str(self.root)},
+                                "fact": "Tool produced unexpected output.", "proposal": f"Note for {next_decision}.",
+                                "reason": "The failure was observed.", "recommendation": "adopt", "priority": "normal",
+                                "target": "triage-retro:skill:orca-session-triage:fact"})
+                ledger.decide({"proposal_id": proposal_id, "decision": "adopt", "actor": "human"})
+                self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+                facts = retro.facts_path(self.target)
+                self.assertIn(proposal_id, facts.read_text())
+                revoked = ledger.decide({"proposal_id": proposal_id, "decision": "revoke", "actor": "human"})
+                ledger.decide({"proposal_id": proposal_id, "decision": next_decision, "actor": "human"})
+
+                self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+                item = next(row for row in ledger.list() if row["proposal_id"] == proposal_id)
+                self.assertEqual(item["status"], expected_status)
+                receipt = item["executions"][-1]
+                self.assertEqual(receipt["decision_id"], revoked["id"])
+                self.assertEqual(receipt["outcome"], "reverted")
+                self.assertFalse(facts.exists())
+                self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 0)
+
     def test_policy_change_waits_for_a_button(self) -> None:
         proposal = sample_candidate()
         proposal["category"] = "rule"

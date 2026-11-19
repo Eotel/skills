@@ -887,11 +887,20 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         _, _, skill, category = parts
         status = item["status"]
         proposal_id = item["proposal_id"]
-        if status not in ("adopted", "revoked"):
+        if status in ("adopted", "revoked"):
+            decision = item["decisions"][-1]
+        elif status in ("held", "rejected") and item.get("revoked_at") and category not in SEPARATE_WORK:
+            decision = next((entry for entry in reversed(item["decisions"]) if entry["decision"] == "revoke"), None)
+            if decision is None:
+                continue
+            status = "revoked"
+        else:
             continue
-        decision_id = item["decisions"][-1]["id"]
-        if ((status == "adopted" and item.get("implemented_at"))
-                or (status == "revoked" and item.get("reverted_at"))):
+        decision_id = decision["id"]
+        reverted = status == "revoked" and any(
+            receipt.get("decision_id") == decision_id and receipt.get("outcome") == "reverted"
+            for receipt in item.get("executions", []))
+        if (status == "adopted" and item.get("implemented_at")) or reverted:
             data["applied_actions"].pop(proposal_id, None)
             data["rewrites"].pop(decision_id, None)
             # Retries counted under an earlier decision no longer stand for a failure once the proposal settles.

@@ -32,8 +32,9 @@ class AdoptionLedgerTests(unittest.TestCase):
                               input=json.dumps(body, ensure_ascii=False) if body is not None else None,
                               text=True, capture_output=True)
 
-    def proposal(self) -> str:
+    def proposal(self, proposal_id: str | None = None) -> str:
         result = self.run_ledger(["propose"], {
+            **({"proposal_id": proposal_id} if proposal_id else {}),
             "source": {"session": "triage", "worktree": "triage"},
             "fact": "同じ失敗が続いた", "proposal": "設定を直す", "reason": "使い方に関わる",
             "recommendation": "adopt", "priority": "high", "evidence": ["2026-10-26 17:00"]})
@@ -70,6 +71,32 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(len(item["decisions"]), 3)
         self.assertEqual(len(item["executions"]), 2)
         self.assertEqual(len(self.events.read_text().splitlines()), 6)
+
+    def test_expected_adoption_id_protects_a_newer_adoption_across_cli_processes(self) -> None:
+        proposal_id = self.proposal(str(uuid.uuid4()).upper())
+        body = {"proposal_id": proposal_id, "actor": "Eotel"}
+        first = self.run_ledger(["decide"], {**body, "decision": "adopt"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["id"]
+        for decision in ("revoke", "adopt"):
+            latest = self.run_ledger(["decide"], {**body, "decision": decision})
+            self.assertEqual(latest.returncode, 0, latest.stderr)
+        latest_id = json.loads(latest.stdout)["id"]
+        before = self.events.read_bytes()
+
+        stale = self.run_ledger(["decide", "--expected-adoption-id", first_id], {**body, "decision": "hold"})
+        self.assertIn("expected adoption is no longer current", stale.stderr)
+        self.assertEqual(self.events.read_bytes(), before)
+
+        changed = self.run_ledger(["decide", "--expected-adoption-id", latest_id], {**body, "decision": "hold"})
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertTrue(json.loads(changed.stdout)["revoked"])
+        item, = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]
+        self.assertEqual(item["status"], "held")
+        revoke, hold = item["decisions"][-2:]
+        self.assertEqual([revoke["decision"], hold["decision"]], ["revoke", "hold"])
+        self.assertEqual(revoke["after_id"], latest_id)
+        self.assertEqual(hold["after_id"], revoke["id"])
 
     def test_invalid_transition_does_not_append(self) -> None:
         proposal_id = self.proposal()
