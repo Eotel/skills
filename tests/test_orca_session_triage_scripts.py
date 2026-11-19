@@ -2896,6 +2896,7 @@ class ScanCommandTests(unittest.TestCase):
         cases = [
             {"agents": [{"type": "codex", "state": "waiting"}]},
             {"unread_mail": [{"from": "worker"}]},
+            {"codex": [{"pending_requests": [{"answered_in_chat_later": False}]}]},
             {"done_cards": [{"handle": "term", "agent": "codex", "draft": True}]},
         ]
         saved.write_text(json.dumps([

@@ -285,16 +285,28 @@ def close_one(rows: Sequence[dict], handle: str, host: TabHost, projects: Path, 
         return False, (f"{handle}: KEPT -> 走査の後に動いた（{last.at.astimezone().strftime('%H:%M:%S')} {last.what}"
                        + (f" ほか {len(moved) - 1} 件" if len(moved) > 1 else "") + "）")
     try:
-        if isinstance(host, OrcaTabs) and any(tab.get("handle") == handle and tab.get("agent")
-                                             for tab in row.get("terminals") or []):
+        agents = [tab.get("agent") for source in ("terminals", "done_cards") for tab in row.get(source) or []
+                  if tab.get("handle") == handle and tab.get("agent")]
+        if isinstance(host, OrcaTabs) and agents:
             environment = row.get("environment")
             key = environment, handle
             frames = scan_sessions.read_screens(host.orca, [{"_environment": environment, "handle": handle}])
-            if (frame := scan_sessions.rendered(frames.get(key))) and (
-                    scan_sessions.has_draft(frame) or scan_sessions.composer_empty(frame) is False):
+            frame = scan_sessions.rendered(frames.get(key))
+            if frame is None:
+                return False, f"{handle}: KEPT -> 画面を確認できない"
+            codex_input = False
+            if "codex" in agents:
+                lines = [line.strip() for line in scan_sessions.screen_lines(frame)]
+                prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith("› ")]
+                if prompts:
+                    prompt = prompts[-1]
+                    codex_input = lines[prompt] != "›" and not scan_sessions.last_codex_activity(lines[prompt + 1:])
+            if scan_sessions.has_draft(frame) or scan_sessions.composer_empty(frame) is False or codex_input:
                 return False, f"{handle}: KEPT -> 未送信の入力"
+        if (row.get("environment"), handle) in scan_sessions.active_holds(datetime.now(timezone.utc)):
+            return False, f"{handle}: KEPT -> 保留中のタブ"
         host.close(row.get("environment"), handle)
-    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
+    except (OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as error:
         return False, f"{handle}: NOT CLOSED -> {error}"
     return True, f"{handle}: CLOSED"
 

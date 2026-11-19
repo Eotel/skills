@@ -78,6 +78,20 @@ class CloseTabsTests(unittest.TestCase):
     def write_transcript(self, *entries: dict) -> None:
         self.transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
 
+    def test_codex_done_card_keeps_its_tab_when_the_composer_cannot_be_cleared(self) -> None:
+        row = json.loads(self.scan.read_text())[0]
+        row["terminals"] = []
+        row["done_cards"] = [{"handle": "term_agent", "agent": "codex"}]
+        caller = close_tabs.Caller.from_environment()
+        tabs = close_tabs.OrcaTabs("unused")
+        for screen in (None, {"source": "screen", "tail": ["› unsent text", "? for shortcuts"]}):
+            with (self.subTest(screen=screen), patch.object(tabs, "agent_changes", return_value=[]),
+                  patch.object(tabs, "close") as closed, patch.object(close_tabs.scan_sessions, "read_screens",
+                                                                   return_value={(None, "term_agent"): screen})):
+                result, _ = close_tabs.close_one([row], "term_agent", tabs, self.projects, self.inbox, caller)
+                self.assertFalse(result)
+                closed.assert_not_called()
+
     def test_a_tab_whose_transcript_moved_after_the_scan_stays_open(self) -> None:
         self.write_transcript({"type": "assistant", "timestamp": "2026-10-28T05:12:58.000Z"},
                               {"type": "cost-state", "totalCostUSD": 1.0})
@@ -271,6 +285,8 @@ state = Path({str(state)!r})
 if sys.argv[1:3] == ["terminal", "close"]:
     state.write_text("closed")
     print(json.dumps({{"ok": True, "result": {{}}}}))
+elif sys.argv[1:3] == ["terminal", "read"]:
+    print(json.dumps({{"ok": True, "result": {{"source": "screen", "tail": ["────", "❯", "────"]}}}}))
 else:
     other = int(time.time() * 1000) if state.exists() else {before}
     print(json.dumps({{"ok": True, "result": {{"worktrees": [

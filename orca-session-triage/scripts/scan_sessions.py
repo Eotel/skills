@@ -2873,14 +2873,14 @@ def active_holds(now: datetime) -> dict[tuple[str | None, str], dict]:
     return {(hold.get("environment") or None, hold["handle"]): hold
             for hold in hold_rows(inbox_read.holds_path())
             if hold["created_at"] <= stamp
-            and (hold["status"] in ("active", "releasing")
+            and (hold["status"] in ("staged", "active", "releasing")
                  if hold["released_at"] is None else hold["released_at"] > stamp)}
 
 
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
                              now: datetime | None = None, *,
                              open_asks: Sequence[inbox_read.OpenAsk] = (),
-                             known_tabs: Collection[str] = ()) -> list[dict]:
+                             known_tabs: Collection[tuple[str | None, str]] = ()) -> list[dict]:
     """Keep the tabs and checkout of rows that a block, an undelivered promise, or a removal answer holds.
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
@@ -2900,8 +2900,13 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
     lead = (state.get("lead") or {}).get("worktree")
     requests = [(key, request.get("owner")) for key, request in state.get("requests", {}).items()
                 if request.get("closed_at") is None]
-    tabs_in_scan = {*known_tabs, *(term["handle"] for row in rows for term in row.get("terminals") or []
-                                   if term.get("handle"))}
+    tabs_in_scan = {*known_tabs, *((row.get("environment"), term["handle"]) for row in rows
+                                   for term in row.get("terminals") or [] if term.get("handle"))}
+
+    def hostname(value: str) -> str:
+        return value.lower().removesuffix(".local")
+
+    local_hostname = os.environ.get("TRIAGE_HOST") or socket.gethostname()
     current_holds = active_holds(now)
     removal_candidates: list[tuple[dict, list[dict]]] = []
 
@@ -2923,13 +2928,18 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
             blockers.append("structured-agent-session の agent がいる作業場")
         blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner == row_identity(row))
-        blockers.extend(f"開いた ask {ask.report['id']}" for ask in open_asks
-                        if ask.report.get("handle") in tabs
-                        or (ask.report.get("handle") not in tabs_in_scan
-                            and ask.report.get("worktree") == Path(row["path"]).name
-                            and (not ask.report.get("host") or str(ask.report["host"]).lower().removesuffix(".local")
-                                 == (environment or socket.gethostname()).lower().removesuffix(".local"))
-                            and (ask.report.get("repo") or "") in row_repos(row)))
+        row_hosts = {hostname(value) for value in
+                     (environment or local_hostname, row.get("host_id"), *([socket.gethostname()] if not environment else []))
+                     if value}
+        for ask in open_asks:
+            report = ask.report
+            if report.get("host") and hostname(report["host"]) not in row_hosts:
+                continue
+            handle = report.get("handle")
+            if handle in tabs or ((environment, handle) not in tabs_in_scan
+                                  and report.get("worktree") == Path(row["path"]).name
+                                  and (report.get("repo") or "") in row_repos(row)):
+                blockers.append(f"開いた ask {report['id']}")
         holds = [current_holds[(environment, tab)] for tab in sorted(tabs) if (environment, tab) in current_holds]
         if holds:
             row["cleanup_before_hold"] = {field: row[field] for field in HOLD_FIELDS if field in row}
@@ -2962,9 +2972,15 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                  *(f"{not_before_label(item)}の約束の送り先: {promise_task(item)}" for item in early)]
         row["reasons"] = [*row.get("reasons", []), *dict.fromkeys(reason for reason in added
                                                                   if reason not in row.get("reasons", []))]
-        keys = ({f"remove:{name}" for name in names} if environment else
-                {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
-                 f"remove:local::{row['path']}"})
+        if environment:
+            primary = f"remove:{row_identity(row)}"
+            legacy_keys = {f"remove:{name}" for name in {*names, row["path"],
+                           f"{row.get('repo')}/{Path(row['path']).name}"}} - {primary}
+            keys = {primary, *(key for key in legacy_keys if (answer := decisions.get(key)) and (
+                not answer.removal and KEEP_DECISION.search(answer.answer)))}
+        else:
+            keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
+                    f"remove:local::{row['path']}"}
         by_key = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
                   if candidate["decision"] in keys}
         for key in keys:
@@ -3206,10 +3222,14 @@ def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dic
     return verdicts
 
 
-def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
+def with_verdicts(rows: list[dict], verdicts: dict[str, dict], *,
+                  reload_holds: bool = False) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
-        row = restore_held_row(row)
+        if row.get("cleanup_before_hold") is not None:
+            if not reload_holds:
+                return row
+            row = restore_held_row(dict(row))
         original = row.get("scan_tab_counts") or {}
         row = {**row, **original}
         interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
@@ -3229,6 +3249,9 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
         closable = [handle for handle in row.get("closable") or [] if handle not in agents]
         meaningful = [handle for handle in row.get("meaningful_tabs") or [] if handle not in agents]
         pending = (row.get("stop") or row.get("unread_mail") or row.get("screen_progress")
+                   or (row.get("claude") or {}).get("pending_questions")
+                   or any(not request.get("answered_in_chat_later") for session in row.get("codex") or []
+                          for request in session.get("pending_requests") or [])
                    or any(agent.get("state") == "waiting" or agent.get("state") == "working" and agent.get("turn") != "done"
                           for agent in row.get("agents") or []))
         drafts = {*row.get("draft_tabs", []), *(card.get("handle") for card in row.get("done_cards") or []
@@ -4026,7 +4049,7 @@ def print_row(rows: list[dict], key: str, transcripts: bool = False, inbox: Path
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    def constrain(rows: list[dict], known_tabs: Collection[str]) -> list[dict]:
+    def constrain(rows: list[dict], known_tabs: Collection[tuple[str | None, str]]) -> list[dict]:
         inbox, answers = Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()
         try:
             entries = inbox_read.inbox_entries(inbox)
@@ -4043,19 +4066,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"--from: {error}", file=sys.stderr)
             return 1
         verdicts = absorb_verdicts(args.verdicts, write=False)
-        known_tabs = {term["handle"] for row in rows for term in row.get("terminals") or [] if term.get("handle")}
+        known_tabs = {(row.get("environment"), term["handle"]) for row in rows
+                      for term in row.get("terminals") or [] if term.get("handle")}
         if args.only:
             try:
                 rows = [select_row(rows, args.only, "--only")]
             except ValueError as error:
                 print(error, file=sys.stderr)
                 return 1
-        rows = constrain(with_verdicts(rows, verdicts), known_tabs)
+        rows = constrain(with_verdicts(rows, verdicts, reload_holds=True), known_tabs)
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
-    known_tabs = {term["handle"] for term in terminals if term.get("handle")}
+    known_tabs = {(term.get("_environment"), term["handle"]) for term in terminals
+                  if term.get("handle") and (term.get("connected") or not term.get("orphaned"))}
     if args.only:
         worktrees, terminals = one_per_path(worktrees, terminals)
         choices = [{"path": w["path"], "repo": w.get("repo"), "environment": w.get("_environment"),
