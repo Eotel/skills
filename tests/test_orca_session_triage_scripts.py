@@ -3486,6 +3486,7 @@ class ScanCommandTests(unittest.TestCase):
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
+        self.assertEqual(err.count(scan.REMOTE_CHECK_RELEASE), 1)
         self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
             str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
             "--summary", "/w/app/far -"]), err)

@@ -3798,6 +3798,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         print(error, file=sys.stderr)
         return 1
     left_out = 0
+    remote_preview = False
     specs = []
     # A row named twice (by name and by path) is printed once.
     for row in {id(row): row for row in selected}.values():
@@ -3810,11 +3811,14 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
             why = requirement
         elif row.get("environment"):
             why = "on another Mac: " + rm_check_command(row, scan_file)
+            remote_preview = remote_preview or batch_has_preview()
         else:
             specs.append(rm_spec(row))
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
+    if remote_preview:
+        print(REMOTE_CHECK_RELEASE, file=sys.stderr)
     print_rm_specs(specs, scan_file)
     return 1 if left_out else 0
 
