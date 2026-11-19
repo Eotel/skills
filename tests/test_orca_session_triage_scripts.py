@@ -3101,7 +3101,8 @@ class ScanCommandTests(unittest.TestCase):
         saved = self.dir / "scan.json"
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
                "open_pr_cleanup": True, "pr": {"number": 10}}
-        with patch.object(scan, "batch_has_preview", return_value=False):
+        with (patch.object(scan, "batch_has_preview", return_value=False),
+              patch.object(scan, "batch_help", return_value="")):
             local = shlex.split(scan.rm_check_command(row, saved, decisions_file=scan.LEAD_DECISIONS))
             remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
             remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
@@ -3113,8 +3114,8 @@ class ScanCommandTests(unittest.TestCase):
         self.assertNotIn("--detach-nested", remote)
         self.assertNotIn("--summary", remote)
         self.assertNotIn("--from", remote)
-        self.assertNotIn("--summary", remove)
-        self.assertIn("--from", remove)
+        self.assertIn("Harness", remove)
+        self.assertNotIn("--remove-ok", remove)
         self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
@@ -3129,6 +3130,7 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
                          patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
                          patch.object(scan, "batch_has_preview", return_value=True),
+                         patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
                          patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
@@ -4130,7 +4132,8 @@ class ScanCommandTests(unittest.TestCase):
                         options.extend(("--preview", "--detach-nested"))
                     spec = f"{row['path']} {number or '-'}"
                     if row.get("open_pr_cleanup") or host:
-                        expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
+                        expected = [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    *host, *options, spec]
                     else:
                         expected = [str(scan.RM_CHECK), *options, "--decisions-file", str(scan.LEAD_DECISIONS),
                                     row["path"], str(number or "-")]
@@ -4151,16 +4154,16 @@ class ScanCommandTests(unittest.TestCase):
                 code = scan.main(["--from", str(saved), "--rm-specs", *(f"--row={name}" for name in names)])
             return code, out.getvalue(), err.getvalue()
 
-        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                               "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
+        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                               "--from", str(saved.absolute()), "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
         self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", expected))
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
         self.assertEqual(err.count(scan.REMOTE_CHECK_RELEASE), 1)
         self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
-            str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
-            "--summary", "/w/app/far -"]), err)
+            str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+            "--host", "mbp16", "--from", str(saved.absolute()), "--summary", "/w/app/far -"]), err)
         self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
 
     def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
@@ -4183,8 +4186,8 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", *named]), 0)
             specs = out.getvalue().splitlines()
             self.assertEqual(specs, ["/w/app/one 7", "/w/app/two -"])
-            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                                                         "--remove-ok", "--summary", *specs])
+            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                                         "--from", str(saved.absolute()), "--remove-ok", "--summary", *specs])
 
     def test_automation_workspaces_are_left_out_even_with_removal_approval(self) -> None:
         rows = [{"path": "/w/app/scheduled", "repo": "app", "class": "finished", "open_pr_cleanup": True,
@@ -4744,6 +4747,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(comment, " ".join(result["blockers"]))
         self.assertIn(key, " ".join(result["blockers"]))
+
+        lead_decisions.append(log, lead_decisions.Decision(
+            "retain", f"remove:local::{self.wt.resolve()}", "保留してください。", "2026-10-27T00:00:00Z"))
+        code, result = self.run_main("--decisions-file", str(log), notes=notes)
+        self.assertEqual((code, result["ok"]), (1, False))
 
         lead_decisions.append(log, lead_decisions.Decision("allow", key, "消してよい", "2026-10-28T00:00:00Z"))
         code, result = self.run_main("--decisions-file", str(log), notes=notes)

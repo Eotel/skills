@@ -3980,10 +3980,10 @@ def decision_options(decisions_file: Path) -> list[str]:
     return ["--decisions-file", str(decisions_file.expanduser().absolute())]
 
 
-def batch_decision_options(decisions_file: Path) -> list[str]:
+def batch_decision_options(decisions_file: Path, *, required: bool = False) -> list[str]:
     if "--decisions-file" in batch_help():
         return decision_options(decisions_file)
-    if decisions_file.expanduser().absolute() != LEAD_DECISIONS.expanduser():
+    if required or decisions_file.expanduser().absolute() != LEAD_DECISIONS.expanduser():
         raise ValueError(BATCH_DECISIONS_REQUIREMENT)
     return []
 
@@ -4004,13 +4004,13 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     if not batch_has_preview():
         options = from_scan if remove_ok else []
     if remove_ok:
-        if (row.get("removal_decision") or {}).get("archive_path") and not scan_file:
-            return "記録済みのアーカイブを照合するには走査を保存し、--from で指定してください"
+        if not scan_file:
+            return "削除前に承認ログを再検査するため、走査を保存し、--from で指定してください"
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
     try:
-        log_options = batch_decision_options(decisions_file) if scan_file else []
+        log_options = batch_decision_options(decisions_file, required=remove_ok) if scan_file else []
     except ValueError as error:
         return str(error)
     return shlex.join([str(RM_CHECK_BATCH), *log_options, *(["--host", environment] if environment else []), *options, rm_spec(row)])
@@ -4264,14 +4264,13 @@ def wake_line(row: dict, stop: StopReason) -> str:
 
 def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
     answer = row.get("removal_decision") or {}
-    if (not answer.get("decision") or removal_approved(row) or answer.get("after")
+    if (not answer.get("decision") or removal_approved(row) or answer.get("after") or row.get("removal_candidates")
             or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
             or not re.fullmatch(r"\s*(?:閉じる|閉じてください|close it)[。.!]?\s*",
                                 answer.get("answer") or "", re.IGNORECASE)):
         return
     target = row_identity(row) if row.get("environment") else f"local::{row['path']}"
-    command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), "--decisions-file",
-                          str(decisions_file.expanduser()), "record", "--decision", f"remove:{target}",
+    command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), *decision_options(decisions_file), "record", "--decision", f"remove:{target}",
                           "--answer-file", "/dev/stdin", "--approve"])
     print(f"{row_name(row)}: 削除を承認する場合は次のコマンドに新しい承認文を標準入力で渡してください\n{command}",
           file=sys.stderr)
@@ -4320,7 +4319,7 @@ def print_rm_specs(specs: list[str], scan_file: Path, decisions_file: Path) -> N
     if specs:
         sys.stdout.flush()
         try:
-            log_options = batch_decision_options(decisions_file)
+            log_options = batch_decision_options(decisions_file, required=True)
         except ValueError as error:
             print(error, file=sys.stderr)
             return

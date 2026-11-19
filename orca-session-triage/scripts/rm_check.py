@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Collection, Sequence
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import filecmp
 from functools import partial
@@ -1635,21 +1636,33 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("worktree note could not be read: %s" % error)
     if comment:
         key = "remove:" + worktree
-        answer = None
+        import scan_sessions
+        approved = False
         try:
             decisions = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
-            answer = max((entry for name in (key, f"remove:local::{worktree}") if (entry := decisions.get(name))),
-                         key=lambda entry: lead_decisions.moment(entry.decided_at) or datetime.min.replace(tzinfo=timezone.utc),
-                         default=None)
-            if answer is not None:
-                key = answer.decision
+            dated = [(lead_decisions.moment(entry.decided_at) or datetime.min.replace(tzinfo=timezone.utc), entry)
+                     for name in (key, f"remove:local::{worktree}") if (entry := decisions.get(name))]
+            if dated:
+                newest_at = max(at for at, _ in dated)
+                approved = True
+                for at, entry in dated:
+                    if at != newest_at:
+                        continue
+                    terms = entry.removal
+                    state = None
+                    if terms and (condition := terms.pull_request()):
+                        found = (lead_decisions.github_pr_states(condition.repo, [condition.number]) or {}).get(condition.number)
+                        state = found.state if found else None
+                    fields = asdict(terms) if terms else {}
+                    if not scan_sessions.removal_answer_approves({**fields, "answer": entry.answer, "after_state": state}):
+                        approved = False
+                    notes.append("Lead answered %s: %r" % (entry.decision, entry.answer))
         except (OSError, ValueError) as error:
+            approved = False
             notes.append("lead decisions could not be read: %s" % error)
-        if answer is None:
-            keep_blocker = ("Orca comment asks to keep it: %s. Remove it only after the lead answers %s"
+        if not approved:
+            keep_blocker = ("Orca comment asks to keep it: %s. Remove it only after the lead approves %s"
                             % (comment, key))
-        else:
-            notes.append("Lead answered %s: %r" % (key, answer.answer))
     remote_default = default_base(worktree)
     local_default = None if remote_default else local_base(worktree)
     fallback = remote_default or local_default
