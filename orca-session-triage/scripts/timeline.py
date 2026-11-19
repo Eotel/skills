@@ -596,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--since", required=True,
                         help="この時刻から（16:30 は直近の過去の 16:30、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
     parser.add_argument("--until",
-                        help="この時刻まで（時刻だけの指定は当日。開始も時刻だけで前日なら直近の過去。省くと今まで）")
+                        help="この時刻まで（時刻だけの指定は当日。開始も時刻だけで前日なら、範囲が逆転しない直近の過去。省くと今まで）")
     parser.add_argument("--lane", help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle）")
     parser.add_argument("--match", help="本文にこの文字列を含む出来事だけ（大文字と小文字を区別しない）")
     parser.add_argument("--json", action="store_true", help="1 件 1 オブジェクトの JSON の配列で、本文を全文出す")
@@ -612,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             previous_start = bool(WALL_CLOCK.fullmatch(args.since)) and since.date() < now.date()
             until = moment(args.until, now, past_wall_clock=previous_start)
+            if previous_start and WALL_CLOCK.fullmatch(args.until) and until < since:
+                until += timedelta(days=1)
         except argparse.ArgumentTypeError as error:
             parser.error(f"--until: {error}")
     reason = "--since が未来" if since > now else "--since が --until より後" if since > until else None

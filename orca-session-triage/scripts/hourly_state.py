@@ -1410,7 +1410,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         kept = earlier if earlier and presented_state(data, key, earlier, decisions) != "settled" else None
         data["presented"][key] = {
             "text": file_text(args.text_file), "link": args.link,
-            "owner": owner_name(args.owner) if args.owner is not None else None,
+            "owner": args.owner,
             "since": kept["since"] if kept else recorded_at(args.since),
             "presented_at": kept["presented_at"] if kept else stamp(), "closed_at": None, "closure_evidence": None}
         return {"id": key, **data["presented"][key]}

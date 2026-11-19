@@ -128,6 +128,16 @@ with patch.object(timeline, "datetime", wraps=datetime) as fixed:
         self.assertEqual(json.loads(future.stdout), [])
         self.assertIn("0 件（--since が未来）", future.stderr)
 
+    def test_a_wall_clock_window_can_cross_midnight(self) -> None:
+        self.append(".cache/orca-briefs/triage-inbox.jsonl",
+                    self.report("2026-11-18T23:30:00+09:00", LANE, "fix-checklist", "info", "前日の記録"),
+                    self.report("2026-11-19T00:15:00+09:00", LANE, "fix-checklist", "info", "当日の記録"))
+
+        result = self.run_tool("--since", "23:10", "--until", "01:00", "--json",
+                               clock="2026-11-19T00:30:00+09:00")
+
+        self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["前日の記録", "当日の記録"])
+
     def test_a_lane_filter_keeps_every_instruction_to_that_lane_in_order(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",
                     self.report("2026-11-15T14:46:03+0900", OTHER, "fix-orders", "info", "頼まれた事実を調べました。"),
