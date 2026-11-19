@@ -881,6 +881,99 @@ class ClassifyTests(unittest.TestCase):
         moved = {"source": "screen", "tail": [question, "  1. Yes", "❯ 2. No"]}
         self.assertEqual(scan.permission_prompt(moved, "term_prompt")["choices"], ["1. Yes", "2. No"])
 
+    def test_codex_command_confirmation_lists_the_blocked_command_and_process(self) -> None:
+        tree = worktree("/w/confirm", "waiting")
+        term = terminal(tree["path"], "codex", "term_codex")
+        heading, command = "Would you like to run the following command?", "$ git status"
+        tail = [heading, "", "Environment: local", "", "Reason: read the Git status", "",
+                command, "› 1. Yes, proceed (y)", "  2. No (esc)",
+                "Press enter to confirm or esc to cancel"]
+        screens = {(None, "term_codex"): {"source": "screen", "tail": tail}}
+        rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, screens=screens)
+
+        processes = {13: (1, "codex"), 14: (1, "codex"), 15: (1, "codex --model gpt-6-sol --yolo"),
+                     16: (1, "codex app-server"), 17: (1, "codex -- --yolo"), 18: (1, "codex Inspect exec code"),
+                     19: (1, "codex resume --dangerously-bypass-approvals-and-sandbox --last"),
+                     20: (1, "codex fork --last --yolo"), 21: (1, "codex resume --last -- --yolo"),
+                     22: (1, "codex resume prior-session --yolo"),
+                     23: (1, "/opt/codex/codex-aarch64-apple-darwin resume --last"),
+                     24: (1, "/opt/codex/codex-x86_64-apple-darwin resume --last"),
+                     25: (1, "/opt/codex/codex-x86_64-apple-darwin resume --last --yolo")}
+        handles = {pid: "term_other" if pid == 14 else "term_codex" for pid in processes}
+        with patch.object(scan.rm_check, "process_table", return_value=processes), \
+             patch.object(scan.rm_check, "process_handles", side_effect=lambda pids: {pid: handles[pid] for pid in pids}):
+            scan.with_codex_permission_reasons(rows)
+
+        self.assertEqual(rows[0]["class"], "waiting")
+        self.assertEqual(rows[0]["prompt_waiting"], {"tab": "term_codex", "question": heading, "target": command,
+                                                       "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
+        self.assertIn("Codex process 13 shows no approvals bypass flag in its process command", rows[0]["reasons"])
+        self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
+                         [f"Codex process {pid} shows no approvals bypass flag in its process command"
+                          for pid in (13, 17, 18, 21, 23, 24)])
+        self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
+            *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
+
+    def test_codex_approval_screen_can_wrap_or_omit_command_output(self) -> None:
+        lines = ["Would you like to run the following", "command?", "[… 43 lines] ⌃g view all",
+                 "› 1. Yes, proceed (y)", "  2. No, and tell Codex what to do", "     differently (esc)",
+                 "Press enter to confirm or esc to", "cancel"]
+        for tail, target in ((lines, "command omitted from terminal view"),
+                             (lines[2:], "approval details omitted from terminal view")):
+            with self.subTest(target=target):
+                prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+                self.assertEqual(prompt["target"], target)
+                self.assertEqual(prompt["choices"], ["1. Yes, proceed (y)", "2. No, and tell Codex what to do differently (esc)"])
+
+    def test_a_clipped_edit_approval_reports_an_approval_with_no_command_target(self) -> None:
+        tail = ["Would you like to make the following edits?", "[… 14 lines]",
+                "› 1. Yes, proceed (y)", "2. Yes, and don't ask again for these files (a)",
+                "3. No, and tell Codex what to do differently (esc)", "Press enter to confirm or esc to cancel"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["question"], "Codex approval")
+        self.assertEqual(prompt["target"], "approval details omitted from terminal view")
+        self.assertEqual(len(prompt["choices"]), 3)
+
+    def test_codex_can_request_command_approval_from_another_thread(self) -> None:
+        tail = ["Would you like to run the following command?", "Thread: Robie [explorer]", "", "$ echo hi",
+                "› 1. Yes, proceed (y)", "2. No, and tell Codex what to do differently (esc)",
+                "Press enter to confirm or esc to cancel or o to open thread"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["target"], "$ echo hi")
+
+    def test_codex_uses_the_command_block_and_configured_approval_keys(self) -> None:
+        tail = ["Would you like to run the following", "command?", "", "Reason: Compare",
+                "$ git diff --stat.", "", "$ git status --short", "", "› 1. Yes",
+                "2. No", "Press f6 to confirm or f7 to cancel"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["target"], "$ git status --short")
+
+    def test_codex_approval_in_an_orca_screen_without_blank_rows(self) -> None:
+        body = ["  Would you like to run the following command?", "  Thread: worker", "  Environment: local",
+                "  Reason: Read status", "  Permission rule: filesystem access", "  $ git status",
+                "› 1. Yes, proceed (y)", "  2. No", "  Press f6 to confirm"]
+        screen = {"source": "screen", "tail": body,
+                  "tailRows": [{"wrapped": False, "trailingSpaces": 0} for _ in body]}
+        prompt = scan.codex_permission_prompt(screen, "term_codex")
+        self.assertEqual(prompt["target"], "$ git status")
+        self.assertEqual(prompt["choices"], ["1. Yes, proceed (y)", "2. No"])
+        ambiguous = {**screen, "tail": [*body[:5], "  $ quoted from reason", *body[5:]]}
+        self.assertEqual(scan.codex_permission_prompt(ambiguous, "term_codex")["target"],
+                         "command omitted from terminal view")
+        for snippet in (["$ cat <<'EOF'", "Reason: example", "$ git status", "EOF"],
+                        ["Reason: Compare the output of", "$ git diff --stat", "[… 12 lines]"]):
+            changed = {**screen, "tail": [body[0], *snippet, *body[-3:]]}
+            self.assertEqual(scan.codex_permission_prompt(changed, "term_codex")["target"],
+                             "$ cat <<'EOF'…" if snippet[0].startswith("$") else "command omitted from terminal view")
+
+    def test_codex_approval_choices_exclude_numbered_command_lines(self) -> None:
+        tail = ["Would you like to run the following command?", "$ cat <<'EOF'", "1. command output",
+                "2. more command output", "EOF", "› 1. Yes, proceed (y)", "2. No (esc)",
+                "Press enter to confirm or esc to cancel"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["target"], "$ cat <<'EOF'…")
+        self.assertEqual(prompt["choices"], ["1. Yes, proceed (y)", "2. No (esc)"])
+
     def test_a_permission_prompt_names_the_command_and_the_hooks_reason_it_asks_about(self) -> None:
         # 2026-10-28: svm-320-321-reply waited on this frame; the scan showed only "Do you want to proceed?".
         screen = {"source": "screen", "tail": [
@@ -1911,7 +2004,8 @@ class ClassifyTests(unittest.TestCase):
         busy = [worktree("/w/uv", "working", agent="codex")]
         self.assertEqual([t["handle"] for t in scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], set())],
                          ["term_u"])
-        self.assertEqual(scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], {"/w/uv"}), [])
+        self.assertEqual([t["handle"] for t in scan.screen_targets(
+            busy, [terminal("/w/uv", "codex", "term_u")], {"/w/uv"})], ["term_u"])
 
     def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self) -> None:
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.
@@ -2873,6 +2967,291 @@ class ScanCommandTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_a_live_scan_reads_a_working_codex_tab_with_an_existing_rollout(self) -> None:
+        lane = str(self.dir / "codex-lane")
+        tree = worktree(lane, "working", agent="codex")
+        term = terminal(lane, "codex", "term_approval")
+        rollouts = self.dir / "rollouts"
+        rollouts.mkdir()
+        write_jsonl(rollouts / "rollout-approval.jsonl", [
+            codex_row("2026-11-19T00:00:00Z", "session_meta", {"cwd": lane}),
+        ])
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?",
+                                                "Environment: local", "Reason: Read Git status", "", "$ git status",
+                                                "› 1. Yes, proceed (y)", "2. No (esc)",
+                                                "Press enter to confirm or esc to cancel"]}
+        duplicate = {**tree, "repo": "other", "worktreeId": "duplicate", "agents": []}
+        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree, duplicate], [term])),
+              patch.object(scan, "read_screens", return_value={(None, term["handle"]): screen}) as screens,
+              patch.object(scan, "read_mail", return_value={}),
+              patch.object(scan, "worktree_processes", return_value={}),
+              patch.object(scan, "with_automation_workspaces", side_effect=lambda rows, _: rows),
+              patch.object(scan, "running_claude_transcripts", return_value={}),
+              patch.object(scan, "process_table", return_value={}),
+              patch.object(scan.rm_check, "process_table", return_value={}),
+              redirect_stdout(io.StringIO()) as out):
+            self.assertEqual(scan.main(["--orca", "orca", "--codex-sessions", str(rollouts), "--since-hours", "0",
+                                        "--claude-projects", str(self.dir / "claude"), "--only", "other/codex-lane",
+                                        "--row", lane]), 0)
+        screens.assert_called_once_with("orca", [term])
+        row = json.loads(out.getvalue())
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+
+    def test_codex_approval_prevents_a_stale_rollout_from_becoming_a_wake_target(self) -> None:
+        lane = str(self.dir / "codex-lane")
+        tree = worktree(lane, "working", agent="codex")
+        term = terminal(lane, "codex", "term_approval")
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?", "$ git status",
+                                                "› 1. Yes, proceed (y)", "2. No (esc)",
+                                                "Press enter to confirm or esc to cancel"]}
+        current = {"pending_requests": []}
+        old = {"pending_requests": [], "api_error": "stream disconnected before completion"}
+        claude = terminal(lane, "claude", "term_claude")
+        claude_screen = {"source": "screen", "tail": ["Do you want to proceed?", "❯ 1. Yes", "2. No"]}
+        screens = {(None, term["handle"]): screen, (None, claude["handle"]): claude_screen}
+        for rollouts in ([old, current], [current, old]):
+            for terms in ([term, claude], [claude, term]):
+                with self.subTest(rollouts=rollouts, terms=terms):
+                    row, = scan.build_inventory([tree], terms, self.dir, {lane: rollouts}, "要判断", now=NOW, screens=screens)
+                    self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
+
+    def test_local_other_panes_keep_new_failures_beside_codex_approval(self) -> None:
+        lane = str(self.dir / "local")
+        tree = worktree(lane, "working", agent="codex")
+        pending = terminal(lane, "codex", "term_pending")
+        other = terminal(lane, "codex", "term_other")
+        screen = {"source": "screen", "_observed_at": datetime.fromtimestamp(NOW, timezone.utc).isoformat(),
+                  "tail": [scan.CODEX_PERMISSION, "$ git status",
+                                                "› 1. Yes", "2. No", "Press f6 to confirm"]}
+        screens = {(None, pending["handle"]): screen}
+        failure = {"pending_requests": [], "api_error": "stream disconnected before completion"}
+        for offset, action in ((-60, None), (60, "wake")):
+            rollout = {**failure, "api_error_at": datetime.fromtimestamp(NOW + offset, timezone.utc).isoformat()}
+            row, = scan.build_inventory([tree], [pending, other], self.dir,
+                                        {lane: [rollout, {"pending_requests": []}]}, "要判断",
+                                        now=NOW + 120, screens=screens)
+            self.assertEqual((row["stop"] or {}).get("action"), action)
+
+        claude = terminal(lane, "claude", "term_claude")
+        transcript = self.dir / "session.jsonl"
+        transcript.write_text("")
+        with patch.object(scan, "read_claude", return_value={**failure, "transcript": str(transcript)}):
+            row, = scan.build_inventory([tree], [pending, claude], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", claude["handle"]))
+
+    def test_an_approval_does_not_make_a_resumed_panes_old_preview_a_stop(self) -> None:
+        lane = str(self.dir / "local")
+        pending = in_pane(terminal(lane, "codex", "term_pending"), "tab:pending")
+        old = "■ stream disconnected before completion"
+        resumed = in_pane(terminal(lane, "codex", "term_resumed", preview=old), "tab:resumed")
+        tree = worktree(lane, "working", agent="codex")
+        tree["agents"].append({"agentType": "codex", "state": "working", "paneKey": scan.hourly_runtime.pane_key(resumed),
+                               "updatedAt": (NOW - 100) * 1000, "lastAssistantMessage": old})
+        approval = {"source": "screen", "tail": [scan.CODEX_PERMISSION, "$ git status",
+                                                  "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel"]}
+        current = {"source": "screen", "tail": [old, "› try again", "• Retrying the build."]}
+        screens = {(None, pending["handle"]): approval, (None, resumed["handle"]): current}
+        row, = scan.build_inventory([tree], [pending, resumed], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["class"], row["stop"]), ("waiting", None))
+
+        new_error = {"pending_requests": [], "api_error": old,
+                     "api_error_at": datetime.fromtimestamp(NOW + 1, timezone.utc).isoformat()}
+        row, = scan.build_inventory([tree], [pending, resumed], self.dir, {lane: [new_error]}, "要判断",
+                                    now=NOW, screens=screens)
+        self.assertEqual(row["stop"]["action"], "wake")
+
+    def test_an_approval_keeps_a_failure_from_an_unidentified_codex_pane(self) -> None:
+        lane = str(self.dir / "local")
+        for environment, rollouts in ((None, {lane}), (None, set()), ("mbp16", set())):
+            with self.subTest(environment=environment, rollouts=rollouts):
+                tree = worktree(lane, "working", agent="codex")
+                tree["_environment"] = environment
+                tree["agents"][0]["lastAssistantMessage"] = "Checking git status."
+                pending = {**terminal(lane, "codex", "term_pending"), "_environment": environment}
+                other = {**terminal(lane, None, "term_other", preview="Checking the build."), "_environment": environment}
+                screens = {
+                    (environment, pending["handle"]): {"source": "screen", "tail": [
+                        scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
+                    (environment, other["handle"]): {"source": "screen", "tail": [
+                        "› check the build", "• Checking the build.", "■ stream disconnected before completion"]},
+                }
+                self.assertEqual(scan.screen_targets([tree], [pending, other], rollouts), [pending, other])
+                row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+                self.assertIsNotNone(row["stop"])
+                self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
+
+    def test_a_remote_codex_pane_with_an_old_error_is_read_for_approval(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        term = terminal(lane, None, "term_approval", preview="approval")
+        term["_environment"] = environment
+        tree["agents"][0].update(paneKey=scan.hourly_runtime.pane_key(term),
+                                  lastAssistantMessage="stream disconnected before completion")
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?", "$ git status",
+                                                "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel"]}
+        self.assertEqual(scan.screen_targets([tree], [term]), [term])
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
+
+    def test_remote_codex_approval_with_earlier_claude_output(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        term = in_pane(terminal(lane, None, "term_reused"), "tab:leaf")
+        term["_environment"] = environment
+        screen = {"source": "screen", "tail": [
+            "⏺ Earlier Claude reply", "✻ Worked for 3m", "› check status", "• Checking status.",
+            scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel",
+        ]}
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+        self.assertEqual(row["terminals"][0]["agent"], "codex")
+        self.assertEqual(row["orca_message"]["text"], "Checking status.")
+        tree["agents"][0]["paneKey"] = "tab:leaf"
+        tree["agents"].append(done_agent("claude", "tab:leaf", said="Earlier Claude reply"))
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+        self.assertEqual(row["terminals"][0]["agent"], "codex")
+
+    def test_screen_targets_keep_a_working_codex_approval_with_stale_identity_and_no_pane_key(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        tree["agents"][0]["lastAssistantMessage"] = "Checking the build."
+        term = {**terminal(lane, "claude", preview="Earlier Claude reply"), "_environment": environment}
+        self.assertEqual(scan.screen_targets([tree], [term], set()), [term])
+        for prefix, target in (([scan.CODEX_PERMISSION, "$ git status"], "$ git status"),
+                               (["[… 43 lines] ⌃g view all"], "approval details omitted from terminal view")):
+            with self.subTest(target=target):
+                screen = {"source": "screen", "tail": [
+                    *prefix, "› 1. Yes, proceed (y)", "2. No (esc)", "Press enter to confirm or esc to cancel",
+                ]}
+                row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                            screens={(environment, term["handle"]): screen})
+                self.assertIsNotNone(row["prompt_waiting"])
+                self.assertEqual((row["class"], row["prompt_waiting"]["target"]), ("waiting", target))
+                self.assertEqual(row["prompt_waiting"]["tab"], term["handle"])
+
+    def test_stale_codex_error_uses_its_own_approval_capture_time(self) -> None:
+        lane = str(self.dir / "local")
+        tree = worktree(lane, "working", agent="codex")
+        first = in_pane(terminal(lane, "codex", "term_first"), "tab:first")
+        second = in_pane(terminal(lane, "codex", "term_second"), "tab:second")
+        old = "stream disconnected before completion"
+        screens = {
+            (None, term["handle"]): {
+                "source": "screen", "_observed_at": datetime.fromtimestamp(captured, timezone.utc).isoformat(),
+                "tail": [scan.CODEX_PERMISSION, command, "› 1. Yes", "2. No", "Press enter to confirm"],
+            }
+            for term, captured, command in ((first, NOW - 10, "$ git status"), (second, NOW, "$ git diff"))
+        }
+        for offset in (-5, 5):
+            with self.subTest(offset=offset):
+                tree["agents"][0].update(paneKey="tab:second", lastAssistantMessage=old, updatedAt=(NOW + offset) * 1000)
+                row, = scan.build_inventory([tree], [first, second], self.dir, {}, "要判断", now=NOW + 10, screens=screens)
+                if offset < 0:
+                    self.assertEqual((row["class"], row["stop"]), ("waiting", None))
+                else:
+                    self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", second["handle"]))
+
+    def test_an_old_agent_record_does_not_hide_a_current_codex_pane_failure(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        current = tree["agents"][0]
+        current.update(paneKey="tab:other", lastAssistantMessage="Checking the build.", updatedAt=NOW * 1000)
+        prior = done_agent("claude", "tab:other", said="Earlier Claude reply")
+        pending = in_pane(terminal(lane, "codex", "term_pending"), "tab:pending")
+        other = in_pane(terminal(lane, None, "term_other"), "tab:other")
+        pending["_environment"] = other["_environment"] = environment
+        screens = {
+            (environment, pending["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
+            (environment, other["handle"]): {"source": "screen", "tail": [
+                "⏺ Earlier Claude reply", "› check the build", "• Checking the build.",
+                "■ stream disconnected before completion"]},
+        }
+        for agents in ([current, prior], [prior, current]):
+            for identity in (None, "claude"):
+                with self.subTest(agent_order=[agent["agentType"] for agent in agents], identity=identity):
+                    tree["agents"] = agents
+                    other["agentIdentity"] = identity
+                    row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+                    self.assertIsNotNone(row["stop"])
+                    self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
+                    self.assertEqual(row["stop"]["agent"], "codex")
+
+        tree["agents"] = [current, prior]
+        prior.update(lastAssistantMessage="API Error: connection error", updatedAt=(NOW - 600) * 1000)
+        other["preview"] = "■ stream disconnected before completion"
+        screens[(environment, other["handle"])]["tail"] = ["⏺ Earlier Claude reply", "› checking the build"]
+        row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["class"], row["stop"]), ("waiting", None))
+
+    def test_approval_screen_targets_include_duplicate_worktree_registrations(self) -> None:
+        lane = str(self.dir / "shared")
+        with_agent = worktree(lane, "working", agent="codex")
+        original_id = with_agent["worktreeId"]
+        term = in_pane(terminal(lane, None, "term_approval"), "tab:leaf")
+        with_agent.update(worktreeId="other-registration", agents=[{
+            **with_agent["agents"][0], "paneKey": scan.hourly_runtime.pane_key(term),
+        }])
+        other = {**with_agent, "worktreeId": original_id, "agents": [], "createdAt": 10, "repo": "original"}
+        self.assertEqual(scan.screen_targets([with_agent, other], [term], {lane}), [term])
+        untracked = {**other, "agents": []}
+        self.assertEqual(scan.screen_targets([untracked], [term], {lane}), [term])
+        missing_pane_key = {**untracked, "agents": [{"agentType": "codex", "state": "working"}]}
+        self.assertEqual(scan.screen_targets([missing_pane_key], [term], {lane}), [term])
+
+    def test_remote_approvals_include_every_tab_and_do_not_hide_another_panes_failure(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = {**worktree(lane, "working", agent="codex"), "_environment": environment, "agents": []}
+        claude = {**terminal(lane, "claude", "term_claude"), "_environment": environment}
+        pending = {**in_pane(terminal(lane, None, "term_pending"), "tab:pending"), "_environment": environment}
+        other = {**in_pane(terminal(lane, "codex", "term_other"), "tab:other"), "_environment": environment}
+        screens = {
+            (environment, claude["handle"]): {"source": "screen", "tail": [
+                "Do you want to proceed?", "❯ 1. Yes", "2. No"]},
+            (environment, pending["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press f6 to confirm"]},
+            (environment, other["handle"]): {"source": "screen", "tail": [
+                scan.CODEX_PERMISSION, "$ git diff", "› 1. Yes", "2. No", "Press f7 to cancel"]},
+        }
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["tab"], claude["handle"])
+        self.assertEqual([prompt["target"] for prompt in row["codex_approvals"]], ["$ git status", "$ git diff"])
+        self.assertEqual(scan.review_queue([row])[0]["codex_approvals"], row["codex_approvals"])
+        view = scan.row_view(row)
+        self.assertIn("term_other:", view["question"])
+        self.assertEqual(view["codex_approvals"][1]["choices"], ["1. Yes", "2. No"])
+        self.assertIn("term_pending $ git status [1. Yes; 2. No]", scan.row_line(view))
+        self.assertIn("term_other $ git diff [1. Yes; 2. No]", scan.row_line(view))
+
+        tree["agents"] = [{"agentType": "codex", "state": "working", "paneKey": scan.hourly_runtime.pane_key(term),
+                            "lastAssistantMessage": "stream disconnected before completion", "updatedAt": timestamp}
+                           for term, timestamp in ((pending, 20), (other, 10))]
+        del screens[(environment, other["handle"])]
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual(row["stop"]["action"], "wake")
+        self.assertEqual(row["orca_message"]["tab"], other["handle"])
+        self.assertEqual(row["stop"]["tab"], other["handle"])
+        self.assertIn(" | term_other | ", scan.wake_line(row, row["stop"]))
+
+        tree["agents"][0]["lastAssistantMessage"] = "Checking the change."
+        tree["agents"][1].update(agentType="claude", state="done", lastAssistantMessage="API Error: connection error")
+        other["agentIdentity"] = "claude"
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["orca_message"]["tab"], row["stop"]["tab"]), (pending["handle"], other["handle"]))
+        self.assertEqual(row["stop"]["agent"], "claude")
+
     def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
         # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
         saved, inbox = self.dir / "scan.json", self.dir / "inbox.jsonl"
@@ -3612,11 +3991,14 @@ class ScanCommandTests(unittest.TestCase):
                 {"result": {"terminal": {"source": "screen", "tail": [cmd[cmd.index("--terminal") + 1]]}}}))
 
         terms = [{"handle": "term_l"}, {"handle": "term_r", "_environment": "macbook-pro-16"}]
-        with patch.object(scan.subprocess, "run", side_effect=orca):
+        observed = datetime.fromtimestamp(NOW, timezone.utc)
+        with patch.object(scan.subprocess, "run", side_effect=orca), patch.object(scan, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = observed
             screens = scan.read_screens("orca", terms)
 
-        self.assertEqual(screens, {(None, "term_l"): {"source": "screen", "tail": ["term_l"]},
-                                   ("macbook-pro-16", "term_r"): {"source": "screen", "tail": ["term_r"]}})
+        self.assertEqual(screens, {(None, "term_l"): {"source": "screen", "tail": ["term_l"], "_observed_at": observed.isoformat()},
+                                   ("macbook-pro-16", "term_r"): {"source": "screen", "tail": ["term_r"],
+                                                                "_observed_at": observed.isoformat()}})
         self.assertIn(["orca", "terminal", "read", "--terminal", "term_r", "--screen", "--environment",
                        "macbook-pro-16", "--json"], calls)
 
