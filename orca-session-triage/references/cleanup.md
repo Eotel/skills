@@ -64,6 +64,9 @@ check, runs `docker compose -p <project> down -v` for each project the check lis
 again before it removes the worktree. It refuses such a row on another Mac (`--host`): clean up there by hand. An
 answer without those values is checked as above.
 
+When the latest answers under different removal keys share a timestamp, keep the worktree
+unless every answer approves removal and specifies the same files to discard and Compose cleanup.
+
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
 blocks its removal).

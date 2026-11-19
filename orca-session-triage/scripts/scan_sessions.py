@@ -2825,19 +2825,21 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
     reading a saved scan again does not repeat it. `removal_decision` is the newest answer to the row's own removal
-    keys and decides `allows_removal`. If the newest answers tie, a non-approving answer takes precedence.
-    The scan retains tied candidates so it can reevaluate their conditions when read without the decision log.
+    keys and decides `allows_removal`. Tied answers allow removal only if all approve and agree on cleanup.
+    The scan retains tied candidates. A log updates one of them if it contains the original record or a later time.
     A newer answer to one of the `::` sub-keys is shown as `newest`. An answer recorded with removal terms carries
     `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub now, its state (or null when it
     cannot be read) in `after_state`.
     """
     import lead_decisions
-    decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    records = list(lead_decisions.records(decisions_file))
+    decisions = lead_decisions.latest(records)
+    recorded_ids = {record.id for record in records}
     now = now or datetime.now(timezone.utc)
     removal_candidates: list[tuple[dict, list[dict]]] = []
 
-    def moment(item: lead_decisions.Decision) -> datetime:
-        return lead_decisions.moment(item.decided_at) or EPOCH
+    def moment(at: str) -> datetime:
+        return lead_decisions.moment(at) or EPOCH
 
     for row in rows:
         if blocker := row.get("automation_blocker"):
@@ -2861,22 +2863,31 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                 f"remove:{row['path']}", f"remove:{row_identity(row)}"}
         if not row.get("environment"):
             keys.add(f"remove:local::{row['path']}")
-        answered = [decisions[key] for key in sorted(keys) if key in decisions]
-        if answered:
-            latest_at = max(map(moment, answered))
+        by_key = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
+                  if candidate["decision"] in keys}
+        for key in keys:
+            if answer := decisions.get(key):
+                if ((saved := by_key.get(key)) and saved.get("record_id") not in recorded_ids
+                        and moment(answer.decided_at) <= moment(saved["decided_at"])):
+                    continue
+                by_key[key] = {
+                    "decision": key, "answer": answer.answer, "decided_at": answer.decided_at,
+                    "record_id": answer.id,
+                    **({"after": answer.removal.after, "discard": list(answer.removal.discard),
+                        "compose_down": answer.removal.compose_down} if answer.removal else {}),
+                }
+        if by_key:
+            latest_at = max(moment(answer["decided_at"]) for answer in by_key.values())
+            candidates = [by_key[key] for key in sorted(by_key) if moment(by_key[key]["decided_at"]) == latest_at]
             later = [item for key, item in decisions.items() if any(key.startswith(base + "::") for base in keys)
-                     and moment(item) > latest_at]
-            newest = max(later, key=moment) if later else None
-            removal_candidates.append((row, [
-                {"decision": answer.decision, "answer": answer.answer, "decided_at": answer.decided_at,
-                 **({"newest": {"decision": newest.decision, "answer": newest.answer,
-                                "decided_at": newest.decided_at}} if newest else {}),
-                 **({"after": answer.removal.after, "discard": list(answer.removal.discard),
-                     "compose_down": answer.removal.compose_down} if answer.removal else {})}
-                for answer in answered if moment(answer) == latest_at
-            ]))
+                     and moment(item.decided_at) > latest_at]
+            if newest := max(later, key=lambda item: moment(item.decided_at), default=None):
+                for candidate in candidates:
+                    candidate["newest"] = {"decision": newest.decision, "answer": newest.answer,
+                                           "decided_at": newest.decided_at}
+            removal_candidates.append((row, candidates))
         elif removal := row.get("removal_decision"):
-            removal_candidates.append((row, row.get("removal_candidates") or [removal]))
+            removal_candidates.append((row, [removal]))
         names = {row["path"], row_identity(row), row_name(row),
                  f"{row.get('repo')}/{Path(row['path']).name}"}
         if not row.get("environment"):
@@ -2886,7 +2897,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                     if any(key == prefix or key.startswith(prefix + "::") for prefix in wake_keys)]
         row.pop("wake_decision", None)
         if answered:
-            answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or EPOCH)
+            answer = max(answered, key=lambda item: moment(item.decided_at))
             row["wake_decision"] = {"answer": answer.answer, "decided_at": answer.decided_at}
     conditions: dict[str, set[int]] = {}
     for pr in (lead_decisions.RemovalTerms(removal.get("after")).pull_request()
@@ -2900,7 +2911,13 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             if pr := lead_decisions.RemovalTerms(removal.get("after")).pull_request():
                 removal["after_state"] = states.get((pr.repo, pr.number))
             removal["allows_removal"] = removal_answer_approves(removal)
-        row["removal_decision"] = min(candidates, key=lambda removal: removal["allows_removal"])
+        selected = min(candidates, key=lambda removal: removal["allows_removal"])
+        if len(candidates) > 1 and selected["allows_removal"]:
+            cleanup_terms = {(frozenset(removal.get("discard") or ()), removal.get("compose_down") is True)
+                             for removal in candidates}
+            if len(cleanup_terms) > 1:
+                selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
+        row["removal_decision"] = {key: value for key, value in selected.items() if key != "record_id"}
         if len(candidates) > 1:
             row["removal_candidates"] = candidates
         else:
@@ -2916,6 +2933,8 @@ def removal_answer_approves(decision: Mapping) -> bool:
     """An explicit removal answer; retaining or deferring in that answer takes precedence. An answer recorded with
     removal terms is decided by them, whatever conditions its words give: one with a PR condition (`after`) once that
     PR merged, and one with only cleanup (`discard`, `compose_down`), which rm-check-batch runs first, at once."""
+    if decision.get("cleanup_conflict"):
+        return False
     if decision.get("after"):
         return decision.get("after_state") == "MERGED"
     if decision.get("discard") or decision.get("compose_down"):
@@ -2940,8 +2959,11 @@ def removal_blocker(row: dict) -> str | None:
         return blocker
     if row.get("pending_handoffs"):
         return "未配信の約束の送り先"
-    if (answer := row.get("removal_decision")) and not removal_approved(row):
-        return f"removal decision {answer['decided_at']} {answer['answer']}"
+    if answer := row.get("removal_decision"):
+        if answer.get("cleanup_conflict"):
+            return "同時刻の削除回答で後始末の指定が異なるため保持"
+        if not removal_approved(row):
+            return f"removal decision {answer['decided_at']} {answer['answer']}"
     return None
 
 

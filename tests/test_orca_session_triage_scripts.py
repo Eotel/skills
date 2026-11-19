@@ -3579,16 +3579,43 @@ class ScanCommandTests(unittest.TestCase):
                             if (matching := [record for record in records if record.decision == key])}
                 self.assertEqual(lead.latest(iter(records)), expected, history)
 
+    def test_same_second_removal_approvals_with_different_cleanup_keep_the_worktree(self) -> None:
+        path = "/w/demo"
+        at = "2026-11-19T00:00:00Z"
+        snapshot = self.dir / "scan.json"
+        snapshot.write_text(json.dumps([{"path": path, "repo": "acme/demo", "class": "finished"}]))
+        decisions = self.dir / "decisions.jsonl"
+        args = ["--from", str(snapshot), "--rm-specs", "--row", path, "--decisions-file", str(decisions),
+                "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")]
+        cases = (
+            ({}, {"compose_down": True}, (1, "")),
+            ({"discard": [".env"]}, {"discard": [".env.local"]}, (1, "")),
+            ({"discard": [".env", ".env.local"]}, {"discard": [".env.local", ".env"]}, (0, f"{path} -\n")),
+        )
+        for first, second, expected in cases:
+            with self.subTest(first=first, second=second):
+                write_jsonl(decisions, [
+                    {"id": "first", "decision": f"remove:{path}", "answer": "消す", "decided_at": at, "removal": first},
+                    {"id": "second", "decision": f"remove:local::{path}", "answer": "消す", "decided_at": at,
+                     "removal": second},
+                ])
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    code = scan.main(args)
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("後始末の指定が異なる", err.getvalue())
+
     def test_saved_scan_keeps_same_second_hold_when_another_alias_meets_its_condition(self) -> None:
         path = "/w/demo"
         decisions = self.dir / "decisions.jsonl"
         state = self.dir / "no-state.json"
         at = "2026-11-19T00:00:00Z"
-        write_jsonl(decisions, [
+        entries = [
             {"id": "after-merge", "decision": f"remove:{path}", "answer": "PR がマージされたら削除する",
              "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
             {"id": "keep", "decision": f"remove:local::{path}", "answer": "残す", "decided_at": at},
-        ])
+        ]
+        write_jsonl(decisions, entries)
         row = {"path": path, "repo": "acme/demo", "class": "finished"}
         with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "OPEN", "updatedAt": at}}):
             rows = scan.with_cleanup_constraints([row], state, decisions)
@@ -3596,14 +3623,22 @@ class ScanCommandTests(unittest.TestCase):
         snapshot = self.dir / "saved-scan.json"
         snapshot.write_text(json.dumps(rows))
 
-        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "MERGED", "updatedAt": at}}), \
-                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
-            code = scan.main(["--from", str(snapshot), "--rm-specs", "--row", path, "--state-file", str(state),
-                              "--decisions-file", str(self.dir / "no-decisions.jsonl"),
-                              "--verdicts", str(self.dir / "verdicts.json")])
-
-        self.assertEqual((code, out.getvalue()), (1, ""), err.getvalue())
-        self.assertIn("残す", err.getvalue())
+        missing = self.dir / "no-decisions.jsonl"
+        partial = self.dir / "partial-decisions.jsonl"
+        write_jsonl(partial, entries[:1])
+        stale = self.dir / "stale-decisions.jsonl"
+        write_jsonl(stale, [entries[0], {**entries[1], "id": "earlier-approval", "answer": "消す"}])
+        corrected = self.dir / "corrected-decisions.jsonl"
+        write_jsonl(corrected, [*entries, {**entries[1], "id": "corrected", "answer": "消す"}])
+        response = {"pr_6": {"state": "MERGED", "updatedAt": at}}
+        for log, expected in ((missing, (1, "")), (partial, (1, "")), (stale, (1, "")), (corrected, (0, f"{path} -\n"))):
+            with self.subTest(log=log.name), patch.object(scan, "graphql_repository", return_value=response), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(snapshot), "--rm-specs", "--row", path, "--state-file", str(state),
+                                  "--decisions-file", str(log), "--verdicts", str(self.dir / "verdicts.json")])
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("残す", err.getvalue())
 
     def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
         # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
