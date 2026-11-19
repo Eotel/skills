@@ -251,18 +251,22 @@ def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
 
 
 def export_candidates(inbox: Path, path: Path, orca: str, wanted: set[str]) -> dict[str, list[dict]]:
-    detected = candidate_answers(inbox, path, orca, wanted)
     cache = path.resolve().with_name(path.name + ".lane-candidates.json")
     with retro.locked(cache.with_suffix(".lock")):
+        version = list(inbox_version(inbox) or ())
+        detected = candidate_answers(inbox, path, orca, wanted)
+        if version != list(inbox_version(inbox) or ()):
+            return {}
         try:
-            saved: dict[str, list[dict]] = json.loads(cache.read_text(encoding="utf-8"))
+            data = json.loads(cache.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            saved = {}
+            data = {}
+        saved: dict[str, list[dict]] = data.get("candidates", {}) if data.get("version") == version else {}
         for answer_id, records in detected.items():
             combined = {(row["ts"], row["input"]): row for row in [*saved.get(answer_id, ()), *records]}
             saved[answer_id] = list(combined.values())
         if detected:
-            retro.atomic_text(cache, json.dumps(saved, ensure_ascii=False) + "\n")
+            retro.atomic_text(cache, json.dumps({"version": version, "candidates": saved}, ensure_ascii=False) + "\n")
         return {answer_id: records for answer_id, records in saved.items() if answer_id.partition(":")[0] in wanted}
 
 

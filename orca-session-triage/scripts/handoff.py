@@ -70,6 +70,7 @@ import sys
 from typing import NamedTuple, Protocol
 
 import answer_evidence
+import ask_state
 from commitment_store import CommitmentWriteError
 import inbox_read
 import hourly_state
@@ -604,15 +605,24 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     answered = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
     keys = list(dict.fromkeys(args.decision))
     bound = decision_asks(args.decision_ask, keys)
-    settled = [answered[key] for key in keys if key in answered]
+    inbox = args.inbox.expanduser()
+    asks = {row["id"]: row for row in inbox_read.inbox_entries(inbox)
+            if row.get("kind") == "ask" and row.get("id")} if bound else {}
+    choices = lead_decisions.ask_answers(inbox_read.answers_path()) if asks else {}
+    settled = []
+    for key in keys:
+        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), bound.get(key)):
+            settled.append(f"{key}: {answered[key].answer}")
+        elif key in bound and (ref := ask_state.handoff_ref(bound[key], key, list(asks.values()))) \
+                and lead_decisions.ask_answer_for_handoff(ref, choices, asks):
+            settled.append(f"{key}: ask {bound[key]} の回答を記録済みです")
     if settled:
         print("handoff: the lead already answered; follow each answer and drop it from the handoff:",
-              *(f"{item.decision}: {item.answer}" for item in settled), sep="\n", file=sys.stderr)
+              *settled, sep="\n", file=sys.stderr)
         return 1
     body = args.body_file.read_text(encoding="utf-8").strip()
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
-    inbox = args.inbox.expanduser()
     before, after, end = inbox_around(inbox, args.since)
     if not args.force and (later := inbox_read.later_run_notes(args.orca, "handoff")):
         print("handoff: not sent: a later scheduled run of this workspace began, or was skipped because this run was "

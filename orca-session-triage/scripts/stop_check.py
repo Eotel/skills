@@ -176,10 +176,12 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
                                  r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
+                                 r"|\d{1,2}:\d{2}|承認を得(?:てから|た後|る前)"
                                  r"|本番|検証環境|ステージング|(?<![a-z])(?:production|prod|staging|stg)(?![a-z])"
                                  r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
 ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
 ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![\w-])", re.I)
+BARE_ASK_CITATION = re.compile(r"(?<![\w-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}(?::[1-9]\d*)?(?![\w-])", re.I)
 SAME_CONDITION = {"本日": "今日", "production": "本番", "prod": "本番",
                   "staging": "ステージング", "stg": "ステージング"}
 
@@ -187,6 +189,18 @@ SAME_CONDITION = {"本日": "今日", "production": "本番", "prod": "本番",
 def question_conditions(value: str) -> list[str]:
     return [SAME_CONDITION.get(term, term)
             for term in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))]
+
+
+def question_scope_agrees(original: dict, current: dict) -> bool:
+    text = current.get("question") or ""
+    original_text = original.get("question") or ""
+    annotations = "".join(f"{original[key]} " for key in ("context", "impact") if original.get(key))
+    if annotations:
+        text = text.removeprefix(annotations)
+    text = BARE_ASK_CITATION.sub("", ASK_CITATION.sub("", text))
+    return question_conditions(original_text) == question_conditions(text) and all(
+        not current.get(key) or question_conditions(original.get(key) or "") == question_conditions(current[key])
+        for key in ("context", "impact"))
 
 
 def question_options_agree(left: dict, right: dict) -> bool:
@@ -312,7 +326,9 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 refs.remove((ask_id, numbers))
                 matched = [item for item in matched if (ask_id, numbers) not in ask_state.references(item, entries)]
         presented = answer_evidence.shown_question(question)
-        cited = [token.lower() for token in ASK_CITATION.findall(presented)]
+        without_links = QUESTION_URL.sub("", presented)
+        cited = [token.lower() for token in dict.fromkeys([
+            *ASK_CITATION.findall(without_links), *BARE_ASK_CITATION.findall(without_links)])]
         tokens = cited or re.findall(rf"(?<![\w-]){ASK_REFERENCE}(?![\w-])", presented)
         named = [ref for token in tokens if (ref := ask_state.reference(token, entries))]
         if cited and len(cited) != len(named):
@@ -324,7 +340,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             original_parts = inbox_read.questions_of(next(e for e in entries if e.get("id") == ask_id))
             if any(isinstance(part := original_parts[number - 1], dict)
                    and (not question_options_agree(part, question)
-                        or question_conditions(part.get("question") or "") != question_conditions(text)) for number in numbers):
+                        or not question_scope_agrees(part, question)) for number in numbers):
                 continue
             refs = numbered[:1]
         elif named or not refs or any(not numbers for _, numbers in refs):
@@ -336,7 +352,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                          if isinstance(original, dict) and (named_ids or not header or original.get("header") == header)
                          and question_options_agree(original, question)
-                         and question_conditions(original.get("question") or "") == question_conditions(text)
+                         and question_scope_agrees(original, question)
                          and (named_ids or entry["id"] not in withdrawn and f"{entry['id']}:{number}" not in withdrawn)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]

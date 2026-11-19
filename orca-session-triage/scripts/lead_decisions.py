@@ -518,6 +518,16 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     return {"id": ask_id, "answers": parts, **({"delivery": delivery} if delivery else {})}
 
 
+def ask_answer_for_handoff(ref: tuple[str, frozenset[int]], answers: Mapping[str, dict],
+                           asks: Mapping[str, dict]) -> dict | None:
+    ask, numbers = ref
+    ids = [f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask]
+    parts = [ask_answer(ask_id, answers, asks) for ask_id in ids]
+    if any(part is None or not genuine_answer(part) for part in parts):
+        return None
+    return parts[0] if len(parts) == 1 else {"answers": parts}
+
+
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
                   workers: IssueWorkers, decisions: list[str] | None = None,
@@ -537,7 +547,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     for key in keys:
         item = history[key][-1] if key in history else None
         bound = next((entry for entry in reversed(history.get(key, [])) if entry.ask_id), None)
-        decision = decision_for_handoff(answered[key].view() if key in answered else None, bound, asks)
+        decision = decision_for_handoff(answered[key].view() if key in answered else None, bound.ask_id if bound else None)
         answer = decision
         if answer is None:
             latest_id = bound.ask_id if bound else None
@@ -545,11 +555,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
                         if key == question["record"].get("decision") and question["record"].get("ask_id")]
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
                                       if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
-            for ask, numbers in refs:
-                ids = [f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask]
-                parts = [ask_answer(ask_id, answers, asks) for ask_id in ids]
-                if all(part is not None and genuine_answer(part) for part in parts):
-                    answer = parts[0] if len(parts) == 1 else {"answers": parts}
+            for ref in refs:
+                if answer := ask_answer_for_handoff(ref, answers, asks):
                     break
             if not refs:
                 answer = next((found for source in bindings if source and (found := ask_answer(source, answers, asks))), None)
@@ -586,13 +593,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     return {"unanswered": unanswered, "settled": settled}
 
 
-def decision_for_handoff(answer: dict | None, handoff: HandOff | None, asks: Mapping[str, dict]) -> dict | None:
-    if not answer or not answer.get("from_ask") or not handoff or not handoff.ask_id:
-        return answer
-    ref, _, _ = handoff.ask_id.partition(":")
-    opened = moment(asks.get(ref, {}).get("ts")) or moment(handoff.handed_off_at)
-    answered_at = moment(answer.get("decided_at"))
-    return answer if opened is None or answered_at is not None and answered_at >= opened else None
+def decision_for_handoff(answer: dict | None, ask_id: str | None) -> dict | None:
+    return None if answer and answer.get("from_ask") and ask_id else answer
 
 
 def genuine_answer(answer: dict) -> bool:

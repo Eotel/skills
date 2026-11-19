@@ -1857,8 +1857,11 @@ def main(argv: list[str] | None = None) -> int:
             claims = {key: claim for key, claim in claims.items() if key in open_keys}
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
-            handed = list({item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
-                           if item.decision not in decided}.values())
+            latest_handoffs = {item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())}
+            for key in decided.keys() & latest_handoffs.keys():
+                if lead_decisions.decision_for_handoff(decided[key][-1].view(), latest_handoffs[key].ask_id) is None:
+                    del decided[key]
+            handed = [item for key, item in latest_handoffs.items() if key not in decided]
             since = handoff.last_sent_at(args.handoffs_dir.expanduser())
             rejected = [{**item, "worktree": worktree.name} for worktree in answer_evidence.asking_worktrees(args)
                         for item in answer_evidence.rejected_questions(answer_evidence.transcripts_of(

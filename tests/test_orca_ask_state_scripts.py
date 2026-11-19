@@ -541,7 +541,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual(handoff.returncode, 0, handoff.stderr)
         self.assertEqual({row["decision"] for row in json.loads(handoff.stdout)["settled"]}, {self.KEY, f"{self.KEY}:1"})
         self.write_lines(self.log, [{"id": "old-answer", "decision": self.KEY, "answer": "本社へ中継済み",
-                                     "decided_at": self.AT, "from_ask": True}])
+                                     "decided_at": "2026-11-14T09:03:00+00:00", "from_ask": True}])
         new = {**ask, "id": "c1234567-1234-4567-8888-123456789abc", "ts": "2026-11-14T09:02:00+00:00"}
         with self.handed.open("a") as stream:
             stream.write(json.dumps({"decision": self.KEY, "ask_id": new["id"], "handed_off_at": new["ts"]}) + "\n")
@@ -989,6 +989,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
         for old, current, updated_approval, blocked in (
                 ("今週金曜にデプロイしますか？", "来週金曜にデプロイしますか？", approval, False),
                 ("今日中にデプロイしますか？", "本日中にデプロイを進めますか？", approval, True),
+                ("17:00 にデプロイしますか？", "18:00 にデプロイしますか？", approval, False),
                 ("staging を再起動しますか？", "production を再起動しますか？", approval, False),
                 ("デプロイしますか？", "デプロイを進めますか？", "監査の承認がない場合のみデプロイする", False),
         ):
@@ -999,12 +1000,19 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "A"}])
                 self.question = {**question, "question": current,
                                  "options": [{"label": "A", "description": updated_approval}, pause]}
-                for ref in (None, self.ASK, f"{self.ASK}:1", "b1234567-1234-4567-8888-123456789abc"):
-                    self.question["question"] = current + (f"（ask {ref}）" if ref else "")
+                for citation in ("", f"（ask {self.ASK}）", f"（{self.ASK}:1）", "（b1234567-1234-4567-8888-123456789abc）"):
+                    self.question["question"] = current + citation
                     result = self.hook()
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual("worker の回答" in result.stdout,
-                                     blocked and (ref is None or ref.startswith(self.ASK)))
+                                     blocked and (not citation or self.ASK in citation))
+        original = {**question, "context": "17:00 までに決定します。 https://example.test/options"}
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "worktree": "worker", "questions": [original]}])
+        rendered = self.python("import json, inbox_read; print(json.dumps(inbox_read.ask_user_question("
+                               "inbox_read.inbox_entries(inbox_read.paths()[0])[0]['questions'][0])))")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.question = json.loads(rendered.stdout)
+        self.assertIn("worker の回答「A」", self.hook().stdout)
 
     def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
         self.ask(key="remove:/w/old", covers=[])
