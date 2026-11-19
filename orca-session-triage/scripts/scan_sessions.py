@@ -709,8 +709,9 @@ def failure(row: dict) -> tuple[str, str | None, str | None] | None:
     """
     running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
     approval_tabs = {prompt["tab"] for prompt in row.get("codex_approvals") or []}
-    codex_tabs = {term["handle"] for term in row.get("terminals", []) if term.get("agent") == "codex"}
-    single_approval = bool(approval_tabs) and len(codex_tabs | approval_tabs) == 1
+    claude_tabs = [term["handle"] for term in row.get("terminals", [])
+                   if term.get("agent") == "claude" and term.get("handle")]
+    claude_tab = claude_tabs[0] if approval_tabs and len(claude_tabs) == 1 else None
     codex = row["codex"][-1] if row["codex"] else {}
     message = row.get("orca_message") or {}
     orca = " ".join((message.get("text") or "").split())
@@ -719,15 +720,17 @@ def failure(row: dict) -> tuple[str, str | None, str | None] | None:
              (row.get("codex_screen_error") if not running or approval_tabs and screen_tab else None,
               "codex", screen_tab, None),
              (codex.get("api_error"), "codex", None, codex.get("api_error_at")),
-             ((row["claude"] or {}).get("api_error"), "claude", None, None),
+             ((row["claude"] or {}).get("api_error"), "claude", claude_tab, None),
              (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None,
               message.get("agent"), message.get("tab"), message.get("at"))]
     observed = parse_time(row.get("approval_observed_at") or row.get("scanned_at"))
     for error, agent, tab, at in found:
         if not error:
             continue
-        same_approval = agent == "codex" and (tab in approval_tabs if tab else single_approval)
-        if same_approval and (not observed or (parse_time(at) or EPOCH) <= observed):
+        # Legacy rollout entries have no terminal handle. Pane evidence is preferred; an unbound
+        # Codex error from before the current approval screen does not identify a pane to wake.
+        may_precede_approval = agent == "codex" and (tab in approval_tabs if tab else bool(approval_tabs))
+        if may_precede_approval and (not observed or (parse_time(at) or EPOCH) <= observed):
             continue
         if agent and running and agent not in running and not (tab and approval_tabs):
             continue
@@ -1758,6 +1761,14 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         screen_error = next(((error, term.get("handle")) for term in terms if term.get("agentIdentity") == "codex"
                              and term.get("handle") not in approval_tabs if (error := api_failure(term.get("preview")))),
                             (None, None))
+        spoken = [agent for agent in w.get("agents") or [] if agent.get("lastAssistantMessage")]
+        pane_errors = []
+        if approval_tabs:
+            pane_errors = [
+                (error, agent.get("agentType"), tab, iso_time(agent.get("updatedAt")))
+                for agent in sorted(spoken, key=lambda item: item.get("updatedAt") or 0, reverse=True)
+                if (tab := pane_handles.get(agent.get("paneKey")))
+                and API_ENDED.match(error := " ".join(agent["lastAssistantMessage"].split()))]
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
@@ -1772,6 +1783,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                            "title": t.get("title")} for t in terms],
             "codex_screen_error": screen_error[0],
             "codex_screen_error_tab": screen_error[1],
+            **({"pane_errors": pane_errors} if pane_errors else {}),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
             **({"codex_approvals": codex_approvals,
@@ -1789,19 +1801,12 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         if waiting and waiting[1] and row["claude"] and (asked_at := row["claude"].get(waiting[1])):
             waiting[0]["asked_at"] = asked_at
         if remote:
-            spoken = [a for a in w.get("agents") or [] if a.get("lastAssistantMessage")]
             if spoken:
                 def approval_error(agent: dict) -> bool:
                     return (agent.get("agentType") == "codex" and pane_handles.get(agent.get("paneKey")) in approval_tabs
                             and bool(API_ENDED.match(" ".join(agent["lastAssistantMessage"].split()))))
 
                 current = [agent for agent in spoken if not approval_error(agent)]
-                if approval_tabs:
-                    row["pane_errors"] = [
-                        (error, agent.get("agentType"), tab, iso_time(agent.get("updatedAt")))
-                        for agent in sorted(current, key=lambda item: item.get("updatedAt") or 0, reverse=True)
-                        if (tab := pane_handles.get(agent.get("paneKey")))
-                        and API_ENDED.match(error := " ".join(agent["lastAssistantMessage"].split()))]
                 newest = max(current or spoken, key=lambda a: a.get("updatedAt") or 0)
                 row["orca_message"] = {"text": newest["lastAssistantMessage"],
                                        "at": iso_time(newest.get("updatedAt")),
@@ -3136,6 +3141,7 @@ def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Col
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
         or (key in untracked and (t.get("agentIdentity") or key in rollout_tabs))
+        or (key in working_codex and key in rollout_tabs and not t.get("agentIdentity"))
         or ((t.get("agentIdentity") == "codex" or (*key, hourly_runtime.pane_key(t)) in codex_panes)
             and (key in quiet_codex or key in working_codex))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")

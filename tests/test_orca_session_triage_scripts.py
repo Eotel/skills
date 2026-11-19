@@ -2947,6 +2947,28 @@ class ScanCommandTests(unittest.TestCase):
                     row, = scan.build_inventory([tree], terms, self.dir, {lane: rollouts}, "要判断", now=NOW, screens=screens)
                     self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
 
+    def test_local_other_panes_keep_new_failures_beside_codex_approval(self) -> None:
+        lane = str(self.dir / "local")
+        tree = worktree(lane, "working", agent="codex")
+        pending = terminal(lane, "codex", "term_pending")
+        other = terminal(lane, "codex", "term_other")
+        screen = {"source": "screen", "tail": [scan.CODEX_PERMISSION, "$ git status",
+                                                "› 1. Yes", "2. No", "Press f6 to confirm"]}
+        screens = {(None, pending["handle"]): screen}
+        failure = {"pending_requests": [], "api_error": "stream disconnected before completion"}
+        for offset, action in ((-60, None), (60, "wake")):
+            rollout = {**failure, "api_error_at": datetime.fromtimestamp(NOW + offset, timezone.utc).isoformat()}
+            row, = scan.build_inventory([tree], [pending, other], self.dir, {lane: [rollout]}, "要判断",
+                                        now=NOW, screens=screens)
+            self.assertEqual((row["stop"] or {}).get("action"), action)
+
+        claude = terminal(lane, "claude", "term_claude")
+        transcript = self.dir / "session.jsonl"
+        transcript.write_text("")
+        with patch.object(scan, "read_claude", return_value={**failure, "transcript": str(transcript)}):
+            row, = scan.build_inventory([tree], [pending, claude], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", claude["handle"]))
+
     def test_a_remote_codex_pane_with_an_old_error_is_read_for_approval(self) -> None:
         lane, environment = str(self.dir / "remote"), "mbp16"
         tree = worktree(lane, "working", agent="codex")
@@ -2974,6 +2996,8 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(scan.screen_targets([with_agent, other], [term], {lane}), [term])
         untracked = {**other, "agents": []}
         self.assertEqual(scan.screen_targets([untracked], [term], {lane}), [term])
+        missing_pane_key = {**untracked, "agents": [{"agentType": "codex", "state": "working"}]}
+        self.assertEqual(scan.screen_targets([missing_pane_key], [term], {lane}), [term])
 
     def test_remote_approvals_include_every_tab_and_do_not_hide_another_panes_failure(self) -> None:
         lane, environment = str(self.dir / "remote"), "mbp16"
