@@ -84,12 +84,14 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
     if not entries:
         return []
     recorded = inbox_read.answer_records(inbox_read.answers_path())
+    bindings = {item.decision: item.ask_id for item in lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser())
+                if item.ask_id}
     planned = []
     for number, item in items:
         if item.get("withdrawn_at") or not item.get("answer"):
             continue
         ids = []
-        for ask_id, parts in ask_state.references(item, entries):
+        for ask_id, parts in ask_state.references(item, entries, bindings=bindings):
             ids.extend([f"{ask_id}:{number}" for number in sorted(parts)] if parts else [ask_id])
         if not ids:
             continue
@@ -171,6 +173,9 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
         fcntl.flock(lock, fcntl.LOCK_EX)
         with lead_decisions.appending(decisions_file) as append_decisions:
             data = hourly_state.read(state_file)
+            questions = data["questions"].values()
+            handoffs = list(lead_decisions.handed_off(handed_off_file))
+            bound = {item.decision: item.ask_id for item in handoffs if item.ask_id}
             log = inbox_read.answers_path()
             recorded = inbox_read.answer_records(log)
             histories: dict[str, list[dict]] = {}
@@ -181,8 +186,8 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             sender = inbox_read.answer_sender()
             touched = [ref for value in ids if (ref := ask_state.reference(value, entries))]
             is_delivery = how in inbox_read.DELIVERY_ANSWERS
-            relevant = any(ask_state.overlaps(ref, given) for item in data["questions"].values()
-                           if not item.get("withdrawn_at") for ref in ask_state.references(item, entries)
+            relevant = any(ask_state.overlaps(ref, given) for item in questions
+                           if not item.get("withdrawn_at") for ref in ask_state.references(item, entries, bindings=bound)
                            for given in touched)
             new_delivery: dict[str, tuple[str, str | None]] = {}
             retries = []
@@ -234,17 +239,21 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 explicit[key] = (hourly_state.stamped_answer(text, checked_at)
                                  if not is_delivery or hourly_state.ANSWERED_AT in text else text)
             keys = dict(explicit)
-            known = {item.decision for item in lead_decisions.handed_off(handed_off_file)}
+            handed_keys = {item.decision for item in handoffs}
+            known = set(handed_keys)
             known.update(latest)
-            known.update(key for item in data["questions"].values()
+            known.update(key for item in questions
                          for key in [item.get("decision") or "", *(item.get("covers") or [])])
-            for key in known:
-                if ((ref := ask_state.reference(key, entries)) and any(ask_state.overlaps(ref, given) for given in touched)
-                        and ask_state.covered(ref, list(records), entries)):
-                    keys.setdefault(key, answer_text(answer_parts(ref, records, entries)))
+            refs_by_key = {key: (ask_state.handoff_target(key, bound.get(key), entries, questions)
+                                 if key in handed_keys else ask_state.reference(key, entries)) for key in known}
+            answers_by_key = {key: answer_text(answer_parts(ref, records, entries)) for key, ref in refs_by_key.items()
+                              if ref and ask_state.covered(ref, list(records), entries)}
+            for key, text in answers_by_key.items():
+                if (ref := refs_by_key[key]) and any(ask_state.overlaps(ref, given) for given in touched):
+                    keys.setdefault(key, text)
             deliveries = [entry for history in histories.values() for entry in history]
             auto_keys = {key for key in keys if key in latest
-                         and automatic(latest[key], ask_state.reference(key, entries), deliveries)}
+                         and automatic(latest[key], refs_by_key.get(key), deliveries)}
             for key, text in keys.items():
                 if key not in latest:
                     continue
@@ -256,10 +265,11 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             for key, item in data["questions"].items():
                 if item.get("withdrawn_at"):
                     continue
-                refs = ask_state.references(item, entries)
+                refs = ask_state.references(item, entries, bindings=bound)
                 matched = any(ask_state.overlaps(ref, given) for ref in refs for given in touched)
                 covered = matched and all(ask_state.covered(ref, list(records), entries) for ref in refs)
                 bindings = item.get("covers") or ([item["decision"]] if item.get("decision") in keys else [])
+                bindings = [value for value in bindings if ask_state.same_bound_ask(item, bound.get(value), value)]
                 source = ask_state.reference(item.get("ask_id") or "", entries)
                 if source and source[1]:
                     # Completing a whole-ask key must not replace a selected part with combined answers.
@@ -270,8 +280,11 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                     continue
                 if bindings:
                     available = {value: latest[value].answer for value in bindings if value in latest
+                                 and not (value in handed_keys and latest[value].from_ask)
                                  and (datetime.fromisoformat(latest[value].decided_at)
                                       >= datetime.fromisoformat(item["asked_at"]))}
+                    available.update({value: answers_by_key[value] for value in bindings if value in answers_by_key
+                                      and value not in available and value in handed_keys})
                     available.update(keys)
                     if not all(value in available for value in bindings) or not any(value in keys for value in bindings):
                         continue

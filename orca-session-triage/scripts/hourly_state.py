@@ -640,7 +640,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
     ask_entries = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
     known_asks = list(ask_entries.values())
-    withdrawn = {ref for ref in inbox_read.withdrawal_times(entries) if ":" in ref}
+    withdrawn = inbox_read.withdrawal_times(entries)
     retained_questions = {key: [number for number in range(1, len(questions) + 1) if f"{key}:{number}" not in withdrawn]
                           for key, ask in ask_entries.items() if (questions := inbox_read.questions_of(ask))}
     answered_ids = [answer.ask_id for answer in answers if answer.source in inbox_read.SUBSTANTIVE_ANSWERS
@@ -668,7 +668,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         handed = [item for item in handed if not ((ref := handoff_refs[item.decision])
                                                   and ask_state.covered(ref, closed_ids, known_asks))]
         pending = {key: item for key, item in state.get("questions", {}).items()
-                   if not (refs := ask_state.references(item, known_asks))
+                   if not (refs := ask_state.references(item, known_asks, bindings=bound_asks))
                    or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
                    or any(not cover_resolved(cover, item)
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}

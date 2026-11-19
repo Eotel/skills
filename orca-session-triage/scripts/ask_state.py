@@ -26,10 +26,15 @@ def reference(value: str, entries: list[dict]) -> tuple[str, frozenset[int]] | N
     return found[0], frozenset(int(number) for number in part.split("+")) if part else frozenset()
 
 
-def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset[int]]]:
+def references(question: dict, entries: list[dict], *,
+               bindings: Mapping[str, str] | None = None) -> list[tuple[str, frozenset[int]]]:
     values = [question.get("decision") or "", *(question.get("covers") or [])]
     # A whole source id leaves numbered decision keys responsible for narrowing it.
-    found = [ref for value in values if (ref := reference(value, entries))]
+    found = []
+    for value in values:
+        target = (bindings or {}).get(value)
+        if same_bound_ask(question, target, value) and (ref := reference(target or value, entries)):
+            found.append(ref)
     source = reference(question.get("ask_id") or "", entries)
     if source and source[1]:
         # A whole-ask key would widen an explicit part back to every question.

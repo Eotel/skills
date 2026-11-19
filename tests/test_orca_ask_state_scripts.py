@@ -559,6 +559,31 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual([item["state"] for item in json.loads(self.run_tool(*stale).stdout)], ["stopped_after_answer"])
         self.assertEqual(json.loads(self.run_tool(*decision).stdout)["unanswered"], [])
 
+    def test_relaying_an_old_answer_cannot_close_the_reassigned_question(self) -> None:
+        old = json.loads(self.inbox.read_text())
+        new = {**old, "id": "b1234567-1234-4567-8888-123456789abc", "worktree": "new-worker"}
+        self.write_lines(self.inbox, [old, new])
+        scan = self.root / "scan.json"
+        scan.write_text(json.dumps([{"path": f"/w/{report['worktree']}", "repo": ""} for report in (old, new)]))
+        old_ref, new_ref = f"{self.ASK}:1", f"{new['id']}:1"
+        key = f"{self.KEY}:1"
+        items = [{"ask": old_ref, "decision": key, "question": old["text"], "asked_at": self.AT},
+                 {"ask": new_ref, "decision": "new-question", "covers": [key], "question": new["text"], "asked_at": self.AT}]
+        registered = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
+                                   stdin="\n".join(map(json.dumps, items)))
+        self.assertEqual(registered.returncode, 0, registered.stderr)
+        handoff = {"decision": key, "handed_off_at": self.AT}
+        self.write_lines(self.handed, [{**handoff, "ask_id": ref} for ref in (old_ref, new_ref)])
+        original, selected = [item["id"] for item in json.loads(registered.stdout)]
+        self.python(f"import answer_sync; answer_sync.record([{old_ref!r}], '待つ', 'send', at={self.AT!r})")
+        questions = json.loads(self.state.read_text())["questions"]
+        self.assertEqual(questions[original]["answer"], "待つ")
+        self.assertIsNone(questions[selected]["answer"])
+
+        self.python(f"import answer_sync; answer_sync.record([{new_ref!r}], '公開する', 'send', at={self.AT!r})")
+        questions = json.loads(self.state.read_text())["questions"]
+        self.assertEqual(questions[selected]["answer"], "公開する")
+
     def test_stale_asks_keeps_only_questions_that_were_not_withdrawn(self) -> None:
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
         ask = json.loads(self.inbox.read_text())
