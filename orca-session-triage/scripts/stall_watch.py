@@ -26,7 +26,7 @@ Signals:
                        one-shot schedule keeps it, and the lane has not moved since that time
   wait_resolved        the saved verdict waits on an outside state that now holds: a date that has come, another Mac
                        the scan reaches, or a forge `git ls-remote` reaches
-  api_error_turn       the newest copy of the lane's transcript ends in an API error that is not a usage limit,
+  api_error_turn       the lane ended in an API error other than a usage limit or has a Codex interruption,
                        fifteen minutes or more ago
   idle_after_report    the lane's last report is an info or an answered ask, its agent has done nothing for two
                        hours, and no open question, active hold, live background job, or Orca automation explains it
@@ -116,7 +116,7 @@ STOP_KINDS = ("connection", "context_limit", "other", "login", "interrupted")
 RECOVERED = ("api_error_turn", "idle_after_report", "busy_without_progress")
 MAX_RECOVERIES = 2
 STEPS = {"connection": "通信断。同じ続きを送る（止まったところから続ける 1 行）",
-         "interrupted": "中断。同じ作業を再開する（止まったところから続ける 1 行）",
+         "interrupted": "中断。元の指示で再開してよいか確認する",
          "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
          "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
                        " spawn-lane し、今の担当は止める）"}
@@ -146,7 +146,7 @@ PROGRESS_COMMAND = re.compile(r"\bgit\s+(?:-[Cc]\s+\S+\s+)*(?:commit|push)\b"
 EXIT_CODE = re.compile(r'\\*"exit_code\\*"\s*:\s*(\d+)')
 
 
-MeasuredBy = Literal["transcript", "rollout", "agent_state", "report", "screen"]
+MeasuredBy = Literal["transcript", "rollout", "agent_state", "report"]
 WaitKind = Literal["pr", "issue", "time", "event", "external", "person"]
 
 
@@ -546,9 +546,10 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
     interrupted = stop["kind"] == "interrupted"
     if interrupted:
         at = parse(stop.get("stopped_at"))
-        if not at or moved_since(act, at) or scan.codex_moved_since(row, at):
+        if (not at or moved_since(act, at) or scan.codex_moved_since(row, at)
+                or any(sent > at for sent in records.sends_by_handle.get(stop.get("tab"), ()))):
             return []
-        act = Activity(at, "screen")
+        act = Activity(at, stop.get("stopped_by", "agent_state"))
     if act.at is None or now - act.at < GRACE:
         return []
     then = (f"。{PERSON_STEPS[stop['kind']]}" if stop["kind"] in PERSON_STEPS

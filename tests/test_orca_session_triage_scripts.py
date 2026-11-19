@@ -2063,6 +2063,42 @@ class ClassifyTests(unittest.TestCase):
                     self.assertEqual(row["stop"]["action"], "wake")
                     self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
 
+    def test_codex_interruption_keeps_its_time_through_a_redraw_and_feedback(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        times: dict[str, str] = {}
+        path = "/w/cut"
+        for tail, quiet, expected in (
+            ([message, "› "], 30, True),
+            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, True),
+            ([message, "› Continue work", "› "], 0, False),
+        ):
+            with self.subTest(quiet=quiet):
+                [row] = scan.build_inventory(
+                    [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=quiet)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}}, interruption_times=times)
+                stop = row["stop"]
+                self.assertEqual(bool(stop), expected)
+                if stop:
+                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 1800) * 1000))
+                    self.assertEqual(stop["stopped_by"], "agent_state")
+
+    def test_codex_interruption_uses_the_rollout_event_time_even_when_a_redraw_is_newer(self) -> None:
+        rollout = self.projects / "rollout.jsonl"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        write_jsonl(rollout, [
+            {"type": "session_meta", "payload": {"cwd": "/w/cut"}},
+            {"type": "event_msg", "timestamp": stopped,
+             "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ])
+        path, event = scan.summarize_rollout(rollout)
+        self.assertEqual(path, "/w/cut")
+        [row] = scan.build_inventory(
+            [worktree("/w/cut", "done", agent="codex")], [terminal("/w/cut", "codex")],
+            self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "rollout"))
+
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),
             assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",

@@ -62,6 +62,7 @@ BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
 Screens = dict[tuple[str | None, str], dict]
 HOURLY_STATE = Path("~/.cache/orca-session-triage/hourly-state.json")
 LEAD_DECISIONS = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
+CODEX_INTERRUPTIONS = Path("~/.cache/orca-session-triage/codex-interruptions.json")
 
 
 class PromptWaiting(TypedDict):
@@ -502,12 +503,18 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
     last_assistant = last_assistant_at = api_error = api_error_at = None
+    interrupted_at = turn_started_at = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
         cwd = cwd or payload.get("cwd")
         kind = payload.get("type")
+        if row.get("type") == "event_msg":
+            if kind == "turn_aborted" and payload.get("reason") == "interrupted":
+                interrupted_at = row.get("timestamp")
+            elif kind in ("task_started", "turn_started"):
+                turn_started_at = row.get("timestamp")
         if row.get("type") == "event_msg" and kind in ("error", "stream_error"):
             message = payload.get("message") or payload.get("error")
             if isinstance(message, str) and API_FAILURE.search(message):
@@ -552,6 +559,8 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
         "last_role": last_role,
         "api_error": api_error,
         **({"api_error_at": api_error_at} if api_error_at else {}),
+        **({"interrupted_at": interrupted_at} if interrupted_at else {}),
+        **({"turn_started_at": turn_started_at} if turn_started_at else {}),
         "pending_requests": pending,
     }
 
@@ -772,11 +781,12 @@ class StopReason(TypedDict):
     resets: str | None
     tab: NotRequired[str]
     stopped_at: NotRequired[str]
+    stopped_by: NotRequired[Literal["rollout", "agent_state"]]
 
 
 def codex_moved_since(row: Mapping, stopped_at: datetime) -> bool:
     return any(at > stopped_at for rollout in row.get("codex") or []
-               for key in ("last_user_at", "last_assistant_at", "api_error_at")
+               for key in ("last_user_at", "last_assistant_at", "api_error_at", "turn_started_at")
                if (at := parse_time(rollout.get(key))))
 
 
@@ -786,7 +796,8 @@ def stop_reason(row: dict) -> StopReason | None:
     another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
     interruption = row.get("codex_interruption")
-    if interruption and not row.get("prompt_waiting") and not row.get("screen_progress"):
+    waiting_tab = (row.get("prompt_waiting") or {}).get("tab")
+    if interruption and interruption.get("tab") != waiting_tab and not row.get("screen_progress"):
         at = parse_time(interruption["stopped_at"])
         if at and not codex_moved_since(row, at):
             return interruption
@@ -1029,6 +1040,20 @@ def last_codex_activity(lines: list[str]) -> str | None:
     return next((line for raw in reversed(lines) if (line := raw.strip())
                  and (line.startswith(CODEX_REPLY) or CODEX_TURN_END.fullmatch(line)
                       or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
+
+
+def current_interruption(screen: dict) -> str | None:
+    lines = [line.strip() for line in screen_lines(screen)]
+    position = max((i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)), default=-1)
+    if position < 0:
+        return None
+    later = lines[position + 1:]
+    prompts = [line for line in later if line == "›" or line.startswith(CODEX_PROMPT)]
+    if len(prompts) > 1 or any(CODEX_TURN_END.fullmatch(line) or api_failure(line)
+                               or (line.startswith(CODEX_REPLY) and not line.startswith("• Feedback uploaded."))
+                               for line in later):
+        return None
+    return lines[position]
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1732,7 +1757,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     mail: dict | None = None, screens: Screens | None = None,
                     live_transcripts: dict[str, list[Path]] | None = None,
                     processes: dict[str, list[WorktreeProcess]] | None = None,
-                    live_sessions: dict[str, list[dict]] | None = None) -> list[dict]:
+                    live_sessions: dict[str, list[dict]] | None = None,
+                    interruption_times: dict[str, str] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1749,6 +1775,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     screens = screens or {}
+    if interruption_times is None:
+        interruption_times = {}
     now = time.time() if now is None else now
     worktrees, terminals = one_per_path(worktrees, terminals)
     by_worktree = {}
@@ -1803,18 +1831,30 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                           and (term.get("agentIdentity") == "codex"
                                or (not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
         interruptions: list[StopReason] = []
+        lane_rollouts = [] if remote else codex_by_cwd.get(w["path"], [])
+        local_codex_tabs = sum(term.get("agentIdentity") == "codex" or term.get("handle") in codex_activity
+                               for term in terms)
         for term in terms:
             handle = term.get("handle")
-            activity = codex_activity.get(handle)
-            if not handle or not activity or not CODEX_INTERRUPTED.match(activity) or handle in approval_tabs:
+            frame = rendered(screens.get((w.get("_environment"), handle)))
+            if not handle or not frame or handle not in codex_activity:
+                continue
+            key = json.dumps([w.get("_environment"), handle])
+            interruption = current_interruption(frame)
+            if not interruption or handle in approval_tabs:
+                interruption_times.pop(key, None)
                 continue
             agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
-            stopped_ms = ((agent.get("stateStartedAt") if agent.get("interrupted") else None)
-                          or term.get("lastOutputAt"))
-            if stopped_ms is not None:
-                stopped_at = datetime.fromtimestamp(stopped_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
-                interruptions.append({"kind": "interrupted", "action": "wake", "agent": "codex",
-                                      "error": activity, "resets": None, "tab": handle, "stopped_at": stopped_at})
+            event_at = max((rollout["interrupted_at"] for rollout in lane_rollouts if rollout.get("interrupted_at")),
+                           default=None) if local_codex_tabs == 1 else None
+            state_at = iso_time(agent.get("stateStartedAt")) if agent.get("interrupted") else None
+            stopped_at = event_at or state_at or interruption_times.get(key)
+            if not stopped_at:
+                stopped_at = iso_time(term.get("lastOutputAt")) or scanned_at
+            interruption_times[key] = stopped_at
+            interruptions.append({"kind": "interrupted", "action": "wake", "agent": "codex",
+                                  "error": interruption, "resets": None, "tab": handle, "stopped_at": stopped_at,
+                                  "stopped_by": "rollout" if event_at else "agent_state"})
         screen_error: tuple[str | None, str | None] = (None, None)
         for term in terms:
             handle = term.get("handle")
@@ -1867,7 +1907,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 "approval_observed_at": approval_observed, "approval_capture_by_tab": approval_captures}
                if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
-            "codex": [] if remote else codex_by_cwd.get(w["path"], []),
+            "codex": lane_rollouts,
         }
         if not remote and (sessions := (live_sessions or {}).get(w["path"])):
             row["claude_sessions"] = sessions
@@ -3973,13 +4013,19 @@ def main(argv: list[str] | None = None) -> int:
               if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local},
         session_details=live_sessions)
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
+    interruption_path = CODEX_INTERRUPTIONS.expanduser()
+    cached_times = read_json_file(interruption_path) if screens else None
+    interruption_times = dict(cached_times) if isinstance(cached_times, dict) else {}
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
-                                               processes=processes, live_sessions=live_sessions),
+                                               processes=processes, live_sessions=live_sessions,
+                                               interruption_times=interruption_times),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
+    if screens and interruption_times != (cached_times or {}):
+        write_json_atomically(interruption_path, interruption_times)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():
@@ -4002,7 +4048,7 @@ def main(argv: list[str] | None = None) -> int:
     return print_rows(args, rows, verdicts)
 
 
-WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 同じ作業を再開する",
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 再開してよいか確認する",
                 "login": "ログイン切れ: 人が /login する",
                 "context_limit": "文脈の上限: 範囲を小さくして新しい担当に渡す", "other": "その他: 人が読む"}
 

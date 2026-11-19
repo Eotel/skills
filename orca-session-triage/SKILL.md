@@ -207,8 +207,9 @@ board's done cards; close what the user approves.
   safeguard flag; a person reads it). `--from SCAN_JSON --wake` prints each
   such row with its agent's tab and what it needs. A Codex screen ending in
   `■ Conversation interrupted` with no later activity is `stalled` with
-  `stop.kind: interrupted` and the stop time. Stall watch signals the lead to
-  resume the same work once the interruption passes its idle grace period.
+  `stop.kind: interrupted` and the stop time. Stall watch signals the lead
+  once the interruption passes its idle grace period. Confirm that the
+  original instruction still stands before resuming an interrupted turn.
   For multiple local Claude
   tabs, it matches the stopped transcript's session record to the live
   process's `ORCA_TERMINAL_HANDLE`. A usage-limit row shows the latest

@@ -374,10 +374,13 @@ class RecoveryTests(unittest.TestCase):
         stopped_at = NOW - timedelta(minutes=20)
         lane = row("cut", codex=[], stop={"kind": "interrupted", "action": "wake", "agent": "codex",
                                          "error": "■ Conversation interrupted", "resets": None,
-                                         "stopped_at": stopped_at.isoformat()})
+                                         "stopped_at": stopped_at.isoformat(), "tab": "term_cut", "stopped_by": "rollout"})
         signals = stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False)
         self.assertEqual([item.stopped_at for item in signals], [stopped_at.isoformat()])
-        self.assertIn("中断。同じ作業を再開", signals[0].reason)
+        self.assertEqual(signals[0].stopped_by, "rollout")
+        self.assertIn("中断。元の指示で再開してよいか確認", signals[0].reason)
+        sent = stall.Records(sends_by_handle={"term_cut": (stopped_at + timedelta(minutes=1),)})
+        self.assertEqual(stall.judge(lane, None, sent, NOW, FakeProbe(), live=False), [])
         lane["codex"] = [{"last_user_at": (stopped_at + timedelta(minutes=1)).isoformat()}]
         self.assertEqual(stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False), [])
 
