@@ -4622,13 +4622,33 @@ class RmCheckTests(unittest.TestCase):
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
         for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
-                         "stash remains", "clone 外の設定: d-note.local.json", "du ", "c-note"):
+                         "stash remains", "clone 外の設定: d-note.local.json"):
             self.assertIn(expected, reason)
-        self.assertNotIn("e-note", reason)
-        self.assertNotIn("du 不明", reason)
-        self.assertIn("du ", held["data"]["reason"])
-        self.assertIn("report.db", held["data"]["reason"])
-        self.assertTrue(any(reason in line for line in result["reasons"]))
+        summary = held["clone"]["content_summary"]
+        self.assertIn("c-note", summary)
+        self.assertNotIn("e-note", summary)
+        self.assertNotIn("du 不明", summary)
+        self.assertIn("du ", held["data"]["content_summary"])
+        self.assertIn("report.db", held["data"]["content_summary"])
+        self.assertTrue(any(reason in line and summary in line for line in result["reasons"]))
+
+    def test_held_clone_with_external_git_settings_keeps_its_worktree(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\n")
+        clone = self.wt / "sandbox"
+        git(self.main, "clone", "-q", str(self.main), str(clone))
+        git(clone, "config", "filter.local.clean", "/does-not-exist")
+        tracked_status = rmcheck.git
+
+        def git_without_external_programs(cwd: str | Path, *args: str,
+                                          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == clone and ("status" in args or "ls-remote" in args):
+                self.fail(f"used clone configuration to run {args[0]}")
+            return tracked_status(cwd, *args, env=env)
+
+        with patch.object(rmcheck, "git", side_effect=git_without_external_programs):
+            held = rmcheck.held_file(clone, "sandbox", False, None)
+        self.assertEqual(held["kind"], "clone")
+        self.assertIn("未確認", held["reason"])
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
