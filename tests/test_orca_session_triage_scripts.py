@@ -3522,31 +3522,28 @@ class ScanCommandTests(unittest.TestCase):
 
     def test_same_second_removal_aliases_keep_the_worktree_for_every_hash_seed(self) -> None:
         decisions = self.dir / "decisions.jsonl"
+        snapshot = self.dir / "scan.json"
+        row = {"path": "/tmp/demo/wt", "repo": "Eotel/demo", "class": "finished"}
+        snapshot.write_text(json.dumps([row]))
         write_jsonl(decisions, [
             {"id": "remove", "decision": "remove:Eotel/demo/wt", "answer": "消す",
              "decided_at": "2026-11-19T00:00:00Z"},
+            {"id": "earlier", "decision": "remove:/tmp/demo/wt", "answer": "消す",
+             "decided_at": "2026-11-19T09:00:00+09:00"},
             {"id": "keep", "decision": "remove:/tmp/demo/wt", "answer": "残す",
              "decided_at": "2026-11-19T09:00:00+09:00"},
         ])
-        probe = """
-from pathlib import Path
-import json
-import sys
-from scan_sessions import with_cleanup_constraints
-
-row = {"path": "/tmp/demo/wt", "repo": "Eotel/demo", "class": "finished"}
-[result] = with_cleanup_constraints([row], Path(sys.argv[1]), Path(sys.argv[2]))
-print(json.dumps(result["removal_decision"]))
-"""
         for seed in range(8):
             with self.subTest(seed=seed):
                 result = subprocess.run(
-                    [sys.executable, "-c", probe, str(self.dir / "no-state.json"), str(decisions)],
-                    env={**os.environ, "PYTHONPATH": str(SCRIPTS), "PYTHONHASHSEED": str(seed)},
-                    capture_output=True, text=True, check=True,
+                    [sys.executable, str(SCRIPTS / "scan_sessions.py"), "--from", str(snapshot),
+                     "--rm-specs", "--row", row["path"], "--decisions-file", str(decisions),
+                     "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")],
+                    env={**os.environ, "PYTHONHASHSEED": str(seed)}, capture_output=True, text=True,
                 )
-                decision = json.loads(result.stdout)
-                self.assertEqual((decision["answer"], decision["allows_removal"]), ("残す", False))
+                self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+                self.assertIn('"allows_removal": false', result.stderr)
+                self.assertIn("残す", result.stderr)
 
     def test_same_second_pending_removal_condition_keeps_the_worktree_until_merge(self) -> None:
         path = "/w/demo"
@@ -3596,12 +3593,17 @@ print(json.dumps(result["removal_decision"]))
         with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "OPEN", "updatedAt": at}}):
             rows = scan.with_cleanup_constraints([row], state, decisions)
         self.assertFalse(rows[0]["removal_decision"]["allows_removal"])
+        snapshot = self.dir / "saved-scan.json"
+        snapshot.write_text(json.dumps(rows))
 
-        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "MERGED", "updatedAt": at}}):
-            [result] = scan.with_cleanup_constraints(json.loads(json.dumps(rows)), state, self.dir / "no-decisions.jsonl")
+        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "MERGED", "updatedAt": at}}), \
+                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            code = scan.main(["--from", str(snapshot), "--rm-specs", "--row", path, "--state-file", str(state),
+                              "--decisions-file", str(self.dir / "no-decisions.jsonl"),
+                              "--verdicts", str(self.dir / "verdicts.json")])
 
-        decision = result["removal_decision"]
-        self.assertEqual((decision["answer"], decision["allows_removal"]), ("残す", False))
+        self.assertEqual((code, out.getvalue()), (1, ""), err.getvalue())
+        self.assertIn("残す", err.getvalue())
 
     def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
         # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
