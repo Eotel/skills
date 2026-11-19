@@ -756,6 +756,11 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 queued = self.run_tool("inbox_read.py", "open-asks", "--json")
                 self.assertEqual(queued.returncode, 0, queued.stderr)
                 self.assertEqual(len(json.loads(queued.stdout)), 1)
+                self.write_lines(events, [{"id": "fixture-intent", "type": "send-intent", "ts": self.AT,
+                                           "to": "term_worker", "text": "/ship A" if provider == "claude" else "A"}])
+                sending = self.run_tool("inbox_read.py", "open-asks", "--json")
+                self.assertEqual(sending.returncode, 0, sending.stderr)
+                self.assertEqual(len(json.loads(sending.stdout)), 1)
                 self.write_lines(events, [])
                 guarded = self.hook()
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]

@@ -186,6 +186,8 @@ def question_options_agree(left: dict, right: dict) -> bool:
     for key, (label, description) in first.items():
         other_label, other_description = second[key]
         if label == other_label:
+            if re.fullmatch(r"[a-z0-9]", label) and description != other_description:
+                return False
             continue
         if key not in (label, other_label) or not description or not other_description:
             return False
@@ -204,7 +206,7 @@ def worker_scope(entry: dict, rows: set[str], remote_hosts: dict) -> bool:
         location = Path(workspace)
         if location.name != entry.get("worktree"):
             continue
-        if (environment or location.parent.parent.name == "workspaces") and entry.get("repo") not in (None, location.parent.name):
+        if entry.get("repo") not in (None, "", location.parent.name):
             continue
         host = (remote_hosts.get(environment) or {}).get("report_host") if environment else local
         if host and entry.get("host") in (None, host):
@@ -245,6 +247,12 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             if len(bindings) > 1:
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
+        for ask_id, numbers in list(refs):
+            original = inbox_read.questions_of(next(item for item in entries if item.get("id") == ask_id))
+            if numbers and original and all(0 < n <= len(original) and isinstance(original[n - 1], dict)
+                                           and not question_options_agree(original[n - 1], question) for n in numbers):
+                refs.remove((ask_id, numbers))
+                matched = [item for item in matched if (ask_id, numbers) not in ask_state.references(item, entries)]
         presented = answer_evidence.shown_question(question)
         named = [ref for token in re.findall(r"(?<![\w-])[0-9a-f-]{8,36}(?::[1-9]\d*)?(?![\w-])", presented)
                  if (ref := ask_state.reference(token, entries))]
@@ -260,7 +268,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts))
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                          if isinstance(original, dict) and (not header or original.get("header") == header)
-                         and question_options_agree(original, question)]
+                         and question_options_agree(original, question)
+                         and (named_ids or not any(item.covers(number) for item in inbox_read.reissues(entry["id"], entries)))]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
             if not shown and header:
@@ -269,6 +278,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          if named_ids or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))]
             if named_ids and len(shown) == 1:
                 refs = shown
+            elif len(named_ids) == 1:
+                refs = [(next(iter(named_ids)), frozenset())]
             elif refs:
                 for index, (ask_id, numbers) in enumerate(refs):
                     candidates = [parts for original, parts in shown if original == ask_id]
@@ -276,6 +287,9 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                         refs[index] = ask_id, candidates[0]
             elif len(shown) == 1:
                 refs.extend(shown)
+        if named:
+            matched = [item for item in matched if any(ask_state.overlaps(ref, other) for ref in refs
+                       for other in ask_state.references(item, entries))]
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
             ask = next(entry for entry in entries if entry.get("id") == ask_id)

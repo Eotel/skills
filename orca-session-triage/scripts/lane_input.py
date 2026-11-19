@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -68,6 +69,36 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
     return targets, prompts
 
 
+def delivery_events(path: Path, recipients: set[str]) -> dict[str, list[tuple[datetime, str, bool]]]:
+    pending: dict[str, tuple[str, datetime, str]] = {}
+    deliveries: dict[str, list[tuple[datetime, str, bool]]] = {}
+    with path.open("rb") as stream:
+        for raw in stream:
+            event = inbox_read.entry(raw)
+            if not event or event.get("type") not in ("send", "send-intent"):
+                continue
+            recipient = event.get("to") or event.get("lane")
+            text = event.get("text")
+            if (not isinstance(recipient, str) or recipient not in recipients or not isinstance(text, str)
+                    or not (at := inbox_read.asked_at(event))):
+                continue
+            sent = " ".join(text.split())
+            if event["type"] == "send-intent":
+                if isinstance(intent := event.get("id"), str):
+                    pending[intent] = recipient, at, sent
+                continue
+            stages = event.get("delivery")
+            queued = isinstance(stages, list) and "input_accepted" in stages and "turn_started" not in stages
+            if isinstance(intent := event.get("intent_id"), str):
+                planned = pending.pop(intent, None)
+                if queued and planned and planned[0] == recipient and planned[2] == sent:
+                    at = planned[1]
+            deliveries.setdefault(recipient, []).append((at, sent, queued))
+    for recipient, at, sent in pending.values():
+        deliveries.setdefault(recipient, []).append((at, sent, True))
+    return deliveries
+
+
 def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
                    require_handle: bool = False) -> dict[str, list[tuple[str, datetime]]]:
     host = os.environ.get("TRIAGE_HOST") or socket.gethostname()
@@ -97,29 +128,20 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
     if not candidates:
         return {}
     try:
-        with inbox_read.events_path().open("rb") as stream:
-            for raw in stream:
-                event = inbox_read.entry(raw)
-                if event is None or event.get("type") != "send" or not isinstance(text := event.get("text"), str):
-                    continue
-                if not (sent_at := scan_sessions.parse_time(event.get("ts"))):
-                    continue
-                sent = " ".join(text.split())
-                recipient = event.get("to") or event.get("lane")
-                stages = event.get("delivery")
-                queued = isinstance(stages, list) and "input_accepted" in stages and "turn_started" not in stages
-                for targets, prompts in candidates.values():
-                    if isinstance(recipient, str) and recipient in targets:
-                        matches = [(abs(at - sent_at), index) for index, (prompt, at) in enumerate(prompts)
-                                   if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN
-                                                          or queued and timedelta() < at - sent_at <= QUEUED_WITHIN)]
-                        if require_handle and len(matches) > 1:
-                            for index in sorted((index for _, index in matches), reverse=True):
-                                prompts.pop(index)
-                        elif matches:
-                            prompts.pop(min(matches)[1])
+        deliveries = delivery_events(inbox_read.events_path(), {target for targets, _ in candidates.values() for target in targets})
     except (OSError, RuntimeError):
         return {}
+    for targets, prompts in candidates.values():
+        for recipient in targets:
+            for sent_at, sent, queued in deliveries.get(recipient, []):
+                matches = [(abs(at - sent_at), index) for index, (prompt, at) in enumerate(prompts)
+                           if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN
+                                                  or queued and timedelta() < at - sent_at <= QUEUED_WITHIN)]
+                if require_handle and len(matches) > 1:
+                    for index in sorted((index for _, index in matches), reverse=True):
+                        prompts.pop(index)
+                elif matches:
+                    prompts.pop(min(matches)[1])
     return {ask_id: direct for ask_id, (_, prompts) in candidates.items()
             if (direct := sorted((pair for pair in prompts if pair[1] > local[ask_id][1]), key=lambda pair: pair[1]))}
 
@@ -211,14 +233,21 @@ def inferred_answers(inbox: Path, path: Path, orca: str,
 
 
 def reconcile_answers(inbox: Path, path: Path, orca: str) -> None:
-    write_inferred_answers(inferred_answers(inbox, path, orca), path)
+    version = inbox_version(inbox)
+    history = list(inbox_read.answer_entries(path))
+    write_inferred_answers(inferred_answers(inbox, path, orca), path,
+                           still_current=lambda: version == inbox_version(inbox)
+                           and history == list(inbox_read.answer_entries(path)))
 
 
-def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:
+def write_inferred_answers(detected: dict[str, dict], path: Path,
+                           *, still_current: Callable[[], bool] | None = None) -> None:
     if not detected:
         return
     path = path.resolve()
     with retro.locked(path.with_name(path.name + ".lane-answer.lock")):
+        if still_current is not None and not still_current():
+            return
         answered = inbox_read.answer_records(path)
         used = {((record.get("sender") or {}).get("worktree"), record.get("ts"), record.get("note"))
                 for record in answered.values() if record.get("how") == inbox_read.TRANSCRIPT_ANSWER}
