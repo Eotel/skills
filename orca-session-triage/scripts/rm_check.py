@@ -1516,8 +1516,10 @@ def confirm_gone(worktree: Path, orca: str, wait: float) -> dict:
 
 def print_check(result: dict, summary: bool) -> None:
     if summary:
-        details = " | ".join(" ".join(reason.split()) for reason in [*result["reasons"], *result.get("notes", [])])
-        print(f"{result['worktree']} | ok={str(result['ok']).lower()} | {details or '-'}")
+        details = [*result["reasons"], *result.get("notes", []),
+                   *(f"Compose {item['project']} {item['status']}" for item in result.get("containers", []))]
+        print(f"{result['worktree']} | ok={str(result['ok']).lower()} | "
+              + (" | ".join(" ".join(detail.split()) for detail in details) or "-"))
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -1568,7 +1570,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
                         help="where --archive-scratch and --archive-path move them (default: %(default)s)")
     output = parser.add_mutually_exclusive_group()
-    output.add_argument("--summary", action="store_true", help="print one line with ok, reasons, and notes instead of JSON")
+    output.add_argument("--summary", action="store_true",
+                        help="print one line with ok, reasons, notes, and Compose status instead of JSON")
     output.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
                         help="instead of checking, confirm after `orca worktree rm` that no row of this Mac's "
                              "`orca worktree ps` has the path and the disk lacks it, reading again for up to SECONDS "

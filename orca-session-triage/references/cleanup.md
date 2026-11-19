@@ -28,9 +28,14 @@ in a tab. To check worktrees of several repositories in one call, give
 for the rows you name, finished ones whose tabs remain included, instead of
 building them by hand. Specs remain on stdout; after them, stderr gives the complete
 `rm-check-batch --from` command with `--remove-ok --summary` for the selected rows.
-For a read-only check, pipe the specs into `rm-check-batch --from SCAN_JSON --summary`.
-The scan's `--cards` and `--summary` views also show a check command for each row.
-Its `--archive-scratch` passes that option to each `rm_check.py`, and
+For a read-only check, pipe the specs into `rm-check-batch --from SCAN_JSON --no-lookup --summary`.
+This pipe requires a harness release containing Eotel/harness#28. That release also enables paths
+with spaces in batch and the saved open PR preview (`--preview --detach-nested`).
+The scan's `--cards` and `--summary` views show one check command per finished or open PR cleanup row.
+On a Mac with the prior harness release, use `scripts/rm_check.py --summary --from SCAN_JSON PATH PR`
+for a local check. It reports current blockers and Compose status. The open PR preview in
+`rm-check-batch` also assesses whether removable nested worktrees would clear those blockers.
+`rm-check-batch --archive-scratch` passes that option to each `rm_check.py`, and
 `--remove-ok` runs steps 3 and 4 below for each worktree whose check is `ok`
 with no `containers`, putting the result in that worktree's line as `removal`
 (it exits 4 when one did not finish). Give it only rows these rules remove

@@ -3201,7 +3201,8 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
+        if (not row.get("open_pr_cleanup") and not row.get("automation_blocker")
+                and (not row.get("removal_decision") or removal_approved(row))):
             print("    " + rm_check_command(row, scan_file))
     open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
@@ -3501,6 +3502,7 @@ def row_line(view: dict) -> str:
 
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
+RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
 RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
 
 
@@ -3514,11 +3516,16 @@ def rm_spec(row: dict) -> str:
 
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
     """A one-line check for this row, using the saved scan's timestamp when available."""
-    return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
-                       *(["--from", str(scan_file)] if scan_file else []), "--summary",
-                       *(["--detach-nested", "--archive-scratch", "--remove-ok"]
-                         if row.get("open_pr_cleanup") and remove_ok else []),
-                       rm_spec(row)])
+    environment = row.get("environment")
+    from_scan = ["--from", str(scan_file)] if scan_file else []
+    options = ["--summary", *from_scan]
+    if not remove_ok and not (row.get("open_pr_cleanup") and scan_file) and not environment:
+        return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
+    if remove_ok:
+        options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
+    elif row.get("open_pr_cleanup") and scan_file:
+        options.extend(("--preview", "--detach-nested"))
+    return shlex.join([str(RM_CHECK_BATCH), *options, *(["--host", environment] if environment else []), rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:

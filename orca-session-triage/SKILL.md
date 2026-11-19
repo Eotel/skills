@@ -113,7 +113,8 @@ board's done cards; close what the user approves.
   keeps an old error until the tab runs again.
   `--summary` prints class counts (the class `--rows --class` keeps, the
   scan's count beside it as `(scan: N)` where they differ), review rows, finished worktree/tab counts,
-  open PR cleanup rows with each one's `rm_check.py` command, and each hook error with its host. `--rows` prints one line per row (name, the
+  open PR cleanup rows, read-only checks for finished and open PR cleanup rows, and hook errors with their hosts.
+  `--rows` prints one line per row (name, the
   verdict's class over the scan's, GitHub repo and PR, tab count, newest final
   message time, its question, `waits_on`, `next_step`, or message start,
   `reasons`, `git.dirty`, and `git.unpushed`); `--class CLASS` keeps one class.
@@ -188,8 +189,8 @@ board's done cards; close what the user approves.
   by its `read: orca terminal read --terminal HANDLE` command: read cards
   through it. `--cards --row NAME` (repeatable) prints only the named rows. With
   `--from`, a row with `closable` tabs ends with the `close_tabs.py` command
-  that closes them, and a finished or open PR cleanup row with its
-  `rm_check.py` command. Each row records the scan's start (`scanned_at`).
+  that closes them. Finished and open PR cleanup rows include the local `rm_check.py` or
+  `rm-check-batch` check from `references/cleanup.md`. Each row records the scan's start (`scanned_at`).
   The board keeps a card in Done until its tab closes.
   `unread` says the user has not opened the worktree since it last spoke. A
   repository's main checkout is a row (`main`) while it hosts an agent. A

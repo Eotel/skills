@@ -2776,14 +2776,17 @@ class NextStepFactTests(unittest.TestCase):
 class ScanCommandTests(unittest.TestCase):
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
-        saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "stalled",
+        saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",
                                       "open_pr_cleanup": True, "pr": {"number": 10}, "terminals": [],
                                       "claude": None, "codex": [], "reasons": []}]))
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
         commands = [line.strip() for line in out.getvalue().splitlines() if "rm-check-batch" in line]
         self.assertEqual(len(commands), 2)
-        self.assertNotIn("--remove-ok", shlex.split(commands[0]))
+        preview = shlex.split(commands[0])
+        self.assertIn("--preview", preview)
+        self.assertIn("--detach-nested", preview)
+        self.assertNotIn("--remove-ok", preview)
         command = commands[1]
         args = shlex.split(command)
         self.assertIn("--detach-nested", args)
@@ -3391,17 +3394,16 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
-                    expected = [str(scan.RM_CHECK_BATCH),
-                                *(["--host", row["environment"]] if row.get("environment") else []),
-                                "--from", str(saved.absolute()), "--summary",
-                                *(["--detach-nested", "--archive-scratch", "--remove-ok"]
-                                  if view == "--summary" and row.get("open_pr_cleanup") else []),
-                                f"{row['path']} {number or '-'}"]
+                    options = ["--summary", "--from", str(saved.absolute())]
+                    host = ["--host", row["environment"]] if row.get("environment") else []
+                    if row.get("open_pr_cleanup"):
+                        options.extend(("--preview", "--detach-nested"))
+                    spec = f"{row['path']} {number or '-'}"
+                    if row.get("open_pr_cleanup") or host:
+                        expected = [str(scan.RM_CHECK_BATCH), *options, *host, spec]
+                    else:
+                        expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
-                    if view == "--summary" and row.get("open_pr_cleanup"):
-                        preview = [arg for arg in expected if arg not in ("--detach-nested", "--archive-scratch",
-                                                                         "--remove-ok")]
-                        self.assertIn(shlex.join(preview), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
         # 2026-11-11: --rm-specs gave 2 of the 8 rows to check; the hourly tab built the other 6 specs by hand, and
@@ -4875,6 +4877,9 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["containers"], [{"project": "app-wt", "status": "running(2)"}])
+        with redirect_stdout(io.StringIO()) as out:
+            rmcheck.print_check(result, summary=True)
+        self.assertIn("Compose app-wt running(2)", out.getvalue())
 
     def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:
         real_run = subprocess.run
