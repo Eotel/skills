@@ -10,6 +10,7 @@ from typing import Literal, NotRequired, TextIO, TypedDict, Unpack
 from contextlib import AbstractContextManager, closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from itertools import product
 import fcntl
 import hashlib
 import importlib.util
@@ -3518,6 +3519,126 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([line.split(" | ")[0] for line in out.getvalue().splitlines()],
                          ["mbp16::app", "dotfiles-73", "fix-login", "mbp16::fix-login"])
+
+    def test_same_second_removal_aliases_keep_the_worktree_for_every_hash_seed(self) -> None:
+        decisions = self.dir / "decisions.jsonl"
+        snapshot = self.dir / "scan.json"
+        row = {"path": "/tmp/demo/wt", "repo": "Eotel/demo", "class": "finished"}
+        snapshot.write_text(json.dumps([row]))
+        write_jsonl(decisions, [
+            {"id": "remove", "decision": "remove:Eotel/demo/wt", "answer": "消す",
+             "decided_at": "2026-11-19T00:00:00Z"},
+            {"id": "earlier", "decision": "remove:/tmp/demo/wt", "answer": "消す",
+             "decided_at": "2026-11-19T09:00:00+09:00"},
+            {"id": "keep", "decision": "remove:/tmp/demo/wt", "answer": "残す",
+             "decided_at": "2026-11-19T09:00:00+09:00"},
+        ])
+        for seed in range(8):
+            with self.subTest(seed=seed):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "scan_sessions.py"), "--from", str(snapshot),
+                     "--rm-specs", "--row", row["path"], "--decisions-file", str(decisions),
+                     "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")],
+                    env={**os.environ, "PYTHONHASHSEED": str(seed)}, capture_output=True, text=True,
+                )
+                self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+                self.assertIn('"allows_removal": false', result.stderr)
+                self.assertIn("残す", result.stderr)
+
+    def test_same_second_pending_removal_condition_keeps_the_worktree_until_merge(self) -> None:
+        path = "/w/demo"
+        decisions = self.dir / "decisions.jsonl"
+        at = "2026-11-19T00:00:00Z"
+        write_jsonl(decisions, [
+            {"id": "after-merge", "decision": f"remove:local::{path}", "answer": "PR がマージされたら削除する",
+             "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
+            {"id": "remove", "decision": f"remove:{path}", "answer": "消す", "decided_at": at},
+        ])
+        row = {"path": path, "repo": "acme/demo", "class": "finished"}
+        for state in ("OPEN", "MERGED", None):
+            with self.subTest(state=state):
+                response = {"pr_6": {"state": state, "updatedAt": at}} if state else None
+                with patch.object(scan, "graphql_repository", return_value=response), redirect_stderr(io.StringIO()):
+                    [result] = scan.with_cleanup_constraints([dict(row)], self.dir / "no-state.json", decisions)
+                decision = result["removal_decision"]
+                self.assertEqual(decision["allows_removal"], state == "MERGED")
+                if state != "MERGED":
+                    self.assertEqual(decision["decision"], f"remove:local::{path}")
+                    self.assertEqual(decision["after_state"], state)
+
+    def test_latest_decisions_take_the_last_record_per_key_across_short_histories(self) -> None:
+        lead = handoff.lead_decisions
+        keys = ("remove:acme/demo/wt", "remove:/w/wt")
+        times = ("2026-11-19T00:00:00Z", "2026-11-19T00:00:01Z")
+        entries = tuple(product(keys, times))
+        for length in range(4):
+            for history in product(entries, repeat=length):
+                records = [lead.Decision(str(index), key, f"answer {index}", at)
+                           for index, (key, at) in enumerate(history)]
+                expected = {key: matching[-1] for key in keys
+                            if (matching := [record for record in records if record.decision == key])}
+                self.assertEqual(lead.latest(iter(records)), expected, history)
+
+    def test_same_second_removal_approvals_with_different_cleanup_keep_the_worktree(self) -> None:
+        path = "/w/demo"
+        at = "2026-11-19T00:00:00Z"
+        snapshot = self.dir / "scan.json"
+        snapshot.write_text(json.dumps([{"path": path, "repo": "acme/demo", "class": "finished"}]))
+        decisions = self.dir / "decisions.jsonl"
+        args = ["--from", str(snapshot), "--rm-specs", "--row", path, "--decisions-file", str(decisions),
+                "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")]
+        cases = (
+            ({}, {"compose_down": True}, (1, "")),
+            ({"discard": [".env"]}, {"discard": [".env.local"]}, (1, "")),
+            ({"discard": [".env", ".env.local"]}, {"discard": [".env.local", "./.env"]}, (0, f"{path} -\n")),
+        )
+        for first, second, expected in cases:
+            with self.subTest(first=first, second=second):
+                write_jsonl(decisions, [
+                    {"id": "first", "decision": f"remove:{path}", "answer": "消す", "decided_at": at, "removal": first},
+                    {"id": "second", "decision": f"remove:local::{path}", "answer": "消す", "decided_at": at,
+                     "removal": second},
+                ])
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    code = scan.main(args)
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("後始末の指定が異なる", err.getvalue())
+
+    def test_saved_scan_keeps_same_second_hold_when_another_alias_meets_its_condition(self) -> None:
+        path = "/w/demo"
+        decisions = self.dir / "decisions.jsonl"
+        state = self.dir / "no-state.json"
+        at = "2026-11-19T00:00:00Z"
+        entries = [
+            {"id": "after-merge", "decision": f"remove:{path}", "answer": "PR がマージされたら削除する",
+             "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
+            {"id": "keep", "decision": f"remove:local::{path}", "answer": "残す", "decided_at": at},
+        ]
+        write_jsonl(decisions, entries)
+        row = {"path": path, "repo": "acme/demo", "class": "finished"}
+        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "OPEN", "updatedAt": at}}):
+            rows = scan.with_cleanup_constraints([row], state, decisions)
+        self.assertFalse(rows[0]["removal_decision"]["allows_removal"])
+        snapshot = self.dir / "saved-scan.json"
+        snapshot.write_text(json.dumps(rows))
+
+        missing = self.dir / "no-decisions.jsonl"
+        partial = self.dir / "partial-decisions.jsonl"
+        write_jsonl(partial, entries[:1])
+        stale = self.dir / "stale-decisions.jsonl"
+        write_jsonl(stale, [entries[0], {**entries[1], "id": "earlier-approval", "answer": "消す"}])
+        corrected = self.dir / "corrected-decisions.jsonl"
+        write_jsonl(corrected, [*entries, {**entries[1], "id": "corrected", "answer": "消す"}])
+        response = {"pr_6": {"state": "MERGED", "updatedAt": at}}
+        for log, expected in ((missing, (1, "")), (partial, (1, "")), (stale, (1, "")), (corrected, (0, f"{path} -\n"))):
+            with self.subTest(log=log.name), patch.object(scan, "graphql_repository", return_value=response), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(snapshot), "--rm-specs", "--row", path, "--state-file", str(state),
+                                  "--decisions-file", str(log), "--verdicts", str(self.dir / "verdicts.json")])
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("残す", err.getvalue())
 
     def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
         # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
@@ -9118,6 +9239,40 @@ class InboxReadTests(unittest.TestCase):
             "注意: この回の後に 11/12 12:00 の定時の回が始まった（dispatched、11/12 12:08 開始、pane pane-12）。"
             "既読位置と引き継ぎはその回のもの",
             "2026-11-12T12:09:00+09:00 info - lane id=abcd1234  経過"])
+
+    def test_short_answer_histories_keep_substantive_answers_and_apply_corrections(self) -> None:
+        keys = ("ask", "ask:1", "ask:2")
+        answer, correction = "send", "hourly_state.py corrected"
+        kinds = ("inbox_read.py open-asks", answer, correction)
+        times = ("2026-11-19T00:00:00Z", "2026-11-19T00:00:01Z")
+        entries = tuple(product(keys, kinds, times))
+        log = inbox_read.answers_path()
+        for length in range(4):
+            for history in product(entries, repeat=length):
+                records = [{"id": key, "how": how, "ts": at, "sequence": index}
+                           for index, (key, how, at) in enumerate(history)]
+                write_jsonl(log, records)
+                current = inbox_read.answer_records(log)
+
+                expected = {}
+                for key in keys:
+                    same_key = [record for record in records if record["id"] == key]
+                    if same_key:
+                        corrected = [record for record in same_key if record["how"] == correction]
+                        substantive = [record for record in same_key if record["how"] == answer]
+                        expected[key] = corrected[-1] if corrected else (substantive or same_key)[0]
+                self.assertEqual(list(current.values()), sorted(expected.values(), key=lambda record: record["sequence"]),
+                                 history)
+
+                whole = expected.get("ask")
+                parts = []
+                for key in ("ask:1", "ask:2"):
+                    part = expected.get(key)
+                    if part and whole and whole["how"] == correction:
+                        part = max(part, whole, key=lambda record: (record["ts"], record["sequence"]))
+                    if chosen := part or whole:
+                        parts.append(chosen)
+                self.assertEqual(inbox_read.answer_parts("ask", (1, 2), current), parts, history)
 
     def test_read_marks_the_asks_and_questions_the_answer_records_hold(self) -> None:
         # 11/11 19:20: three asks answered by then were read from --summary as open and put in a handoff.
