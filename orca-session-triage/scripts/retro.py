@@ -112,13 +112,14 @@ def load(state: Path = STATE) -> dict[str, Any]:
     state_file = paths(state)[1]
     if not state_file.exists():
         return {"offset": 0, "sessions": {}, "target_versions": {},
-                "action_attempts": {}, "applied_actions": {}, "rewrites": {}}
+                "action_attempts": {}, "applied_actions": {}, "applied_action_ids": {}, "rewrites": {}}
     data = json.loads(state_file.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not all(k in data for k in ("offset", "sessions")):
         raise ValueError(f"invalid worker state: {state_file}")
     data.setdefault("target_versions", {})
     data.setdefault("action_attempts", {})
     data.setdefault("applied_actions", {})
+    data.setdefault("applied_action_ids", {})
     data.setdefault("rewrites", {})
     return data
 
@@ -885,11 +886,11 @@ def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_
 
 
 def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
-                        rewrites: dict[str, str]) -> str | None:
+                        rewrites: dict[str, str], recorded_id: str | None) -> str | None:
     if checkpoint is None:
         return None
-    if decision_id := checkpoint.get("decision_id"):
-        return decision_id
+    if recorded_id is not None:
+        return recorded_id
     proposal_id = item["proposal_id"]
     adoptions = [entry["id"] for entry in item["decisions"] if entry["decision"] == "adopt"]
     for decision_id in reversed(adoptions):
@@ -917,7 +918,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         applications = {run["decision_id"]: run["undo"] for run in item.get("executions", [])
                         if run["outcome"] == "applied" and run.get("undo") and run.get("actor") == "triage-retro"}
         decision_ids = [entry["id"] for entry in item["decisions"]]
-        checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"])
+        checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"],
+                                             data["applied_action_ids"].get(proposal_id))
         reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id)
                     if category not in SEPARATE_WORK else None)
         if reversal is not None:
@@ -929,11 +931,11 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         else:
             continue
         decision_id = decision["id"]
-        stored = {key: value for key, value in checkpoint.items() if key != "decision_id"} if (
-            checkpoint is not None and checkpoint_id == adoption_id) else None
+        stored = checkpoint if checkpoint_id == adoption_id else None
         if status == "adopted" and item.get("implemented_at"):
             if stored is not None:
                 data["applied_actions"].pop(proposal_id, None)
+                data["applied_action_ids"].pop(proposal_id, None)
             data["rewrites"].pop(decision_id, None)
             # Retries counted under an earlier decision no longer stand for a failure once the proposal settles.
             data["action_attempts"] = {key: count for key, count in data["action_attempts"].items()
@@ -1001,7 +1003,8 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                     if f"{MARKER}{proposal_id} -->" in data.get("revoked_notes", []):
                         data["revoked_notes"].remove(f"{MARKER}{proposal_id} -->")
                     remember_versions(data, router, path)
-                data["applied_actions"][proposal_id] = {**expected, "decision_id": decision_id}
+                data["applied_actions"][proposal_id] = expected
+                data["applied_action_ids"][proposal_id] = decision_id
                 writing_completed = True
                 if state is not None:
                     save(data, state)
@@ -1039,6 +1042,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
                                "actor": "triage-retro", "result": result})
             if status == "adopted" or stored is not None:
                 data["applied_actions"].pop(proposal_id, None)
+                data["applied_action_ids"].pop(proposal_id, None)
             data["action_attempts"].pop(action_key, None)
             data["rewrites"].pop(adoption_id, None)
             changed += 1

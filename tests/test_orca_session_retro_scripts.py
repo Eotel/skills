@@ -330,7 +330,8 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
         first_revoke = ledger.decide({**body, "decision": "revoke"})
         second = ledger.decide({**body, "decision": "adopt", "reason": "Rewrite the note."})
-        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+        with mock.patch.object(retro, "run_claude", return_value={"note": "Rewritten note."}):
+            self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
         self.assertEqual(ledger.list()[0]["executions"][-1]["decision_id"], first_revoke["id"])
 
         with (mock.patch.object(retro, "run_claude", return_value={"note": "Rewritten note."}),
