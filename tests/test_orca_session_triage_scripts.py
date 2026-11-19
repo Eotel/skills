@@ -6679,15 +6679,16 @@ class HourlyStateTests(unittest.TestCase):
         saved = self.source("scan.json", json.dumps([
             {"path": "/w/app/lane", "repo": "app"},
             {"path": "/w/other/second", "repo": "other"},
+            {"path": "/w/second", "repo": None},
         ]))
         message = self.source("message.txt", "Ready.")
         _, question = self.call("asked", "--row", "app/lane", "--from", saved, "--decision", "publish",
                                 "--no-comment", "--final-message-file", message, "--question-file", message)
-        _, item = self.call("presented", "--owner", "second", "--from", saved, "--key", "user:publish",
+        _, item = self.call("presented", "--owner", "/second", "--from", saved, "--key", "user:publish",
                             "--text-file", message, "--since", "2026-11-19T00:00:00Z")
 
         self.assertEqual(question["row"], "/w/app/lane")
-        self.assertEqual(item["owner"], "/w/other/second")
+        self.assertEqual(item["owner"], "/w/second")
         self.assertEqual(self.call("get", question["id"]), self.call("get", "--id", question["id"]))
 
     def test_a_saved_scan_with_two_lanes_of_the_same_name_rejects_both_mutations(self) -> None:

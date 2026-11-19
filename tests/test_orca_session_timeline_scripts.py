@@ -120,6 +120,10 @@ with patch.object(timeline, "datetime", wraps=datetime) as fixed:
 
         self.assertEqual([item["text"] for item in json.loads(previous.stdout)], ["前日の記録"])
         self.assertEqual([item["text"] for item in json.loads(today.stdout)], ["当日の記録"])
+        for since in ("2d", "2026-11-18T09:00:00+09:00"):
+            with self.subTest(since=since):
+                result = self.run_tool("--since", since, "--until", "17:00", "--json", clock=clock)
+                self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["前日の記録", "当日の記録"])
         future = self.run_tool("--since", "2026-11-20T16:00:00+09:00", "--json", clock=clock)
         self.assertEqual(json.loads(future.stdout), [])
         self.assertIn("0 件（--since が未来）", future.stderr)

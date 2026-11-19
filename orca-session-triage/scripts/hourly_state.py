@@ -869,14 +869,13 @@ def owner_name(value: str) -> str:
 
 
 def selected_worktree(value: str, scan_file: str | None, option: str) -> str:
+    if scan_file is not None:
+        rows = scan_sessions.saved_rows(scan_file)
+        return scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option))
     try:
         return owner_name(value)
-    except ValueError:
-        pass
-    if scan_file is None:
-        raise ValueError(f"{option} {value}: use --from SCAN_JSON to resolve a worktree name")
-    rows = scan_sessions.saved_rows(scan_file)
-    return scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option))
+    except ValueError as error:
+        raise ValueError(f"{option} {value}: use --from SCAN_JSON to resolve a worktree name") from error
 
 
 def repository_names(owner: str) -> frozenset[str]:
