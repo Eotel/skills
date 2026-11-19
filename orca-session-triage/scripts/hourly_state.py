@@ -637,6 +637,17 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
     shared = answer_evidence.shared_questions(entries)
     latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
+    ask_entries = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    lane_answered = [answer.ask_id for answer in answers if answer.source == inbox_read.LANE_ANSWER
+                     and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
+                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
+    if lane_answered:
+        handed = [item for item in handed if not (item.ask_id and (ref := ask_state.reference(item.ask_id, entries))
+                                                  and ask_state.covered(ref, lane_answered, entries))]
+        pending = {key: item for key, item in state.get("questions", {}).items()
+                   if not (refs := ask_state.references(item, entries))
+                   or not all(ask_state.covered(ref, lane_answered, entries) for ref in refs)}
+        state = {**state, "questions": pending}
     for row in rows:
         identity = scan_sessions.row_identity(row)
         own_handle = os.environ.get("ORCA_TERMINAL_HANDLE")
@@ -667,7 +678,9 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and (item.get("repo") or "") in scan_sessions.row_repos(row)
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
-        keys = {item["id"]: [handoff.decision for handoff in handed if (key := answer_evidence.key_ask_id(handoff.decision))
+        keys = {item["id"]: [handoff.decision for handoff in handed
+                            if (key := ((handoff.ask_id or "").partition(":")[0]
+                                        or answer_evidence.key_ask_id(handoff.decision)))
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
                 for _, item in lane if item.get("kind") == "ask" and item.get("id")}
         shared_pending = [dict(id=key, **item) for key, item in state.get("questions", {}).items()

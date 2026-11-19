@@ -154,8 +154,9 @@ appointed lead's workspace even when this skill is not active. It matches inbox
 question headers and the recorded questions' `covers` keys. An answered ask,
 another workspace's claim, or another tab's unanswered hourly question blocks
 the call, naming the question, workspace, and time. Direct input in the asking
-lane's tab on this Mac after an open ask blocks once per ask and prompt timestamp,
-with a command to record the answer if the prompt answers the ask.
+lane's tab on this Mac after an open ask blocks once per ask and prompt timestamp.
+If the prompt answers the ask, have the lane record it with the
+`triage-notify --answered <id>[:<n>]` command the reason names.
 Its own claim and the current tab's question record permit the call. Keep the
 appointed lead current with `hourly_state.py appoint-lead`.
 

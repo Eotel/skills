@@ -459,6 +459,38 @@ assert writer is not None and writer.wait(timeout=10) == 0
         row = json.loads(result.stdout)[0]
         self.assertEqual((row["state"], row["answer"]["text"]), ("stopped_after_answer", "待つ"))
 
+    def test_lane_answers_settle_only_the_corresponding_hourly_questions_and_handoffs(self) -> None:
+        questions = [self.question, {**self.question, "header": "宛先", "question": "宛先を選びますか？"}]
+        ask = json.loads(self.inbox.read_text())
+        self.write_lines(self.inbox, [{**ask, "questions": questions}])
+        state_questions = [self.ask(key=f"{self.KEY}:{number}", covers=[f"{self.KEY}:{number}"])
+                           for number in (1, 2)]
+        self.write_lines(self.handed, [{"decision": f"{self.KEY}:{number}", "ask_id": f"{self.ASK}:{number}",
+                                      "handed_off_at": self.AT} for number in (1, 2)])
+        scan = self.root / "scan.json"
+        scan.write_text(json.dumps([{"path": "/w/worker", "repo": "", "class": "waiting",
+                                     "claude": {"final_text": "公開しますか？", "final_at": ask["ts"]}}]))
+        for answered in (1, 2):
+            with self.answers.open("a") as stream:
+                stream.write(json.dumps({"id": f"{self.ASK}:{answered}", "ts": "2026-11-14T09:02:00Z",
+                                         "how": "triage-notify --answered", "note": "回答確認"}) + "\n")
+            pending = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                    "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+            self.assertEqual(pending.returncode, 0, pending.stderr)
+            self.assertEqual([item["decision"] for item in json.loads(pending.stdout)["unanswered"]],
+                             [f"{self.KEY}:2"] if answered == 1 else [])
+            stale = self.run_tool("hourly_state.py", "stale-asks", "--from", str(scan),
+                                  "--verdicts", str(self.root / "no-verdicts"), "--claude-projects",
+                                  str(self.root / "projects"), "--handed-off-file", str(self.handed))
+            self.assertEqual(stale.returncode, 0, stale.stderr)
+            row = json.loads(stale.stdout)[0]
+            if answered == 1:
+                self.assertEqual(row["state"], "unanswered")
+                self.assertEqual(row["decisions"], [f"{self.KEY}:2"])
+                self.assertNotIn(state_questions[0]["id"], [item["id"] for item in row["asking"]])
+            else:
+                self.assertEqual(row["state"], "stopped_after_answer")
+
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
         other = "b1234567-1234-4567-8888-123456789abc"
@@ -586,8 +618,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
         events = self.root / "events.jsonl"
         self.env.update(TRIAGE_HOST="mac-a", TRIAGE_AGENT_STATUS_FILE=str(status), ORCA_BOARD_EVENTS=str(events),
                         ORCA_CLI_COMMAND="false")
+        second = {**self.question, "question": "公開の宛先はどちらですか？", "header": "宛先"}
         ask = {"id": self.ASK, "ts": "2026-11-14T09:00:00Z", "kind": "ask",
-               "host": "mac-a", "worktree": "worker", "handle": "term_worker", "questions": [self.question]}
+               "host": "mac-a", "worktree": "worker", "handle": "term_worker", "questions": [self.question, second]}
         self.write_lines(self.inbox, [ask])
         self.answers.write_text("")
         self.claims.write_text("")
@@ -599,7 +632,13 @@ assert writer is not None and writer.wait(timeout=10) == 0
             })))
         prompt = "公開は明日まで待ってください。"
         typed = {"type": "user", "timestamp": self.AT, "message": {"role": "user", "content": prompt}}
-        self.write_lines(transcript, [typed])
+        output = {"type": "user", "timestamp": "2026-11-14T09:01:30Z", "message": {
+            "role": "user", "content": "<local-command-stdout>Compacted</local-command-stdout>"}}
+        self.write_lines(transcript, [typed, output])
+        self.write_lines(events, [
+            {"type": "send", "ts": "2026-11-13T09:01:00Z", "to": "term_worker", "text": prompt},
+            {"type": "send", "ts": self.AT, "to": "term_other", "lane": "worker", "text": prompt},
+        ])
 
         guarded = self.hook()
         self.assertEqual(guarded.returncode, 0, guarded.stderr)
@@ -607,7 +646,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
         decision = json.loads(guarded.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
         self.assertIn(prompt, decision["permissionDecisionReason"])
-        self.assertIn(self.ASK, decision["permissionDecisionReason"])
+        self.assertIn(f"triage-notify --answered {self.ASK}:1 <", decision["permissionDecisionReason"])
         self.assertEqual(self.hook().stdout, "")
 
         sent = {"type": "user", "timestamp": "2026-11-14T09:02:00Z",

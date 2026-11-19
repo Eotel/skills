@@ -24,6 +24,8 @@ Find Orca worktrees whose agents finished, stalled, wait on a human, or never
 got a task; relay the user's answers and next steps in one batch; clear the
 board's done cards; close what the user approves.
 
+When a lane receives the user's answer in its own tab, have that lane record the answered ask or question number with `triage-notify --answered`.
+
 ## Where
 
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus

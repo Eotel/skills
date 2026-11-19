@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import re
@@ -14,8 +14,9 @@ import orca_agent_status
 import retro
 import scan_sessions
 
-INJECTED = re.compile(r"<(?P<tag>task-notification|system-reminder|environment_context|image)\b[^>]*>.*?</(?P=tag)>",
-                      re.S)
+INJECTED = re.compile(r"<(?P<tag>task-notification|system-reminder|environment_context|image|local-command-stdout"
+                      r"|local-command-caveat)\b[^>]*>.*?</(?P=tag)>", re.S)
+SENT_WITHIN = timedelta(minutes=2)
 
 
 def user_prompt(row: dict[str, Any]) -> str:
@@ -34,27 +35,26 @@ def user_prompt(row: dict[str, Any]) -> str:
 
 
 def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str, Any]],
-                 handles: dict[str, str]) -> tuple[set[str], dict[str, datetime]]:
-    lane, handle = ask.get("worktree"), ask.get("handle")
+                 handles: dict[str, str]) -> tuple[set[str], list[tuple[str, datetime]]]:
+    lane, handle, repo = ask.get("worktree"), ask.get("handle"), ask.get("repo")
     suffix = Path(lane).parts if lane else ()
-    targets = {target for target in (lane, handle) if target}
-    paths = set()
-    for pane, entry in panes.items():
-        workspace = (entry.get("worktreeId") or "").split("::", 1)[-1]
-        terminal = handles.get(pane)
-        if not (suffix and Path(workspace).parts[-len(suffix):] == suffix or handle and terminal == handle):
+    chosen = [pane for pane in panes if handle and handles.get(pane) == handle] or [
+        pane for pane, entry in panes.items()
+        if suffix and (parts := Path((entry.get("worktreeId") or "").split("::", 1)[-1]).parts)[-len(suffix):] == suffix
+        and (not repo or repo in parts)]
+    if len(chosen) != 1:
+        return set(), []
+    pane = chosen[0]
+    path = (panes[pane].get("providerSession") or {}).get("transcriptPath")
+    if not path:
+        return set(), []
+    targets = {target for target in (handles.get(pane) or handle or lane,) if target}
+    prompts = []
+    for row in retro.transcript_rows(Path(path).expanduser()):
+        if not isinstance(row, dict) or not (at := scan_sessions.parse_time(row.get("timestamp"))) or at <= after:
             continue
-        if terminal:
-            targets.add(terminal)
-        if path := (entry.get("providerSession") or {}).get("transcriptPath"):
-            paths.add(Path(path).expanduser())
-    prompts: dict[str, datetime] = {}
-    for path in paths:
-        for row in retro.transcript_rows(path):
-            if not isinstance(row, dict) or not (at := scan_sessions.parse_time(row.get("timestamp"))) or at <= after:
-                continue
-            if (prompt := user_prompt(row)) and (prompt not in prompts or at > prompts[prompt]):
-                prompts[prompt] = at.astimezone(timezone.utc)
+        if prompt := user_prompt(row):
+            prompts.append((prompt, at.astimezone(timezone.utc)))
     return targets, prompts
 
 
@@ -91,12 +91,14 @@ def latest(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, tuple[str, d
                 event = inbox_read.entry(raw)
                 if event is None or event.get("type") != "send" or not isinstance(text := event.get("text"), str):
                     continue
-                prompt = " ".join(text.split())
-                recipients = {value for key in ("to", "lane") if isinstance(value := event.get(key), str)}
-                for targets, prompts in candidates.values():
-                    if targets & recipients:
-                        prompts.pop(prompt, None)
+                if not (sent_at := scan_sessions.parse_time(event.get("ts"))):
+                    continue
+                sent = " ".join(text.split())
+                recipient = event.get("to") or event.get("lane")
+                for ask_id, (targets, prompts) in candidates.items():
+                    if isinstance(recipient, str) and recipient in targets:
+                        candidates[ask_id] = targets, [(prompt, at) for prompt, at in prompts
+                                                       if prompt != sent or abs(at - sent_at) > SENT_WITHIN]
     except (OSError, RuntimeError):
         return {}
-    return {ask_id: max(prompts.items(), key=lambda pair: pair[1])
-            for ask_id, (_, prompts) in candidates.items() if prompts}
+    return {ask_id: max(prompts, key=lambda pair: pair[1]) for ask_id, (_, prompts) in candidates.items() if prompts}
