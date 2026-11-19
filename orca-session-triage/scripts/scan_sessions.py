@@ -2826,9 +2826,10 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
     reading a saved scan again does not repeat it. `removal_decision` is the newest answer to the row's own removal
     keys and decides `allows_removal`. If the newest answers tie, a non-approving answer takes precedence.
-    A newer answer to one of their `::` sub-keys is shown as its `newest`. An answer
-    recorded with removal terms carries `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub
-    now, its state (or null when it cannot be read) in `after_state`.
+    The scan retains tied candidates so it can reevaluate their conditions when read without the decision log.
+    A newer answer to one of the `::` sub-keys is shown as `newest`. An answer recorded with removal terms carries
+    `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub now, its state (or null when it
+    cannot be read) in `after_state`.
     """
     import lead_decisions
     decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
@@ -2875,7 +2876,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                 for answer in answered if moment(answer) == latest_at
             ]))
         elif removal := row.get("removal_decision"):
-            removal_candidates.append((row, [removal]))
+            removal_candidates.append((row, row.get("removal_candidates") or [removal]))
         names = {row["path"], row_identity(row), row_name(row),
                  f"{row.get('repo')}/{Path(row['path']).name}"}
         if not row.get("environment"):
@@ -2900,6 +2901,10 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                 removal["after_state"] = states.get((pr.repo, pr.number))
             removal["allows_removal"] = removal_answer_approves(removal)
         row["removal_decision"] = min(candidates, key=lambda removal: removal["allows_removal"])
+        if len(candidates) > 1:
+            row["removal_candidates"] = candidates
+        else:
+            row.pop("removal_candidates", None)
     return rows
 
 

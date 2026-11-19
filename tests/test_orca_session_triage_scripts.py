@@ -3582,6 +3582,27 @@ print(json.dumps(result["removal_decision"]))
                             if (matching := [record for record in records if record.decision == key])}
                 self.assertEqual(lead.latest(iter(records)), expected, history)
 
+    def test_saved_scan_keeps_same_second_hold_when_another_alias_meets_its_condition(self) -> None:
+        path = "/w/demo"
+        decisions = self.dir / "decisions.jsonl"
+        state = self.dir / "no-state.json"
+        at = "2026-11-19T00:00:00Z"
+        write_jsonl(decisions, [
+            {"id": "after-merge", "decision": f"remove:{path}", "answer": "PR がマージされたら削除する",
+             "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
+            {"id": "keep", "decision": f"remove:local::{path}", "answer": "残す", "decided_at": at},
+        ])
+        row = {"path": path, "repo": "acme/demo", "class": "finished"}
+        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "OPEN", "updatedAt": at}}):
+            rows = scan.with_cleanup_constraints([row], state, decisions)
+        self.assertFalse(rows[0]["removal_decision"]["allows_removal"])
+
+        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "MERGED", "updatedAt": at}}):
+            [result] = scan.with_cleanup_constraints(json.loads(json.dumps(rows)), state, self.dir / "no-decisions.jsonl")
+
+        decision = result["removal_decision"]
+        self.assertEqual((decision["answer"], decision["allows_removal"]), ("残す", False))
+
     def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
         # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
         path = "/w/collect-catalog-left-pane-scroll"
