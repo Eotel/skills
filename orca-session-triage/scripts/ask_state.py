@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 
@@ -138,7 +138,8 @@ def overlaps(left: tuple[str, frozenset[int]], right: tuple[str, frozenset[int]]
     return left[0] == right[0] and (not left[1] or not right[1] or bool(left[1] & right[1]))
 
 
-def active(state: dict, decisions: Mapping[str, object] | None = None) -> list[dict]:
+def active(state: dict, decisions: Mapping[str, object] | None = None, *,
+           bindings: Mapping[str, HandoffBinding] | None = None) -> list[dict]:
     """Open hourly questions with the workspace, time, row and every decision key being asked."""
     return [{"id": key, "by": item.get("asked_in") or "", "at": item.get("asked_at"),
              "row": item.get("row"), "keys": list(dict.fromkeys([item.get("decision"), *(item.get("covers") or [])])),
@@ -146,9 +147,20 @@ def active(state: dict, decisions: Mapping[str, object] | None = None) -> list[d
             for key, item in state.get("questions", {}).items()
             if item.get("answer") is None and not item.get("withdrawn_at")
             and not (item.get("covers") and decisions and all(
-                decision in decisions and datetime.fromisoformat(getattr(decisions[decision], "decided_at"))
-                > datetime.fromisoformat(item["asked_at"])
+                decision in decisions and same_bound_ask(item, (bindings or {}).get(decision), decision)
+                and answer_follows_question(decisions[decision], item["asked_at"])
                 for decision in item["covers"]))]
+
+
+def answer_follows_question(decision: object, asked_at: str) -> bool:
+    try:
+        decided = datetime.fromisoformat(getattr(decision, "decided_at"))
+        asked = datetime.fromisoformat(asked_at)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    decided = decided if decided.tzinfo else decided.replace(tzinfo=timezone.utc)
+    asked = asked if asked.tzinfo else asked.replace(tzinfo=timezone.utc)
+    return decided > asked or decided == asked and bool(getattr(decision, "from_ask", False))
 
 
 def view(item: dict) -> dict:
@@ -161,7 +173,7 @@ def active_keys(item: dict, bindings: Mapping[str, HandoffBinding]) -> list[str]
 
 def asking(state: dict, decisions: Mapping[str, object] | None, bindings: Mapping[str, HandoffBinding], *,
            row: str | None = None) -> list[dict]:
-    return [{**view(item), "keys": keys} for item in active(state, decisions)
+    return [{**view(item), "keys": keys} for item in active(state, decisions, bindings=bindings)
             if (row is None or item["row"] == row) and (keys := active_keys(item, bindings))]
 
 

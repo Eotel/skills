@@ -493,6 +493,13 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertNotIn(state_questions[0]["id"], [item["id"] for item in row["asking"]])
                 self.assertIn(questions[1]["question"], row["question"])
                 self.assertNotIn(questions[0]["question"], row["question"])
+                asking = self.run_tool("hourly_state.py", "asking")
+                self.assertEqual(asking.returncode, 0, asking.stderr)
+                self.assertEqual([item["id"] for item in json.loads(asking.stdout)], [state_questions[1]["id"]])
+                registered = self.run_tool("hourly_state.py", "pending")
+                self.assertEqual(registered.returncode, 0, registered.stderr)
+                self.assertEqual([item["id"] for item in json.loads(registered.stdout)["questions"]],
+                                 [state_questions[1]["id"]])
             else:
                 self.assertEqual(row["state"], "stopped_after_answer")
 

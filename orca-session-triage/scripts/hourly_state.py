@@ -595,10 +595,12 @@ def with_issue_states(items: list[dict]) -> None:
         item["related_issues_closed"] = bool(shown) and all(ref["state"] in CLOSED_STATES for ref in shown)
 
 
-def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision]) -> list[lead_decisions.Decision]:
-    asked_at = scan_sessions.parse_time(question.get("asked_at"))
+def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision],
+                     bindings: Mapping[str, ask_state.HandoffBinding] | None = None) -> list[lead_decisions.Decision]:
+    asked_at = question.get("asked_at")
     return [decisions[key] for key in question.get("covers") or [] if key in decisions
-            and asked_at and (at := scan_sessions.parse_time(decisions[key].decided_at)) is not None and at > asked_at]
+            and ask_state.same_bound_ask(question, (bindings or {}).get(key), key)
+            and asked_at and ask_state.answer_follows_question(decisions[key], asked_at)]
 
 
 def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision],
@@ -606,12 +608,12 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
     decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
     history = list(lead_decisions.handed_off(handoffs.expanduser()))
     bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id)
-    derived = {item.decision for item in history if item.decision in decisions and decisions[item.decision].from_ask}
+    derived = {item.decision for item in history if item.decision not in decisions or decisions[item.decision].from_ask}
     if derived:
         asks = {item["id"]: item for item in inbox_entries() if item.get("id") and item.get("kind") == "ask"}
         answers = lead_decisions.ask_answers(inbox_read.answers_path())
         for key in derived:
-            previous = decisions.pop(key)
+            previous = decisions.pop(key, None)
             ask_id = binding.ask_id if (binding := bindings.get(key)) else None
             if proof := lead_decisions.bound_handoff_answer(key, ask_id, answers, asks, state["questions"].values()):
                 parts = proof.get("answers", [proof])
@@ -619,7 +621,8 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
                 notes = list(dict.fromkeys(note for part in parts if (note := part.get("note"))))
                 if times and notes:
                     decided_at = max(times, key=datetime.fromisoformat)
-                    decisions[key] = lead_decisions.Decision(previous.id, key, "\n".join(notes), decided_at, from_ask=True)
+                    record_id = previous.id if previous else str(parts[0]["id"])
+                    decisions[key] = lead_decisions.Decision(record_id, key, "\n".join(notes), decided_at, from_ask=True)
     return decisions, bindings
 
 
@@ -1430,7 +1433,8 @@ def unrecorded_questions(data: dict, projects: Path, workspaces: list[Path]) -> 
 
 def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             answers: list[answer_evidence.Answer], now: datetime, entries: list[dict] | None = None,
-            unrecorded: list[dict] | None = None) -> dict[str, list[dict]]:
+            unrecorded: list[dict] | None = None, *,
+            bindings: Mapping[str, ask_state.HandoffBinding] | None = None) -> dict[str, list[dict]]:
     """Open items as lists, settled questions with evidence, transcript answers still missing from state, and the
     asked questions never recorded (`unrecorded`, from unrecorded_questions). An unanswered question carries
     `reissued` (withdrawn_by) from the inbox `entries`."""
@@ -1442,7 +1446,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             continue
         view = {"id": key, **item}
         asked_at = scan_sessions.parse_time(item["asked_at"])
-        covered = covering_answers(item, decisions)
+        covered = covering_answers(item, decisions, bindings)
         if item.get("withdrawn_at"):
             settled.append({**view, "state": "withdrawn", "since": item["withdrawn_at"],
                             "reason": item["withdrawal_reason"]})
@@ -2036,10 +2040,11 @@ def main(argv: list[str] | None = None) -> int:
                                      if item.get("asked_in"))
                 if lead := appointed_lead(data):
                     args.asked_in.append(lead)
-                decided, _ = current_decisions(data, args.decisions_file, lead_decisions.HANDED_OFF_LOG)
+                decided, bindings = current_decisions(data, args.decisions_file, lead_decisions.HANDED_OFF_LOG)
                 result = pending(data, decided,
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
-                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
+                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces),
+                                 bindings=bindings)
             elif args.action == "get":
                 key = args.id or args.item_id
                 result = next(({"id": key, **data[kind][key]} for kind in
