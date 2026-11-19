@@ -353,8 +353,8 @@ class AdoptionLedgerTests(unittest.TestCase):
         adoption = json.loads(self.run_ledger(["decide"], {"proposal_id": proposal_id, "decision": "adopt",
                                                            "actor": "Eotel"}).stdout)["id"]
 
-        def record(outcome: str, actor: str, result: str) -> None:
-            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id, "decision_id": adoption,
+        def record(outcome: str, actor: str, result: str, decision_id: str = adoption) -> None:
+            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id, "decision_id": decision_id,
                                                     "outcome": outcome, "actor": actor, "result": result})
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
 
@@ -375,6 +375,14 @@ class AdoptionLedgerTests(unittest.TestCase):
         done = owner()
         self.assertEqual(done[:4], [proposal_id, "adopted", "担当 next-lane", "指示書 なし"])
         self.assertRegex(done[4], r"^実施 済 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        held = self.run_ledger(["decide", "--expected-adoption-id", adoption], {
+            "proposal_id": proposal_id, "decision": "hold", "actor": "Eotel"})
+        self.assertEqual(held.returncode, 0, held.stderr)
+        revoke_id = json.loads(held.stdout)["after_id"]
+        record("failed", "triage-retro", "target skill is missing", revoke_id)
+        self.assertRegex(owner()[4], r"^実施 失敗 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        record("reverted", "triage-retro", "removed adopted line", revoke_id)
+        self.assertRegex(owner()[4], r"^実施 戻した \d{4}-\d\d-\d\dT\d\d:\d\d$")
         unknown = self.run_ledger(["owner", "00000000"])
         self.assertEqual((unknown.returncode, unknown.stdout), (1, ""))
         self.assertIn("00000000", unknown.stderr)

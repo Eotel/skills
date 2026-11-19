@@ -343,8 +343,8 @@ def owner_view(item: Proposal) -> dict:
     brief = found.group(1) if lanes and (found := BRIEF.search(lanes[-1]["result"])) else None
     current = item["current_execution"] or {}
     state = (f"戻した {item['reverted_at'][:16]}" if item["reverted_at"]
-             else f"済 {item['implemented_at'][:16]}" if item["implemented_at"]
-             else f"失敗 {current['ts'][:16]}" if current.get("outcome") == "failed" else "未")
+             else f"失敗 {current['ts'][:16]}" if current.get("outcome") == "failed"
+             else f"済 {item['implemented_at'][:16]}" if item["implemented_at"] else "未")
     return {"proposal_id": item["proposal_id"], "status": item["status"], "owner": holder and holder["actor"],
             "brief": brief, "state": state}
 

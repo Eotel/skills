@@ -336,7 +336,13 @@ class RetroTests(unittest.TestCase):
                                "target": "triage-retro:skill:orca-session-triage:fact"})
         body = {"proposal_id": item["proposal_id"], "actor": "human"}
         data = retro.load(self.state)
-        ledger.decide({**body, "decision": "adopt"})
+        first = ledger.decide({**body, "decision": "adopt", "reason": "Rewrite the note."})
+        with (mock.patch.object(retro, "run_claude", return_value={"note": "Rewritten note."}),
+              mock.patch.object(ledger, "record", side_effect=subprocess.TimeoutExpired("ledger record", 30)),
+              self.assertRaises(subprocess.TimeoutExpired)):
+            retro.sync_decisions(ledger, data, self.root, self.state)
+        first_checkpoint = retro.load(self.state)["applied_action_ids"][item["proposal_id"]]
+        self.assertEqual(first_checkpoint["decision_id"], first["id"])
         self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
         first_revoke = ledger.decide({**body, "decision": "revoke"})
         second = ledger.decide({**body, "decision": "adopt", "reason": "Rewrite the note."})
@@ -350,6 +356,9 @@ class RetroTests(unittest.TestCase):
             retro.sync_decisions(ledger, data, self.root, self.state)
         facts = retro.facts_path(self.target)
         self.assertIn("Rewritten note.", facts.read_text())
+        data = retro.load(self.state)
+        data["applied_action_ids"][item["proposal_id"]] = first_checkpoint
+        retro.save(data, self.state)
         latest = ledger.call("decide", {**body, "decision": "hold"}, "--expected-adoption-id", second["id"])
         self.assertEqual(retro.sync_decisions(ledger, retro.load(self.state), self.root, self.state), 1)
         item = ledger.list()[0]
@@ -357,6 +366,7 @@ class RetroTests(unittest.TestCase):
         self.assertEqual(item["executions"][-1]["decision_id"], latest["after_id"])
         self.assertEqual(item["executions"][-1]["outcome"], "reverted")
         self.assertFalse(facts.exists())
+        self.assertEqual(retro.sync_decisions(ledger, retro.load(self.state), self.root, self.state), 0)
 
     def test_policy_change_waits_for_a_button(self) -> None:
         proposal = sample_candidate()
