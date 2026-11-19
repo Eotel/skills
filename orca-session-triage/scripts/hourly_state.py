@@ -649,6 +649,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     closed_ids = [*answered_ids, *withdrawn]
     handoff_refs = {item.decision: ask_state.handoff_ref(item.ask_id, item.decision, known_asks,
                                                         state.get("questions", {}).values()) for item in handed}
+    bound_asks = {item.decision: item.ask_id for item in handed if item.ask_id}
     handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
                          for item in handed}
     if closed_ids:
@@ -657,7 +658,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 return True
             if cover in handoff_refs:
                 ref = handoff_refs[cover]
-                return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
+                return bool(ref and (not ask_state.same_bound_ask(item, bound_asks.get(cover))
+                                     or ask_state.covered(ref, closed_ids, known_asks)))
             bound = ask_state.registered_ask_id(item, cover)
             ref = ask_state.handoff_ref(bound, cover, known_asks, [item]) if bound else None
             return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
@@ -741,7 +743,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         view["waiting_reports"] = received
         if sources := scan_sessions.question_sources(row, entries):
             view["question_sources"] = sources
-        view["asking"] = ask_state.for_row(state, identity, latest_decisions)
+        view["asking"] = ask_state.for_row(state, identity, latest_decisions, bindings=bound_asks)
         if undecided:
             view.update(undecided_proposals=undecided, undecided_count=len(undecided))
         if blocked_by_user(row):

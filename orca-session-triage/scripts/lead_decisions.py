@@ -544,16 +544,18 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     questions = (state or {}).get("questions", {}).values()
     settled = []
     last = {}
+    bound_asks = {key: item.ask_id for key, items in history.items() for item in items if item.ask_id}
     for key in keys:
         item = history[key][-1] if key in history else None
-        bound = next((entry for entry in reversed(history.get(key, [])) if entry.ask_id), None)
-        decision = decision_for_handoff(answered[key].view() if key in answered else None, bound.ask_id if bound else None)
+        latest_id = bound_asks.get(key)
+        decision = decision_for_handoff(answered[key].view() if key in answered else None, latest_id)
         answer = decision
         if answer is None:
-            latest_id = bound.ask_id if bound else None
             bindings = [latest_id] if latest_id else []
-            if not bindings and ask_state.reference(key, ask_entries) is None:
-                bindings = [ref for question in active if (ref := ask_state.registered_ask_id(question["record"], key))]
+            if not bindings:
+                named_ref = ask_state.reference(key, ask_entries)
+                bindings = [ref for question in active if (ref := ask_state.registered_ask_id(question["record"], key))
+                            and (not named_ref or ask_state.same_bound_ask(question["record"], named_ref[0]))]
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
                                       if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
             for ref in refs:
@@ -581,7 +583,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         row = {"decision": key, "handed_off_at": at,
                "first_handed_off_at": history[key][0].handed_off_at if item else None,
                "handoff_count": len(history.get(key, [])), "prs": views}
-        if state is not None and (asking := ask_state.for_key(state, key, entries)):
+        if state is not None and (asking := ask_state.for_key(state, key, entries, bound_asks.get(key))):
             row["asking"] = asking
         candidates = [found for entry in history.get(key, [])
                       if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))

@@ -63,6 +63,15 @@ def registered_ask_id(question: dict, key: str) -> str | None:
     return None
 
 
+def same_bound_ask(question: dict, ask_id: str | None) -> bool:
+    if not ask_id or not (registered := question.get("ask_id")):
+        return True
+    new, _, new_part = ask_id.partition(":")
+    old, _, old_part = registered.partition(":")
+    same = inbox_read.names(new, old) or inbox_read.names(old, new)
+    return same and (not new_part or not old_part or bool(set(new_part.split("+")) & set(old_part.split("+"))))
+
+
 def covered(ref: tuple[str, frozenset[int]], ids: list[str], entries: list[dict]) -> bool:
     """Whether the supplied answers cover this reference, including all numbered parts of a whole ask."""
     ask_id, numbers = ref
@@ -95,15 +104,21 @@ def view(item: dict) -> dict:
     return {key: value for key, value in item.items() if key != "record"}
 
 
-def for_row(state: dict, row: str, decisions: Mapping[str, object] | None = None) -> list[dict]:
-    return [view(item) for item in active(state, decisions) if item["row"] == row]
+def for_row(state: dict, row: str, decisions: Mapping[str, object] | None = None, *,
+            bindings: Mapping[str, str | None] | None = None) -> list[dict]:
+    result = []
+    for item in active(state, decisions):
+        if item["row"] == row and (keys := [key for key in item["keys"]
+                                           if same_bound_ask(item["record"], (bindings or {}).get(key))]):
+            result.append({**view(item), "keys": keys})
+    return result
 
 
-def for_key(state: dict, key: str, entries: list[dict]) -> list[dict]:
+def for_key(state: dict, key: str, entries: list[dict], ask_id: str | None = None) -> list[dict]:
     ref = reference(key, entries)
-    return [view(item) for item in active(state) if key in item["keys"] or ref and any(
+    return [view(item) for item in active(state) if same_bound_ask(item["record"], ask_id) and (key in item["keys"] or ref and any(
         other[0] == ref[0] and (not other[1] or not ref[1] or bool(other[1] & ref[1]))
-        for other in references(item["record"], entries))]
+        for other in references(item["record"], entries)))]
 
 
 def same_workspace(by: str, cwd: str) -> bool:
