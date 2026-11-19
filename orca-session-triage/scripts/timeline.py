@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -573,13 +573,12 @@ def timeline(records: Records, host: SessionHost, window: Window, lane: str | No
                   key=lambda event: event.at)
 
 
-def moment(value: str) -> datetime:
-    now = datetime.now(JST)
+def moment(value: str, now: datetime) -> datetime:
     if relative := re.fullmatch(r"(\d+)([mhd])", value):
         unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
         return now - timedelta(**{unit: int(relative[1])})
     if re.fullmatch(r"\d{1,2}:\d{2}", value):
-        return datetime.combine(now.date(), time.fromisoformat(value.zfill(5)), JST)
+        return inbox_read.since_time(value.zfill(5), now=now)
     parsed = when(value)
     if parsed is None:
         raise argparse.ArgumentTypeError(f"時刻が読めません: {value}（例: 16:30、2026-11-15T16:30、3h）")
@@ -587,20 +586,28 @@ def moment(value: str) -> datetime:
 
 
 def main(argv: list[str] | None = None) -> int:
+    now = datetime.now(JST)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--since", required=True, type=moment,
-                        help="この時刻から（16:30 は今日、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
-    parser.add_argument("--until", type=moment, help="この時刻まで（--since と同じ書き方。省くと今まで）")
+    parser.add_argument("--since", required=True, type=lambda value: moment(value, now),
+                        help="この時刻から（16:30 は直近の過去の 16:30、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
+    parser.add_argument("--until", type=lambda value: moment(value, now),
+                        help="この時刻まで（--since と同じ書き方。省くと今まで）")
     parser.add_argument("--lane", help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle）")
     parser.add_argument("--match", help="本文にこの文字列を含む出来事だけ（大文字と小文字を区別しない）")
     parser.add_argument("--json", action="store_true", help="1 件 1 オブジェクトの JSON の配列で、本文を全文出す")
     parser.add_argument("--orca", default="orca", help="Orca の CLI（既定: orca）")
     args = parser.parse_args(argv)
 
-    host = OrcaHost.from_environment(args.orca)
-    events = timeline(Records.from_environment(), host, Window(args.since, args.until), args.lane)
-    if args.match:
-        events = [event for event in events if args.match.casefold() in event.text.casefold()]
+    until = args.until or now
+    reason = "--since が未来" if args.since > now else "--since が --until より後" if args.since > until else None
+    events: list[Event] = []
+    if reason is None:
+        host = OrcaHost.from_environment(args.orca)
+        events = timeline(Records.from_environment(), host, Window(args.since, until), args.lane)
+        if args.match:
+            events = [event for event in events if args.match.casefold() in event.text.casefold()]
+    if not events:
+        print("0 件" + (f"（{reason}）" if reason else "（指定した条件に該当するイベントなし）"), file=sys.stderr)
     if args.json:
         print(json.dumps([event.row() for event in events], ensure_ascii=False, indent=2))
     else:

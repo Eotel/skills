@@ -6675,6 +6675,21 @@ class HourlyStateTests(unittest.TestCase):
             self.call("promise", "--from-row", "/w/a", "--to-row", "/w/d", "--condition", "x", "--task", "y",
                       "--not-before", "11/17")
 
+    def test_a_saved_scan_resolves_question_and_owner_names(self) -> None:
+        saved = self.source("scan.json", json.dumps([
+            {"path": "/w/app/lane", "repo": "app"},
+            {"path": "/w/other/second", "repo": "other"},
+        ]))
+        message = self.source("message.txt", "Ready.")
+        _, question = self.call("asked", "--row", "app/lane", "--from", saved, "--decision", "publish",
+                                "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, item = self.call("presented", "--owner", "second", "--from", saved, "--key", "user:publish",
+                            "--text-file", message, "--since", "2026-11-19T00:00:00Z")
+
+        self.assertEqual(question["row"], "/w/app/lane")
+        self.assertEqual(item["owner"], "/w/other/second")
+        self.assertEqual(self.call("get", question["id"]), self.call("get", "--id", question["id"]))
+
     def test_an_item_the_hourly_report_listed_stays_presented_until_an_answer_a_decision_or_its_start(self) -> None:
         saved = self.root / "scan.json"
         saved.write_text("[]")

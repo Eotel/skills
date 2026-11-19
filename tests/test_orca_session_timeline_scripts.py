@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -95,6 +96,20 @@ class TimelineTests(unittest.TestCase):
                       lines[1])
         self.assertIn("16:36:44  triage-lead → fix-checklist  送った  取り消しです。", lines[2])
         self.assertIn("16:51:43  fix-checklist  完了が届いた", lines[3])
+
+    def test_wall_clock_uses_the_most_recent_past_date(self) -> None:
+        jst = timezone(timedelta(hours=9))
+        now = datetime.now(jst)
+        previous = now - timedelta(hours=23, minutes=58)
+        self.append(".cache/orca-briefs/triage-inbox.jsonl",
+                    self.report(previous.isoformat(), LANE, "fix-checklist", "info", "直近の指定時刻のあと"))
+
+        result = self.run_tool("--since", (previous - timedelta(minutes=1)).strftime("%H:%M"), "--json")
+
+        self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["直近の指定時刻のあと"])
+        future = self.run_tool("--since", (now + timedelta(days=1)).isoformat(), "--json")
+        self.assertEqual(json.loads(future.stdout), [])
+        self.assertIn("0 件（--since が未来）", future.stderr)
 
     def test_a_lane_filter_keeps_every_instruction_to_that_lane_in_order(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",

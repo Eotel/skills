@@ -217,6 +217,7 @@ def origin_slug(path: str) -> str | None:
 def scan_keys(worktree: dict) -> dict:
     """An Orca worktree under the key names a scan row gives the same facts."""
     return {"path": worktree["path"], "environment": worktree.get("_environment"), "repo": worktree.get("repo"),
+            "other_repos": worktree.get("_other_repos") or [],
             "linked_pr": worktree.get("linkedPR"), "linked_issue": worktree.get("linkedIssue"),
             "linked_items": worktree.get("linkedItems") or []}
 
@@ -866,6 +867,15 @@ def owner_name(value: str) -> str:
     if not owner or not Path(path if separator else owner).is_absolute() or (separator and not environment):
         raise ValueError("owner must be a scan row identity: PATH or ENVIRONMENT::PATH")
     return owner
+
+
+def selected_worktree(value: str, scan_file: str | None, orca: str, option: str) -> str:
+    try:
+        return owner_name(value)
+    except ValueError:
+        pass
+    rows = scan_sessions.saved_rows(scan_file) if scan_file else [scan_keys(row) for row in orca_worktrees(orca)]
+    return scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option))
 
 
 def repository_names(owner: str) -> frozenset[str]:
@@ -1571,7 +1581,9 @@ def main(argv: list[str] | None = None) -> int:
     pending_command.add_argument("--summary", action="store_true", help="print one line per item with its age and question")
     answer_evidence.add_arguments(pending_command)
     get = commands.add_parser("get", help="read one saved question, handoff, request, user wait, or left row")
-    get.add_argument("--id", required=True)
+    get_id = get.add_mutually_exclusive_group(required=True)
+    get_id.add_argument("item_id", nargs="?", metavar="ID")
+    get_id.add_argument("--id")
     appoint = commands.add_parser("appoint-lead", help="record the appointed lead's worktree, replacing an earlier one")
     appoint.add_argument("--worktree", type=Path, required=True, metavar="PATH")
     appoint.add_argument("--appointed-at", metavar="ISO", help="original ISO 8601 appointment time (saved in UTC)")
@@ -1667,7 +1679,8 @@ def main(argv: list[str] | None = None) -> int:
     asked = commands.add_parser(
         "asked", help="record the exact question before presenting it; for each issue it names, print the PRs that "
                       "close or name it merged after what the question rests on (merged_after_basis)")
-    asked.add_argument("--row", required=True)
+    asked.add_argument("--row", required=True, help="a scan row identity, unique worktree name, or repository/name")
+    asked.add_argument("--from", dest="from_file", metavar="SCAN_JSON", help="resolve worktree names using a saved scan")
     asked.add_argument("--decision", required=True, help="stable subject and action, e.g. merge:PR#10")
     asked.add_argument("--final-message-file", required=True)
     asked.add_argument("--question-file", required=True)
@@ -1724,7 +1737,10 @@ def main(argv: list[str] | None = None) -> int:
     presented.add_argument("--text-file", required=True, help="the item as the report put it, in a UTF-8 file")
     presented.add_argument("--since", required=True, help="ISO 8601 time with offset the item began waiting")
     presented.add_argument("--link", help="the issue, PR, or ticket URL the report linked")
-    presented.add_argument("--owner", help="the scan row identity (PATH or ENVIRONMENT::PATH) of the lane it holds up")
+    presented.add_argument("--owner", help="the row identity, unique worktree name, or repository/name of the owner")
+    presented.add_argument("--from", dest="from_file", metavar="SCAN_JSON", help="resolve worktree names using a saved scan")
+    presented.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                           help="Orca CLI used to resolve a worktree name without --from")
     presented.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                            help="the lead's decision log, read to tell a settled key from an open one")
     presented_close = commands.add_parser(
@@ -1820,6 +1836,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     try:
+        if args.action == "asked":
+            args.row = selected_worktree(args.row, args.from_file, args.orca, "--row")
+        if args.action == "presented" and args.owner is not None:
+            args.owner = selected_worktree(args.owner, args.from_file, args.orca, "--owner")
         path.parent.mkdir(parents=True, exist_ok=True)
         live: frozenset[str] = frozenset()
         intake: Intake | None = None
@@ -1870,12 +1890,13 @@ def main(argv: list[str] | None = None) -> int:
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
                                  inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
             elif args.action == "get":
-                result = next(({"id": args.id, **data[kind][args.id]} for kind in
+                key = args.id or args.item_id
+                result = next(({"id": key, **data[kind][key]} for kind in
                                ("questions", "handoffs", "requests", "user_waits", "presented", "left")
-                               if args.id in data[kind]),
+                               if key in data[kind]),
                               None)
                 if result is None:
-                    raise ValueError(f"unknown id: {args.id}")
+                    raise ValueError(f"unknown id: {key}")
             elif args.action == "asked-many":
                 inbox = Inbox(args.from_file)
                 askings = checked_lines(given, lambda raw: asking_line(raw, inbox))
@@ -1926,7 +1947,7 @@ def main(argv: list[str] | None = None) -> int:
                     skipped = True
                     notices.append(f"記録しなかった: 既存 {item['id']}（取り下げ済み）"
                                    + (f"。置き換え先: {item['replaced_by']}" if item.get("replaced_by") else ""))
-    except (OSError, ValueError, KeyError, TypeError, CommitmentWriteError) as error:
+    except (*READ_ERRORS, CommitmentWriteError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
     if args.action == "asking" and args.summary and isinstance(result, list):
