@@ -3973,10 +3973,10 @@ def batch_requirement(row: dict) -> str | None:
     return None
 
 
-def decision_environment(decisions_file: Path) -> list[str]:
+def decision_options(decisions_file: Path) -> list[str]:
     if decisions_file.expanduser().absolute() == LEAD_DECISIONS.expanduser():
         return []
-    return ["env", f"TRIAGE_LEAD_DECISIONS={decisions_file.expanduser().absolute()}"]
+    return ["--decisions-file", str(decisions_file.expanduser().absolute())]
 
 
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False,
@@ -3998,7 +3998,7 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
-    return shlex.join([*(decision_environment(decisions_file) if scan_file else []), str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
+    return shlex.join([str(RM_CHECK_BATCH), *(decision_options(decisions_file) if scan_file else []), *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None, *,
@@ -4305,7 +4305,7 @@ def print_rm_specs(specs: list[str], scan_file: Path, decisions_file: Path) -> N
         print(spec)
     if specs:
         sys.stdout.flush()
-        print(shlex.join([*decision_environment(decisions_file), str(RM_CHECK_BATCH), "--from", str(scan_file),
+        print(shlex.join([str(RM_CHECK_BATCH), *decision_options(decisions_file), "--from", str(scan_file),
                           "--remove-ok", "--summary", *specs]),
               file=sys.stderr)
 

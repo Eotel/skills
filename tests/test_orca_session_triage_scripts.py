@@ -3019,7 +3019,8 @@ class ScanCommandTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
             command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
-            self.assertIn("TRIAGE_LEAD_DECISIONS=" + str(decisions), shlex.split(command))
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
 
     def test_unstructured_keep_and_conditional_answers_get_no_approval_command(self) -> None:
         for answer in ("保持してください。", "アーカイブ後、閉じる。", "not ready to remove",
