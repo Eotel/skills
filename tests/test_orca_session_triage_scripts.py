@@ -3010,7 +3010,7 @@ class ScanCommandTests(unittest.TestCase):
                "open_pr_cleanup": True,
                "removal_decision": {"archive_path": [".cache/notes.txt"], "answer": "削除してよい。",
                                     "decided_at": "2026-11-19T12:00:00Z"}}
-        with patch.object(scan, "batch_help", return_value="--preview  recorded archive_path"):
+        with patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"):
             with redirect_stdout(io.StringIO()) as out:
                 scan.print_summary([row], {})
             self.assertNotIn("--remove-ok", out.getvalue())
@@ -3021,10 +3021,16 @@ class ScanCommandTests(unittest.TestCase):
             command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
             args = shlex.split(command)
             self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
+            with patch.object(scan, "LEAD_DECISIONS", decisions), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
 
     def test_unstructured_keep_and_conditional_answers_get_no_approval_command(self) -> None:
         for answer in ("保持してください。", "アーカイブ後、閉じる。", "not ready to remove",
-                       "remove it after the experiment finishes", "タブだけ閉じる。"):
+                       "remove it after the experiment finishes", "タブだけ閉じる。",
+                       "作業記録をアーカイブして、閉じる。", "タブを閉じて。作業場はそのまま。"):
             with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as err:
                 scan.print_removal_approval_hint(
                     {"path": "/w/app/test", "repo": "app", "removal_decision":
@@ -3096,11 +3102,12 @@ class ScanCommandTests(unittest.TestCase):
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
                "open_pr_cleanup": True, "pr": {"number": 10}}
         with patch.object(scan, "batch_has_preview", return_value=False):
-            local = shlex.split(scan.rm_check_command(row, saved))
+            local = shlex.split(scan.rm_check_command(row, saved, decisions_file=scan.LEAD_DECISIONS))
             remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
             remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
             spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
-        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
+        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary",
+                                 "--decisions-file", str(scan.LEAD_DECISIONS), "/w/app/案件", "10"])
         self.assertEqual(remote[-1], "/w/app/案件 10")
         self.assertNotIn("--preview", remote)
         self.assertNotIn("--detach-nested", remote)
@@ -4125,7 +4132,8 @@ class ScanCommandTests(unittest.TestCase):
                     if row.get("open_pr_cleanup") or host:
                         expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
                     else:
-                        expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
+                        expected = [str(scan.RM_CHECK), *options, "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:

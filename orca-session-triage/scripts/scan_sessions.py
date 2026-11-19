@@ -3973,21 +3973,32 @@ def batch_requirement(row: dict) -> str | None:
     return None
 
 
+BATCH_DECISIONS_REQUIREMENT = "--decisions-file に対応した Harness が必要です"
+
+
 def decision_options(decisions_file: Path) -> list[str]:
-    if decisions_file.expanduser().absolute() == LEAD_DECISIONS.expanduser():
-        return []
     return ["--decisions-file", str(decisions_file.expanduser().absolute())]
 
 
+def batch_decision_options(decisions_file: Path) -> list[str]:
+    if "--decisions-file" in batch_help():
+        return decision_options(decisions_file)
+    if decisions_file.expanduser().absolute() != LEAD_DECISIONS.expanduser():
+        raise ValueError(BATCH_DECISIONS_REQUIREMENT)
+    return []
+
+
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False,
-                     decisions_file: Path = LEAD_DECISIONS) -> str:
+                     decisions_file: Path | None = None) -> str:
     """A one-line check for this row, using the saved scan's timestamp when available."""
+    decisions_file = decisions_file or Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or LEAD_DECISIONS)
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
     options = [*from_scan, "--summary"]
     plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
     if not remove_ok and not plan_cleanup and not environment:
-        return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
+        return shlex.join([str(RM_CHECK), *options, *decision_options(decisions_file),
+                           row["path"], str(pr_number(row) or "-")])
     if requirement := batch_requirement(row):
         return requirement
     if not batch_has_preview():
@@ -3998,7 +4009,11 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
-    return shlex.join([str(RM_CHECK_BATCH), *(decision_options(decisions_file) if scan_file else []), *(["--host", environment] if environment else []), *options, rm_spec(row)])
+    try:
+        log_options = batch_decision_options(decisions_file) if scan_file else []
+    except ValueError as error:
+        return str(error)
+    return shlex.join([str(RM_CHECK_BATCH), *log_options, *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None, *,
@@ -4249,11 +4264,10 @@ def wake_line(row: dict, stop: StopReason) -> str:
 
 def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
     answer = row.get("removal_decision") or {}
-    if (not answer.get("decision") or not answer.get("answer") or removal_approved(row)
-            or answer.get("after") or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
-            or DEFER_REMOVAL.search(answer["answer"]) or KEEP_DECISION.search(answer["answer"])
-            or re.search(r"タブ(?:だけ|のみ)|後[、。\s]|\b(?:if|until|after|before|unless|not|only)\b",
-                         answer["answer"], re.IGNORECASE)):
+    if (not answer.get("decision") or removal_approved(row) or answer.get("after")
+            or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
+            or not re.fullmatch(r"\s*(?:閉じる|閉じてください|close it)[。.!]?\s*",
+                                answer.get("answer") or "", re.IGNORECASE)):
         return
     target = row_identity(row) if row.get("environment") else f"local::{row['path']}"
     command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), "--decisions-file",
@@ -4305,9 +4319,13 @@ def print_rm_specs(specs: list[str], scan_file: Path, decisions_file: Path) -> N
         print(spec)
     if specs:
         sys.stdout.flush()
-        print(shlex.join([str(RM_CHECK_BATCH), *decision_options(decisions_file), "--from", str(scan_file),
-                          "--remove-ok", "--summary", *specs]),
-              file=sys.stderr)
+        try:
+            log_options = batch_decision_options(decisions_file)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return
+        print(shlex.join([str(RM_CHECK_BATCH), *log_options, "--from", str(scan_file),
+                          "--remove-ok", "--summary", *specs]), file=sys.stderr)
 
 
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:

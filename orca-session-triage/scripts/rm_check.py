@@ -1637,7 +1637,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         key = "remove:" + worktree
         answer = None
         try:
-            answer = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())).get(key)
+            decisions = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
+            answer = max((entry for name in (key, f"remove:local::{worktree}") if (entry := decisions.get(name))),
+                         key=lambda entry: lead_decisions.moment(entry.decided_at) or datetime.min.replace(tzinfo=timezone.utc),
+                         default=None)
+            if answer is not None:
+                key = answer.decision
         except (OSError, ValueError) as error:
             notes.append("lead decisions could not be read: %s" % error)
         if answer is None:
