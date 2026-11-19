@@ -3500,8 +3500,6 @@ def row_line(view: dict) -> str:
 
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
-RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
-# Runs rm_check.py on another Mac over ssh; see references/cleanup.md.
 RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
 
 
@@ -3510,24 +3508,20 @@ def pr_number(row: dict) -> int | None:
 
 
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
-    """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it.
-    Another Mac's row is checked on that Mac through rm-check-batch --host."""
+    """A one-line check for this row, using the saved scan's timestamp when available."""
     pr = pr_number(row)
-    if row.get("open_pr_cleanup") and remove_ok:
-        return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
-                           *(["--from", str(scan_file)] if scan_file else []),
-                           "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {pr or '-'}"])
-    if row.get("environment"):
-        return shlex.join([str(RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {pr or '-'}"])
-    return shlex.join([str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
-                       *(["--from", str(scan_file)] if scan_file else [])])
+    return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
+                       *(["--from", str(scan_file)] if scan_file else []), "--summary",
+                       *(["--detach-nested", "--archive-scratch", "--remove-ok"]
+                         if row.get("open_pr_cleanup") and remove_ok else []),
+                       f"{row['path']} {pr or '-'}"])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown.
 
     With the saved scan's path, a row with closable tabs includes the close_tabs.py command that closes them
-    once nothing moved after the scan. Finished and open_pr_cleanup rows include their rm_check.py command.
+    once nothing moved after the scan. Finished and open_pr_cleanup rows include a removal check command.
     """
     lead = f"{row_name(row)} | {class_label((row.get('verdict') or {}).get('class') or row['class'], row['class'])}"
     where = ["--environment", row["environment"]] if row.get("environment") else []

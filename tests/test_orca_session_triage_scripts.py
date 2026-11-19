@@ -3388,14 +3388,12 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
-                    if view == "--summary" and row.get("open_pr_cleanup"):
-                        expected = [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                                    "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {number or '-'}"]
-                    elif row.get("environment"):
-                        expected = [str(scan.RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {number or '-'}"]
-                    else:
-                        expected = [str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
-                                    *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
+                    expected = [str(scan.RM_CHECK_BATCH),
+                                *(["--host", row["environment"]] if row.get("environment") else []),
+                                "--from", str(saved.absolute()), "--summary",
+                                *(["--detach-nested", "--archive-scratch", "--remove-ok"]
+                                  if view == "--summary" and row.get("open_pr_cleanup") else []),
+                                f"{row['path']} {number or '-'}"]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
@@ -3419,7 +3417,9 @@ class ScanCommandTests(unittest.TestCase):
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
-        self.assertIn(f"mbp16::far: left out: on another Mac: {scan.RM_CHECK_BATCH} --host mbp16 '/w/app/far -'", err)
+        self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
+            str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
+            "--summary", "/w/app/far -"]), err)
         self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
 
     def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
