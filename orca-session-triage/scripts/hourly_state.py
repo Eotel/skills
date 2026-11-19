@@ -217,7 +217,6 @@ def origin_slug(path: str) -> str | None:
 def scan_keys(worktree: dict) -> dict:
     """An Orca worktree under the key names a scan row gives the same facts."""
     return {"path": worktree["path"], "environment": worktree.get("_environment"), "repo": worktree.get("repo"),
-            "other_repos": worktree.get("_other_repos") or [],
             "linked_pr": worktree.get("linkedPR"), "linked_issue": worktree.get("linkedIssue"),
             "linked_items": worktree.get("linkedItems") or []}
 
@@ -869,12 +868,14 @@ def owner_name(value: str) -> str:
     return owner
 
 
-def selected_worktree(value: str, scan_file: str | None, orca: str, option: str) -> str:
+def selected_worktree(value: str, scan_file: str | None, option: str) -> str:
     try:
         return owner_name(value)
     except ValueError:
         pass
-    rows = scan_sessions.saved_rows(scan_file) if scan_file else [scan_keys(row) for row in orca_worktrees(orca)]
+    if scan_file is None:
+        raise ValueError(f"{option} {value}: use --from SCAN_JSON to resolve a worktree name")
+    rows = scan_sessions.saved_rows(scan_file)
     return scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option))
 
 
@@ -1739,8 +1740,6 @@ def main(argv: list[str] | None = None) -> int:
     presented.add_argument("--link", help="the issue, PR, or ticket URL the report linked")
     presented.add_argument("--owner", help="the row identity, unique worktree name, or repository/name of the owner")
     presented.add_argument("--from", dest="from_file", metavar="SCAN_JSON", help="resolve worktree names using a saved scan")
-    presented.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
-                           help="Orca CLI used to resolve a worktree name without --from")
     presented.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                            help="the lead's decision log, read to tell a settled key from an open one")
     presented_close = commands.add_parser(
@@ -1837,9 +1836,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         if args.action == "asked":
-            args.row = selected_worktree(args.row, args.from_file, args.orca, "--row")
+            args.row = selected_worktree(args.row, args.from_file, "--row")
         if args.action == "presented" and args.owner is not None:
-            args.owner = selected_worktree(args.owner, args.from_file, args.orca, "--owner")
+            args.owner = selected_worktree(args.owner, args.from_file, "--owner")
         path.parent.mkdir(parents=True, exist_ok=True)
         live: frozenset[str] = frozenset()
         intake: Intake | None = None

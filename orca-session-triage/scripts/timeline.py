@@ -47,6 +47,7 @@ from commitment_store import hold_rows, read_lines
 
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
+WALL_CLOCK = re.compile(r"\d{1,2}:\d{2}")
 # Transcripts only grow, so reading starts this far before --since: a call may finish well after it began, and
 # Claude Code lets a foreground Bash call run for up to two hours.
 CALL_SLACK = timedelta(hours=2)
@@ -577,8 +578,11 @@ def moment(value: str, now: datetime) -> datetime:
     if relative := re.fullmatch(r"(\d+)([mhd])", value):
         unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
         return now - timedelta(**{unit: int(relative[1])})
-    if re.fullmatch(r"\d{1,2}:\d{2}", value):
-        return inbox_read.since_time(value.zfill(5), now=now)
+    if WALL_CLOCK.fullmatch(value):
+        try:
+            return inbox_read.since_time(value.zfill(5), now=now)
+        except argparse.ArgumentTypeError:
+            pass
     parsed = when(value)
     if parsed is None:
         raise argparse.ArgumentTypeError(f"時刻が読めません: {value}（例: 16:30、2026-11-15T16:30、3h）")
@@ -590,15 +594,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--since", required=True, type=lambda value: moment(value, now),
                         help="この時刻から（16:30 は直近の過去の 16:30、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
-    parser.add_argument("--until", type=lambda value: moment(value, now),
-                        help="この時刻まで（--since と同じ書き方。省くと今まで）")
+    parser.add_argument("--until", help="この時刻まで（時刻だけの指定で範囲が逆転する場合は当日。省くと今まで）")
     parser.add_argument("--lane", help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle）")
     parser.add_argument("--match", help="本文にこの文字列を含む出来事だけ（大文字と小文字を区別しない）")
     parser.add_argument("--json", action="store_true", help="1 件 1 オブジェクトの JSON の配列で、本文を全文出す")
     parser.add_argument("--orca", default="orca", help="Orca の CLI（既定: orca）")
     args = parser.parse_args(argv)
 
-    until = args.until or now
+    until = now
+    if args.until is not None:
+        try:
+            until = moment(args.until, now)
+        except argparse.ArgumentTypeError as error:
+            parser.error(f"--until: {error}")
+        if WALL_CLOCK.fullmatch(args.until) and until < args.since and until.date() < now.date():
+            until += timedelta(days=1)
     reason = "--since が未来" if args.since > now else "--since が --until より後" if args.since > until else None
     events: list[Event] = []
     if reason is None:

@@ -2,7 +2,6 @@
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -63,8 +62,21 @@ class TimelineTests(unittest.TestCase):
         return {"id": report_id or f"report-{ts}", "host": "mac", "ts": ts, "worktree": worktree,
                 "repo": "app", "handle": handle, "kind": kind, "text": text}
 
-    def run_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=self.env)
+    def run_tool(self, *args: str, clock: str | None = None) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, str(SCRIPT), *args]
+        if clock is not None:
+            code = """\
+from datetime import datetime
+import sys
+from unittest.mock import patch
+import timeline
+
+with patch.object(timeline, "datetime", wraps=datetime) as fixed:
+    fixed.now.return_value = datetime.fromisoformat(sys.argv[1])
+    sys.exit(timeline.main(sys.argv[2:]))
+"""
+            command = [sys.executable, "-c", code, clock, *args]
+        result = subprocess.run(command, capture_output=True, text=True, env=self.env, cwd=SCRIPT.parent)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -98,16 +110,17 @@ class TimelineTests(unittest.TestCase):
         self.assertIn("16:51:43  fix-checklist  完了が届いた", lines[3])
 
     def test_wall_clock_uses_the_most_recent_past_date(self) -> None:
-        jst = timezone(timedelta(hours=9))
-        now = datetime.now(jst)
-        previous = now - timedelta(hours=23, minutes=58)
+        clock = "2026-11-19T16:00:00+09:00"
         self.append(".cache/orca-briefs/triage-inbox.jsonl",
-                    self.report(previous.isoformat(), LANE, "fix-checklist", "info", "直近の指定時刻のあと"))
+                    self.report("2026-11-18T23:30:00+09:00", LANE, "fix-checklist", "info", "前日の記録"),
+                    self.report("2026-11-19T15:30:00+09:00", LANE, "fix-checklist", "info", "当日の記録"))
 
-        result = self.run_tool("--since", (previous - timedelta(minutes=1)).strftime("%H:%M"), "--json")
+        previous = self.run_tool("--since", "23:10", "--until", "23:45", "--json", clock=clock)
+        today = self.run_tool("--since", "15:00", "--until", "17:00", "--json", clock=clock)
 
-        self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["直近の指定時刻のあと"])
-        future = self.run_tool("--since", (now + timedelta(days=1)).isoformat(), "--json")
+        self.assertEqual([item["text"] for item in json.loads(previous.stdout)], ["前日の記録"])
+        self.assertEqual([item["text"] for item in json.loads(today.stdout)], ["当日の記録"])
+        future = self.run_tool("--since", "2026-11-20T16:00:00+09:00", "--json", clock=clock)
         self.assertEqual(json.loads(future.stdout), [])
         self.assertIn("0 件（--since が未来）", future.stderr)
 

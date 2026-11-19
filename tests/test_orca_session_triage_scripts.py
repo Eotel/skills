@@ -6690,6 +6690,22 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual(item["owner"], "/w/other/second")
         self.assertEqual(self.call("get", question["id"]), self.call("get", "--id", question["id"]))
 
+    def test_a_saved_scan_with_two_lanes_of_the_same_name_rejects_both_mutations(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": f"/w/{repo}/lane", "repo": repo}
+                                                    for repo in ("app", "other")]))
+        message = self.source("message.txt", "Ready.")
+        for args in [
+            ("asked", "--row", "lane", "--decision", "publish", "--no-comment",
+             "--final-message-file", message, "--question-file", message),
+            ("presented", "--owner", "lane", "--key", "user:publish", "--text-file", message,
+             "--since", "2026-11-19T00:00:00Z"),
+        ]:
+            with self.subTest(command=args[0]), redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(hourly_state.main(["--state-file", str(self.state), *args, "--from", saved]), 1)
+                self.assertIn("app/lane", stderr.getvalue())
+                self.assertIn("other/lane", stderr.getvalue())
+        self.assertFalse(self.state.exists())
+
     def test_an_item_the_hourly_report_listed_stays_presented_until_an_answer_a_decision_or_its_start(self) -> None:
         saved = self.root / "scan.json"
         saved.write_text("[]")
