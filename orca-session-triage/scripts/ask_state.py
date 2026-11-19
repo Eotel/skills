@@ -51,7 +51,10 @@ def references(question: dict, entries: list[dict], *,
         binding = (bindings or {}).get(value)
         if not same_bound_ask(question, binding, value):
             continue
-        ref = handoff_ref(binding.ask_id, value, entries, (question,)) if binding else reference(value, entries)
+        declared = reference(value, entries)
+        ref = handoff_ref(binding.ask_id, value, entries, (question,)) if binding else declared
+        if declared and ref and declared[0] == ref[0] and ref[1] and ref[1] < declared[1]:
+            ref = declared
         if ref:
             found.append(ref)
     source = reference(question.get("ask_id") or "", entries)

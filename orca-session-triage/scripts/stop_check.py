@@ -189,6 +189,7 @@ BARE_ASK_CITATION = re.compile(r"(?<![a-z0-9_-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[
 SAME_CONDITION = {"本日": "今日", "リスタート": "再起動", "production": "本番", "prod": "本番",
                   "staging": "ステージング", "stg": "ステージング"}
 DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
+ISSUE_NUMBER = re.compile(r"(?:#|＃)\s*(\d+)")
 
 
 def question_conditions(value: str) -> list[str]:
@@ -200,6 +201,13 @@ def question_conditions(value: str) -> list[str]:
 def question_scope_agrees(original: dict, current: dict) -> bool:
     text = current.get("question") or ""
     original_text = original.get("question") or ""
+    known_links = set(QUESTION_URL.findall(answer_evidence.shown_question(original)))
+    shown_links = set(QUESTION_URL.findall(answer_evidence.shown_question(current)))
+    known_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(original_text)))
+    shown_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(text)))
+    if (known_links and shown_links and not known_links.intersection(shown_links)
+            or known_numbers and shown_numbers and known_numbers != shown_numbers):
+        return False
     annotations = "".join(f"{original[key]} " for key in ("context", "impact") if original.get(key))
     if annotations:
         text = text.removeprefix(annotations)
@@ -337,7 +345,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
         for ask_id, numbers in list(refs):
             original = inbox_read.questions_of(next(item for item in entries if item.get("id") == ask_id))
             if numbers and original and all(0 < n <= len(original) and isinstance(original[n - 1], dict)
-                                           and not question_options_agree(original[n - 1], question) for n in numbers):
+                                           and (not question_options_agree(original[n - 1], question)
+                                                or not question_scope_agrees(original[n - 1], question)) for n in numbers):
                 refs.remove((ask_id, numbers))
                 matched = [item for item in matched
                            if (ask_id, numbers) not in ask_state.references(item, entries, bindings=handoff_ids)]

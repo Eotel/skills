@@ -864,6 +864,27 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.question = {**self.question, "question": "別の公開を進めますか？", "header": "公開"}
         self.assertEqual(self.hook().stdout, "")
 
+    def test_guard_allows_another_pr_with_the_same_registered_question_header(self) -> None:
+        other_ask = "b1234567-1234-4567-8888-123456789abc"
+        original = {**self.question, "question": "skills #237 を公開しますか？ https://example.test/pr/237"}
+        self.question = {**self.question, "question": "skills #241 を公開しますか？ https://example.test/pr/241"}
+        self.write_lines(self.inbox, [
+            {"id": self.ASK, "ts": self.AT, "kind": "ask", "worktree": "worker",
+             "text": original["question"], "questions": [original]},
+            {"id": other_ask, "ts": self.AT, "kind": "ask", "worktree": "worker-b",
+             "text": self.question["question"], "questions": [self.question]},
+        ])
+        scan = self.root / "scan.json"
+        scan.write_text(json.dumps([{"path": "/w/worker", "repo": ""}]))
+        register = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
+                                 stdin=json.dumps({"ask": f"{self.ASK}:1", "decision": f"{self.KEY}:1",
+                                                   "covers": [f"{self.KEY}:1"], "header": original["header"],
+                                                   "question": original["question"], "asked_at": self.AT}))
+        self.assertEqual(register.returncode, 0, register.stderr)
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": "2026-11-14T09:03:00Z",
+                                         "how": "triage-notify --answered", "note": "公開する"}])
+        self.assertEqual(self.hook().stdout, "")
+
     def test_lane_choice_closes_the_ask_and_blocks_the_reworded_question(self) -> None:
         status = self.root / "last-status.db"
         transcript = self.root / "worker.jsonl"
