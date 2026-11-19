@@ -197,7 +197,8 @@ board's done cards; close what the user approves.
   workers' reports, questions, or escalations sit unread since its last turn
   began (`unread_mail`, from Orca's orchestration mailbox), are `stalled` with
   that reason; the mail reason is also added to a `waiting` row. The API error
-  wins even while Orca shows the agent working, and the row's `stop` says
+  wins even while Orca shows the agent working. A current Codex approval panel
+  takes precedence over earlier Codex rollout errors. The row's `stop` says
   which: a lost connection (`connection`, wake it), a usage limit
   (`usage_limit`, with the time it `resets`), an expired login (`login`, a
   person logs in), a full context window (`context_limit`, a new lane with a

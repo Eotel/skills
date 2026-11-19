@@ -892,7 +892,10 @@ class ClassifyTests(unittest.TestCase):
         rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, screens=screens)
 
         processes = {13: (1, "codex"), 14: (1, "codex"), 15: (1, "codex --model gpt-6-sol --yolo"),
-                     16: (1, "codex app-server"), 17: (1, "codex -- --yolo"), 18: (1, "codex Inspect exec code")}
+                     16: (1, "codex app-server"), 17: (1, "codex -- --yolo"), 18: (1, "codex Inspect exec code"),
+                     19: (1, "codex resume --dangerously-bypass-approvals-and-sandbox --last"),
+                     20: (1, "codex fork --last --yolo"), 21: (1, "codex resume --last -- --yolo"),
+                     22: (1, "codex resume prior-session --yolo")}
         handles = {pid: "term_other" if pid == 14 else "term_codex" for pid in processes}
         with patch.object(scan.rm_check, "process_table", return_value=processes), \
              patch.object(scan.rm_check, "process_handles", side_effect=lambda pids: {pid: handles[pid] for pid in pids}):
@@ -903,7 +906,7 @@ class ClassifyTests(unittest.TestCase):
                                                        "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
         self.assertIn("Codex process 13 was started without the approvals bypass flag", rows[0]["reasons"])
         self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
-                         [f"Codex process {pid} was started without the approvals bypass flag" for pid in (13, 17, 18)])
+                         [f"Codex process {pid} was started without the approvals bypass flag" for pid in (13, 17, 18, 21)])
         self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
             *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
 
@@ -911,11 +914,28 @@ class ClassifyTests(unittest.TestCase):
         lines = ["Would you like to run the following", "command?", "[… 43 lines] ⌃g view all",
                  "› 1. Yes, proceed (y)", "  2. No, and tell Codex what to do", "     differently (esc)",
                  "Press enter to confirm or esc to", "cancel"]
-        for tail in (lines, lines[2:]):
-            with self.subTest(tail=tail):
+        for tail, target in ((lines, "command omitted from terminal view"),
+                             (lines[2:], "approval details omitted from terminal view")):
+            with self.subTest(target=target):
                 prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
-                self.assertEqual(prompt["target"], "command omitted from terminal view")
+                self.assertEqual(prompt["target"], target)
                 self.assertEqual(prompt["choices"], ["1. Yes, proceed (y)", "2. No, and tell Codex what to do differently (esc)"])
+
+    def test_a_clipped_edit_approval_reports_an_approval_with_no_command_target(self) -> None:
+        tail = ["Would you like to make the following edits?", "[… 14 lines]",
+                "› 1. Yes, proceed (y)", "2. Yes, and don't ask again for these files (a)",
+                "3. No, and tell Codex what to do differently (esc)", "Press enter to confirm or esc to cancel"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["question"], "Codex approval")
+        self.assertEqual(prompt["target"], "approval details omitted from terminal view")
+        self.assertEqual(len(prompt["choices"]), 3)
+
+    def test_codex_can_request_command_approval_from_another_thread(self) -> None:
+        tail = ["Would you like to run the following command?", "Thread: Robie [explorer]", "$ echo hi",
+                "› 1. Yes, proceed (y)", "2. No, and tell Codex what to do differently (esc)",
+                "Press enter to confirm or esc to cancel or o to open thread"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["target"], "$ echo hi")
 
     def test_codex_approval_choices_exclude_numbered_command_lines(self) -> None:
         tail = ["Would you like to run the following command?", "$ cat <<'EOF'", "1. command output",

@@ -705,14 +705,14 @@ def failure(row: dict) -> tuple[str, str | None] | None:
     message names no agent.
     """
     running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
-    awaiting_command = (row.get("prompt_waiting") or {}).get("question") == CODEX_PERMISSION
+    awaiting_approval = (row.get("prompt_waiting") or {}).get("question") in (CODEX_PERMISSION, CODEX_APPROVAL)
     codex = row["codex"][-1] if row["codex"] else {}
     orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
     found = [(None if running else row.get("codex_screen_error"), "codex"), (codex.get("api_error"), "codex"),
              ((row["claude"] or {}).get("api_error"), "claude"),
              (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None, None)]
     return next(((error, agent) for error, agent in found
-                 if error and not (agent == "codex" and awaiting_command)
+                 if error and not (agent == "codex" and awaiting_approval)
                  and not (agent and running and agent not in running)), None)
 
 
@@ -809,7 +809,7 @@ def prompt_question(prompt: dict) -> str:
 def waiting_reasons(row: dict, decision_marker: str) -> list[str]:
     reasons = []
     if prompt := row.get("prompt_waiting"):
-        kind = "permission prompt" if prompt["question"].startswith((PERMISSION_QUESTION, CODEX_PERMISSION)) else "question"
+        kind = "permission prompt" if prompt["question"].startswith((PERMISSION_QUESTION, CODEX_PERMISSION, CODEX_APPROVAL)) else "question"
         reasons.append(f"{kind} on screen: " + prompt_question(prompt))
     claude = row["claude"] or {}
     jev = row.get("jev") or {}
@@ -1014,7 +1014,8 @@ def composer_empty(screen: dict) -> bool | None:
 # with ❯ on whichever choice the user has moved to.
 PERMISSION_QUESTION = "Do you want to"
 CODEX_PERMISSION = "Would you like to run the following command?"
-CODEX_PERMISSION_FOOTER = "press enter to confirm or esc to cancel"
+CODEX_APPROVAL = "Codex approval"
+CODEX_PERMISSION_FOOTER = re.compile(r"press enter to confirm or esc to cancel(?: or .+ to open thread)?\.?", re.I)
 CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
 CODEX_CLIPPED = re.compile(r"\[… \d+ lines?\](?:\s.*)?")
 CODEX_BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
@@ -1080,7 +1081,7 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
 def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     lines = [line.strip() for line in screen_lines(screen) if line.strip()]
     footer = next((index for index in range(max(0, len(lines) - 5), len(lines))
-                   if " ".join(lines[index:]).casefold().rstrip(".") == CODEX_PERMISSION_FOOTER), None)
+                   if CODEX_PERMISSION_FOOTER.fullmatch(" ".join(lines[index:]))), None)
     if footer is None:
         return None
     choices: list[str] = []
@@ -1101,10 +1102,12 @@ def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     heading_end = next((end for end in range(first - 1, -1, -1)
                         if any(" ".join(lines[start:end + 1]) == CODEX_PERMISSION
                                for start in range(max(0, end - 3), end + 1))), None)
-    if heading_end is None and not (first and CODEX_CLIPPED.fullmatch(lines[first - 1])
-                                    and choices[0].startswith("1. Yes, proceed")):
+    if heading_end is None:
+        if first and CODEX_CLIPPED.fullmatch(lines[first - 1]):
+            return {"tab": tab, "question": CODEX_APPROVAL, "choices": choices,
+                    "target": "approval details omitted from terminal view"}
         return None
-    body = lines[heading_end + 1:first] if heading_end is not None else []
+    body = lines[heading_end + 1:first]
     command = next((index for index, line in enumerate(body) if line.startswith("$ ")), None)
     if command is None:
         target = "command omitted from terminal view"
@@ -1803,8 +1806,18 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
             continue
         options: set[str] = set()
         arguments = iter(args[binary + 1:])
+        reopened = False
+        has_session = False
         for token in arguments:
-            if token == "--" or not token.startswith("-"):
+            if not reopened and token in ("resume", "fork"):
+                reopened = True
+                continue
+            if token == "--":
+                break
+            if not token.startswith("-"):
+                if reopened and not has_session and "--last" not in options:
+                    has_session = True
+                    continue
                 break
             option, equal, _ = token.partition("=")
             options.add(option)
@@ -1812,7 +1825,7 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
                 next(arguments, None)
         else:
             token = ""
-        if token not in ("app-server", "exec", "e", "exec-server", "review"):
+        if reopened or token not in ("app-server", "exec", "e", "exec-server", "review"):
             codex_processes[pid] = options
     for pid, handle in rm_check.process_handles(sorted(codex_processes)).items():
         if handle in waiting and CODEX_BYPASS_FLAGS.isdisjoint(codex_processes[pid]):
