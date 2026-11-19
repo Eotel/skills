@@ -62,8 +62,21 @@ class TimelineTests(unittest.TestCase):
         return {"id": report_id or f"report-{ts}", "host": "mac", "ts": ts, "worktree": worktree,
                 "repo": "app", "handle": handle, "kind": kind, "text": text}
 
-    def run_tool(self, *args: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, env=self.env)
+    def run_tool(self, *args: str, clock: str | None = None) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable, str(SCRIPT), *args]
+        if clock is not None:
+            code = """\
+from datetime import datetime
+import sys
+from unittest.mock import patch
+import timeline
+
+with patch.object(timeline, "datetime", wraps=datetime) as fixed:
+    fixed.now.return_value = datetime.fromisoformat(sys.argv[1])
+    sys.exit(timeline.main(sys.argv[2:]))
+"""
+            command = [sys.executable, "-c", code, clock, *args]
+        result = subprocess.run(command, capture_output=True, text=True, env=self.env, cwd=SCRIPT.parent)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
@@ -95,6 +108,35 @@ class TimelineTests(unittest.TestCase):
                       lines[1])
         self.assertIn("16:36:44  triage-lead → fix-checklist  送った  取り消しです。", lines[2])
         self.assertIn("16:51:43  fix-checklist  完了が届いた", lines[3])
+
+    def test_wall_clock_uses_the_most_recent_past_date(self) -> None:
+        clock = "2026-11-19T16:00:00+09:00"
+        self.append(".cache/orca-briefs/triage-inbox.jsonl",
+                    self.report("2026-11-18T23:30:00+09:00", LANE, "fix-checklist", "info", "前日の記録"),
+                    self.report("2026-11-19T15:30:00+09:00", LANE, "fix-checklist", "info", "当日の記録"))
+
+        previous = self.run_tool("--since", "23:10", "--until", "23:45", "--json", clock=clock)
+        today = self.run_tool("--since", "15:00", "--until", "17:00", "--json", clock=clock)
+
+        self.assertEqual([item["text"] for item in json.loads(previous.stdout)], ["前日の記録"])
+        self.assertEqual([item["text"] for item in json.loads(today.stdout)], ["当日の記録"])
+        for since in ("2d", "2026-11-18T09:00:00+09:00"):
+            with self.subTest(since=since):
+                result = self.run_tool("--since", since, "--until", "17:00", "--json", clock=clock)
+                self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["前日の記録", "当日の記録"])
+        future = self.run_tool("--since", "2026-11-20T16:00:00+09:00", "--json", clock=clock)
+        self.assertEqual(json.loads(future.stdout), [])
+        self.assertIn("0 件（--since が未来）", future.stderr)
+
+    def test_a_wall_clock_window_can_cross_midnight(self) -> None:
+        self.append(".cache/orca-briefs/triage-inbox.jsonl",
+                    self.report("2026-11-18T23:30:00+09:00", LANE, "fix-checklist", "info", "前日の記録"),
+                    self.report("2026-11-19T00:15:00+09:00", LANE, "fix-checklist", "info", "当日の記録"))
+
+        result = self.run_tool("--since", "23:10", "--until", "01:00", "--json",
+                               clock="2026-11-19T00:30:00+09:00")
+
+        self.assertEqual([item["text"] for item in json.loads(result.stdout)], ["前日の記録", "当日の記録"])
 
     def test_a_lane_filter_keeps_every_instruction_to_that_lane_in_order(self) -> None:
         self.append(".cache/orca-briefs/triage-inbox.jsonl",

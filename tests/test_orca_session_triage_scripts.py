@@ -6675,6 +6675,124 @@ class HourlyStateTests(unittest.TestCase):
             self.call("promise", "--from-row", "/w/a", "--to-row", "/w/d", "--condition", "x", "--task", "y",
                       "--not-before", "11/17")
 
+    def test_a_saved_scan_resolves_question_and_owner_names(self) -> None:
+        saved = self.source("scan.json", json.dumps([
+            {"path": "/w/app/lane", "repo": "app"},
+            {"path": "/w/other/second", "repo": "other"},
+            {"path": "/w/second", "repo": None},
+        ]))
+        message = self.source("message.txt", "Ready.")
+        _, question = self.call("asked", "--row", "app/lane", "--from", saved, "--decision", "publish",
+                                "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, item = self.call("presented", "--owner", "/second", "--from", saved, "--key", "user:publish",
+                            "--text-file", message, "--since", "2026-11-19T00:00:00Z")
+
+        self.assertEqual(question["row"], "/w/app/lane")
+        self.assertEqual(item["owner"], "/w/second")
+        self.assertEqual(self.call("get", question["id"]), self.call("get", "--id", question["id"]))
+
+    def test_a_saved_scan_with_two_lanes_of_the_same_name_rejects_both_mutations(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": f"/w/{repo}/lane", "repo": repo}
+                                                    for repo in ("app", "other")]))
+        message = self.source("message.txt", "Ready.")
+        for args in [
+            ("asked", "--row", "lane", "--decision", "publish", "--no-comment",
+             "--final-message-file", message, "--question-file", message),
+            ("presented", "--owner", "lane", "--key", "user:publish", "--text-file", message,
+             "--since", "2026-11-19T00:00:00Z"),
+        ]:
+            with self.subTest(command=args[0]), redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(hourly_state.main(["--state-file", str(self.state), *args, "--from", saved]), 1)
+                self.assertIn("app/lane", stderr.getvalue())
+                self.assertIn("other/lane", stderr.getvalue())
+        self.assertFalse(self.state.exists())
+
+    def test_asking_again_reuses_the_id_saved_under_a_worktree_alias(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, original = self.call("asked", "--row", "/w/app/lane", *args)
+        self.call("answered", "--id", original["id"], "--answer-file", message)
+        previous = json.loads(self.state.read_text())
+        old_id = hourly_state.identifier("app/lane", "publish")
+        previous["questions"][old_id] = {**previous["questions"].pop(original["id"]), "row": "app/lane"}
+        row = {"path": "/w/app/lane", "repo": "app"}
+        saved = self.source("scan.json", json.dumps([row, {**row, "environment": "mac-b"}]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/w/app/lane", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        for command in (("asked", "--row", "/w/app/lane", "--from", saved, *args),
+                        ("asked-many", "--from", saved, "--file", batch, "--no-comment")):
+            with self.subTest(command=command[0]):
+                self.state.write_text(json.dumps(previous))
+                _, result = self.call(*command)
+                asked = result[0] if isinstance(result, list) else result
+                self.assertEqual((asked["id"], asked["row"], asked["answer"]), (old_id, "/w/app/lane", "Ready."))
+        self.assertEqual(self.call("asked", "--row", "app/lane", *args)[1]["id"], old_id)
+        result, answer = self.call("answered", "--decision", "publish", "--answer-file", message)
+        self.assertEqual((result, answer["id"]), (0, old_id))
+
+    def test_an_ambiguous_old_alias_does_not_block_either_asked_path(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, original = self.call("asked", "--row", "lane", *args)
+        self.call("answered", "--id", original["id"], "--answer-file", message)
+        previous = self.state.read_bytes()
+        saved = self.source("scan.json", json.dumps([{"path": f"/w/{repo}/lane", "repo": repo}
+                                                    for repo in ("app", "other")]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/w/app/lane", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        for command in (("asked", "--row", "/w/app/lane", "--from", saved, *args),
+                        ("asked-many", "--from", saved, "--file", batch, "--no-comment")):
+            with self.subTest(command=command[0]):
+                self.state.write_bytes(previous)
+                code, result = self.call(*command)
+                self.assertEqual(code, 0)
+                asked = result[0] if isinstance(result, list) else result
+                self.assertNotEqual(asked["id"], original["id"])
+                self.assertEqual((asked["row"], asked["answer"]), ("/w/app/lane", None))
+                stored = self.call("get", original["id"])[1]
+                self.assertEqual((stored["row"], stored["answer"]), ("lane", "Ready."))
+
+    def test_a_remote_scan_never_moves_an_existing_local_question(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, local = self.call("asked", "--row", "/w/app/lane", *args)
+        self.call("answered", "--id", local["id"], "--answer-file", message)
+        saved = self.source("scan.json", json.dumps([{"path": "/w/app/lane", "repo": "app", "environment": "mac-b"}]))
+
+        _, remote = self.call("asked", "--row", "mac-b::lane", "--from", saved, *args)
+
+        self.assertNotEqual(remote["id"], local["id"])
+        self.assertIsNone(remote["answer"])
+        self.assertEqual(self.call("get", local["id"])[1]["row"], "/w/app/lane")
+        state = self.state.read_bytes()
+        for command in (("asked", "--row", "/w/app/lane", *args),
+                        ("presented", "--owner", "/w/app/lane", "--key", "user:publish", "--text-file", message,
+                         "--since", "2026-11-19T00:00:00Z")):
+            with self.subTest(command=command[0]), redirect_stderr(io.StringIO()):
+                self.assertEqual(hourly_state.main(["--state-file", str(self.state), *command, "--from", saved]), 1)
+        self.assertEqual(self.state.read_bytes(), state)
+
+    def test_asked_many_resolves_the_same_no_repo_alias_as_asked(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": "/w/second", "repo": None}]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/second", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        _, recorded = self.call("asked-many", "--from", saved, "--file", batch, "--no-comment")
+        self.assertEqual(recorded[0]["row"], "/w/second")
+        message = self.source("message.txt", "Ready.")
+        _, asked = self.call("asked", "--row", "/second", "--decision", "publish", "--from", saved, "--no-comment",
+                             "--final-message-file", message, "--question-file", message)
+        self.assertEqual((asked["id"], asked["row"]), (recorded[0]["id"], "/w/second"))
+
+    def test_a_relative_path_in_a_saved_scan_cannot_be_recorded_as_owner(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": "lane", "repo": "app"}]))
+        with redirect_stderr(io.StringIO()) as stderr:
+            code = hourly_state.main(["--state-file", str(self.state), "presented", "--owner", "lane", "--from", saved,
+                                      "--key", "user:publish", "--text-file", self.source("message.txt", "Ready."),
+                                      "--since", "2026-11-19T00:00:00Z"])
+        self.assertEqual(code, 1)
+        self.assertIn("owner must be a scan row identity", stderr.getvalue())
+        self.assertFalse(self.state.exists())
+
     def test_an_item_the_hourly_report_listed_stays_presented_until_an_answer_a_decision_or_its_start(self) -> None:
         saved = self.root / "scan.json"
         saved.write_text("[]")

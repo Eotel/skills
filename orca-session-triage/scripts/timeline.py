@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -47,6 +47,7 @@ from commitment_store import hold_rows, read_lines
 
 JST = timezone(timedelta(hours=9))
 SUMMARY = 120
+WALL_CLOCK = re.compile(r"\d{1,2}:\d{2}")
 # Transcripts only grow, so reading starts this far before --since: a call may finish well after it began, and
 # Claude Code lets a foreground Bash call run for up to two hours.
 CALL_SLACK = timedelta(hours=2)
@@ -573,13 +574,16 @@ def timeline(records: Records, host: SessionHost, window: Window, lane: str | No
                   key=lambda event: event.at)
 
 
-def moment(value: str) -> datetime:
-    now = datetime.now(JST)
+def moment(value: str, now: datetime, *, past_wall_clock: bool = True) -> datetime:
     if relative := re.fullmatch(r"(\d+)([mhd])", value):
         unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
         return now - timedelta(**{unit: int(relative[1])})
-    if re.fullmatch(r"\d{1,2}:\d{2}", value):
-        return datetime.combine(now.date(), time.fromisoformat(value.zfill(5)), JST)
+    if WALL_CLOCK.fullmatch(value):
+        try:
+            at = inbox_read.since_time(value.zfill(5), now=now)
+            return at if past_wall_clock or at.date() == now.date() else at + timedelta(days=1)
+        except argparse.ArgumentTypeError:
+            pass
     parsed = when(value)
     if parsed is None:
         raise argparse.ArgumentTypeError(f"時刻が読めません: {value}（例: 16:30、2026-11-15T16:30、3h）")
@@ -587,20 +591,41 @@ def moment(value: str) -> datetime:
 
 
 def main(argv: list[str] | None = None) -> int:
+    now = datetime.now(JST)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--since", required=True, type=moment,
-                        help="この時刻から（16:30 は今日、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
-    parser.add_argument("--until", type=moment, help="この時刻まで（--since と同じ書き方。省くと今まで）")
+    parser.add_argument("--since", required=True,
+                        help="この時刻から（16:30 は直近の過去の 16:30、2026-11-15T16:30、3h・90m・2d は今から遡る。時差の無い時刻は JST）")
+    parser.add_argument("--until",
+                        help="この時刻まで（時刻だけの指定は当日。開始も時刻だけで前日なら直近の過去を使用し、"
+                             "終了が開始より前になる場合は当日を使用。省くと今まで）")
     parser.add_argument("--lane", help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle）")
     parser.add_argument("--match", help="本文にこの文字列を含む出来事だけ（大文字と小文字を区別しない）")
     parser.add_argument("--json", action="store_true", help="1 件 1 オブジェクトの JSON の配列で、本文を全文出す")
     parser.add_argument("--orca", default="orca", help="Orca の CLI（既定: orca）")
     args = parser.parse_args(argv)
 
-    host = OrcaHost.from_environment(args.orca)
-    events = timeline(Records.from_environment(), host, Window(args.since, args.until), args.lane)
-    if args.match:
-        events = [event for event in events if args.match.casefold() in event.text.casefold()]
+    try:
+        since = moment(args.since, now)
+    except argparse.ArgumentTypeError as error:
+        parser.error(f"--since: {error}")
+    until = now
+    if args.until is not None:
+        try:
+            previous_start = bool(WALL_CLOCK.fullmatch(args.since)) and since.date() < now.date()
+            until = moment(args.until, now, past_wall_clock=previous_start)
+            if previous_start and WALL_CLOCK.fullmatch(args.until) and until < since:
+                until += timedelta(days=1)
+        except argparse.ArgumentTypeError as error:
+            parser.error(f"--until: {error}")
+    reason = "--since が未来" if since > now else "--since が --until より後" if since > until else None
+    events: list[Event] = []
+    if reason is None:
+        host = OrcaHost.from_environment(args.orca)
+        events = timeline(Records.from_environment(), host, Window(since, until), args.lane)
+        if args.match:
+            events = [event for event in events if args.match.casefold() in event.text.casefold()]
+    if not events:
+        print("0 件" + (f"（{reason}）" if reason else "（指定した条件に該当するイベントなし）"), file=sys.stderr)
     if args.json:
         print(json.dumps([event.row() for event in events], ensure_ascii=False, indent=2))
     else:

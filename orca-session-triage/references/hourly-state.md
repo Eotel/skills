@@ -42,6 +42,11 @@ For `asked --decision`, use the same subject and action across runs, such as
 | Nothing will answer it | `withdraw --id ID --reason-file FILE` closes a question no answer will settle, keeping the reason and time. Add `--replaced-by ID` when an existing question replaces it. `answered` and `answered-many` leave withdrawn questions unanswered, name the replacement on stderr and in `replaced_by`, and exit 2; valid answers in the same batch are still recorded. Inspect the replacement before answering it. |
 | User promises “when A settles, give B the task” | Record `promise --from-row A --to-row B --condition CONDITION --task TASK`, adding `--not-before YYYY-MM-DD` when the task may not go out before a JST day: until then `pending` shows it as 期限前（M/D） instead of undelivered, and the scan keeps B open with the reason 「期限前（M/D）の約束の送り先」 without making it stalled. Every run checks due undelivered promises against the latest A result. When the condition holds, send B the task as the Boundary permits. Record `delivered --id ID --delivery queued` or `--delivery turn_started` once that delivery is confirmed. |
 
+With a saved scan, `asked --row app/fix-login --from SCAN_JSON` and
+`presented --owner fix-login --from SCAN_JSON` accept a unique worktree name.
+For a name that matches multiple rows, use one of the printed candidates or the
+full row identity.
+
 `asked-many` accepts `ask` as `ID:N` to bind a record to question N of an inbox
 ask, using the same numbering as `claim` and `send --ask`. ID may be an
 unambiguous prefix of eight or more characters. The stored `ask_id` retains
@@ -228,7 +233,7 @@ still open (unanswered questions, undelivered handoffs, open requests, and left
 rows), plus settled questions with evidence, unrecorded transcript answers,
 open user waits (`user_waits`), and `unrecorded_questions`, each as a list entry carrying its `id` (`row` for a left row); read the
 open items with it rather than walking `show`'s dictionaries by hand, and
-`get --id ID` for one entry. A question is settled when it was withdrawn, every
+`get ID` (or `get --id ID`) for one entry. A question is settled when it was withdrawn, every
 `--covers` key has a lead answer after it was asked, or every issue and PR it
 names is CLOSED; each unanswered question's `prs` lists them with their
 `type`, current state, head, and update time, read in one batch per repository.

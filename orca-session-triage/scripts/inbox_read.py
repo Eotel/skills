@@ -198,9 +198,9 @@ def entry_ids(value: str) -> frozenset[str]:
     return ids
 
 
-def since_time(value: str) -> datetime:
+def since_time(value: str, *, now: datetime | None = None) -> datetime:
     """An ISO time or the most recent local HH:MM, as `inbox --since` accepts."""
-    now = datetime.now().astimezone()
+    now = now if now is not None else datetime.now().astimezone()
     try:
         if len(value) == 5 and value[2] == ":":
             hour, minute = (int(part) for part in value.split(":"))

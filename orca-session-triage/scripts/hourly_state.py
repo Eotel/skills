@@ -868,6 +868,23 @@ def owner_name(value: str) -> str:
     return owner
 
 
+def same_environment_rows(rows: list[dict], value: str) -> list[dict]:
+    environment, separator, _ = value.partition("::")
+    return [row for row in rows if row.get("environment") == (environment if separator else None)]
+
+
+def selected_worktree(value: str, rows: list[dict] | None, option: str) -> str:
+    wanted = value.strip()
+    if rows is None:
+        return wanted if option == "--row" else owner_name(wanted)
+    path = wanted.split("::", 1)[-1]
+    if Path(path).is_absolute():
+        if option == "--row" and not scan_sessions.matching_rows(rows, wanted):
+            return owner_name(wanted)
+        rows = same_environment_rows(rows, wanted)
+    return owner_name(scan_sessions.row_identity(scan_sessions.select_row(rows, wanted, option)))
+
+
 def repository_names(owner: str) -> frozenset[str]:
     """The names of the repositories gh lists for an organization or user; none, named on stderr, when gh cannot."""
     listed, why = gh_json(["repo", "list", owner, "--limit", str(ISSUE_LIMIT), "--json", "name"])
@@ -994,8 +1011,24 @@ class Answering:
 
 def current_question(data: dict, asking: Asking) -> str | None:
     return next((key for key, item in reversed(list(data["questions"].items()))
-                 if item["row"] == asking.row and item["decision"] == asking.decision
+                 if asking.row in (item["row"], item.get("row_alias")) and item["decision"] == asking.decision
                  and not item.get("withdrawn_at")), None)
+
+
+def reuse_question_rows(data: dict, askings: list[Asking], rows: list[dict]) -> None:
+    for asking in askings:
+        if current_question(data, asking) is not None:
+            continue
+        for item in reversed(list(data["questions"].values())):
+            if item["decision"] != asking.decision or item.get("withdrawn_at"):
+                continue
+            old = item["row"]
+            scoped = same_environment_rows(rows, old)
+            matches = scan_sessions.matching_rows(scoped, old)
+            if len(matches) == 1 and scan_sessions.row_identity(matches[0]) == asking.row:
+                item["row"] = asking.row
+                item["row_alias"] = old
+                break
 
 
 def new_references(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
@@ -1025,7 +1058,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, asking.row),
+    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, data["questions"][key]["row"]),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1174,6 +1207,8 @@ def asking_line(raw: str, inbox: Inbox) -> Asking:
         raise ValueError("an ask gives the final message; leave final_message out")
     row, message, ask = (inbox.lane(line_text(item, "ask")) if "ask" in item
                          else (line_text(item, "row"), line_text(item, "final_message"), {}))
+    if "row" in item and inbox.scan is not None:
+        row = selected_worktree(row, inbox.rows, "--row")
     covers = item.get("covers", [])
     if not isinstance(covers, list) or not all(isinstance(key, str) and key.strip() for key in covers):
         raise ValueError("covers must be a list of lead decision keys")
@@ -1342,7 +1377,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
     }
 
 
-def change(data: dict, args: argparse.Namespace) -> dict:
+def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | None = None) -> dict:
     if args.action == "appoint-lead":
         at = datetime.fromisoformat(recorded_at(args.appointed_at)).astimezone(timezone.utc).isoformat()
         data["lead"] = {"worktree": str(args.worktree.expanduser().resolve()), "appointed_at": at}
@@ -1400,7 +1435,7 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         kept = earlier if earlier and presented_state(data, key, earlier, decisions) != "settled" else None
         data["presented"][key] = {
             "text": file_text(args.text_file), "link": args.link,
-            "owner": owner_name(args.owner) if args.owner is not None else None,
+            "owner": args.owner,
             "since": kept["since"] if kept else recorded_at(args.since),
             "presented_at": kept["presented_at"] if kept else stamp(), "closed_at": None, "closure_evidence": None}
         return {"id": key, **data["presented"][key]}
@@ -1422,6 +1457,8 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
                         question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
                         covers=tuple(args.covers), session=args.session, header=args.header)
+        if selected_rows is not None:
+            reuse_question_rows(data, [asking], selected_rows)
         return record_question(data, asking, new_references(data, [asking]))
     if args.action == "answered":
         return record_answer(data, Answering(
@@ -1571,7 +1608,9 @@ def main(argv: list[str] | None = None) -> int:
     pending_command.add_argument("--summary", action="store_true", help="print one line per item with its age and question")
     answer_evidence.add_arguments(pending_command)
     get = commands.add_parser("get", help="read one saved question, handoff, request, user wait, or left row")
-    get.add_argument("--id", required=True)
+    get_id = get.add_mutually_exclusive_group(required=True)
+    get_id.add_argument("item_id", nargs="?", metavar="ID")
+    get_id.add_argument("--id")
     appoint = commands.add_parser("appoint-lead", help="record the appointed lead's worktree, replacing an earlier one")
     appoint.add_argument("--worktree", type=Path, required=True, metavar="PATH")
     appoint.add_argument("--appointed-at", metavar="ISO", help="original ISO 8601 appointment time (saved in UTC)")
@@ -1667,7 +1706,8 @@ def main(argv: list[str] | None = None) -> int:
     asked = commands.add_parser(
         "asked", help="record the exact question before presenting it; for each issue it names, print the PRs that "
                       "close or name it merged after what the question rests on (merged_after_basis)")
-    asked.add_argument("--row", required=True)
+    asked.add_argument("--row", required=True, help="a scan row identity, unique worktree name, or repository/name")
+    asked.add_argument("--from", dest="from_file", metavar="SCAN_JSON", help="resolve worktree names using a saved scan")
     asked.add_argument("--decision", required=True, help="stable subject and action, e.g. merge:PR#10")
     asked.add_argument("--final-message-file", required=True)
     asked.add_argument("--question-file", required=True)
@@ -1724,7 +1764,8 @@ def main(argv: list[str] | None = None) -> int:
     presented.add_argument("--text-file", required=True, help="the item as the report put it, in a UTF-8 file")
     presented.add_argument("--since", required=True, help="ISO 8601 time with offset the item began waiting")
     presented.add_argument("--link", help="the issue, PR, or ticket URL the report linked")
-    presented.add_argument("--owner", help="the scan row identity (PATH or ENVIRONMENT::PATH) of the lane it holds up")
+    presented.add_argument("--owner", help="the row identity, unique worktree name, or repository/name of the owner")
+    presented.add_argument("--from", dest="from_file", metavar="SCAN_JSON", help="resolve worktree names using a saved scan")
     presented.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                            help="the lead's decision log, read to tell a settled key from an open one")
     presented_close = commands.add_parser(
@@ -1820,6 +1861,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     try:
+        selected_rows = (scan_sessions.saved_rows(args.from_file)
+                         if args.action in ("asked", "presented") and args.from_file is not None else None)
+        if args.action == "asked":
+            args.row = selected_worktree(args.row, selected_rows, "--row")
+        if args.action == "presented" and args.owner is not None:
+            args.owner = selected_worktree(args.owner, selected_rows, "--owner")
         path.parent.mkdir(parents=True, exist_ok=True)
         live: frozenset[str] = frozenset()
         intake: Intake | None = None
@@ -1870,16 +1917,20 @@ def main(argv: list[str] | None = None) -> int:
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
                                  inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
             elif args.action == "get":
-                result = next(({"id": args.id, **data[kind][args.id]} for kind in
+                key = args.id or args.item_id
+                result = next(({"id": key, **data[kind][key]} for kind in
                                ("questions", "handoffs", "requests", "user_waits", "presented", "left")
-                               if args.id in data[kind]),
+                               if key in data[kind]),
                               None)
                 if result is None:
-                    raise ValueError(f"unknown id: {args.id}")
+                    raise ValueError(f"unknown id: {key}")
             elif args.action == "asked-many":
                 inbox = Inbox(args.from_file)
                 askings = checked_lines(given, lambda raw: asking_line(raw, inbox))
-                references = new_references(data, [line for _, line in askings if isinstance(line, Asking)])
+                planned = [line for _, line in askings if isinstance(line, Asking)]
+                if inbox.scan is not None:
+                    reuse_question_rows(data, planned, inbox.rows)
+                references = new_references(data, planned)
                 result = record_lines(askings, lambda asking: record_question(data, asking, references))
                 # record_lines returned, so every line was read: the results follow the lines.
                 unrecorded = [f"記録しなかった: 行 {number}（問いの #番号がすべて閉じている: " + "、".join(
@@ -1898,7 +1949,7 @@ def main(argv: list[str] | None = None) -> int:
                 view: dict[str, Any] = {"workspace": here, "comment": workspace_comment(data, here)}
                 result = view
             else:
-                result = data if args.action == "show" else change(data, args)
+                result = data if args.action == "show" else change(data, args, selected_rows)
             items = result if isinstance(result, list) else [result]
             # A question answered or withdrawn from another tab (the lead's) rewrites the comment of the workspace it
             # was asked in, once this script writes that comment.
@@ -1926,7 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
                     skipped = True
                     notices.append(f"記録しなかった: 既存 {item['id']}（取り下げ済み）"
                                    + (f"。置き換え先: {item['replaced_by']}" if item.get("replaced_by") else ""))
-    except (OSError, ValueError, KeyError, TypeError, CommitmentWriteError) as error:
+    except (*READ_ERRORS, CommitmentWriteError) as error:
         print(f"hourly state: {error}", file=sys.stderr)
         return 1
     if args.action == "asking" and args.summary and isinstance(result, list):
