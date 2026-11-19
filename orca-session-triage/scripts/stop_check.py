@@ -176,13 +176,16 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
                                  r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
+                                 r"|本番|検証環境|ステージング|(?<![a-z])(?:production|prod|staging|stg)(?![a-z])"
                                  r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
 ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
 ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![\w-])", re.I)
+SAME_CONDITION = {"本日": "今日", "production": "本番", "prod": "本番",
+                  "staging": "ステージング", "stg": "ステージング"}
 
 
 def question_conditions(value: str) -> list[str]:
-    return ["今日" if term == "本日" else term
+    return [SAME_CONDITION.get(term, term)
             for term in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))]
 
 

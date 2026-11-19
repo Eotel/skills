@@ -989,6 +989,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
         for old, current, updated_approval, blocked in (
                 ("今週金曜にデプロイしますか？", "来週金曜にデプロイしますか？", approval, False),
                 ("今日中にデプロイしますか？", "本日中にデプロイを進めますか？", approval, True),
+                ("staging を再起動しますか？", "production を再起動しますか？", approval, False),
                 ("デプロイしますか？", "デプロイを進めますか？", "監査の承認がない場合のみデプロイする", False),
         ):
             with self.subTest(question=current):
