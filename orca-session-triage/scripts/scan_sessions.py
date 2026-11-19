@@ -1038,6 +1038,9 @@ CODEX_WORKING = re.compile(r"• Working \(")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
+CODEX_MODEL_FOOTER = re.compile(r"(?:gpt|codex)-[\w.-]+(?: \w+)? · (?:[~/].*)", re.IGNORECASE)
+CODEX_SHORTCUT_FOOTER = re.compile(
+    r"(?:← for agents · )?\? for shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?")
 CODEX_INTERRUPTED = re.compile(r"■ Conversation interrupted(?:$|[ .—-])")
 
 
@@ -1111,10 +1114,12 @@ def composer_empty(screen: dict, agent: str | None = None) -> bool | None:
         trailing = lines[prompt + 1:]
         if last_codex_activity(trailing):
             return None
-        return (lines[prompt] in ("›", "› Ask Codex to do anything") and
-                not any(line and line != "? for shortcuts" and not RULE.fullmatch(line)
-                        and not re.fullmatch(r"(?:gpt|codex)-[\w.-]+(?: \w+)? · (?:[~/].*)", line, re.IGNORECASE)
-                        for line in trailing))
+        content = [line for line in trailing if line and not RULE.fullmatch(line)]
+        if content and CODEX_SHORTCUT_FOOTER.fullmatch(content[-1]):
+            content.pop()
+        if content and CODEX_MODEL_FOOTER.fullmatch(content[-1]):
+            content.pop()
+        return lines[prompt] in ("›", "› Ask Codex to do anything") and not content
     rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
     for top, bottom in reversed(list(zip(rules, rules[1:]))):
         box = [line for line in lines[top + 1:bottom] if line]
