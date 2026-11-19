@@ -579,8 +579,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
 
 
 def genuine_answer(answer: dict) -> bool:
-    """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
-    if answer.get("how") in inbox_read.LANE_ANSWERS:
+    """A delivery, direct answer or withdrawal settles the corresponding handoff."""
+    if answer.get("how") in inbox_read.LANE_ANSWERS or answer.get("how") == "triage-notify --withdraws":
         return True
     if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
         return True

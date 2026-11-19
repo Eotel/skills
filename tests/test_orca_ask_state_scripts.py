@@ -525,11 +525,19 @@ assert writer is not None and writer.wait(timeout=10) == 0
         pending = self.run_tool(*args)
         self.assertEqual(pending.returncode, 0, pending.stderr)
         self.assertEqual(json.loads(pending.stdout)[0]["ask"]["question_numbers"], [2])
-        self.write_lines(self.answers, [{"id": f"{self.ASK}:2", "ts": self.AT,
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT,
+                                        "how": "triage-notify --withdraws", "note": "第一問を取り下げます"},
+                                       {"id": f"{self.ASK}:2", "ts": self.AT,
                                         "how": "triage-notify --answered", "note": "本社"}])
         resolved = self.run_tool(*args)
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         self.assertEqual([row["state"] for row in json.loads(resolved.stdout)], ["stopped_after_answer"])
+        self.write_lines(self.handed, [{"decision": self.KEY, "ask_id": self.ASK, "handed_off_at": self.AT},
+                                      {"decision": f"{self.KEY}:1", "ask_id": f"{self.ASK}:1", "handed_off_at": self.AT}])
+        handoff = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+        self.assertEqual(handoff.returncode, 0, handoff.stderr)
+        self.assertEqual({row["decision"] for row in json.loads(handoff.stdout)["settled"]}, {self.KEY, f"{self.KEY}:1"})
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"

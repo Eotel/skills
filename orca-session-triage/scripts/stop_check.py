@@ -76,6 +76,7 @@ JAPANESE = ("HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
             "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
 QUESTION_URL = re.compile(r"https?://[^\s<>()（）「」、。]+")
 KANJI = re.compile(r"[\u3400-\u9fff]")
+ALPHANUMERIC = re.compile(r"[a-z0-9]+")
 
 
 def in_japanese(question: dict[str, Any]) -> bool:
@@ -188,15 +189,18 @@ def question_options_agree(left: dict, right: dict) -> bool:
     for key, (label, description) in first.items():
         other_label, other_description = second[key]
         if label == other_label:
-            if description and other_description and description != other_description:
-                return False
-            continue
-        if key not in (label, other_label) or not description or not other_description:
+            if not description or not other_description or description == other_description:
+                continue
+        elif key not in (label, other_label) or not description or not other_description:
             return False
-        if description == other_description:
+        elif description == other_description:
             continue
         wording = SequenceMatcher(None, description, other_description, autojunk=False)
-        if wording.find_longest_match().size < 24 or any(
+        if ALPHANUMERIC.findall(description) != ALPHANUMERIC.findall(other_description):
+            return False
+        if (wording.ratio() < 0.6 if label == other_label else wording.find_longest_match().size < 24):
+            return False
+        if any(
                 action == "replace" and end - start <= 8 and other_end - other_start <= 8
                 and KANJI.search(description[start:end]) and KANJI.search(other_description[other_start:other_end])
                 for action, start, end, other_start, other_end in wording.get_opcodes()):
