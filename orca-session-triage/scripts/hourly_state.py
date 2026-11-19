@@ -659,7 +659,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                    or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
                    or any(not (ask_state.reference(cover, known_asks)
                                or ((ref := handoff_refs.get(cover) or ask_state.reference(item.get("ask_id") or "", known_asks))
-                                   and ref[1] and ask_state.covered(ref, closed_ids, known_asks)))
+                                   and ask_state.covered(ref, closed_ids, known_asks)))
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
@@ -1860,7 +1860,12 @@ def main(argv: list[str] | None = None) -> int:
             claims = {key: claim for key, claim in claims.items() if key in open_keys}
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
-            latest_handoffs = {item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())}
+            latest_handoffs: dict[str, lead_decisions.HandOff] = {}
+            for item in lead_decisions.handed_off(args.handed_off_file.expanduser()):
+                earlier = latest_handoffs.get(item.decision)
+                if not item.ask_id and earlier and earlier.ask_id:
+                    item = lead_decisions.HandOff(item.decision, item.handed_off_at, earlier.ask_id)
+                latest_handoffs[item.decision] = item
             for key in decided.keys() & latest_handoffs.keys():
                 if lead_decisions.decision_for_handoff(decided[key][-1].view(), latest_handoffs[key].ask_id) is None:
                     del decided[key]
