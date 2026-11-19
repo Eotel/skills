@@ -622,6 +622,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
         ask = {"id": self.ASK, "ts": "2026-11-14T09:00:00Z", "kind": "ask",
                "host": "mac-a", "worktree": "worker", "handle": "term_worker", "questions": [self.question, second]}
         self.write_lines(self.inbox, [ask])
+        recorded = self.ask()
+        state = json.loads(self.state.read_text())
+        state["questions"][recorded["id"]].update(asked_in="/w/lead", session="lead-session")
+        self.state.write_text(json.dumps(state))
         self.answers.write_text("")
         self.claims.write_text("")
         events.write_text("")
@@ -651,6 +655,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
 
         sent = {"type": "user", "timestamp": "2026-11-14T09:02:00Z",
                 "message": {"role": "user", "content": "状況を確認して\n  報告してください。"}}
+        state = json.loads(self.state.read_text())
+        self.state.write_text(json.dumps({**state, "questions": {}}))
         self.write_lines(self.inbox, [{**ask, "id": "b1234567-1234-4567-8888-123456789abc"}])
         self.write_lines(transcript, [sent])
         self.write_lines(events, [{"type": "send", "ts": sent["timestamp"], "to": "term_worker",

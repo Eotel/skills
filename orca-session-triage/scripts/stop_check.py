@@ -149,7 +149,9 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
                 times.append(at.isoformat())
                 questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
                 lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
-                ref = ",".join(f"{ask_id}:{number}" for number in sorted(numbers[ask_id])) or ask_id
+                ref = ",".join(f"{ask_id}:{number}" for number in sorted(numbers[ask_id]))
+                if not ref:
+                    ref = f"{ask_id}:<質問番号>" if inbox_read.questions_of(asks[ask_id]) else ask_id
                 reasons.append(f"{questions}（ask {ask_id}）の後、{at.astimezone():%m/%d %H:%M} に {lane} のタブへ"
                                f"入力がありました:「{prompt[:80]}」。三浦さんの回答なら、伺わずに担当へ "
                                f"`triage-notify --answered {ref} <答えの要約>` での記録を頼んでください。"
@@ -189,13 +191,16 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             if len(bindings) > 1:
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
-        if not matched:
+        if not matched or any(not numbers for _, numbers in refs):
             shown = [(str(entry["id"]), frozenset((number,)))
                      for entry in entries if entry.get("kind") == "ask" and entry.get("id")
                      for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                      if text in (original.get("question"), answer_evidence.shown_question(original))
                      and (not header or original.get("header") == header)]
-            if len({ref[0] for ref in shown}) == 1:
+            if matched:
+                refs = [(ask_id, numbers or frozenset(number for original, parts in shown if original == ask_id
+                                                      for number in parts)) for ask_id, numbers in refs]
+            elif len({ref[0] for ref in shown}) == 1:
                 refs.extend(shown)
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
@@ -208,8 +213,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             else:
                 uncovered[ask_id] = ask
                 labels.setdefault(ask_id, []).append(text or header)
-                parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
-                asked_numbers.setdefault(ask_id, set()).update(parts)
+                asked_numbers.setdefault(ask_id, set()).update(numbers)
             parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
             candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
                           if parts else [claims.get(ask_id)])
