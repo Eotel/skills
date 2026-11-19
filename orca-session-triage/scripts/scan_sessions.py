@@ -1772,9 +1772,11 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         pane_handles = {key: term["handle"] for term in terms
                         if term.get("handle") and (key := hourly_runtime.pane_key(term))}
         codex_activity = {term["handle"]: last_codex_activity(screen_lines(frame)) for term in terms
-                          if term.get("agentIdentity") == "codex" and term.get("handle")
-                          and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))}
-        screen_error = next(((error, term.get("handle")) for term in terms if term.get("agentIdentity") == "codex"
+                          if term.get("handle") and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
+                          and (term.get("agentIdentity") == "codex"
+                               or (approval_tabs and not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
+        screen_error = next(((error, term.get("handle")) for term in terms
+                             if (term.get("agentIdentity") == "codex" or term.get("handle") in codex_activity)
                              and term.get("handle") not in approval_tabs
                              if (error := api_failure(codex_activity.get(term.get("handle")) or
                                                       last_codex_activity(str(term.get("preview") or "").splitlines())))),
