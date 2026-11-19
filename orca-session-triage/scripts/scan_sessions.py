@@ -1215,8 +1215,7 @@ def waiting_prompts(terms: list[dict], screens: Screens,
     for term in terms:
         if not term.get("handle") or not (screen := rendered(screens.get((environment, term["handle"])))):
             continue
-        if (prompt := codex_permission_prompt(screen, term["handle"])) and (
-                prompt["question"] == CODEX_PERMISSION or term.get("agentIdentity") in (None, "codex")):
+        if prompt := codex_permission_prompt(screen, term["handle"]):
             yield prompt, None
         elif prompt := permission_prompt(screen, term["handle"]):
             yield prompt, "pending_call_at"

@@ -3057,13 +3057,18 @@ class ScanCommandTests(unittest.TestCase):
         tree["_environment"] = environment
         tree["agents"][0]["lastAssistantMessage"] = "Checking the build."
         term = {**terminal(lane, "claude", preview="Earlier Claude reply"), "_environment": environment}
-        screen = {"source": "screen", "tail": [
-            scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm",
-        ]}
         self.assertEqual(scan.screen_targets([tree], [term], set()), [term])
-        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
-                                    screens={(environment, term["handle"]): screen})
-        self.assertEqual((row["class"], row["prompt_waiting"]["target"]), ("waiting", "$ git status"))
+        for prefix, target in (([scan.CODEX_PERMISSION, "$ git status"], "$ git status"),
+                               (["[… 43 lines] ⌃g view all"], "approval details omitted from terminal view")):
+            with self.subTest(target=target):
+                screen = {"source": "screen", "tail": [
+                    *prefix, "› 1. Yes, proceed (y)", "2. No (esc)", "Press enter to confirm or esc to cancel",
+                ]}
+                row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                            screens={(environment, term["handle"]): screen})
+                self.assertIsNotNone(row["prompt_waiting"])
+                self.assertEqual((row["class"], row["prompt_waiting"]["target"]), ("waiting", target))
+                self.assertEqual(row["prompt_waiting"]["tab"], term["handle"])
 
     def test_stale_codex_error_uses_its_own_approval_capture_time(self) -> None:
         lane = str(self.dir / "local")
