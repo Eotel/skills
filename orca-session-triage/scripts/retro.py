@@ -930,9 +930,12 @@ def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
     if checkpoint is None:
         return None
     adoptions = [entry for entry in item["decisions"] if entry["decision"] == "adopt"]
+    recorded_id = None
     if (isinstance(recorded, dict) and any(entry["id"] == recorded.get("decision_id") for entry in adoptions) and
             recorded.get("line_hash") == hashlib.sha256(checkpoint["line"].encode()).hexdigest()):
-        return recorded["decision_id"]
+        recorded_id = recorded["decision_id"]
+        if recorded_id not in completed:
+            return recorded_id
     adoptions = [entry for entry in adoptions if entry["id"] not in completed]
     proposal_id = item["proposal_id"]
     for adoption in reversed(adoptions):
@@ -941,6 +944,8 @@ def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
             return decision_id
         if decision_id in applications and json.loads(applications[decision_id]) == checkpoint:
             return decision_id
+    if recorded_id is not None:
+        return recorded_id
     return next((entry["id"] for entry in reversed(adoptions)
                  if entry.get("actor") == "triage-retro" or not entry.get("reason")), None)
 
