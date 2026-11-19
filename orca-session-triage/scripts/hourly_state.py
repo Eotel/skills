@@ -649,7 +649,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         pending = {key: item for key, item in state.get("questions", {}).items()
                    if not (refs := ask_state.references(item, known_asks))
                    or not all(ask_state.covered(ref, answered_ids, known_asks) for ref in refs)
-                   or any(not ask_state.reference(cover, known_asks) and cover not in latest_decisions
+                   or any(not ask_state.reference(cover, known_asks)
+                          and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
         state = {**state, "questions": pending}
     for row in rows:
@@ -734,9 +735,9 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             for asked_at, ask in unanswered:
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
-                remaining = [question for number, question in enumerate(answer_evidence.questions_of(ask), 1)
+                remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask), 1)
                              if not ask_state.covered((ask["id"], frozenset((number,))), answered_ids, known_asks)]
-                asked = "\n".join(remaining) or ask.get("text")
+                asked = "\n".join(question for _, question in remaining) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
                     "question": excerpt(asked) or view["question"],
@@ -744,6 +745,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     "decisions": keys.get(ask["id"], []), "related_issues": related_issues(ask),
                     "reissued": withdrawn_by((ask["id"], frozenset()), entries),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids,
+                            "question_numbers": [number for number, _ in remaining],
                             "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
             continue

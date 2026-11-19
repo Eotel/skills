@@ -474,6 +474,14 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     whole_id, _, number = ask_id.partition(":")
     whole = answers.get(whole_id)
     lane_answer = whole if whole and whole.get("how") in inbox_read.LANE_ANSWERS else None
+
+    def with_lane_evidence(part: dict) -> dict:
+        if not lane_answer or genuine_answer(part):
+            return part
+        if part.get("how") == inbox_read.HOURLY_CORRECTION:
+            return {**part, "delivery": lane_answer}
+        return lane_answer
+
     delivery = (whole.get("delivery") or whole) if whole else None
     if delivery and delivery.get("how") not in inbox_read.DELIVERY_ANSWERS:
         delivery = None
@@ -481,13 +489,12 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
         if not number.isdecimal():
             return None
         part = next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
-        if lane_answer and not genuine_answer(part or {}):
-            return lane_answer
+        if part is not None:
+            part = with_lane_evidence(part)
         return {**part, "delivery": delivery} if part and delivery and not genuine_answer(part) else part
     numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
     parts = inbox_read.answer_parts(whole_id, numbers, answers)
-    if lane_answer:
-        parts = [part if genuine_answer(part) else lane_answer for part in parts]
+    parts = [with_lane_evidence(part) for part in parts]
     if not parts or numbers and len(parts) != len(numbers):
         return None
     if not numbers or all(part is whole for part in parts):
@@ -564,7 +571,7 @@ def genuine_answer(answer: dict) -> bool:
     """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
     if answer.get("how") in inbox_read.LANE_ANSWERS:
         return True
-    if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS:
+    if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
         return True
     parts = answer.get("answers")
     return isinstance(parts, list) and bool(parts) and all(genuine_answer(part) for part in parts)

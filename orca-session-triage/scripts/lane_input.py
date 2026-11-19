@@ -113,7 +113,10 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
                         matches = [(abs(at - sent_at), index) for index, (prompt, at) in enumerate(prompts)
                                    if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN
                                                           or queued and timedelta() < at - sent_at <= QUEUED_WITHIN)]
-                        if matches:
+                        if require_handle and len(matches) > 1:
+                            for index in sorted((index for _, index in matches), reverse=True):
+                                prompts.pop(index)
+                        elif matches:
                             prompts.pop(min(matches)[1])
     except (OSError, RuntimeError):
         return {}
@@ -121,17 +124,20 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
             if (direct := sorted((pair for pair in prompts if pair[1] > local[ask_id][1]), key=lambda pair: pair[1]))}
 
 
+def normalized(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
 def option_key(value: str) -> str:
-    label = unicodedata.normalize("NFKC", value).strip().casefold()
+    label = normalized(value)
     if code := OPTION_CODE.match(label):
         return code[1]
     return label.removesuffix("(推奨)").removesuffix("(recommended)").strip()
 
 
-def option_labels(question: dict) -> dict[str, str]:
-    return {key: label for option in question.get("options") or []
-            if isinstance(option, dict) and isinstance(label := option.get("label"), str)
-            and (key := option_key(label))}
+def option_labels(question: dict) -> list[str]:
+    return [label for option in question.get("options") or []
+            if isinstance(option, dict) and isinstance(label := option.get("label"), str) and label.strip()]
 
 
 def inferred_answers(asks: list[inbox_read.OpenAsk], orca: str) -> dict[str, dict]:
@@ -140,22 +146,23 @@ def inferred_answers(asks: list[inbox_read.OpenAsk], orca: str) -> dict[str, dic
     matches: dict[tuple[str, datetime, str], list[tuple[str, str]]] = {}
     for ask_id, inputs in prompts.items():
         ask = pending[ask_id]
-        questions = inbox_read.questions_of(ask.report)
-        for number in ask.open_questions:
-            question = questions[number - 1]
+        for number, question in enumerate(inbox_read.questions_of(ask.report), 1):
             if not isinstance(question, dict) or question.get("multiSelect"):
                 continue
             labels = option_labels(question)
             for prompt, at in inputs:
-                choice = unicodedata.normalize("NFKC", prompt.removeprefix("/ship ")).strip().casefold()
-                if label := labels.get(choice):
+                choice = normalized(prompt.removeprefix("/ship "))
+                selected = [label for label in labels if normalized(label) == choice]
+                for label in (selected or [label for label in labels if option_key(label) == choice]):
                     key = (ask.report["handle"], at, prompt)
                     matches.setdefault(key, []).append((f"{ask_id}:{number}", label))
     choices: dict[str, dict[str, datetime]] = {}
+    available = {f"{ask_id}:{number}" for ask_id, ask in pending.items() for number in ask.open_questions}
     for (_, at, _), matches_for_input in matches.items():
         if len(matches_for_input) == 1:
             answer_id, label = matches_for_input[0]
-            choices.setdefault(answer_id, {}).setdefault(label, at)
+            if answer_id in available:
+                choices.setdefault(answer_id, {}).setdefault(label, at)
     return {answer_id: {"id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER,
                         "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
                         "note": label}
@@ -171,8 +178,12 @@ def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:
         return
     path = path.resolve()
     with retro.locked(path.with_name(path.name + ".lane-answer.lock")):
-        answered = inbox_read.answered_ids(path)
+        answered = inbox_read.answer_records(path)
+        used = {((record.get("sender") or {}).get("worktree"), record.get("ts"), record.get("note"))
+                for record in answered.values() if record.get("how") == inbox_read.TRANSCRIPT_ANSWER}
         for answer_id, record in detected.items():
-            if answer_id not in answered and answer_id.partition(":")[0] not in answered:
+            source = (record["sender"]["worktree"], record["ts"], record["note"])
+            if source not in used and answer_id not in answered and answer_id.partition(":")[0] not in answered:
                 inbox_read.record_answers(path, [answer_id], record["how"], record["note"],
                                           at=record["ts"], sender=record["sender"])
+                used.add(source)

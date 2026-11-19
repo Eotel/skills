@@ -155,7 +155,10 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
                     times.extend(at.isoformat() for _, at in new_inputs if at.isoformat() not in times)
                 questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
                 lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
-                ref = ",".join(refs) or (f"{ask_id}:<質問番号>" if has_parts else ask_id)
+                if len(refs) == 1 and ask_id not in unmatched:
+                    ref = refs[0]
+                else:
+                    ref = f"{ask_id}:<質問番号>" if has_parts else ask_id
                 unknown = ("番号を特定できない問いは、元の ask で対応する質問番号を確認してください。"
                            if ask_id in unmatched else "")
                 excerpts = "、".join(f"{at.astimezone():%m/%d %H:%M}「{prompt[:80]}」" for prompt, at in new_inputs)
@@ -208,11 +211,11 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          if isinstance(original, dict) and (not header or original.get("header") == header)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
-            if not shown and header and (labels_in_question := lane_input.option_labels(question)):
+            if not shown and header and (labels_in_question := set(map(lane_input.option_key, lane_input.option_labels(question)))):
                 presented = answer_evidence.shown_question(question)
                 links = set(QUESTION_URL.findall(presented))
                 possible = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
-                            if labels_in_question.keys() == lane_input.option_labels(original).keys()
+                            if labels_in_question == set(map(lane_input.option_key, lane_input.option_labels(original)))
                             and (answer_evidence.names_id(presented, ask_id)
                                  or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original))))]
                 if len(possible) == 1:

@@ -729,6 +729,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.question = {**original, "question": "管理画面で「音声」欄の配置をどれにしますか？",
                          "options": [{**option, "label": f"{option['label']}: 配置案"}
                                      for option in original["options"]]}
+        ask = {"id": self.ASK, "ts": "2026-11-14T09:00:00Z", "kind": "ask", "host": "mac-a",
+               "worktree": "worker", "handle": "term_worker", "questions": [original]}
         with closing(sqlite3.connect(status)) as db, db:
             db.execute("CREATE TABLE rows(key TEXT PRIMARY KEY, seq INTEGER NOT NULL, value TEXT NOT NULL)")
             db.execute("INSERT INTO rows VALUES (?, ?, ?)", ("entry\0worker:leaf", 1, json.dumps({
@@ -741,9 +743,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
                   "content": [{"type": "input_text", "text": "A"}]}})):
             with self.subTest(provider=provider):
                 self.answers.write_text("")
-                self.write_lines(self.inbox, [{"id": self.ASK, "ts": "2026-11-14T09:00:00Z", "kind": "ask",
-                                               "host": "mac-a", "worktree": "worker", "handle": "term_worker",
-                                               "questions": [original]}])
+                self.write_lines(self.inbox, [ask])
                 self.write_lines(transcript, [{**row, "timestamp": self.AT}])
                 self.write_lines(events, [{"type": "send", "ts": self.AT, "to": "term_worker",
                                            "text": "/ship A" if provider == "claude" else "A"}])
@@ -762,6 +762,11 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
                 self.assertIn("worker の回答「A」", reason)
                 self.assertEqual(json.loads(self.answers.read_text())["how"], "lane transcript")
+        second = {**original, "header": "別の配置", "question": "別の欄は、どの配置で実装しますか？"}
+        self.write_lines(self.inbox, [{**ask, "questions": [original, second]}])
+        opened = self.run_tool("inbox_read.py", "open-asks", "--json")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual([item["number"] for item in json.loads(opened.stdout)[0]["open_questions"]], [2])
 
     def test_guard_allows_different_numbered_questions_from_the_same_worker(self) -> None:
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [
