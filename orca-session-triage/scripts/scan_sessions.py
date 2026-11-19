@@ -765,12 +765,19 @@ RESETS = re.compile(r"(?:resets|try again at)\s+(.+?)\.?$")
 
 
 class StopReason(TypedDict):
-    kind: str  # connection, usage_limit, login, context_limit, or other
+    kind: str  # connection, interrupted, usage_limit, login, context_limit, or other
     action: str  # wake, wait (until resets), human, or new_lane
     agent: str | None
     error: str
     resets: str | None
     tab: NotRequired[str]
+    stopped_at: NotRequired[str]
+
+
+def codex_moved_since(row: Mapping, stopped_at: datetime) -> bool:
+    return any(at > stopped_at for rollout in row.get("codex") or []
+               for key in ("last_user_at", "last_assistant_at", "api_error_at")
+               if (at := parse_time(rollout.get(key))))
 
 
 def stop_reason(row: dict) -> StopReason | None:
@@ -778,6 +785,11 @@ def stop_reason(row: dict) -> StopReason | None:
     expired login a person has to renew, a full context window a new lane with a smaller scope gets past, or
     another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
+    interruption = row.get("codex_interruption")
+    if interruption and not row.get("prompt_waiting") and not row.get("screen_progress"):
+        at = parse_time(interruption["stopped_at"])
+        if at and not codex_moved_since(row, at):
+            return interruption
     if not (found := failure(row)):
         return None
     error, agent, tab = found
@@ -797,6 +809,8 @@ def stop_reason(row: dict) -> StopReason | None:
 
 
 def stop_line(stop: StopReason) -> str:
+    if stop["kind"] == "interrupted":
+        return f"turn interrupted at {stop['stopped_at']}: {stop['error']}"
     if stop["kind"] == "usage_limit":
         return "usage limit; resets " + stop["resets"] if stop["resets"] else "usage limit: " + stop["error"]
     if stop["kind"] == "login":
@@ -956,7 +970,7 @@ def agents_done(row: dict) -> bool:
     lead with unread worker mail, are woken in that tab.
     """
     still_working = (row.get("jev") or {}).get("status") == "in_progress"
-    to_wake = cut_off(row) or row.get("unread_mail")
+    to_wake = row.get("stop") or cut_off(row) or row.get("unread_mail")
     return row["class"] in ("finished", "stalled") and not still_working and not to_wake
 
 
@@ -1002,6 +1016,7 @@ CODEX_WORKING = re.compile(r"• Working \(")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
+CODEX_INTERRUPTED = re.compile(r"■ Conversation interrupted(?:$|[ .—-])")
 
 
 def screen_lines(screen: dict) -> list[str]:
@@ -1010,9 +1025,10 @@ def screen_lines(screen: dict) -> list[str]:
 
 
 def last_codex_activity(lines: list[str]) -> str | None:
-    """The last Codex reply, action, or error in a terminal excerpt."""
+    """The last Codex reply, action, turn end, or error in a terminal excerpt."""
     return next((line for raw in reversed(lines) if (line := raw.strip())
-                 and (line.startswith(CODEX_REPLY) or api_failure(line))), None)
+                 and (line.startswith(CODEX_REPLY) or CODEX_TURN_END.fullmatch(line)
+                      or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1235,7 +1251,7 @@ def screen_agent(screen: dict) -> str | None:
     lines = screen_lines(screen)
     if any(CLAUDE_LINE_STARTS.match(line.strip()) or CLAUDE_MODE_LINE in line for line in lines):
         return "claude"
-    if any(CODEX_TURN_END.fullmatch(line.strip()) for line in lines) or (
+    if any(CODEX_TURN_END.fullmatch(line.strip()) or CODEX_INTERRUPTED.match(line.strip()) for line in lines) or (
             any(line.startswith(CODEX_PROMPT) for line in lines) and any(line.startswith(CODEX_REPLY) for line in lines)):
         return "codex"
     return None
@@ -1785,7 +1801,20 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         codex_activity = {term["handle"]: last_codex_activity(screen_lines(frame)) for term in terms
                           if term.get("handle") and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
                           and (term.get("agentIdentity") == "codex"
-                               or (approval_tabs and not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
+                               or (not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
+        interruptions: list[StopReason] = []
+        for term in terms:
+            handle = term.get("handle")
+            activity = codex_activity.get(handle)
+            if not handle or not activity or not CODEX_INTERRUPTED.match(activity) or handle in approval_tabs:
+                continue
+            agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
+            stopped_ms = ((agent.get("stateStartedAt") if agent.get("interrupted") else None)
+                          or term.get("lastOutputAt"))
+            if stopped_ms is not None:
+                stopped_at = datetime.fromtimestamp(stopped_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
+                interruptions.append({"kind": "interrupted", "action": "wake", "agent": "codex",
+                                      "error": activity, "resets": None, "tab": handle, "stopped_at": stopped_at})
         screen_error: tuple[str | None, str | None] = (None, None)
         for term in terms:
             handle = term.get("handle")
@@ -1829,6 +1858,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                            "title": t.get("title")} for t in terms],
             "codex_screen_error": screen_error[0],
             "codex_screen_error_tab": screen_error[1],
+            **({"codex_interruption": max(interruptions, key=lambda stop: stop["stopped_at"])}
+               if interruptions else {}),
             **({"pane_errors": pane_errors} if pane_errors else {}),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
@@ -1874,9 +1905,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["claude"] = {**(row["claude"] or {}), "api_error": None, "api_error_kind": None,
                              **({"final_text": resumed.text, "final_at": None} if resumed.text else {})}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
-        latest = None if turn_runs(row) or cut_off(row) or row["screen_progress"] else latest_message(row)
-        row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["stop"] = stop_reason(row)
+        latest = None if turn_runs(row) or row["stop"] or row["screen_progress"] else latest_message(row)
+        row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
         if resumed:
             error_kind = "usage limit" if resumed.kind == "usage_limit" else "connection error"
@@ -3100,7 +3131,9 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
         # A prompt on the tab's screen is the state now, whatever a reader saved before.
-        verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES and not row.get("prompt_waiting")
+        interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
+        verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES
+                   and not row.get("prompt_waiting") and not interrupted
                    else None)
         return {**row, "verdict": verdict} if verdict else row
     return [marked(row) for row in rows]
@@ -3388,7 +3421,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "left out is named on stderr with why, and the exit status is 1. After the specs, "
                             "stderr prints the full rm-check-batch --from command with --remove-ok --summary")
     views.add_argument("--wake", action="store_true",
-                       help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
+                       help="with --from, print one line per row an API failure or interruption stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
                             "logs in, 文脈の上限: a new lane with a smaller scope, その他: a person reads it) | the error's first 200 characters")
     parser.add_argument("--transcripts", action="store_true",
@@ -3969,7 +4002,8 @@ def main(argv: list[str] | None = None) -> int:
     return print_rows(args, rows, verdicts)
 
 
-WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する",
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 同じ作業を再開する",
+                "login": "ログイン切れ: 人が /login する",
                 "context_limit": "文脈の上限: 範囲を小さくして新しい担当に渡す", "other": "その他: 人が読む"}
 
 
@@ -4041,6 +4075,8 @@ def wake_line(row: dict, stop: StopReason) -> str:
         if (answer := row.get("wake_decision")) and "起こさない" in answer["answer"]:
             action = f"利用上限: {answer['decided_at']} " + " ".join(answer["answer"].split())
     error = " ".join(stop["error"].split())
+    if stopped_at := stop.get("stopped_at"):
+        action += f"（停止 {stopped_at}）"
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 
 

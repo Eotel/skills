@@ -2047,6 +2047,22 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((row["stop"]["kind"], row["stop"]["action"]), ("connection", "wake"))
         self.assertFalse(row["closable"])
 
+    def test_codex_interruption_stops_only_the_last_turn(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        end = [message, "", "› ", "  ? for shortcuts"]
+        for tail, expected in ((end, "interrupted"), ([message, "Worked for 2s • 12:05", "› "], None)):
+            with self.subTest(expected=expected):
+                [row] = scan.build_inventory(
+                    [worktree("/w/cut", "working", agent="codex")],
+                    [terminal("/w/cut", "codex", quiet_minutes=5)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}})
+                self.assertEqual((row["stop"] or {}).get("kind"), expected)
+                if expected:
+                    self.assertEqual(row["class"], "stalled")
+                    self.assertEqual(row["stop"]["action"], "wake")
+                    self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),
             assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",

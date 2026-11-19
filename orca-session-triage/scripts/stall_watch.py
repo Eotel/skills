@@ -112,10 +112,11 @@ CODEX_SINCE = timedelta(days=2)
 PROBE_TIMEOUT = 15
 DELIVERED = ("send", "send --decision")
 WITHDRAWN = "triage-notify --withdraws"
-STOP_KINDS = ("connection", "context_limit", "other", "login")
+STOP_KINDS = ("connection", "context_limit", "other", "login", "interrupted")
 RECOVERED = ("api_error_turn", "idle_after_report", "busy_without_progress")
 MAX_RECOVERIES = 2
 STEPS = {"connection": "通信断。同じ続きを送る（止まったところから続ける 1 行）",
+         "interrupted": "中断。同じ作業を再開する（止まったところから続ける 1 行）",
          "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
          "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
                        " spawn-lane し、今の担当は止める）"}
@@ -145,7 +146,7 @@ PROGRESS_COMMAND = re.compile(r"\bgit\s+(?:-[Cc]\s+\S+\s+)*(?:commit|push)\b"
 EXIT_CODE = re.compile(r'\\*"exit_code\\*"\s*:\s*(\d+)')
 
 
-MeasuredBy = Literal["transcript", "rollout", "agent_state", "report"]
+MeasuredBy = Literal["transcript", "rollout", "agent_state", "report", "screen"]
 WaitKind = Literal["pr", "issue", "time", "event", "external", "person"]
 
 
@@ -542,12 +543,19 @@ def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) 
     stop = row.get("stop")
     if not stop or stop.get("kind") not in STOP_KINDS:
         return []
+    interrupted = stop["kind"] == "interrupted"
+    if interrupted:
+        at = parse(stop.get("stopped_at"))
+        if not at or moved_since(act, at) or scan.codex_moved_since(row, at):
+            return []
+        act = Activity(at, "screen")
     if act.at is None or now - act.at < GRACE:
         return []
     then = (f"。{PERSON_STEPS[stop['kind']]}" if stop["kind"] in PERSON_STEPS
             else recovery(row, records, now, STEPS[stop["kind"]]))
+    cause = "中断" if interrupted else f"API エラー（{stop['kind']}）"
     return [base_signal(row, act, records, "api_error_turn", f"{act.by}@{act.at:%Y%m%dT%H%M%S}",
-                        f"最後の turn が {short(act.at)} に API エラー（{stop['kind']}）で終わった: "
+                        f"最後の turn が {short(act.at)} に {cause}で終わった: "
                         f"{stop['error'][:100]}{then}")]
 
 

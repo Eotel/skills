@@ -370,6 +370,17 @@ class BusyWithoutProgressTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_interrupted_codex_uses_screen_stop_time_and_ignores_a_later_turn(self) -> None:
+        stopped_at = NOW - timedelta(minutes=20)
+        lane = row("cut", codex=[], stop={"kind": "interrupted", "action": "wake", "agent": "codex",
+                                         "error": "■ Conversation interrupted", "resets": None,
+                                         "stopped_at": stopped_at.isoformat()})
+        signals = stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False)
+        self.assertEqual([item.stopped_at for item in signals], [stopped_at.isoformat()])
+        self.assertIn("中断。同じ作業を再開", signals[0].reason)
+        lane["codex"] = [{"last_user_at": (stopped_at + timedelta(minutes=1)).isoformat()}]
+        self.assertEqual(stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False), [])
+
     def test_a_new_rollout_error_is_not_hidden_by_the_previous_approval_screen(self) -> None:
         earlier = NOW - timedelta(minutes=1)
         row = {"path": "/w/lane", "claude": None,
