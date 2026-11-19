@@ -10,7 +10,7 @@ in a forked copy (``claude -p --resume --fork-session``) that leaves the origina
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import fcntl
@@ -872,23 +872,41 @@ def note_from_undo(item: dict[str, Any], token: dict[str, Any] | None) -> str:
     return line[2:-len(suffix)] if line.startswith("- ") and line.endswith(suffix) else item["proposal"]
 
 
+def reversal_target_available(skill: str, root: Path, proposal_id: str, has_application: bool) -> bool:
+    try:
+        router = skill_target(skill, root)
+        if router is None:
+            return False
+        if has_application:
+            return True
+        return MARKER + proposal_id in facts_path(router).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+
+
 def pending_reversal(item: dict[str, Any], attempts: dict[str, int], checkpoint_id: str | None,
-                     applications: dict[str, str], skill_available: bool) -> tuple[str, dict[str, Any], str] | None:
+                     applications: dict[str, str],
+                     available: Callable[[bool], bool]) -> tuple[str, dict[str, Any], str] | None:
     reverted = {run["decision_id"] for run in item.get("executions", []) if run["outcome"] == "reverted"}
-    failures = {run["decision_id"]: run["result"] for run in item.get("executions", []) if run["outcome"] == "failed"}
+    missing_target = {run["decision_id"] for run in item.get("executions", [])
+                      if run["outcome"] == "failed" and run["result"] == "target skill is missing"}
     adoption_id = None
+    pending = None
     for decision in item["decisions"]:
         if decision["decision"] == "adopt":
             adoption_id = decision["id"]
-        elif decision["decision"] == "revoke" and adoption_id is not None and decision["id"] not in reverted:
+        elif decision["decision"] == "revoke" and adoption_id is not None:
             action_key = f"{item['proposal_id']}:revoked:{decision['ts']}"
-            if (attempts.get(action_key, 0) >= 3 and skill_available and
-                    (adoption_id in applications or checkpoint_id == adoption_id) and
-                    failures.get(decision["id"]) == "target skill is missing"):
-                action_key = f"{action_key}:target-restored"
-            if attempts.get(action_key, 0) < 3:
-                return adoption_id, decision, action_key
-    return None
+            if decision["id"] in reverted:
+                attempts.pop(action_key, None)
+                attempts.pop(f"{action_key}:target-restored", None)
+            elif pending is None:
+                if (attempts.get(action_key, 0) >= 3 and decision["id"] in missing_target and
+                        available(adoption_id in applications or checkpoint_id == adoption_id)):
+                    action_key = f"{action_key}:target-restored"
+                if attempts.get(action_key, 0) < 3:
+                    pending = adoption_id, decision, action_key
+    return pending
 
 
 def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
@@ -913,7 +931,8 @@ def checkpoint_adoption(item: dict[str, Any], checkpoint: dict[str, Any] | None,
             return decision_id
         if decision_id in applications and json.loads(applications[decision_id]) == checkpoint:
             return decision_id
-    return next((entry["id"] for entry in reversed(adoptions) if not entry.get("reason")), None)
+    return next((entry["id"] for entry in reversed(adoptions)
+                 if entry.get("actor") == "triage-retro" or not entry.get("reason")), None)
 
 
 def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, state: Path | None = None) -> int:
@@ -935,10 +954,10 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         applications = {run["decision_id"]: run["undo"] for run in item.get("executions", [])
                         if run["outcome"] == "applied" and run.get("undo") and run.get("actor") == "triage-retro"}
         decision_ids = [entry["id"] for entry in item["decisions"]]
-        checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"],
-                                             data["applied_action_ids"].get(proposal_id), applications)
-        router = skill_target(skill, root) if category not in SEPARATE_WORK else None
-        reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id, applications, router is not None)
+        checkpoint_hint = data["applied_action_ids"].get(proposal_id)
+        checkpoint_id = checkpoint_adoption(item, checkpoint, data["rewrites"], checkpoint_hint, applications)
+        reversal = (pending_reversal(item, data["action_attempts"], checkpoint_id, applications,
+                                     lambda applied: reversal_target_available(skill, root, proposal_id, applied))
                     if category not in SEPARATE_WORK else None)
         if reversal is not None:
             adoption_id, decision, action_key = reversal
@@ -948,6 +967,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             adoption_id = decision["id"]
             action_key = f"{proposal_id}:{status}:{decision['ts']}"
         else:
+            if item.get("reverted_at"):
+                data["applied_actions"].pop(proposal_id, None)
+                data["applied_action_ids"].pop(proposal_id, None)
             continue
         decision_id = decision["id"]
         stored = checkpoint if checkpoint_id == adoption_id else None
@@ -978,6 +1000,7 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
         proposal = {"id": proposal_id, "note": item["proposal"], "target_skill": skill}
         writing_completed = False
         try:
+            router = skill_target(skill, root)
             if router is None:
                 raise ValueError("target skill is missing")
             reference = facts_path(router)
@@ -1002,6 +1025,9 @@ def sync_decisions(ledger: Ledger, data: dict[str, Any], root: Path = SOURCE, st
             if not newer_application and MARKER + proposal_id in contents and contents.count(line) != 1:
                 raise ValueError("adopted line changed; review target before retry")
             if status == "adopted":
+                if (stored == expected and contents.count(line) == 0 and
+                        isinstance(checkpoint_hint, dict) and checkpoint_hint.get("decision_id") != adoption_id):
+                    stored = None
                 if stored is not None and stored != expected:
                     raise ValueError("saved adoption target does not match the skill")
                 if stored is not None or (contents.count(line) == 1
