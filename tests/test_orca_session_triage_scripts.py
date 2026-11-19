@@ -6707,6 +6707,31 @@ class HourlyStateTests(unittest.TestCase):
                 self.assertIn("other/lane", stderr.getvalue())
         self.assertFalse(self.state.exists())
 
+    def test_asking_again_reuses_the_id_saved_under_a_worktree_alias(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, original = self.call("asked", "--row", "/w/app/lane", *args)
+        previous = json.loads(self.state.read_text())
+        previous["questions"][original["id"]]["row"] = "app/lane"
+        self.state.write_text(json.dumps(previous))
+        saved = self.source("scan.json", json.dumps([{"path": "/w/app/lane", "repo": "app"}]))
+
+        _, asked = self.call("asked", "--row", "app/lane", "--from", saved, *args)
+
+        self.assertEqual((asked["id"], asked["row"]), (original["id"], "/w/app/lane"))
+        result, answer = self.call("answered", "--decision", "publish", "--answer-file", message)
+        self.assertEqual((result, answer["id"]), (0, original["id"]))
+
+    def test_a_relative_path_in_a_saved_scan_cannot_be_recorded_as_owner(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": "lane", "repo": "app"}]))
+        with redirect_stderr(io.StringIO()) as stderr:
+            code = hourly_state.main(["--state-file", str(self.state), "presented", "--owner", "lane", "--from", saved,
+                                      "--key", "user:publish", "--text-file", self.source("message.txt", "Ready."),
+                                      "--since", "2026-11-19T00:00:00Z"])
+        self.assertEqual(code, 1)
+        self.assertIn("owner must be a scan row identity", stderr.getvalue())
+        self.assertFalse(self.state.exists())
+
     def test_an_item_the_hourly_report_listed_stays_presented_until_an_answer_a_decision_or_its_start(self) -> None:
         saved = self.root / "scan.json"
         saved.write_text("[]")

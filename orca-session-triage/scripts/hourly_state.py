@@ -868,10 +868,9 @@ def owner_name(value: str) -> str:
     return owner
 
 
-def selected_worktree(value: str, scan_file: str | None, option: str) -> str:
-    if scan_file is not None:
-        rows = scan_sessions.saved_rows(scan_file)
-        return scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option))
+def selected_worktree(value: str, rows: list[dict] | None, option: str) -> str:
+    if rows is not None:
+        return owner_name(scan_sessions.row_identity(scan_sessions.select_row(rows, value.strip(), option)))
     try:
         return owner_name(value)
     except ValueError as error:
@@ -1352,7 +1351,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
     }
 
 
-def change(data: dict, args: argparse.Namespace) -> dict:
+def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | None = None) -> dict:
     if args.action == "appoint-lead":
         at = datetime.fromisoformat(recorded_at(args.appointed_at)).astimezone(timezone.utc).isoformat()
         data["lead"] = {"worktree": str(args.worktree.expanduser().resolve()), "appointed_at": at}
@@ -1432,6 +1431,14 @@ def change(data: dict, args: argparse.Namespace) -> dict:
         asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
                         question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
                         covers=tuple(args.covers), session=args.session, header=args.header)
+        if selected_rows is not None and current_question(data, asking) is None:
+            for item in reversed(list(data["questions"].values())):
+                if item["decision"] != decision or item.get("withdrawn_at"):
+                    continue
+                matches = scan_sessions.matching_rows(selected_rows, item["row"])
+                if len(matches) == 1 and scan_sessions.row_identity(matches[0]) == asking.row:
+                    item["row"] = asking.row
+                    break
         return record_question(data, asking, new_references(data, [asking]))
     if args.action == "answered":
         return record_answer(data, Answering(
@@ -1834,10 +1841,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
     try:
+        selected_rows = (scan_sessions.saved_rows(args.from_file)
+                         if args.action in ("asked", "presented") and args.from_file is not None else None)
         if args.action == "asked":
-            args.row = selected_worktree(args.row, args.from_file, "--row")
+            args.row = selected_worktree(args.row, selected_rows, "--row")
         if args.action == "presented" and args.owner is not None:
-            args.owner = selected_worktree(args.owner, args.from_file, "--owner")
+            args.owner = selected_worktree(args.owner, selected_rows, "--owner")
         path.parent.mkdir(parents=True, exist_ok=True)
         live: frozenset[str] = frozenset()
         intake: Intake | None = None
@@ -1917,7 +1926,7 @@ def main(argv: list[str] | None = None) -> int:
                 view: dict[str, Any] = {"workspace": here, "comment": workspace_comment(data, here)}
                 result = view
             else:
-                result = data if args.action == "show" else change(data, args)
+                result = data if args.action == "show" else change(data, args, selected_rows)
             items = result if isinstance(result, list) else [result]
             # A question answered or withdrawn from another tab (the lead's) rewrites the comment of the workspace it
             # was asked in, once this script writes that comment.
