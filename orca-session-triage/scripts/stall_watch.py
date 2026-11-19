@@ -26,7 +26,7 @@ Signals:
                        one-shot schedule keeps it, and the lane has not moved since that time
   wait_resolved        the saved verdict waits on an outside state that now holds: a date that has come, another Mac
                        the scan reaches, or a forge `git ls-remote` reaches
-  api_error_turn       the newest copy of the lane's transcript ends in an API error that is not a usage limit,
+  api_error_turn       the lane ended in an API error other than a usage limit or has a Codex interruption,
                        fifteen minutes or more ago
   idle_after_report    the lane's last report is an info or an answered ask, its agent has done nothing for two
                        hours, and no open question, active hold, live background job, or Orca automation explains it
@@ -112,10 +112,11 @@ CODEX_SINCE = timedelta(days=2)
 PROBE_TIMEOUT = 15
 DELIVERED = ("send", "send --decision")
 WITHDRAWN = "triage-notify --withdraws"
-STOP_KINDS = ("connection", "context_limit", "other", "login")
+STOP_KINDS = ("connection", "context_limit", "other", "login", "interrupted")
 RECOVERED = ("api_error_turn", "idle_after_report", "busy_without_progress")
 MAX_RECOVERIES = 2
 STEPS = {"connection": "通信断。同じ続きを送る（止まったところから続ける 1 行）",
+         "interrupted": "中断。元の指示で再開してよいか確認する",
          "context_limit": "文脈の上限。範囲を小さくして新しい担当に渡す（残りの作業だけの指示書で spawn-lane し、今の担当は止める）",
          "tool_error": "道具のエラー。画面で同じ道具の失敗が続いていれば {other} の担当に移す（同じ作業を {other} で"
                        " spawn-lane し、今の担当は止める）"}
@@ -540,15 +541,33 @@ def recovery(row: Mapping, records: Records, now: datetime, step: str | None) ->
 
 def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     stop = row.get("stop")
-    if not stop or stop.get("kind") not in STOP_KINDS:
-        return []
+    interruptions = row.get("codex_interruptions") or ()
+    if interruptions and stop and stop.get("kind") == "interrupted":
+        stop = scan.api_stop_reason(dict(row))
+    stops = [*([stop] if stop else []), *interruptions]
+    return [signal for item in stops if item.get("kind") in STOP_KINDS
+            for signal in stop_signals(row, item, act, records, now)]
+
+
+def stop_signals(row: Mapping, stop: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
+    interrupted = stop["kind"] == "interrupted"
+    if interrupted:
+        at = parse(stop.get("stopped_at"))
+        if (not at or scan.codex_moved_since(row, at, stop.get("rollout"))
+                or any(sent > at for sent in records.sends_by_handle.get(stop.get("tab"), ()))):
+            return []
+        act = Activity(at, stop.get("stopped_by", "agent_state"))
     if act.at is None or now - act.at < GRACE:
         return []
     then = (f"。{PERSON_STEPS[stop['kind']]}" if stop["kind"] in PERSON_STEPS
             else recovery(row, records, now, STEPS[stop["kind"]]))
-    return [base_signal(row, act, records, "api_error_turn", f"{act.by}@{act.at:%Y%m%dT%H%M%S}",
-                        f"最後の turn が {short(act.at)} に API エラー（{stop['kind']}）で終わった: "
-                        f"{stop['error'][:100]}{then}")]
+    cause = "中断" if interrupted else f"API エラー（{stop['kind']}）"
+    where = (f"。タブ {stop['tab']}" + (f"（--environment {row['environment']}）" if row.get("environment") else "")
+             if interrupted and stop.get("tab") else "")
+    fingerprint = f"{stop.get('tab')}@{iso(act.at)}" if interrupted else f"{act.by}@{act.at:%Y%m%dT%H%M%S}"
+    return [base_signal(row, act, records, "api_error_turn", fingerprint,
+                        f"最後の turn が {short(act.at)} に {cause}で終わった: "
+                        f"{stop['error'][:100]}{where}{then}")]
 
 
 def waits_explained(row: Mapping, verdict: Mapping | None, records: Records, now: float) -> bool:
@@ -882,12 +901,31 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
     codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS),
                             (now - CODEX_SINCE).timestamp())
     jobs = scan.worktree_processes(paths, CPU_FILE, now.timestamp())
+    def interruptions(row: dict) -> list[dict]:
+        if candidates := row.get("codex_interruptions"):
+            return candidates
+        return [stop] if (stop := row.get("stop")) and stop.get("kind") == "interrupted" else []
+
+    interrupted_tabs = [{"handle": stop["tab"], "_environment": row.get("environment")}
+                        for row in rows for stop in interruptions(row) if stop.get("tab")]
+    screens = scan.read_screens(os.environ.get("ORCA_CLI_COMMAND", "orca"), interrupted_tabs)
     fresh = []
     for row in rows:
-        if row in local:
-            row = {**row, "claude": scan.read_claude(projects, row["path"], live.get(row["path"], [])),
-                   "codex": codex.get(row["path"]) or row.get("codex") or [],
-                   "processes": jobs.get(row["path"], [])}
+        surviving = []
+        for stop in interruptions(row):
+            screen = scan.rendered(screens.get((row.get("environment"), stop.get("tab"))))
+            seen = scan.current_interruption(screen) if screen else None
+            if (screen and seen and not scan.changed_interruption(seen, stop)
+                    and not scan.codex_permission_prompt(screen, stop["tab"])):
+                surviving.append(stop)
+        if interruptions(row):
+            stop = row.get("stop") or {}
+            api_stop = scan.api_stop_reason(row) if stop.get("kind") == "interrupted" else stop or None
+            row = {**row, "codex_interruptions": surviving, "stop": next(iter(surviving), api_stop)}
+        if not row.get("environment") and isinstance(path := row.get("path"), str):
+            row = {**row, "claude": scan.read_claude(projects, path, live.get(path, [])),
+                   "codex": codex.get(path) or row.get("codex") or [],
+                   "processes": jobs.get(path, [])}
             row["stop"] = scan.stop_reason(row)
         fresh.append(row)
     return fresh
@@ -916,7 +954,8 @@ def ask_text(signals: Sequence[Signal]) -> str:
         names = "・".join(SIGNALS[item.signal] for item in items)
         lines.append(f"{number}. {work}（{names}）")
         lines += [f"   - {item.reason}" for item in items]
-    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。新しい担当に渡したら"
+    lines += ["起こす・立て直す: 合図の「立て直し」のとおり send <作業場> --ask <この ask の id> \"…\"。"
+              "中断を再開するときは、表示したタブの handle を送信先に指定します。新しい担当に渡したら"
               " inbox_read.py answered <この ask の id> --note \"立て直し: <元の作業場> → <新しい作業場>\"（orca-session-triage の"
               " references/next-step.md の Recovering a stopped lane）。閉じる・待つ: inbox_read.py answered <この ask の id>"
               " --note \"理由\"。", "合図の記録: ~/.cache/orca-session-triage/work-checks.json"]

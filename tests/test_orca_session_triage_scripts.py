@@ -10,6 +10,7 @@ from typing import Literal, NotRequired, TextIO, TypedDict, Unpack
 from contextlib import AbstractContextManager, closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from itertools import product
 import fcntl
 import hashlib
 import importlib.util
@@ -1356,6 +1357,20 @@ class ClassifyTests(unittest.TestCase):
         screen["tail"][4:5] = ["❯", "  2 行目から書いた指示"]
         self.assertFalse(scan.composer_empty(screen))
 
+    def test_codex_footer_does_not_mark_a_finished_tab_as_having_a_draft(self) -> None:
+        lane = {**worktree("/w/d"), "agents": [done_agent("codex", "tab1:leaf1")]}
+        tab = in_pane(terminal("/w/d", "codex", "term_codex"), "tab1:leaf1")
+        for prompt, empty in (("› Ask Codex to do anything", True), ("› keep this draft", False)):
+            with self.subTest(prompt=prompt):
+                screen = {"source": "screen", "tail": [
+                    prompt, "  GPT-6.2-Sol xhigh · ~/orca/workspaces/app/composer",
+                    "  ← for agents · ? for shortcuts     ⚠ 1 warning · f2 to view"]}
+                [row] = scan.build_inventory([lane], [tab], self.projects, {}, "要判断", now=NOW,
+                                             judge=judging({}), screens={(None, "term_codex"): screen})
+                [card] = row["done_cards"]
+                self.assertEqual(card["composer_empty"], empty)
+                self.assertEqual(row.get("draft_tabs", []), [] if empty else ["term_codex"])
+
     def test_a_hook_that_fails_for_a_missing_file_is_named_with_its_host_and_path(self) -> None:
         # Another Mac lost two hook scripts overnight: every Bash call and stop printed this, and nobody noticed.
         remote: dict = {**worktree("/remote/lane-241", "working"), "_environment": "macbook-pro-16"}
@@ -2046,6 +2061,84 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual((row["stop"]["kind"], row["stop"]["action"]), ("connection", "wake"))
         self.assertFalse(row["closable"])
 
+    def test_codex_interruption_stops_only_the_last_turn(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        end = [message, "", "› ", "  ? for shortcuts"]
+        for tail, expected in ((end, "interrupted"), ([message, "Worked for 2s • 12:05", "› "], None)):
+            with self.subTest(expected=expected):
+                [row] = scan.build_inventory(
+                    [worktree("/w/cut", "working", agent="codex")],
+                    [terminal("/w/cut", "codex", quiet_minutes=5)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}})
+                self.assertEqual((row["stop"] or {}).get("kind"), expected)
+                if expected:
+                    self.assertEqual(row["class"], "stalled")
+                    self.assertEqual(row["stop"]["action"], "wake")
+                    self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
+    def test_codex_interruption_keeps_its_time_through_a_redraw_and_feedback(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        times: dict[str, scan.StopReason] = {}
+        path = "/w/cut"
+        for tail, quiet, stopped in (
+            ([message, "› "], 30, 30),
+            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
+            ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
+            (["› Continue work", "• Working (1s)", message, "› "], 0, 1),
+            ([message, "› Continue work", message, "› Continue work", message, "› "], 0, 0),
+            ([message, "› Continue work", "› "], 0, None),
+        ):
+            with self.subTest(quiet=quiet):
+                [row] = scan.build_inventory(
+                    [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=quiet)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}}, interruption_times=times)
+                stop = row["stop"]
+                self.assertEqual(bool(stop), stopped is not None)
+                if stop and stopped is not None:
+                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 60 * stopped) * 1000))
+                    self.assertEqual(stop["stopped_by"], "agent_state")
+
+    def test_codex_interruption_uses_the_tab_state_time_even_when_a_redraw_is_newer(self) -> None:
+        rollout = self.projects / "rollout.jsonl"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        write_jsonl(rollout, [
+            {"type": "session_meta", "payload": {"cwd": "/w/cut"}},
+            {"type": "event_msg", "timestamp": stopped,
+             "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ])
+        path, event = scan.summarize_rollout(rollout)
+        self.assertEqual(path, "/w/cut")
+        [row] = scan.build_inventory(
+            [{**worktree("/w/cut"), "agents": [done_agent("codex", "tab1:leaf1", minutes_ago=30, interrupted=True)]}],
+            [in_pane(terminal("/w/cut", "codex"), "tab1:leaf1")],
+            self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "agent_state"))
+
+    def test_older_screen_cannot_bring_back_a_cleared_interruption(self) -> None:
+        path = self.projects / "stops.json"
+        key = '[null, "term_a"]'
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        new = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        stop = {"kind": "interrupted", "stopped_at": old}
+        scan.save_interruption_times(path, {key: new}, {})
+        scan.save_interruption_times(path, {key: old}, {key: stop})
+        self.assertIsNone(json.loads(path.read_text())[key]["stop"])
+
+    def test_unmatched_rollout_does_not_hide_an_interruption_in_a_different_tab(self) -> None:
+        path = "/w/cut"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        rollout = {"rollout": "/tmp/closed-tab.jsonl", "interrupted_at": stopped,
+                   "turn_started_at": scan.iso_time((NOW - 120) * 1000), "pending_requests": []}
+        [row] = scan.build_inventory(
+            [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=5)],
+            self.projects, {path: [rollout]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual(row["class"], "stalled")
+        self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),
             assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",
@@ -2531,6 +2624,12 @@ class NextStepFactTests(unittest.TestCase):
                              {"branch": "main", "head": git(work, "rev-parse", "HEAD"),
                               "head_at": git(work, "log", "-1", "--format=%cI"),
                               "dirty": 1, "unpushed": 1, "github": "acme/app"})
+            git(work, "update-ref", "refs/remotes/origin/already-published", "HEAD")
+            self.assertEqual((scan.git_state(str(work)) or {})["unpushed"], 0)
+            git(work, "branch", "--unset-upstream")
+            git(work, "revert", "--no-edit", "HEAD")
+            reverted = scan.git_state(str(work)) or {}
+            self.assertEqual((reverted["unpushed"], reverted["unpushed_content"]), (1, 0))
             self.assertIsNone(scan.git_state(str(Path(tmp) / "missing")))
 
         self.assertEqual(scan.github_slug("https://github.com/spin-dd/taihei-report.git"), "spin-dd/taihei-report")
@@ -2868,6 +2967,153 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_a_saved_finished_verdict_does_not_close_waiting_or_draft_tabs(self) -> None:
+        saved = self.dir / "scan.json"
+        cases = [
+            {"agents": [{"type": "codex", "state": "waiting"}]},
+            {"agents": [{"type": "codex", "state": "working", "turn": "done"}]},
+            {"unread_mail": [{"from": "worker"}]},
+            {"codex": [{"pending_requests": [{"answered_in_chat_later": False}]}]},
+            {"done_cards": [{"handle": "term", "agent": "codex", "draft": True}]},
+        ]
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{index}", "repo": "app", "class": "stalled",
+             "terminals": [{"handle": "term", "agent": "codex"}], "meaningful_tabs": ["term"],
+             "verdict": {"class": "finished"}, **case} for index, case in enumerate(cases)]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_hold_releasing_retains_checkout_and_release_restores_saved_tab_counts(self) -> None:
+        state, log = self.dir / "state.json", self.dir / "decisions"
+        row = {"path": "/w/app/held", "repo": "app", "class": "finished",
+               "terminals": [{"handle": "term"}], "closable": ["term"], "meaningful_tabs": []}
+        holds = self.dir / "releasing-hold.sqlite"
+        with closing(sqlite3.connect(holds)) as db:
+            db.execute("CREATE TABLE holds(handle, created_at, released_at, status, condition_kind, "
+                       "condition_value, instruction)")
+            db.execute("INSERT INTO holds VALUES ('term', 0, NULL, 'releasing', 'signal', 'term_lead', 'follow-up')")
+            db.commit()
+        with patch.dict(os.environ, {"TRIAGE_HOLDS": str(holds)}):
+            [held] = scan.with_cleanup_constraints([row], state, log)
+            with patch.object(close_tabs, "moved_after_scan", side_effect=AssertionError("protected tab was checked")):
+                closed, message = close_tabs.close_one(
+                    [held], "term", close_tabs.OrcaTabs("unused"), self.dir, self.dir / "inbox",
+                    close_tabs.Caller.from_environment(), state)
+                self.assertFalse(closed)
+                self.assertIn("保留中のタブ", message)
+        self.assertEqual((held["class"], held["closable"]), ("blocked", []))
+        with patch.object(scan, "hold_rows", return_value=[]):
+            [released] = scan.with_cleanup_constraints([held], state, log)
+        self.assertEqual((released["class"], released["closable"], released["meaningful_tabs"]),
+                         ("finished", ["term"], []))
+
+    def test_saved_verdicts_recount_agent_tabs_and_apply_removal_specs(self) -> None:
+        saved = self.dir / "scan.json"
+        names = ("finished", "blocked", "waiting", "needs-user")
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{name}", "repo": "app", "class": "stalled",
+             "terminals": [{"handle": "term_agent", "agent": "codex"}, {"handle": "term_shell", "agent": None}],
+             "closable": ["term_shell"] if name in ("finished", "needs-user") else ["term_agent", "term_shell"],
+             "meaningful_tabs": ["term_agent"] if name in ("finished", "needs-user") else [],
+             "verdict": {"class": "finished" if name == "needs-user" else name, "needs_user": name == "needs-user"}}
+            for name in names]))
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/finished -"])
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        self.assertEqual([(row["closable"], row["meaningful_tabs"]) for row in json.loads(out.getvalue())],
+                         [(["term_shell", "term_agent"], []), *([(["term_shell"], ["term_agent"])] * 3)])
+
+    def test_removal_views_name_protected_worktrees_and_respect_newer_approval(self) -> None:
+        saved, state, decisions, inbox = (self.dir / name for name in ("scan.json", "state.json", "decisions", "inbox"))
+        names = ("lead", "structured", "owner", "cleared", "ask", "request", "held")
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{name}", "repo": "app", "class": "finished", "meaningful_tabs": [],
+             "agents": [{"structured_host_owned": True}] if name == "structured" else [],
+             "terminals": [{"handle": "term_held"}] if name == "held" else []} for name in names]))
+        state.write_text(json.dumps({"lead": {"worktree": "/w/app/lead"},
+                                     "requests": {"req1": {"owner": "/w/app/request", "closed_at": None}}}))
+        write_jsonl(inbox, [{"kind": "ask", "id": "ask1", "repo": "app", "worktree": "ask"}])
+        write_jsonl(decisions, [{"id": str(index), "decision": f"{kind}:/w/app/{name}", "answer": text,
+                                 "decided_at": f"2026-11-19T10:0{index}:00Z"}
+                                for index, (kind, name, text) in enumerate((
+                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで削除しない"),
+                                    ("owner", "cleared", "残す"), ("remove", "cleared", "消してよい")))])
+        holds = [{"handle": "term_held", "environment": None, "created_at": 0.0, "released_at": None,
+                  "status": "active", "condition_kind": "time", "condition_value": "2026-11-20T10:00:00Z",
+                  "instruction": "follow-up:check1"}]
+        base = ["--from", str(saved), "--state-file", str(state), "--decisions-file", str(decisions), "--inbox", str(inbox)]
+        with patch.object(scan, "hold_rows", return_value=holds):
+            for view in ("--rm-specs", "--summary", "--cards"):
+                with self.subTest(view=view), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(scan.main([*base, view]), 0)
+                if view == "--rm-specs":
+                    self.assertEqual(out.getvalue(), "/w/app/cleared -\n")
+                else:
+                    self.assertIn("/w/app/cleared", out.getvalue())
+                    self.assertNotIn("/w/app/held", out.getvalue())
+                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで削除しない",
+                               "開いた ask ask1", "未解決の request req1", "保留中", "follow-up:check1"):
+                    self.assertIn(reason, err.getvalue())
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main([*base, "--rows", "--class", "blocked"]), 0)
+            self.assertIn("held", out.getvalue())
+
+    def test_removal_specs_use_structured_approval_even_with_meaningful_tabs(self) -> None:
+        saved, decisions = self.dir / "scan.json", self.dir / "decisions"
+        saved.write_text(json.dumps([{"path": f"/w/app/{name}", "class": "stalled", "repo": "app",
+                                      "meaningful_tabs": ["term"]} for name in ("approve", "archive", "legacy")]))
+        records = (("approve", {"approve": True}), ("archive", {"archive_path": ["work notes"]}), ("legacy", None))
+        write_jsonl(decisions, [{"id": name, "decision": f"remove:/w/app/{name}", "answer": "閉じる。",
+                                 "decided_at": "2026-11-19T12:00:00Z", "removal": terms} for name, terms in records])
+        with (patch.object(scan, "batch_help", return_value="recorded archive_path"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -", "/w/app/archive -"])
+        self.assertIn("lead_decisions.py", err.getvalue())
+        self.assertIn("--decision remove:local::/w/app/legacy", err.getvalue())
+        self.assertIn("--approve", err.getvalue())
+        with (patch.object(scan, "batch_help", return_value="--archive-path PATH"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -"])
+        self.assertIn("対応した Harness が必要", err.getvalue())
+
+    def test_archive_approval_requires_a_saved_scan_and_reuses_its_decisions_log(self) -> None:
+        saved, decisions = self.dir / "scan.json", self.dir / "custom decisions"
+        row = {"path": "/w/app/archive", "repo": "app", "class": "stalled", "terminals": [],
+               "open_pr_cleanup": True,
+               "removal_decision": {"archive_path": [".cache/notes.txt"], "answer": "削除してよい。",
+                                    "decided_at": "2026-11-19T12:00:00Z"}}
+        with patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"):
+            with redirect_stdout(io.StringIO()) as out:
+                scan.print_summary([row], {})
+            self.assertNotIn("--remove-ok", out.getvalue())
+            self.assertIn("--from", out.getvalue())
+            saved.write_text(json.dumps([row]))
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
+            with patch.object(scan, "LEAD_DECISIONS", decisions), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
+
+    def test_unstructured_keep_and_conditional_answers_get_no_approval_command(self) -> None:
+        for answer in ("保持してください。", "アーカイブ後、閉じる。", "not ready to remove",
+                       "remove it after the experiment finishes", "タブだけ閉じる。",
+                       "作業記録をアーカイブして、閉じる。", "タブを閉じて。作業場はそのまま。"):
+            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as err:
+                scan.print_removal_approval_hint(
+                    {"path": "/w/app/test", "repo": "app", "removal_decision":
+                     {"decision": "remove:/w/app/test", "answer": answer}}, self.dir / "decisions")
+                self.assertEqual(err.getvalue(), "")
+
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",
@@ -2932,19 +3178,21 @@ class ScanCommandTests(unittest.TestCase):
         saved = self.dir / "scan.json"
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
                "open_pr_cleanup": True, "pr": {"number": 10}}
-        with patch.object(scan, "batch_has_preview", return_value=False):
-            local = shlex.split(scan.rm_check_command(row, saved))
+        with (patch.object(scan, "batch_has_preview", return_value=False),
+              patch.object(scan, "batch_help", return_value="")):
+            local = shlex.split(scan.rm_check_command(row, saved, decisions_file=scan.LEAD_DECISIONS))
             remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
             remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
             spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
-        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
+        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary",
+                                 "--decisions-file", str(scan.LEAD_DECISIONS), "/w/app/案件", "10"])
         self.assertEqual(remote[-1], "/w/app/案件 10")
         self.assertNotIn("--preview", remote)
         self.assertNotIn("--detach-nested", remote)
         self.assertNotIn("--summary", remote)
         self.assertNotIn("--from", remote)
-        self.assertNotIn("--summary", remove)
-        self.assertIn("--from", remove)
+        self.assertIn("Harness", remove)
+        self.assertNotIn("--remove-ok", remove)
         self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
@@ -2952,15 +3200,18 @@ class ScanCommandTests(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         # A host's real Jev key and verdict store must never reach a test run.
         for hermetic in (patch.dict(os.environ, {"TYPESAFE_API_KEY": "", "TRIAGE_INBOX": "",
+                                                "TRIAGE_HOLDS": str(self.dir / "no-holds.sqlite"),
                                                 "TRIAGE_REVIEW_DIR": str(self.dir / "reviews"),
                                                 "TRIAGE_ASK_ANSWERS": str(self.dir / "no-answers.jsonl")}),
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
                          patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
                          patch.object(scan, "batch_has_preview", return_value=True),
+                         patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
-                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
+                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity")),
+                         patch.object(scan, "CODEX_INTERRUPTIONS", self.dir / "codex-interruptions.json")):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
@@ -3519,6 +3770,126 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual([line.split(" | ")[0] for line in out.getvalue().splitlines()],
                          ["mbp16::app", "dotfiles-73", "fix-login", "mbp16::fix-login"])
 
+    def test_same_second_removal_aliases_keep_the_worktree_for_every_hash_seed(self) -> None:
+        decisions = self.dir / "decisions.jsonl"
+        snapshot = self.dir / "scan.json"
+        row = {"path": "/tmp/demo/wt", "repo": "Eotel/demo", "class": "finished"}
+        snapshot.write_text(json.dumps([row]))
+        write_jsonl(decisions, [
+            {"id": "remove", "decision": "remove:Eotel/demo/wt", "answer": "消す",
+             "decided_at": "2026-11-19T00:00:00Z"},
+            {"id": "earlier", "decision": "remove:/tmp/demo/wt", "answer": "消す",
+             "decided_at": "2026-11-19T09:00:00+09:00"},
+            {"id": "keep", "decision": "remove:/tmp/demo/wt", "answer": "残す",
+             "decided_at": "2026-11-19T09:00:00+09:00"},
+        ])
+        for seed in range(8):
+            with self.subTest(seed=seed):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPTS / "scan_sessions.py"), "--from", str(snapshot),
+                     "--rm-specs", "--row", row["path"], "--decisions-file", str(decisions),
+                     "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")],
+                    env={**os.environ, "PYTHONHASHSEED": str(seed)}, capture_output=True, text=True,
+                )
+                self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
+                self.assertIn('"allows_removal": false', result.stderr)
+                self.assertIn("残す", result.stderr)
+
+    def test_same_second_pending_removal_condition_keeps_the_worktree_until_merge(self) -> None:
+        path = "/w/demo"
+        decisions = self.dir / "decisions.jsonl"
+        at = "2026-11-19T00:00:00Z"
+        write_jsonl(decisions, [
+            {"id": "after-merge", "decision": f"remove:local::{path}", "answer": "PR がマージされたら削除する",
+             "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
+            {"id": "remove", "decision": f"remove:{path}", "answer": "消す", "decided_at": at},
+        ])
+        row = {"path": path, "repo": "acme/demo", "class": "finished"}
+        for state in ("OPEN", "MERGED", None):
+            with self.subTest(state=state):
+                response = {"pr_6": {"state": state, "updatedAt": at}} if state else None
+                with patch.object(scan, "graphql_repository", return_value=response), redirect_stderr(io.StringIO()):
+                    [result] = scan.with_cleanup_constraints([dict(row)], self.dir / "no-state.json", decisions)
+                decision = result["removal_decision"]
+                self.assertEqual(decision["allows_removal"], state == "MERGED")
+                if state != "MERGED":
+                    self.assertEqual(decision["decision"], f"remove:local::{path}")
+                    self.assertEqual(decision["after_state"], state)
+
+    def test_latest_decisions_take_the_last_record_per_key_across_short_histories(self) -> None:
+        lead = handoff.lead_decisions
+        keys = ("remove:acme/demo/wt", "remove:/w/wt")
+        times = ("2026-11-19T00:00:00Z", "2026-11-19T00:00:01Z")
+        entries = tuple(product(keys, times))
+        for length in range(4):
+            for history in product(entries, repeat=length):
+                records = [lead.Decision(str(index), key, f"answer {index}", at)
+                           for index, (key, at) in enumerate(history)]
+                expected = {key: matching[-1] for key in keys
+                            if (matching := [record for record in records if record.decision == key])}
+                self.assertEqual(lead.latest(iter(records)), expected, history)
+
+    def test_same_second_removal_approvals_with_different_cleanup_keep_the_worktree(self) -> None:
+        path = "/w/demo"
+        at = "2026-11-19T00:00:00Z"
+        snapshot = self.dir / "scan.json"
+        snapshot.write_text(json.dumps([{"path": path, "repo": "acme/demo", "class": "finished"}]))
+        decisions = self.dir / "decisions.jsonl"
+        args = ["--from", str(snapshot), "--rm-specs", "--row", path, "--decisions-file", str(decisions),
+                "--state-file", str(self.dir / "no-state.json"), "--verdicts", str(self.dir / "verdicts.json")]
+        cases = (
+            ({}, {"compose_down": True}, (1, "")),
+            ({"discard": [".env"]}, {"discard": [".env.local"]}, (1, "")),
+            ({"discard": [".env", ".env.local"]}, {"discard": [".env.local", "./.env"]}, (0, f"{path} -\n")),
+        )
+        for first, second, expected in cases:
+            with self.subTest(first=first, second=second):
+                write_jsonl(decisions, [
+                    {"id": "first", "decision": f"remove:{path}", "answer": "消す", "decided_at": at, "removal": first},
+                    {"id": "second", "decision": f"remove:local::{path}", "answer": "消す", "decided_at": at,
+                     "removal": second},
+                ])
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                    code = scan.main(args)
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("後始末の指定が異なる", err.getvalue())
+
+    def test_saved_scan_keeps_same_second_hold_when_another_alias_meets_its_condition(self) -> None:
+        path = "/w/demo"
+        decisions = self.dir / "decisions.jsonl"
+        state = self.dir / "no-state.json"
+        at = "2026-11-19T00:00:00Z"
+        entries = [
+            {"id": "after-merge", "decision": f"remove:{path}", "answer": "PR がマージされたら削除する",
+             "decided_at": at, "removal": {"after": "pr-merged:https://github.com/acme/demo/pull/6"}},
+            {"id": "keep", "decision": f"remove:local::{path}", "answer": "残す", "decided_at": at},
+        ]
+        write_jsonl(decisions, entries)
+        row = {"path": path, "repo": "acme/demo", "class": "finished"}
+        with patch.object(scan, "graphql_repository", return_value={"pr_6": {"state": "OPEN", "updatedAt": at}}):
+            rows = scan.with_cleanup_constraints([row], state, decisions)
+        self.assertFalse(rows[0]["removal_decision"]["allows_removal"])
+        snapshot = self.dir / "saved-scan.json"
+        snapshot.write_text(json.dumps(rows))
+
+        missing = self.dir / "no-decisions.jsonl"
+        partial = self.dir / "partial-decisions.jsonl"
+        write_jsonl(partial, entries[:1])
+        stale = self.dir / "stale-decisions.jsonl"
+        write_jsonl(stale, [entries[0], {**entries[1], "id": "earlier-approval", "answer": "消す"}])
+        corrected = self.dir / "corrected-decisions.jsonl"
+        write_jsonl(corrected, [*entries, {**entries[1], "id": "corrected", "answer": "消す"}])
+        response = {"pr_6": {"state": "MERGED", "updatedAt": at}}
+        for log, expected in ((missing, (1, "")), (partial, (1, "")), (stale, (1, "")), (corrected, (0, f"{path} -\n"))):
+            with self.subTest(log=log.name), patch.object(scan, "graphql_repository", return_value=response), \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                code = scan.main(["--from", str(snapshot), "--rm-specs", "--row", path, "--state-file", str(state),
+                                  "--decisions-file", str(log), "--verdicts", str(self.dir / "verdicts.json")])
+                self.assertEqual((code, out.getvalue()), expected, err.getvalue())
+                if code:
+                    self.assertIn("残す", err.getvalue())
+
     def test_removal_decision_shows_a_newer_answer_under_its_key_without_reading_it_as_approval(self) -> None:
         # 2026-11-16: the 10/28 answer hid the 16:24 ::db-down decision, and the triage nearly asked again.
         path = "/w/collect-catalog-left-pane-scroll"
@@ -3839,9 +4210,11 @@ class ScanCommandTests(unittest.TestCase):
                         options.extend(("--preview", "--detach-nested"))
                     spec = f"{row['path']} {number or '-'}"
                     if row.get("open_pr_cleanup") or host:
-                        expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
+                        expected = [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    *host, *options, spec]
                     else:
-                        expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
+                        expected = [str(scan.RM_CHECK), *options, "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
@@ -3859,16 +4232,16 @@ class ScanCommandTests(unittest.TestCase):
                 code = scan.main(["--from", str(saved), "--rm-specs", *(f"--row={name}" for name in names)])
             return code, out.getvalue(), err.getvalue()
 
-        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                               "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
+        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                               "--from", str(saved.absolute()), "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
         self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", expected))
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
         self.assertEqual(err.count(scan.REMOTE_CHECK_RELEASE), 1)
         self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
-            str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
-            "--summary", "/w/app/far -"]), err)
+            str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+            "--host", "mbp16", "--from", str(saved.absolute()), "--summary", "/w/app/far -"]), err)
         self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
 
     def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
@@ -3891,8 +4264,8 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", *named]), 0)
             specs = out.getvalue().splitlines()
             self.assertEqual(specs, ["/w/app/one 7", "/w/app/two -"])
-            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                                                         "--remove-ok", "--summary", *specs])
+            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                                         "--from", str(saved.absolute()), "--remove-ok", "--summary", *specs])
 
     def test_automation_workspaces_are_left_out_even_with_removal_approval(self) -> None:
         rows = [{"path": "/w/app/scheduled", "repo": "app", "class": "finished", "open_pr_cleanup": True,
@@ -4383,6 +4756,83 @@ class FakeWorktreeNotes:
 
 
 class RmCheckTests(unittest.TestCase):
+    def test_held_directory_reports_clone_branches_changes_stash_and_size(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\ndata/\n")
+        sandbox = self.wt / "sandbox"
+        sandbox.mkdir()
+        for name in ("a-clone", "b-clone"):
+            clone = sandbox / name
+            git(self.main, "clone", "-q", str(self.main), str(clone))
+            git(clone, "config", "user.email", "t@example.com")
+            git(clone, "config", "user.name", "t")
+        changed = sandbox / "a-clone"
+        git(changed, "checkout", "-q", "-b", "draft")
+        git(changed, "commit", "-q", "--allow-empty", "-m", "local")
+        sha = git(changed, "rev-parse", "--short=12", "HEAD")
+        (changed / "app.txt").write_text("stash")
+        git(changed, "stash", "push", "-q")
+        tagged = sandbox / "b-clone"
+        git(tagged, "checkout", "-q", "--detach")
+        git(tagged, "commit", "-q", "--allow-empty", "-m", "retained by tag")
+        tag_commit = git(tagged, "rev-parse", "--short=12", "HEAD")
+        git(tagged, "tag", "keep-tag")
+        git(tagged, "checkout", "-q", "-")
+        (changed / ".git/info/exclude").write_text(".env\n")
+        (changed / "backend").mkdir()
+        (changed / "backend/.env").write_text("EXTRA=fixture")
+        for name in (".env.app.example", ".env.db.example", ".env.test.example"):
+            (changed / name).write_text("VARIABLE=")
+        outside = self.wt.parent / "external-linked"
+        git(tagged, "worktree", "add", "-q", "--detach", str(outside))
+        git(outside, "commit", "-q", "--allow-empty", "-m", "external detached commit")
+        linked_commit = git(outside, "rev-parse", "--short=12", "HEAD")
+        modules = changed / ".git/modules/stored"
+        modules.mkdir(parents=True)
+        git(modules, "init", "-q", "--bare")
+        (changed / "app.txt").write_text("dirty")
+        (sandbox / "c-note").write_text("note")
+        (sandbox / "d-note.local.json").write_text("a local setting")
+        (sandbox / "e-note").write_text("another note")
+        (self.wt / "data").mkdir()
+        (self.wt / "data" / "report.db").write_text("report")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        held = {item["kind"]: item for item in result["held"]}
+        reason = held["clone"]["reason"]
+        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています",
+                         tag_commit, linked_commit, str(outside)):
+            self.assertIn(expected, reason)
+        summary = held["clone"]["content_summary"]
+        self.assertIn("c-note", summary)
+        self.assertNotIn("e-note", summary)
+        self.assertNotIn("du 不明", summary)
+        self.assertIn("du ", held["data"]["content_summary"])
+        self.assertIn("report.db", held["data"]["content_summary"])
+        self.assertTrue(any(reason in line and summary in line for line in result["reasons"]))
+
+    def test_held_clone_with_external_git_settings_keeps_its_worktree(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\n")
+        clone = self.wt / "sandbox"
+        git(self.main, "clone", "-q", str(self.main), str(clone))
+        git(clone, "config", "filter.local.clean", "/does-not-exist")
+        tracked_status = rmcheck.git
+
+        def git_without_external_programs(cwd: str | Path, *args: str,
+                                          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == clone and ("status" in args or "ls-remote" in args):
+                self.fail(f"used clone configuration to run {args[0]}")
+            return tracked_status(cwd, *args, env=env)
+
+        empty = self.wt / "empty-git-config"
+        empty.write_text("")
+        with (patch.object(rmcheck, "git", side_effect=git_without_external_programs),
+              patch.dict(os.environ, {"GIT_CONFIG": str(empty)})):
+            held = rmcheck.held_file(clone, "sandbox", False, None)
+        self.assertEqual(held["kind"], "clone")
+        self.assertIn("未確認", held["reason"])
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         binary = Path(self.tmp.name) / "orca-bin/orca"
@@ -4452,6 +4902,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(comment, " ".join(result["blockers"]))
         self.assertIn(key, " ".join(result["blockers"]))
+
+        lead_decisions.append(log, lead_decisions.Decision(
+            "retain", f"remove:local::{self.wt.resolve()}", "保留してください。", "2026-10-27T00:00:00Z"))
+        code, result = self.run_main("--decisions-file", str(log), notes=notes)
+        self.assertEqual((code, result["ok"]), (1, False))
 
         lead_decisions.append(log, lead_decisions.Decision("allow", key, "消してよい", "2026-10-28T00:00:00Z"))
         code, result = self.run_main("--decisions-file", str(log), notes=notes)
@@ -4970,6 +5425,36 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue((self.wt / ".yomiyasu/inputs/draft.md").exists())
         code, result = self.run_main(*args, "--archive-scratch")
         self.assertEqual((code, result["ok"]), (0, True))
+
+    def test_explicitly_approved_regenerable_logs_are_archived_and_verified(self) -> None:
+        (self.main / ".git/info/exclude").write_text("logs/\n")
+        logs = self.wt / "logs"
+        logs.mkdir()
+        server_log = logs / "server.log"
+        os.mkfifo(server_log)
+        archive = Path(self.tmp.name) / "archive"
+        failed, result = self.run_main("--archive-path", "logs", "--archive-dir", str(archive))
+        self.assertEqual((failed, result["ok"]), (1, False))
+        self.assertTrue(logs.exists())
+        server_log.unlink()
+        server_log.write_text("fixture log\n")
+        code, result = self.run_main("--archive-path", "logs", "--archive-dir", str(archive))
+        self.assertEqual((code, result["ok"]), (0, True))
+        [saved] = result["archived"]
+        self.assertTrue(saved["verified"])
+        self.assertEqual((Path(saved["to"]) / "server.log").read_text(), "fixture log\n")
+        self.assertFalse(logs.exists())
+
+    def test_explicit_archive_never_moves_a_tracked_file(self) -> None:
+        tracked = self.wt / "app.txt"
+        tracked.write_text("changed tracked content\n")
+        code, result = self.run_main("--archive-path", "app.txt", "--archive-dir", str(self.wt.parent / "archive"))
+        self.assertEqual((code, result["archived"]), (1, []))
+        self.assertTrue(tracked.is_file())
+        if (self.wt / "APP.TXT").exists():
+            code, result = self.run_main("--archive-path", "APP.TXT", "--archive-dir", str(self.wt.parent / "archive"))
+            self.assertEqual((code, result["archived"]), (1, []))
+            self.assertTrue(tracked.is_file())
 
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")
@@ -8600,6 +9085,104 @@ class HourlyCleanupCommandTests(unittest.TestCase):
 
 
 class HourlyReadTests(unittest.TestCase):
+    def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            cursor = directory / "backlog-cursor.json"
+            cursor.write_text('{"last_notification_id": 1}')
+
+            def advance(args: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                cursor.write_text('{"last_notification_id": 2}')
+                return subprocess.CompletedProcess(args, 124)
+
+            with (patch.object(hourly, "BACKLOG_CURSOR", cursor),
+                  patch("subprocess.run", side_effect=advance) as run):
+                result = hourly.read_with_retry(hourly.ReadTask("backlog-watch", ["backlog-watch"]),
+                                                directory, 100, True)
+            self.assertEqual(result["exit_code"], 124)
+            self.assertIsNone(result["retry"])
+            self.assertIn("通知カーソル", result["error"])
+            run.assert_called_once()
+
+    def test_high_load_retries_the_scan_and_compares_each_successful_read(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root)
+            old, failed, earlier = (parent / name for name in (
+                "20261118T030000Z-first", "20261118T040000Z-next", "20261118T050000Z-slow"))
+            old.mkdir()
+            failed.mkdir()
+            earlier.mkdir()
+            former = {"gaps": [{"key": "backlog:OLD-1", "missing": ["due date"]}]}
+            (old / "tracker-gaps.json").write_text(json.dumps(former))
+            (old / "asana99-status.json").write_text(json.dumps([{"url": "https://example.test/pr/1"}]))
+            (old / "backlog-watch.stdout").write_text(
+                "返信 OLD-1 Prior issue\n返信 DEMO-7 Same issue | comment-42 | 5分 | - | PR Eotel/skills#7 レビュー待ち 1時間 → priority\n返信 DEMO-8 Draft | PR Eotel/skills#8 下書き 1時間 | issue Eotel/skills#9 OPEN\n")
+            old_results = [{"name": name, "exit_code": 0, "read_at": 100.0, "result": str(old / f"{name}.json"),
+                            "stdout": str(old / f"{name}.stdout")}
+                           for name in ("tracker-gaps", "asana99-status", "backlog-watch")]
+            (old / "results.json").write_text(json.dumps(old_results))
+            (failed / "results.json").write_text(json.dumps([{"name": "tracker-gaps", "exit_code": 124}]))
+            (earlier / "tracker-gaps.json").write_text(json.dumps({"gaps": []}))
+            (earlier / "results.json").write_text(json.dumps([
+                {"name": "tracker-gaps", "exit_code": 0, "read_at": 50.0,
+                 "result": str(earlier / "tracker-gaps.json")}]))
+            decisions = parent / "decisions.jsonl"
+            write_jsonl(decisions, [{"id": "d", "decision": "tracker:backlog:NEW-1",
+                                     "answer": "放置: 次回の着手時に登録", "decided_at": "2026-11-18T03:30:00Z"}])
+            calls: list[tuple[str, float]] = []
+
+            def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
+                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                command = Path(args[0]).name
+                calls.append((command, timeout))
+                if command == "scan_sessions.py" and calls.count((command, timeout)) == 1:
+                    return subprocess.CompletedProcess(args, 124)
+                if command == "topic":
+                    return subprocess.CompletedProcess(args, 7)
+                if "--review-out" in args:
+                    Path(args[args.index("--review-out") + 1]).write_text('{"rows":[]}')
+                if "open-asks" in args:
+                    result = [{"ts": "2026-11-18T04:01:00Z", "source": "skills/lane", "id": "a1", "text": "用件\n続き"}]
+                elif "stale-asks" in args:
+                    result = [{"name": "old-ask", "state": "unasked", "question": "確認事項"}]
+                elif command == "project-status":
+                    result = {"gaps": [{"key": "backlog:NEW-1", "missing": ["start date"]}]}
+                elif command == "asana99_status.py":
+                    result = [{"url": "https://example.test/pr/2"}]
+                    Path(args[1]).write_text(json.dumps(result))
+                elif command == "backlog-watch":
+                    stdout.write("返信 NEW-1 New issue\n返信 DEMO-7 Same issue | comment-42 | 1時間05分 | - | PR Eotel/skills#7 レビュー待ち 2日 → priority\n返信 DEMO-8 Draft | PR Eotel/skills#8 下書き 2日 | issue Eotel/skills#9 OPEN\n")
+                    return subprocess.CompletedProcess(args, 0)
+                else:
+                    result = []
+                if "--out" in args:
+                    Path(args[args.index("--out") + 1]).write_text(json.dumps(result))
+                else:
+                    stdout.write(json.dumps(result))
+                return subprocess.CompletedProcess(args, 0)
+
+            with (patch("subprocess.run", side_effect=run), patch.object(os, "getloadavg", return_value=(301, 0, 0)),
+                  patch.dict(os.environ, {"TRIAGE_LEAD_DECISIONS": str(decisions)}), redirect_stdout(io.StringIO()) as out):
+                hourly.main(["--workspace", "/w/triage", "--output-root", root, "--timeout", "40"])
+            [current] = [path for path in parent.iterdir() if path.is_dir() and path not in (old, failed, earlier)]
+            results = {item["name"]: item for item in json.loads((current / "results.json").read_text())}
+            self.assertEqual([timeout for name, timeout in calls if name == "scan_sessions.py"], [100, 100])
+            self.assertEqual(sum(name == "topic" for name, _ in calls), 1)
+            self.assertEqual(results["scan"]["retry"]["exit_code"], 0)
+            self.assertEqual(results["stale-asks"]["exit_code"], 0)
+            for name in ("tracker-gaps", "asana99-status", "backlog-watch"):
+                self.assertEqual(results[name]["compared_to"], str(old.resolve()))
+            self.assertEqual(results["backlog-watch"]["changes"]["new"], ["返信 NEW-1 New issue"])
+            self.assertEqual(results["backlog-watch"]["changes"]["gone"], ["返信 OLD-1 Prior issue"])
+            gaps = json.loads((current / "tracker-gaps.json").read_text())
+            self.assertTrue(gaps["gaps"][0]["ignored"])
+            self.assertTrue(gaps["new"][0]["ignored"])
+            self.assertEqual(gaps["gone"], former["gaps"])
+            for shown in ("scan: retry", "skills/lane", "a1", "用件 続き", "old-ask | unasked", str(old.resolve())):
+                self.assertIn(shown, out.getvalue())
+
     def test_parallel_reads_keep_outputs_and_report_each_failure_in_a_unique_run_directory(self) -> None:
         hourly_read = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
@@ -8629,7 +9212,8 @@ class HourlyReadTests(unittest.TestCase):
                 if "--review-out" in args:
                     Path(args[args.index("--review-out") + 1]).write_text(json.dumps({"rows": [{"path": "/w/a"}]}))
                 return subprocess.CompletedProcess(args, 0)
-            with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()) as out:
+            with (patch("subprocess.run", side_effect=run), patch.object(os, "getloadavg", return_value=(1, 0, 0)),
+                  redirect_stdout(io.StringIO()) as out):
                 code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
             self.assertEqual(code, 1)
             [run_dir] = directory.iterdir()
@@ -8642,7 +9226,7 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual(json.loads((run_dir / "scan.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "lead-state.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "asana99-status.json").read_text()), [])
-            self.assertEqual(json.loads((run_dir / "tracker-gaps.json").read_text()), [])
+            self.assertEqual(json.loads((run_dir / "tracker-gaps.json").read_text()), {"gaps": [], "new": [], "gone": []})
             self.assertIn("topic unavailable", (run_dir / "topic-check.stderr").read_text())
             self.assertIn("topic-check: exit 7", out.getvalue())
             self.assertIn(str(run_dir), out.getvalue())
@@ -8650,7 +9234,7 @@ class HourlyReadTests(unittest.TestCase):
                           out.getvalue())
             self.assertEqual(out.getvalue().splitlines()[-1],
                              f"results: {run_dir.resolve() / 'results.json'}（命令ごとの記録の配列。各記録の鍵: "
-                             "name・command・exit_code・stdout・stderr・result・error）")
+                             "name・command・exit_code・stdout・stderr・result・error・retry・compared_to・changes・read_at）")
 
     def test_a_skipped_stale_asks_record_has_every_key_of_a_run_record(self) -> None:
         hourly_read = load_script("hourly_read")
@@ -8663,7 +9247,8 @@ class HourlyReadTests(unittest.TestCase):
             [run_dir] = Path(root).iterdir()
             result = json.loads((run_dir / "results.json").read_text())
             self.assertEqual({tuple(item) for item in result},
-                             {("name", "command", "exit_code", "stdout", "stderr", "result", "error")})
+                             {("name", "command", "exit_code", "stdout", "stderr", "result", "error",
+                               "retry", "compared_to", "changes", "read_at")})
             self.assertEqual(result[-1]["error"], "skipped: scan failed")
 
 
@@ -8893,6 +9478,8 @@ class HourlyTabCleanupTests(unittest.TestCase):
                                                   ("stream", ["finished", "❯"], None, True),
                                                   ("screen", ["finished", "❯ draft reply"], None, True),
                                                   ("screen", ["finished"], None, True),
+                                                  ("screen", ["›", "  typed on the next line",
+                                                              "  ← for agents · ? for shortcuts"], None, True),
                                                   ("screen", ["Switch to gpt-6-luna?", "  2. Keep current model",
                                                               "  enter select · esc back",
                                                               "› Ask Codex to do anything"], None, True)):
@@ -9134,6 +9721,40 @@ class InboxReadTests(unittest.TestCase):
             "注意: この回の後に 11/12 12:00 の定時の回が始まった（dispatched、11/12 12:08 開始、pane pane-12）。"
             "既読位置と引き継ぎはその回のもの",
             "2026-11-12T12:09:00+09:00 info - lane id=abcd1234  経過"])
+
+    def test_short_answer_histories_keep_substantive_answers_and_apply_corrections(self) -> None:
+        keys = ("ask", "ask:1", "ask:2")
+        answer, correction = "send", "hourly_state.py corrected"
+        kinds = ("inbox_read.py open-asks", answer, correction)
+        times = ("2026-11-19T00:00:00Z", "2026-11-19T00:00:01Z")
+        entries = tuple(product(keys, kinds, times))
+        log = inbox_read.answers_path()
+        for length in range(4):
+            for history in product(entries, repeat=length):
+                records = [{"id": key, "how": how, "ts": at, "sequence": index}
+                           for index, (key, how, at) in enumerate(history)]
+                write_jsonl(log, records)
+                current = inbox_read.answer_records(log)
+
+                expected = {}
+                for key in keys:
+                    same_key = [record for record in records if record["id"] == key]
+                    if same_key:
+                        corrected = [record for record in same_key if record["how"] == correction]
+                        substantive = [record for record in same_key if record["how"] == answer]
+                        expected[key] = corrected[-1] if corrected else (substantive or same_key)[0]
+                self.assertEqual(list(current.values()), sorted(expected.values(), key=lambda record: record["sequence"]),
+                                 history)
+
+                whole = expected.get("ask")
+                parts = []
+                for key in ("ask:1", "ask:2"):
+                    part = expected.get(key)
+                    if part and whole and whole["how"] == correction:
+                        part = max(part, whole, key=lambda record: (record["ts"], record["sequence"]))
+                    if chosen := part or whole:
+                        parts.append(chosen)
+                self.assertEqual(inbox_read.answer_parts("ask", (1, 2), current), parts, history)
 
     def test_read_marks_the_asks_and_questions_the_answer_records_hold(self) -> None:
         # 11/11 19:20: three asks answered by then were read from --summary as open and put in a handoff.

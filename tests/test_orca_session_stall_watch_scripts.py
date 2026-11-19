@@ -370,6 +370,46 @@ class BusyWithoutProgressTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_refresh_checks_the_remote_screen_before_signaling_an_interruption(self) -> None:
+        lane = row("cut", environment="remote", stop={"kind": "interrupted", "tab": "term_cut"})
+        screens = {("remote", "term_cut"): {"source": "screen", "tail": [
+            "■ Conversation interrupted", "› Continue work", "› ",
+        ]}}
+        with patch.multiple(
+            stall.scan, running_claude_transcripts=lambda *args: {}, claude_session_dirs=lambda: [],
+            process_table=lambda: {}, expand_roots=lambda roots: [], read_codex=lambda *args: {},
+            worktree_processes=lambda *args: {}, read_screens=lambda *args: screens,
+        ):
+            [fresh] = stall.refreshed([lane], NOW)
+        self.assertIsNone(fresh["stop"])
+
+    def test_interrupted_codex_uses_screen_stop_time_and_ignores_a_later_turn(self) -> None:
+        stopped_at = NOW - timedelta(minutes=20)
+        lane = row("cut", codex=[], stop={"kind": "interrupted", "action": "wake", "agent": "codex",
+                                         "error": "■ Conversation interrupted", "resets": None,
+                                         "stopped_at": stopped_at.isoformat(), "tab": "term_cut", "stopped_by": "rollout",
+                                         "rollout": "bound.jsonl"})
+        signals = stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False)
+        self.assertEqual([item.stopped_at for item in signals], [stopped_at.isoformat()])
+        self.assertEqual(signals[0].stopped_by, "rollout")
+        self.assertIn("中断。元の指示で再開してよいか確認", signals[0].reason)
+        sent = stall.Records(sends_by_handle={"term_cut": (stopped_at + timedelta(minutes=1),)})
+        self.assertEqual(stall.judge(lane, None, sent, NOW, FakeProbe(), live=False), [])
+        lane["codex"] = [{"rollout": "another.jsonl", "last_user_at": NOW.isoformat()}]
+        done = stall.Records(done_at_by_worktree={"cut": NOW})
+        self.assertEqual(len(stall.judge(lane, None, done, NOW, FakeProbe(), live=False)), 1)
+        lane["codex"] = [{"rollout": "bound.jsonl", "last_user_at": (stopped_at + timedelta(minutes=1)).isoformat()}]
+        self.assertEqual(stall.judge(lane, None, stall.Records(), NOW, FakeProbe(), live=False), [])
+
+    def test_send_to_one_interrupted_tab_leaves_the_other_tab_for_recovery(self) -> None:
+        first_at, second_at = NOW - timedelta(minutes=40), NOW - timedelta(minutes=20)
+        first = {"kind": "interrupted", "tab": "term_a", "stopped_at": first_at.isoformat(), "error": "interrupted"}
+        second = {**first, "tab": "term_b", "stopped_at": second_at.isoformat()}
+        lane = row("cut", codex=[], stop=second, codex_interruptions=[first, second])
+        records = stall.Records(sends_by_handle={"term_b": (second_at + timedelta(minutes=1),)})
+        signals = stall.judge(lane, None, records, NOW, FakeProbe(), live=False)
+        self.assertEqual([item.stopped_at for item in signals], [first_at.isoformat()])
+
     def test_a_new_rollout_error_is_not_hidden_by_the_previous_approval_screen(self) -> None:
         earlier = NOW - timedelta(minutes=1)
         row = {"path": "/w/lane", "claude": None,

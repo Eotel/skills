@@ -109,6 +109,8 @@ For lane-tab answers and duplicate-question checks, see [references/hourly.md](r
   Remote `git.dirty`, `git.unpushed`, and
   `pr.head_matches` are unknown until checked on that host. A failed remote
   connection is reported on stderr while the other hosts still scan.
+  Local `git.unpushed` counts commits absent from every remote-tracking ref.
+  `git.unpushed_content: 0` means HEAD has the same tree as `origin/main`.
   A tab whose output or screen shows a hook Claude Code could not run for a
   missing file (`hook error … No such file or directory`) puts it in the row's
   `hook_errors` (`host`, `path`, `tab`) and reasons, on any Mac. The screen
@@ -142,12 +144,17 @@ For lane-tab answers and duplicate-question checks, see [references/hourly.md](r
   instead of scanning again; `--rm-specs` with it prints `<path> <PR|->` for
   `rm-check-batch`: this Mac's open PR cleanup rows and finished rows without
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
-  commands). `--rm-specs --row NAME` (repeatable) prints only the named rows,
+  commands). A saved `finished` verdict without `needs_user` makes its agent
+  tabs closable. Saved `blocked` and `waiting` verdicts keep their agent tabs.
+  Removal views report the appointed lead, structured sessions, a current
+  owner decision, open asks and requests, and active holds on stderr.
+  Active holds make the row `blocked` and name the release condition and
+  follow-up. `--rm-specs --row NAME` (repeatable) prints only the named rows,
   a finished one also while its tabs remain. An explicit removal approval in
   `removal_decision` also permits a check; retain or defer answers keep the row.
   An answer recorded with `--after pr-merged:<PR URL>` permits it once that PR
-  merged, and one with only cleanup values (`--discard`, `--compose-down`) at
-  once, whatever its words (`references/cleanup.md`).
+  merged. One with cleanup values (`--discard`, `--compose-down`, `--archive-path`)
+  or explicit `--approve` permits a check at once (`references/cleanup.md`).
   Only the row's own `remove:` keys decide it; a newer answer to one of their
   `::` sub-keys (`remove:local::PATH::db-down`) is shown as its `newest`
   (`decision`, `answer`, `decided_at`), and `--summary` adds it after the answer.
@@ -207,7 +214,12 @@ For lane-tab answers and duplicate-question checks, see [references/hourly.md](r
   person logs in), a full context window (`context_limit`, a new lane with a
   smaller scope), or another error waking would repeat (`other`, such as a
   safeguard flag; a person reads it). `--from SCAN_JSON --wake` prints each
-  such row with its agent's tab and what it needs. For multiple local Claude
+  such row with its agent's tab and what it needs. A Codex screen ending in
+  `■ Conversation interrupted` with no later activity is `stalled` with
+  `stop.kind: interrupted` and the stop time. Stall watch signals the lead
+  once the interruption passes its idle grace period. Confirm that the
+  original instruction still stands before resuming an interrupted turn.
+  For multiple local Claude
   tabs, it matches the stopped transcript's session record to the live
   process's `ORCA_TERMINAL_HANDLE`. A usage-limit row shows the latest
   `wake:<row>::*` answer and time when that answer says 「起こさない」.

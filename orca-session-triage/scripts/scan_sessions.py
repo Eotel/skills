@@ -21,11 +21,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from functools import cache, partial
 from itertools import dropwhile, takewhile
+import fcntl
 import hashlib
 import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import socket
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -41,7 +42,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import hourly_runtime
 import inbox_read
-from commitment_store import read_document, read_lines
+from commitment_store import hold_rows, read_document, read_lines
 import retro_ledger
 import rm_check
 from worktree_notes import keep_note
@@ -62,6 +63,7 @@ BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
 Screens = dict[tuple[str | None, str], dict]
 HOURLY_STATE = Path("~/.cache/orca-session-triage/hourly-state.json")
 LEAD_DECISIONS = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
+CODEX_INTERRUPTIONS = Path("~/.cache/orca-session-triage/codex-interruptions.json")
 
 
 class PromptWaiting(TypedDict):
@@ -502,12 +504,18 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
     last_assistant = last_assistant_at = api_error = api_error_at = None
+    interrupted_at = turn_started_at = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
         cwd = cwd or payload.get("cwd")
         kind = payload.get("type")
+        if row.get("type") == "event_msg":
+            if kind == "turn_aborted" and payload.get("reason") == "interrupted":
+                interrupted_at = row.get("timestamp")
+            elif kind in ("task_started", "turn_started"):
+                turn_started_at = row.get("timestamp")
         if row.get("type") == "event_msg" and kind in ("error", "stream_error"):
             message = payload.get("message") or payload.get("error")
             if isinstance(message, str) and API_FAILURE.search(message):
@@ -552,6 +560,8 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
         "last_role": last_role,
         "api_error": api_error,
         **({"api_error_at": api_error_at} if api_error_at else {}),
+        **({"interrupted_at": interrupted_at} if interrupted_at else {}),
+        **({"turn_started_at": turn_started_at} if turn_started_at else {}),
         "pending_requests": pending,
     }
 
@@ -765,12 +775,27 @@ RESETS = re.compile(r"(?:resets|try again at)\s+(.+?)\.?$")
 
 
 class StopReason(TypedDict):
-    kind: str  # connection, usage_limit, login, context_limit, or other
+    kind: str  # connection, interrupted, usage_limit, login, context_limit, or other
     action: str  # wake, wait (until resets), human, or new_lane
     agent: str | None
     error: str
     resets: str | None
     tab: NotRequired[str]
+    stopped_at: NotRequired[str]
+    stopped_by: NotRequired[Literal["rollout", "agent_state"]]
+    rollout: NotRequired[str]
+    turn_key: NotRequired[str]
+    screen_turn: NotRequired[str]
+    screen_marks: NotRequired[int]
+
+
+def codex_moved_since(row: Mapping, stopped_at: datetime, resume_rollout: str | None) -> bool:
+    if not resume_rollout:
+        return False
+    return any(at > stopped_at for rollout in row.get("codex") or []
+               if rollout.get("rollout") == resume_rollout
+               for key in ("last_user_at", "last_assistant_at", "api_error_at", "turn_started_at")
+               if (at := parse_time(rollout.get(key))))
 
 
 def stop_reason(row: dict) -> StopReason | None:
@@ -778,6 +803,15 @@ def stop_reason(row: dict) -> StopReason | None:
     expired login a person has to renew, a full context window a new lane with a smaller scope gets past, or
     another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
+    waiting_tab = (row.get("prompt_waiting") or {}).get("tab")
+    for interruption in row.get("codex_interruptions", ()):
+        if (interruption.get("tab") != waiting_tab and (at := parse_time(interruption["stopped_at"]))
+                and not codex_moved_since(row, at, interruption.get("rollout"))):
+            return interruption
+    return api_stop_reason(row)
+
+
+def api_stop_reason(row: dict) -> StopReason | None:
     if not (found := failure(row)):
         return None
     error, agent, tab = found
@@ -797,6 +831,8 @@ def stop_reason(row: dict) -> StopReason | None:
 
 
 def stop_line(stop: StopReason) -> str:
+    if stop["kind"] == "interrupted":
+        return f"turn interrupted at {stop['stopped_at']}: {stop['error']}"
     if stop["kind"] == "usage_limit":
         return "usage limit; resets " + stop["resets"] if stop["resets"] else "usage limit: " + stop["error"]
     if stop["kind"] == "login":
@@ -956,7 +992,7 @@ def agents_done(row: dict) -> bool:
     lead with unread worker mail, are woken in that tab.
     """
     still_working = (row.get("jev") or {}).get("status") == "in_progress"
-    to_wake = cut_off(row) or row.get("unread_mail")
+    to_wake = row.get("stop") or cut_off(row) or row.get("unread_mail")
     return row["class"] in ("finished", "stalled") and not still_working and not to_wake
 
 
@@ -1002,6 +1038,10 @@ CODEX_WORKING = re.compile(r"• Working \(")
 CODEX_RESULT = "└"
 CODEX_RECAP = "↳ Recap:"
 CODEX_PROMPT = "› "
+CODEX_MODEL_FOOTER = re.compile(r"(?:gpt|codex)-[\w.-]+(?: \w+)? · (?:[~/].*)", re.IGNORECASE)
+CODEX_SHORTCUT_FOOTER = re.compile(
+    r"(?:← for agents · )?\? for shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?")
+CODEX_INTERRUPTED = re.compile(r"■ Conversation interrupted(?:$|[ .—-])")
 
 
 def screen_lines(screen: dict) -> list[str]:
@@ -1010,9 +1050,35 @@ def screen_lines(screen: dict) -> list[str]:
 
 
 def last_codex_activity(lines: list[str]) -> str | None:
-    """The last Codex reply, action, or error in a terminal excerpt."""
+    """The last Codex reply, action, turn end, or error in a terminal excerpt."""
     return next((line for raw in reversed(lines) if (line := raw.strip())
-                 and (line.startswith(CODEX_REPLY) or api_failure(line))), None)
+                 and (line.startswith(CODEX_REPLY) or CODEX_TURN_END.fullmatch(line)
+                      or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
+
+
+def current_interruption(screen: dict) -> tuple[str, str, int] | None:
+    lines = [line.strip() for line in screen_lines(screen)]
+    positions = [i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)]
+    if not positions:
+        return None
+    position = positions[-1]
+    later = lines[position + 1:]
+    prompts = [line for line in later if line == "›" or line.startswith(CODEX_PROMPT)]
+    if len(prompts) > 1 or any(CODEX_TURN_END.fullmatch(line) or api_failure(line)
+                               or (line.startswith(CODEX_REPLY) and not line.startswith("• Feedback uploaded."))
+                               for line in later):
+        return None
+    previous = positions[-2] if len(positions) > 1 else -1
+    prompt = next((line for line in reversed(lines[previous + 1:position]) if line.startswith(CODEX_PROMPT)), "")
+    turn = hashlib.sha256(prompt.encode()).hexdigest() if prompt else ""
+    return lines[position], turn, len(positions)
+
+
+def changed_interruption(seen: tuple[str, str, int], previous: Mapping) -> bool:
+    _, prompt, count = seen
+    old_prompt = previous.get("screen_turn", "")
+    return bool(prompt and (count > previous.get("screen_marks", 1)
+                            or old_prompt and prompt != old_prompt))
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1036,9 +1102,24 @@ def draft_excerpt(screen: dict) -> str:
     return said[:DRAFT_EXCERPT] + ("…" if len(said) > DRAFT_EXCERPT else "")
 
 
-def composer_empty(screen: dict) -> bool | None:
-    """Whether Claude's last input line between rules is bare; None when no composer is visible."""
-    lines = [line.strip() for line in screen_lines(screen)]
+def composer_empty(screen: dict, agent: str | None = None) -> bool | None:
+    """Whether the visible input is empty. None means the composer was not visible."""
+    shown = screen_lines(screen)
+    lines = [line.strip() for line in shown]
+    if agent == "codex":
+        prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith(CODEX_PROMPT)]
+        if not prompts:
+            return None
+        prompt = min(prompts, key=lambda index: (len(shown[index]) - len(shown[index].lstrip()), -index))
+        trailing = lines[prompt + 1:]
+        if last_codex_activity(trailing):
+            return None
+        content = [line for line in trailing if line and not RULE.fullmatch(line)]
+        if content and CODEX_SHORTCUT_FOOTER.fullmatch(content[-1]):
+            content.pop()
+        if content and CODEX_MODEL_FOOTER.fullmatch(content[-1]):
+            content.pop()
+        return lines[prompt] in ("›", "› Ask Codex to do anything") and not content
     rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
     for top, bottom in reversed(list(zip(rules, rules[1:]))):
         box = [line for line in lines[top + 1:bottom] if line]
@@ -1235,7 +1316,7 @@ def screen_agent(screen: dict) -> str | None:
     lines = screen_lines(screen)
     if any(CLAUDE_LINE_STARTS.match(line.strip()) or CLAUDE_MODE_LINE in line for line in lines):
         return "claude"
-    if any(CODEX_TURN_END.fullmatch(line.strip()) for line in lines) or (
+    if any(CODEX_TURN_END.fullmatch(line.strip()) or CODEX_INTERRUPTED.match(line.strip()) for line in lines) or (
             any(line.startswith(CODEX_PROMPT) for line in lines) and any(line.startswith(CODEX_REPLY) for line in lines)):
         return "codex"
     return None
@@ -1362,7 +1443,7 @@ def resumed_after_error(row: dict, claude_screens: list[dict]) -> ResumedTurn | 
     Claude tab shows a later turn, and none shows the notice as its last word. A lane resumed in another account
     writes a transcript elsewhere, so the one read here still ends at the error. A connection error needs
     a later reply/tool call and a running status line; a limit also accepts a completed later turn."""
-    stop = stop_reason(row)
+    stop = api_stop_reason(row)
     if not (stop and stop["kind"] in ("usage_limit", "connection") and stop["agent"] == "claude"):
         return None
     later = [(line, screen) for screen in claude_screens if (line := turn_after_error(screen, stop["error"]))
@@ -1447,7 +1528,7 @@ def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = 
             "prompt": agent.get("prompt") or "", "last_message": agent.get("lastAssistantMessage") or "",
             "screen_tail": screen_tail(screen) if screen else [], "draft": has_draft(screen) if screen else None,
             "draft_text": draft_excerpt(screen) if screen else None,
-            "composer_empty": composer_empty(screen) if screen else None,
+            "composer_empty": composer_empty(screen, agent.get("agentType")) if screen else None,
         }
 
     return [card(a) for a in agents if a.get("state") == "done"]
@@ -1716,7 +1797,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     mail: dict | None = None, screens: Screens | None = None,
                     live_transcripts: dict[str, list[Path]] | None = None,
                     processes: dict[str, list[WorktreeProcess]] | None = None,
-                    live_sessions: dict[str, list[dict]] | None = None) -> list[dict]:
+                    live_sessions: dict[str, list[dict]] | None = None,
+                    interruption_times: dict[str, StopReason] | None = None,
+                    interruption_observations: dict[str, str] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1733,6 +1816,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     screens = screens or {}
+    if interruption_times is None:
+        interruption_times = {}
     now = time.time() if now is None else now
     worktrees, terminals = one_per_path(worktrees, terminals)
     by_worktree = {}
@@ -1785,7 +1870,48 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         codex_activity = {term["handle"]: last_codex_activity(screen_lines(frame)) for term in terms
                           if term.get("handle") and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
                           and (term.get("agentIdentity") == "codex"
-                               or (approval_tabs and not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
+                               or (not term.get("agentIdentity") and screen_agent(frame) == "codex"))}
+        interruptions: list[StopReason] = []
+        for term in terms:
+            handle = term.get("handle")
+            frame = rendered(screens.get((w.get("_environment"), handle)))
+            if not handle or not frame or handle not in codex_activity:
+                continue
+            key = json.dumps([w.get("_environment"), handle])
+            if interruption_observations is not None:
+                interruption_observations[key] = frame.get("_observed_at") or scanned_at
+            interruption = current_interruption(frame)
+            if not interruption or handle in approval_tabs:
+                interruption_times.pop(key, None)
+                continue
+            agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
+            state_at = iso_time(agent.get("stateStartedAt")) if agent.get("interrupted") else None
+            mtime = iso_time(term.get("lastOutputAt")) or scanned_at
+            error, screen_turn, screen_marks = interruption
+            previous = interruption_times.get(key)
+            if previous:
+                last_stop = parse_time(previous["stopped_at"])
+                event_time = parse_time(state_at)
+                new_state = event_time is not None and last_stop is not None and event_time > last_stop
+                old_prompt = previous.get("screen_turn", "")
+                old_marks = previous.get("screen_marks", 1)
+                changed = changed_interruption(interruption, previous)
+                if not (new_state or changed):
+                    if screen_turn and not old_prompt:
+                        previous["screen_turn"] = screen_turn
+                    previous["screen_marks"] = max(old_marks, screen_marks)
+                    interruptions.append(previous)
+                    continue
+                if not new_state:
+                    state_at = None
+                    if changed:
+                        mtime = frame.get("_observed_at") or mtime
+            stopped_at = state_at or mtime
+            stop: StopReason = {"kind": "interrupted", "action": "wake", "agent": "codex",
+                                "error": error, "resets": None, "tab": handle, "stopped_at": stopped_at,
+                                "stopped_by": "agent_state", "screen_turn": screen_turn, "screen_marks": screen_marks}
+            interruption_times[key] = stop
+            interruptions.append(stop)
         screen_error: tuple[str | None, str | None] = (None, None)
         for term in terms:
             handle = term.get("handle")
@@ -1822,13 +1948,16 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "linked_issue": w.get("linkedIssue"), "linked_items": w.get("linkedItems") or [],
             "status": w.get("workspaceStatus"),
             "unread": bool(w.get("unread")),
-            "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a)}
+            "agents": [{"type": a.get("agentType"), "state": a.get("state"), "turn": main_state(a),
+                        **({"structured_host_owned": True} if a.get("structuredHostOwned") else {})}
                        for a in w.get("agents") or []],
             "terminals": [{"handle": t.get("handle"),
                            "agent": "codex" if t.get("handle") in approval_tabs else t.get("agentIdentity"),
                            "title": t.get("title")} for t in terms],
             "codex_screen_error": screen_error[0],
             "codex_screen_error_tab": screen_error[1],
+            **({"codex_interruptions": sorted(interruptions, key=lambda stop: stop["stopped_at"], reverse=True)}
+               if interruptions else {}),
             **({"pane_errors": pane_errors} if pane_errors else {}),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
@@ -1874,9 +2003,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["claude"] = {**(row["claude"] or {}), "api_error": None, "api_error_kind": None,
                              **({"final_text": resumed.text, "final_at": None} if resumed.text else {})}
         row["unread_mail"] = unread_since_turn(row, mail or {}, now)
-        latest = None if turn_runs(row) or cut_off(row) or row["screen_progress"] else latest_message(row)
-        row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["stop"] = stop_reason(row)
+        latest = None if turn_runs(row) or row["stop"] or row["screen_progress"] else latest_message(row)
+        row["jev"] = {"source": latest[0], **(judge(latest[1]) or NO_VERDICT)} if latest else None
         row["class"], row["reasons"] = classify(row, decision_marker)
         if resumed:
             error_kind = "usage limit" if resumed.kind == "usage_limit" else "connection error"
@@ -1899,7 +2028,13 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             row["reasons"].extend(f"予約が消えた: {job['cron']} {job['prompt'][:100]}" for job in row["lost_schedules"])
             if row["class"] in ("finished", "unstarted", "unsure"):
                 row["class"] = "stalled"
-        row["closable"] = closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
+        drafts = [term["handle"] for term in terms if term.get("handle")
+                  and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
+                  and (has_draft(frame) or composer_empty(frame, term.get("agentIdentity")) is False)]
+        if drafts:
+            row["draft_tabs"] = drafts
+        row["closable"] = [handle for handle in closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
+                           if handle not in drafts]
         row["meaningful_tabs"] = [t.get("handle") or NO_HANDLE + (t.get("title") or "")
                                   for t in terms if t.get("handle") not in row["closable"]]
         rows.append(row)
@@ -1954,10 +2089,7 @@ def remote_git_hint(row: dict) -> dict:
 
 
 def git_state(path: str) -> dict | None:
-    """Branch, uncommitted paths, commits not pushed to the upstream, and the GitHub repo.
-
-    None outside a git checkout; `unpushed` is None without an upstream.
-    """
+    """Branch, uncommitted paths, commits missing from all remote refs, and the GitHub repo."""
     def run(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
 
@@ -1965,16 +2097,19 @@ def git_state(path: str) -> dict | None:
         status = run("status", "--porcelain")
         if status.returncode != 0:
             return None
-        ahead = run("rev-list", "--count", "@{u}..HEAD")
+        ahead = run("rev-list", "--count", "HEAD", "--not", "--remotes")
         branch = run("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or None
         head, _, head_at = run("log", "-1", "--format=%H %cI").stdout.strip().partition(" ")
         origin = run("remote", "get-url", "origin").stdout.strip()
+        main_tree = run("rev-parse", "--verify", "origin/main^{tree}")
+        same_tree = main_tree.returncode == 0 and main_tree.stdout == run("rev-parse", "HEAD^{tree}").stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     return {
         "branch": branch, "head": head or None, "head_at": head_at or None,
         "dirty": len(status.stdout.splitlines()),
         "unpushed": int(ahead.stdout) if ahead.returncode == 0 else None,
+        **({"unpushed_content": 0} if same_tree else {}),
         "github": github_slug(origin),
     }
 
@@ -2333,11 +2468,7 @@ def merged_with_nothing_left(row: dict, pr: dict) -> bool:
 
 
 def open_pr_with_no_local_work(row: dict, pr: dict, git: dict) -> bool:
-    """No current agent or local work remains beyond the published PR head.
-
-    `git.unpushed` is relative to the branch's upstream, which can be the PR's
-    base. An exact PR head match proves this HEAD was pushed to the PR.
-    """
+    """An exact PR head match proves this HEAD was pushed to the PR."""
     return (not row.get("agents")
             and not any(term.get("agent") for term in row.get("terminals", []))
             and pr.get("state") == "OPEN" and pr.get("head_matches") is True
@@ -2766,10 +2897,10 @@ def row_identity(row: Mapping) -> str:
 
 def pending_handoffs(row: dict, state_file: Path) -> list[dict]:
     """Undelivered promises addressed to this row, read again before closing its tabs."""
-    document = read_document(state_file)
-    if document is None:
-        return []
-    data = json.loads(document)
+    return undelivered_handoffs(row, json.loads(read_document(state_file) or "{}"))
+
+
+def undelivered_handoffs(row: dict, data: dict) -> list[dict]:
     names = handoff_names(row)
     return [item for item in data.get("handoffs", {}).values()
             if item.get("delivered_at") is None and item.get("to") in names]
@@ -2819,27 +2950,116 @@ def not_before_label(item: Mapping) -> str:
     return f"期限前（{day.month}/{day.day}）"
 
 
+HOLD_FIELDS = ("class", "closable", "meaningful_tabs", "open_pr_cleanup", "verdict")
+KEEP_DECISION = re.compile(r"残す|残し|残して|保持(?!しない)|保留|削除(?:しない|せず|するな|禁止)|"
+                           r"消さ(?:ない|ず)|\b(?:keep|retain|do not remove|don't remove)\b", re.IGNORECASE)
+
+
+def restore_held_row(row: dict) -> dict:
+    before = row.pop("cleanup_before_hold", None)
+    if before is not None:
+        for field in HOLD_FIELDS:
+            row.pop(field, None)
+        row.update(before)
+        row["reasons"] = [reason for reason in row.get("reasons", []) if not reason.startswith("保留中: ")]
+    return row
+
+
+def active_holds(now: datetime) -> dict[tuple[str | None, str], dict]:
+    stamp = now.timestamp()
+    return {(hold.get("environment") or None, hold["handle"]): hold
+            for hold in hold_rows(inbox_read.holds_path())
+            if hold["created_at"] <= stamp
+            and (hold["status"] in ("staged", "active", "releasing")
+                 if hold["released_at"] is None else hold["released_at"] > stamp)}
+
+
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
-                             now: datetime | None = None) -> list[dict]:
+                             now: datetime | None = None, *,
+                             open_asks: Sequence[inbox_read.OpenAsk] = (),
+                             known_tabs: Collection[tuple[str | None, str]] = ()) -> list[dict]:
     """Keep the tabs and checkout of rows that a block, an undelivered promise, or a removal answer holds.
 
     A promise before its `not_before` date holds the row without making it stalled. Each reason is added once, so
     reading a saved scan again does not repeat it. `removal_decision` is the newest answer to the row's own removal
-    keys and decides `allows_removal`; a newer answer to one of their `::` sub-keys is shown as its `newest`. An answer
-    recorded with removal terms carries `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub
-    now, its state (or null when it cannot be read) in `after_state`.
+    keys and decides `allows_removal`. Tied answers allow removal only if all approve and agree on cleanup.
+    The scan retains tied candidates. A log updates one of them if it contains the original record or a later time.
+    A newer answer to one of the `::` sub-keys is shown as `newest`. An answer recorded with removal terms carries
+    `after`, `discard`, and `compose_down`; a condition's PR is read from GitHub now, its state (or null when it
+    cannot be read) in `after_state`.
     """
     import lead_decisions
-    decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    records = list(lead_decisions.records(decisions_file))
+    decisions = lead_decisions.latest(records)
+    recorded_ids = {record.id for record in records}
     now = now or datetime.now(timezone.utc)
+    state = json.loads(read_document(state_file) or "{}")
+    lead = (state.get("lead") or {}).get("worktree")
+    requests = [(key, request.get("owner")) for key, request in state.get("requests", {}).items()
+                if request.get("closed_at") is None]
+    tabs_in_scan = {*known_tabs, *((row.get("environment"), term["handle"]) for row in rows
+                                   for term in row.get("terminals") or [] if term.get("handle"))}
 
-    def moment(item: lead_decisions.Decision) -> datetime:
-        return lead_decisions.moment(item.decided_at) or EPOCH
+    def hostname(value: str) -> str:
+        return value.lower().removesuffix(".local")
+
+    local_hostname = os.environ.get("TRIAGE_HOST") or socket.gethostname()
+    current_holds = active_holds(now)
+    removal_candidates: list[tuple[dict, list[dict]]] = []
+
+    def moment(at: str) -> datetime:
+        return lead_decisions.moment(at) or EPOCH
 
     for row in rows:
+        restore_held_row(row)
+        environment = row.get("environment")
+        if environment:
+            names = {row_identity(row), row_name(row), f"{environment}::{row.get('repo')}/{Path(row['path']).name}"}
+        else:
+            names = handoff_names(row)
+            names.add(f"local::{row['path']}")
+        tabs = {term["handle"] for term in row.get("terminals") or [] if term.get("handle")}
+        blockers = []
+        if lead == row_identity(row):
+            blockers.append("指揮の作業場")
+        if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
+            blockers.append("structured-agent-session の agent がいる作業場")
+        if row.get("scanned_at") and not row.get("agent_ownership_observed"):
+            blockers.append("構造化セッションの情報がない走査です。再走査してください")
+        blockers.extend(f"未解決の request {key} の owner" for key, owner in requests if owner == row_identity(row))
+        row_hosts = {hostname(value) for value in
+                     (environment or local_hostname, row.get("host_id"), *([socket.gethostname()] if not environment else []))
+                     if value}
+        for ask in open_asks:
+            report = ask.report
+            host_matches = not report.get("host") or hostname(report["host"]) in row_hosts
+            handle = report.get("handle")
+            known_environments = {host for host, tab in tabs_in_scan if tab == handle}
+            if known_environments:
+                matches = handle in tabs and (len(known_environments) == 1 or host_matches)
+            else:
+                matches = (host_matches and report.get("worktree") == Path(row["path"]).name
+                           and (report.get("repo") or "") in row_repos(row))
+            if matches:
+                blockers.append(f"開いた ask {report['id']}")
+        holds = [current_holds[(environment, tab)] for tab in sorted(tabs) if (environment, tab) in current_holds]
+        if holds:
+            row["cleanup_before_hold"] = {field: row[field] for field in HOLD_FIELDS if field in row}
+            row["reasons"] = list(row.get("reasons") or [])
+            row["open_pr_cleanup"] = False
+            row["class"] = "blocked"
+            row.pop("verdict", None)
+            row["meaningful_tabs"] = list(dict.fromkeys([*(row.get("meaningful_tabs") or []),
+                                                       *(row.get("closable") or [])]))
+            row["closable"] = []
+            for hold in holds:
+                reason = f"保留中: {hold['condition_kind']}:{hold['condition_value']} {hold.get('instruction') or ''}".rstrip()
+                blockers.append(reason)
+                row["reasons"].append(reason)
+        row["cleanup_blockers"] = blockers
         if blocker := row.get("automation_blocker"):
             row.update(closable=[], open_pr_cleanup=False)
-        promises = pending_handoffs(row, state_file)
+        promises = undelivered_handoffs(row, state)
         due = [item for item in promises if promise_due(item, now)]
         if promises:
             row.update(pending_handoffs=promises, closable=[], open_pr_cleanup=False)
@@ -2854,63 +3074,126 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                  *(f"{not_before_label(item)}の約束の送り先: {promise_task(item)}" for item in early)]
         row["reasons"] = [*row.get("reasons", []), *dict.fromkeys(reason for reason in added
                                                                   if reason not in row.get("reasons", []))]
-        keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}",
-                f"remove:{row['path']}", f"remove:{row_identity(row)}"}
-        if not row.get("environment"):
-            keys.add(f"remove:local::{row['path']}")
-        answered = [decisions[key] for key in keys if key in decisions]
-        if answered:
-            answer = max(answered, key=moment)
+        primary = f"remove:{row_identity(row)}" if environment else None
+        if primary:
+            legacy_keys = {f"remove:{name}" for name in {*names, row["path"],
+                           f"{row.get('repo')}/{Path(row['path']).name}"}} - {primary}
+            keys = {primary}
+            for key in legacy_keys:
+                if answer := decisions.get(key):
+                    if (answer.removal and answer.removal.after) or (
+                            not answer.removal and not removal_answer_approves({"answer": answer.answer})):
+                        keys.add(key)
+            saved_removal = row.get("removal_decision") or {}
+            if saved_removal.get("decision") in legacy_keys and not removal_answer_approves(saved_removal):
+                keys.add(saved_removal["decision"])
+        else:
+            keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
+                    f"remove:local::{row['path']}"}
+        by_key: dict[str, dict] = {candidate["decision"]: candidate for candidate in row.get("removal_candidates") or []
+                  if candidate["decision"] in keys}
+        if primary:
+            saved = row.get("removal_decision") or {}
+            if isinstance(saved_key := saved.get("decision"), str) and saved_key in keys and saved_key != primary:
+                by_key.setdefault(saved_key, saved)
+            by_key = {key: ({**candidate, "legacy_retain": True} if key != primary else candidate)
+                      for key, candidate in by_key.items()}
+        for key in keys:
+            if answer := decisions.get(key):
+                if ((saved := by_key.get(key)) and saved.get("record_id") not in recorded_ids
+                        and moment(answer.decided_at) <= moment(saved["decided_at"])):
+                    continue
+                by_key[key] = {
+                    "decision": key, "answer": answer.answer, "decided_at": answer.decided_at,
+                    "record_id": answer.id,
+                    **({"legacy_retain": True} if primary and key != primary else {}),
+                    **({"after": answer.removal.after, "discard": list(answer.removal.discard),
+                        "compose_down": answer.removal.compose_down} if answer.removal else {}),
+                        **({"archive_path": list(answer.removal.archive_path)}
+                           if answer.removal and answer.removal.archive_path else {}),
+                        **({"approve": True} if answer.removal and answer.removal.approve else {}),
+                }
+        removal_at = EPOCH
+        if by_key:
+            latest_at = max(moment(answer["decided_at"]) for answer in by_key.values())
+            removal_at = latest_at
+            candidates = [by_key[key] for key in sorted(by_key) if moment(by_key[key]["decided_at"]) == latest_at]
             later = [item for key, item in decisions.items() if any(key.startswith(base + "::") for base in keys)
-                     and moment(item) > moment(answer)]
-            newest = max(later, key=moment) if later else None
-            row["removal_decision"] = {"decision": answer.decision, "answer": answer.answer,
-                                       "decided_at": answer.decided_at,
-                                       **({"newest": {"decision": newest.decision, "answer": newest.answer,
-                                                      "decided_at": newest.decided_at}} if newest else {}),
-                                       **({"after": answer.removal.after, "discard": list(answer.removal.discard),
-                                           "compose_down": answer.removal.compose_down} if answer.removal else {})}
-        names = {row["path"], row_identity(row), row_name(row),
-                 f"{row.get('repo')}/{Path(row['path']).name}"}
-        if not row.get("environment"):
-            names.update((Path(row["path"]).name, f"local::{row['path']}"))
+                     and moment(item.decided_at) > latest_at]
+            if newest := max(later, key=lambda item: moment(item.decided_at), default=None):
+                for candidate in candidates:
+                    candidate["newest"] = {"decision": newest.decision, "answer": newest.answer,
+                                           "decided_at": newest.decided_at}
+            removal_candidates.append((row, candidates))
+        elif (removal := row.get("removal_decision")) and (
+                not environment or not removal.get("decision") or removal["decision"] in keys):
+            removal_candidates.append((row, [removal]))
+            removal_at = moment(removal["decided_at"])
+        else:
+            row.pop("removal_decision", None)
+        owner = max((answer for name in names if (answer := decisions.get(f"owner:{name}"))),
+                    key=lambda answer: moment(answer.decided_at), default=None)
+        if owner and moment(owner.decided_at) >= removal_at and KEEP_DECISION.search(owner.answer):
+            blockers.append(f"owner の決定 {owner.decided_at} {owner.answer}")
         wake_keys = {f"wake:{name}" for name in names}
         answered = [answer for key, answer in decisions.items()
                     if any(key == prefix or key.startswith(prefix + "::") for prefix in wake_keys)]
         row.pop("wake_decision", None)
         if answered:
-            answer = max(answered, key=lambda item: lead_decisions.moment(item.decided_at) or EPOCH)
+            answer = max(answered, key=lambda item: moment(item.decided_at))
             row["wake_decision"] = {"answer": answer.answer, "decided_at": answer.decided_at}
     conditions: dict[str, set[int]] = {}
     for pr in (lead_decisions.RemovalTerms(removal.get("after")).pull_request()
-               for row in rows if (removal := row.get("removal_decision"))):
+               for _, candidates in removal_candidates for removal in candidates):
         if pr:
             conditions.setdefault(pr.repo, set()).add(pr.number)
     states = {(repo, number): state.state for repo, numbers in conditions.items()
               for number, state in (lead_decisions.github_pr_states(repo, sorted(numbers)) or {}).items()}
-    for row in rows:
-        if removal := row.get("removal_decision"):
+    for row, candidates in removal_candidates:
+        for removal in candidates:
             if pr := lead_decisions.RemovalTerms(removal.get("after")).pull_request():
                 removal["after_state"] = states.get((pr.repo, pr.number))
-            removal["allows_removal"] = removal_approved(row)
+            removal["allows_removal"] = removal_answer_approves(removal)
+        selected = min(candidates, key=lambda removal: removal["allows_removal"])
+        if len(candidates) > 1 and selected["allows_removal"]:
+            cleanup_terms = {(frozenset(map(PurePosixPath, removal.get("discard") or ())),
+                              frozenset(map(PurePosixPath, removal.get("archive_path") or ())),
+                              removal.get("compose_down") is True)
+                             for removal in candidates}
+            if len(cleanup_terms) > 1:
+                selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
+        row["removal_decision"] = {key: value for key, value in selected.items() if key != "record_id"}
+        if len(candidates) > 1:
+            row["removal_candidates"] = candidates
+        else:
+            row.pop("removal_candidates", None)
     return rows
 
 
 def removal_approved(row: dict) -> bool:
+    return removal_answer_approves(row.get("removal_decision") or {})
+
+
+DEFER_REMOVAL = re.compile(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|削除禁止|"
+                           r"たら|れば|なら|次第|まで|から|後に|後で|消すか|消せない|(?:消す|削除する)な|"
+                           r"\b(?:keep|defer|do not remove|don't remove)\b", re.IGNORECASE)
+
+
+def removal_answer_approves(decision: Mapping) -> bool:
     """An explicit removal answer; retaining or deferring in that answer takes precedence. An answer recorded with
     removal terms is decided by them, whatever conditions its words give: one with a PR condition (`after`) once that
     PR merged, and one with only cleanup (`discard`, `compose_down`), which rm-check-batch runs first, at once."""
-    if (decision := row.get("removal_decision") or {}).get("after"):
+    if decision.get("cleanup_conflict") or decision.get("legacy_retain"):
+        return False
+    if decision.get("after"):
         return decision.get("after_state") == "MERGED"
-    if decision.get("discard") or decision.get("compose_down"):
+    if decision.get("approve") is True or decision.get("discard") or decision.get("compose_down") or decision.get("archive_path"):
         return True
     text = str(decision.get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
     text = re.sub(r"rm_check(?:\.py)?\s*(?:が\s*)?ok\s*なら|検査が通れば", "", text, flags=re.IGNORECASE)
     text = re.sub(r"タブを閉じてから|--archive-scratch\s*で(?:作業記録を|控えに)?移してから", "", text)
-    if re.search(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|"
-                 r"たら|れば|なら|次第|まで|から|後に|後で|消すか|消せない|(?:消す|削除する)な|"
-                 r"\b(?:keep|defer|do not remove|don't remove)\b", text, re.IGNORECASE):
+    if DEFER_REMOVAL.search(text):
         return False
     # English answers are whole commands: a substring cannot establish approval or its timing.
     if re.fullmatch(r"\s*(?:remove it|ready to remove)\s*[.!]?\s*", text, re.IGNORECASE):
@@ -2920,12 +3203,17 @@ def removal_approved(row: dict) -> bool:
 
 
 def removal_blocker(row: dict) -> str | None:
+    if blockers := row.get("cleanup_blockers"):
+        return "。".join(blockers)
     if blocker := row.get("automation_blocker"):
         return blocker
     if row.get("pending_handoffs"):
         return "未配信の約束の送り先"
-    if (answer := row.get("removal_decision")) and not removal_approved(row):
-        return f"removal decision {answer['decided_at']} {answer['answer']}"
+    if answer := row.get("removal_decision"):
+        if answer.get("cleanup_conflict"):
+            return "同時刻の削除回答で後始末の指定が異なるため保持"
+        if not removal_approved(row):
+            return f"removal decision {answer['decided_at']} {answer['answer']}"
     return None
 
 
@@ -3001,6 +3289,35 @@ def write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
+def save_interruption_times(path: Path, observed: Mapping[str, str], stops: dict[str, StopReason]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stored = read_json_file(path)
+        current = stored if isinstance(stored, dict) else {}
+        oldest = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        for key, observed_at in observed.items():
+            entry = current.get(key, {})
+            observed_before = entry.get("observed_at", "")
+            stop = stops.get(key)
+            saved = entry.get("stop")
+            if observed_at <= observed_before:
+                if saved is None:
+                    stops.pop(key, None)
+                else:
+                    stops[key] = saved
+                continue
+            if stop and observed_before:
+                stopped_at = parse_time(stop["stopped_at"])
+                if saved and stopped_at and (saved_at := parse_time(saved["stopped_at"])) and stopped_at < saved_at:
+                    stop["stopped_at"] = saved["stopped_at"]
+                elif not saved and stopped_at and (cleared_at := parse_time(observed_before)) and stopped_at <= cleared_at:
+                    stop["stopped_at"] = observed_at
+            current[key] = {"observed_at": observed_at, "stop": stop}
+        write_json_atomically(path, {key: entry for key, entry in current.items()
+                                     if entry.get("stop") or entry.get("observed_at", "") >= oldest})
+
+
 def load_verdicts(store_path: str | Path) -> dict[str, dict]:
     """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
     store = Path(store_path).expanduser()
@@ -3057,13 +3374,47 @@ def absorb_verdicts(store_path: str | Path, write: bool = True) -> dict[str, dic
     return verdicts
 
 
-def with_verdicts(rows: list[dict], verdicts: dict[str, dict]) -> list[dict]:
+def with_verdicts(rows: list[dict], verdicts: dict[str, dict], *,
+                  reload_holds: bool = False) -> list[dict]:
     """Rows a careful reader classed carry that verdict while what it read still holds."""
     def marked(row: dict) -> dict:
-        # A prompt on the tab's screen is the state now, whatever a reader saved before.
-        verdict = (current_verdict(row, verdicts) if row["class"] in READ_CLASSES and not row.get("prompt_waiting")
-                   else None)
-        return {**row, "verdict": verdict} if verdict else row
+        if row.get("cleanup_before_hold") is not None:
+            if not reload_holds:
+                return row
+            row = restore_held_row(dict(row))
+        original = row.get("scan_tab_counts") or {}
+        row = {**row, **original}
+        interrupted = (row.get("stop") or {}).get("kind") == "interrupted"
+        if row.get("prompt_waiting") or interrupted:
+            return {key: value for key, value in row.items() if key != "verdict"}
+        fresh = current_verdict(row, verdicts) if row["class"] in READ_CLASSES or row["class"] == "finished" else None
+        verdict = fresh or row.get("verdict") or {}
+        if fresh:
+            row = {**row, "verdict": fresh}
+        shown = verdict.get("class")
+        if shown not in ("finished", "blocked", "waiting", "in_progress"):
+            return row
+        agents = dict.fromkeys(tab["handle"] for tab in [*(row.get("terminals") or []), *(row.get("done_cards") or [])]
+                               if tab.get("agent") and tab.get("handle"))
+        if not agents:
+            return row
+        closable = [handle for handle in row.get("closable") or [] if handle not in agents]
+        meaningful = [handle for handle in row.get("meaningful_tabs") or [] if handle not in agents]
+        pending = (row.get("stop") or row.get("unread_mail") or row.get("screen_progress")
+                   or (row.get("claude") or {}).get("pending_questions")
+                   or any(not request.get("answered_in_chat_later") for session in row.get("codex") or []
+                          for request in session.get("pending_requests") or [])
+                   or any(agent.get("state") in ("waiting", "working") for agent in row.get("agents") or []))
+        drafts = {*row.get("draft_tabs", []), *(card.get("handle") for card in row.get("done_cards") or []
+                                               if card.get("draft") or card.get("composer_empty") is False)}
+        if None in drafts:
+            drafts.update(agents)
+        eligible = [handle for handle in agents if shown == "finished"
+                    and not verdict.get("needs_user") and not pending and handle not in drafts]
+        closable.extend(eligible)
+        meaningful.extend(handle for handle in agents if handle not in eligible)
+        original = {name: row.get(name, []) for name in ("closable", "meaningful_tabs")}
+        return {**row, "closable": closable, "meaningful_tabs": meaningful, "scan_tab_counts": original}
     return [marked(row) for row in rows]
 
 
@@ -3349,7 +3700,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "left out is named on stderr with why, and the exit status is 1. After the specs, "
                             "stderr prints the full rm-check-batch --from command with --remove-ok --summary")
     views.add_argument("--wake", action="store_true",
-                       help="with --from, print one line per row an API failure stopped: name | its agent's tab | "
+                       help="with --from, print one line per row an API failure or interruption stopped: name | its agent's tab | "
                             "what it needs (通信断: wake it, 利用上限: wait until it resets, ログイン切れ: a person "
                             "logs in, 文脈の上限: a new lane with a smaller scope, その他: a person reads it) | the error's first 200 characters")
     parser.add_argument("--transcripts", action="store_true",
@@ -3369,7 +3720,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "they are read again only when the PR's updatedAt moves (default: %(default)s)")
     parser.add_argument("--state-file", type=Path, default=HOURLY_STATE,
                         help="shared hourly state; undelivered destinations stay open")
-    parser.add_argument("--decisions-file", type=Path, default=LEAD_DECISIONS,
+    parser.add_argument("--decisions-file", type=Path,
+                        default=Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or LEAD_DECISIONS),
                         help="lead answers; rows with remove answers are left out of automatic removal")
     args = parser.parse_args(argv)
     if args.from_file and args.review_out:
@@ -3401,7 +3753,7 @@ def write_review_queue(path: str, rows: list[dict], verdicts: dict | None = None
 
 
 def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = False,
-                  scan_file: Path | None = None) -> None:
+                  scan_file: Path | None = None, decisions_file: Path = LEAD_DECISIONS) -> None:
     # The class --rows --class keeps (the verdict's, else the scan's), with the scan's own count where it differs.
     shown = Counter((row.get("verdict") or {}).get("class") or row["class"] for row in rows)
     scanned = Counter(row["class"] for row in rows)
@@ -3421,14 +3773,16 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
         if not row.get("open_pr_cleanup") and not removal_blocker(row):
-            print("    " + rm_check_command(row, scan_file))
+            print("    " + rm_check_command(row, scan_file, decisions_file=decisions_file))
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
         if not removal_blocker(row):
-            print("    " + rm_check_command(row, scan_file))
-            print("    " + rm_check_command(row, scan_file, remove_ok=True))
+            print("    " + rm_check_command(row, scan_file, decisions_file=decisions_file))
+            print("    " + rm_check_command(row, scan_file, remove_ok=True, decisions_file=decisions_file))
     for row in rows:
+        if blockers := row.get("cleanup_blockers"):
+            print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
         if blocker := row.get("automation_blocker"):
             print(f"{row_name(row)}: {blocker}")
         if answer := row.get("removal_decision"):
@@ -3742,41 +4096,72 @@ def rm_spec(row: dict) -> str:
 
 
 @cache
-def batch_has_preview() -> bool:
-    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+def batch_help() -> str:
     try:
         help_text = subprocess.run([str(RM_CHECK_BATCH), "--help"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return help_text.returncode == 0 and re.search(r"(?<!\S)--preview\s", help_text.stdout) is not None
+        return ""
+    return help_text.stdout if help_text.returncode == 0 else ""
+
+
+def batch_has_preview() -> bool:
+    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+    return re.search(r"(?<!\S)--preview\s", batch_help()) is not None
 
 
 def batch_requirement(row: dict) -> str | None:
+    if (row.get("removal_decision") or {}).get("archive_path") and "recorded archive_path" not in batch_help():
+        return f"{row['path']}: 記録済みの --archive-path に対応した Harness が必要です"
     if any(char.isspace() for char in row["path"]) and not batch_has_preview():
         return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
     return None
 
 
-def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
+BATCH_DECISIONS_REQUIREMENT = "--decisions-file に対応した Harness が必要です"
+
+
+def decision_options(decisions_file: Path) -> list[str]:
+    return ["--decisions-file", str(decisions_file.expanduser().absolute())]
+
+
+def batch_decision_options(decisions_file: Path, *, required: bool = False) -> list[str]:
+    if "--decisions-file" in batch_help():
+        return decision_options(decisions_file)
+    if required or decisions_file.expanduser().absolute() != LEAD_DECISIONS.expanduser():
+        raise ValueError(BATCH_DECISIONS_REQUIREMENT)
+    return []
+
+
+def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False,
+                     decisions_file: Path | None = None) -> str:
     """A one-line check for this row, using the saved scan's timestamp when available."""
+    decisions_file = decisions_file or Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or LEAD_DECISIONS)
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
     options = [*from_scan, "--summary"]
     plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
     if not remove_ok and not plan_cleanup and not environment:
-        return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
+        return shlex.join([str(RM_CHECK), *options, *decision_options(decisions_file),
+                           row["path"], str(pr_number(row) or "-")])
     if requirement := batch_requirement(row):
         return requirement
     if not batch_has_preview():
         options = from_scan if remove_ok else []
     if remove_ok:
+        if not scan_file:
+            return "削除前に承認ログを再検査するため、走査を保存し、--from で指定してください"
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
-    return shlex.join([str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
+    try:
+        log_options = batch_decision_options(decisions_file, required=remove_ok) if scan_file else []
+    except ValueError as error:
+        return str(error)
+    return shlex.join([str(RM_CHECK_BATCH), *log_options, *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
-def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
+def card_lines(row: dict, scan_file: Path | None = None, *,
+               decisions_file: Path = LEAD_DECISIONS) -> list[str]:
     """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown.
 
     With the saved scan's path, a row with closable tabs includes the close_tabs.py command that closes them
@@ -3811,7 +4196,7 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
             (row.get("verdict") or {}).get("class") or row["class"]) == "finished"):
         if row.get("environment") and batch_has_preview():
             lines.append(f"{lead} | {REMOTE_CHECK_RELEASE}")
-        lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
+        lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file, decisions_file=decisions_file))
     return lines
 
 
@@ -3847,6 +4232,16 @@ def print_row(rows: list[dict], key: str, transcripts: bool = False, inbox: Path
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    def constrain(rows: list[dict], known_tabs: Collection[tuple[str | None, str]]) -> list[dict]:
+        inbox, answers = Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()
+        try:
+            entries = inbox_read.inbox_entries(inbox)
+        except FileNotFoundError:
+            entries = []
+        asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers))
+        return with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(),
+                                        open_asks=asks, known_tabs=known_tabs)
+
     if args.from_file:
         try:
             rows = saved_rows(args.from_file)
@@ -3854,18 +4249,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"--from: {error}", file=sys.stderr)
             return 1
         verdicts = absorb_verdicts(args.verdicts, write=False)
+        known_tabs = {(row.get("environment"), term["handle"]) for row in rows
+                      for term in row.get("terminals") or [] if term.get("handle")}
         if args.only:
             try:
                 rows = [select_row(rows, args.only, "--only")]
             except ValueError as error:
                 print(error, file=sys.stderr)
                 return 1
-        rows = with_cleanup_constraints(with_verdicts(rows, verdicts), args.state_file.expanduser(),
-                                        args.decisions_file.expanduser())
+        rows = constrain(with_verdicts(rows, verdicts, reload_holds=True), known_tabs)
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
+    known_tabs = {(term.get("_environment"), term["handle"]) for term in terminals
+                  if term.get("handle") and (term.get("connected") or not term.get("orphaned"))}
     if args.only:
         worktrees, terminals = one_per_path(worktrees, terminals)
         choices = [{"path": w["path"], "repo": w.get("repo"), "environment": w.get("_environment"),
@@ -3901,13 +4299,37 @@ def main(argv: list[str] | None = None) -> int:
               if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local},
         session_details=live_sessions)
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
+    interruption_path = CODEX_INTERRUPTIONS.expanduser()
+    cached_times = read_json_file(interruption_path) if screens else None
+    interruption_times: dict[str, StopReason] = {}
+    if isinstance(cached_times, dict):
+        interruption_times = {key: cast(StopReason, dict(stop)) for key, entry in cached_times.items()
+                              if isinstance(entry, dict) and (stop := entry.get("stop"))
+                              and isinstance(stop.get("stopped_at"), str)}
+    interruption_observations: dict[str, str] = {}
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
-                                               processes=processes, live_sessions=live_sessions),
+                                               processes=processes, live_sessions=live_sessions,
+                                               interruption_times=interruption_times,
+                                               interruption_observations=interruption_observations),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
+    if interruption_observations:
+        save_interruption_times(interruption_path, interruption_observations, interruption_times)
+        for row in rows:
+            tabs = [json.dumps([row.get("environment"), tab["handle"]]) for tab in row["terminals"]]
+            if not any(key in interruption_observations for key in tabs):
+                continue
+            current = [interruption_times[key] for key in tabs
+                       if key in interruption_times and key in interruption_observations]
+            previous = row.pop("codex_interruptions", None)
+            if current:
+                row["codex_interruptions"] = sorted(current, key=lambda stop: stop["stopped_at"], reverse=True)
+            if previous or current:
+                row["stop"] = stop_reason(row)
+                row["class"], row["reasons"] = classify(row, args.decision_marker)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():
@@ -3915,7 +4337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(line)
         print(line, file=sys.stderr)
         return NETWORK_DOWN_EXIT
-    rows = [{**row, "scanned_at": scanned_at}
+    rows = [{**row, "scanned_at": scanned_at, "agent_ownership_observed": True}
             for row in with_inbox(rows, inbox_reports(Path(args.inbox).expanduser(), Path(args.ask_answers).expanduser()))]
     try:
         rows = with_reported_times(rows, inbox_read.inbox_entries(Path(args.inbox).expanduser()))
@@ -3924,13 +4346,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.ps_json:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
-    rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser())
+    rows = constrain(rows, known_tabs)
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)
 
 
-WAKE_ACTIONS = {"connection": "通信断: 起こす", "login": "ログイン切れ: 人が /login する",
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 再開してよいか確認する",
+                "login": "ログイン切れ: 人が /login する",
                 "context_limit": "文脈の上限: 範囲を小さくして新しい担当に渡す", "other": "その他: 人が読む"}
 
 
@@ -4002,10 +4425,26 @@ def wake_line(row: dict, stop: StopReason) -> str:
         if (answer := row.get("wake_decision")) and "起こさない" in answer["answer"]:
             action = f"利用上限: {answer['decided_at']} " + " ".join(answer["answer"].split())
     error = " ".join(stop["error"].split())
+    if stopped_at := stop.get("stopped_at"):
+        action += f"（停止 {stopped_at}）"
     return f"{row_name(row)} | {tab or '-'} | {action} | {error[:200]}{'…' if len(error) > 200 else ''}"
 
 
-def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
+def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
+    answer = row.get("removal_decision") or {}
+    if (not answer.get("decision") or removal_approved(row) or answer.get("after") or row.get("removal_candidates")
+            or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
+            or not re.fullmatch(r"\s*(?:閉じる|閉じてください|close it)[。.!]?\s*",
+                                answer.get("answer") or "", re.IGNORECASE)):
+        return
+    target = row_identity(row) if row.get("environment") else f"local::{row['path']}"
+    command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), *decision_options(decisions_file), "record", "--decision", f"remove:{target}",
+                          "--answer-file", "/dev/stdin", "--approve"])
+    print(f"{row_name(row)}: 削除を承認する場合は次のコマンドに新しい承認文を標準入力で渡してください\n{command}",
+          file=sys.stderr)
+
+
+def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path, decisions_file: Path) -> int:
     """Print `<path> <PR|->` for each named row a removal check may take: an open PR cleanup row, or a finished one
     even while its tabs remain (rm_check.py names the tabs to close). Every other row is named on stderr with why,
     and makes the exit status 1; an unknown name prints nothing."""
@@ -4027,32 +4466,38 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         elif requirement := batch_requirement(row):
             why = requirement
         elif row.get("environment"):
-            why = "on another Mac: " + rm_check_command(row, scan_file)
+            why = "on another Mac: " + rm_check_command(row, scan_file, decisions_file=decisions_file)
             remote_preview = remote_preview or batch_has_preview()
         else:
             specs.append(rm_spec(row))
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
+        print_removal_approval_hint(row, decisions_file)
     if remote_preview:
         print(REMOTE_CHECK_RELEASE, file=sys.stderr)
-    print_rm_specs(specs, scan_file)
+    print_rm_specs(specs, scan_file, decisions_file)
     return 1 if left_out else 0
 
 
-def print_rm_specs(specs: list[str], scan_file: Path) -> None:
+def print_rm_specs(specs: list[str], scan_file: Path, decisions_file: Path) -> None:
     """Keep stdout usable as specs; give the executable next command on stderr after them."""
     for spec in specs:
         print(spec)
     if specs:
         sys.stdout.flush()
-        print(shlex.join([str(RM_CHECK_BATCH), "--from", str(scan_file), "--remove-ok", "--summary", *specs]),
-              file=sys.stderr)
+        try:
+            log_options = batch_decision_options(decisions_file, required=True)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return
+        print(shlex.join([str(RM_CHECK_BATCH), *log_options, "--from", str(scan_file),
+                          "--remove-ok", "--summary", *specs]), file=sys.stderr)
 
 
 def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> int:
     if args.row and args.rm_specs:
-        return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute())
+        return named_rm_specs(rows, args.row, Path(args.from_file).expanduser().absolute(), args.decisions_file)
     if args.row and args.cards:
         try:
             rows = list({id(row): row for row in (select_row(rows, name) for name in args.row)}.values())
@@ -4074,8 +4519,9 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
             if blocker := removal_blocker(row):
-                if not row.get("pending_handoffs") or row.get("automation_blocker"):
+                if not row.get("pending_handoffs") or row.get("automation_blocker") or row.get("cleanup_blockers"):
                     print(f"{row_name(row)}: {blocker} | {removal_facts(row)}", file=sys.stderr)
+                    print_removal_approval_hint(row, args.decisions_file)
                 continue
             if removal_approved(row) or row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
                 if requirement := batch_requirement(row):
@@ -4084,7 +4530,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
                     remote += 1
                 else:
                     specs.append(rm_spec(row))
-        print_rm_specs(specs, Path(args.from_file).expanduser().absolute())
+        print_rm_specs(specs, Path(args.from_file).expanduser().absolute(), args.decisions_file)
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
                   file=sys.stderr)
@@ -4095,11 +4541,14 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
     elif args.cards:
         scan_file = Path(args.from_file).expanduser().absolute() if args.from_file else None
         for row in rows:
-            for line in card_lines(row, scan_file):
+            if blockers := row.get("cleanup_blockers"):
+                print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
+            for line in card_lines(row, scan_file, decisions_file=args.decisions_file):
                 print(line)
     elif args.summary:
         print_summary(rows, verdicts, force_review=bool(args.only),
-                      scan_file=Path(args.from_file).expanduser().absolute() if args.from_file else None)
+                      scan_file=Path(args.from_file).expanduser().absolute() if args.from_file else None,
+                      decisions_file=args.decisions_file)
     else:
         json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
         print()

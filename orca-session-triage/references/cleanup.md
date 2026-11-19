@@ -10,8 +10,8 @@ comment contains 「消さない」 or 「残す」: its reasons quote the comme
 A HEAD commit or review-pr log (`~/.cache/orca-briefs/review/out/<owner>-<repo>-<PR>.log`) under
 thirty minutes old also keeps it, with the reason 「別の担当が使用中（時刻）」: another lane works there
 without an agent in its tabs.
-HEAD matching the PR head proves it was pushed to that PR; `git.unpushed` may
-still be positive when the branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
+HEAD matching the PR head proves it was pushed to that PR even when local
+remote-tracking refs are stale. Remove these checkouts after `rm_check.py` clears
 them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
@@ -57,12 +57,18 @@ shell's environment, so `rm_check.py` names no `tab` for an empty one: as many s
 removal. A live tab left without one keeps the row.
 Record a removal answer's condition and cleanup as values, not only in its words. `lead_decisions.py record --decision
 remove:… --after pr-merged:<PR URL>` approves the row once the scan reads that PR as merged, whatever conditions the
-words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` (repeatable, relative to the
-worktree, such as a `.env` pointing only at localhost) or `--compose-down`, the scan approves the row whatever the
-words give, and `rm-check-batch --from SCAN_JSON --remove-ok` closes the row's scanned tabs without the idle-tab
-check, runs `docker compose -p <project> down -v` for each project the check lists, deletes those files, and checks
-again before it removes the worktree. It refuses such a row on another Mac (`--host`): clean up there by hand. An
-answer without those values is checked as above.
+words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` or `--archive-path PATH`
+(both repeatable, relative to the worktree) or `--compose-down`, the scan approves the row whatever the
+words give. `rm-check-batch --from SCAN_JSON --remove-ok` closes the scanned tabs, runs the recorded cleanup,
+verifies any requested archives, and checks again before removal. A named path is archived even if the removal
+check already passes without it. Tracked files and paths inside a symlinked directory are kept. Run that cleanup
+on the worktree's Mac.
+Use `--approve` for an explicit approval without conditions or cleanup. If an answer has no structured values,
+the scan reads its text. For a short closure instruction such as `閉じる。` or `close it`, it prints a command to
+record an explicit approval. A live summary asks for a saved scan before displaying a removal command.
+
+When the latest answers under different removal keys share a timestamp, keep the worktree
+unless every answer approves removal and specifies the same archive, discard, and Compose cleanup.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`
@@ -120,8 +126,13 @@ Run these per worktree, in order.
        remove, they move aside and the removal goes on without another
        question: run `rm_check.py` again with `--archive-scratch`.
      - `held` are settings (`setting`: `.env`, `*.local.*`), data (`data`:
-       SQLite, CSV, dumps), and anything else (`unknown`), each with `reason`
-       and the `decision` the user makes. Collect them and ask once. A `.env`
+       SQLite, CSV, dumps), Git clones (`clone`), and anything else (`unknown`).
+       Each has a `reason`, the `decision` the user makes, and a `content_summary`
+       with its disk usage and up to three entry names. General held clones include
+       the branch, commits absent from remote-tracking refs, uncommitted changes,
+       and stash. The check reports unknown when Git configuration prevents inspecting
+       changes and marks the live remote state unverified. The existing `local-deps`
+       check queries origin directly before marking a clone disposable. Collect them and ask once. A `.env`
        names the keys whose values its `.env.example` lacks, never the values:
        they may be the only copy of an API key.
 

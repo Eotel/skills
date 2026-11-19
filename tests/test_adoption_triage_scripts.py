@@ -32,8 +32,9 @@ class AdoptionLedgerTests(unittest.TestCase):
                               input=json.dumps(body, ensure_ascii=False) if body is not None else None,
                               text=True, capture_output=True)
 
-    def proposal(self) -> str:
+    def proposal(self, proposal_id: str | None = None) -> str:
         result = self.run_ledger(["propose"], {
+            **({"proposal_id": proposal_id} if proposal_id else {}),
             "source": {"session": "triage", "worktree": "triage"},
             "fact": "同じ失敗が続いた", "proposal": "設定を直す", "reason": "使い方に関わる",
             "recommendation": "adopt", "priority": "high", "evidence": ["2026-10-26 17:00"]})
@@ -70,6 +71,32 @@ class AdoptionLedgerTests(unittest.TestCase):
         self.assertEqual(len(item["decisions"]), 3)
         self.assertEqual(len(item["executions"]), 2)
         self.assertEqual(len(self.events.read_text().splitlines()), 6)
+
+    def test_expected_adoption_id_protects_a_newer_adoption_across_cli_processes(self) -> None:
+        proposal_id = self.proposal(str(uuid.uuid4()).upper())
+        body = {"proposal_id": proposal_id, "actor": "Eotel"}
+        first = self.run_ledger(["decide"], {**body, "decision": "adopt"})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_id = json.loads(first.stdout)["id"]
+        for decision in ("revoke", "adopt"):
+            latest = self.run_ledger(["decide"], {**body, "decision": decision})
+            self.assertEqual(latest.returncode, 0, latest.stderr)
+        latest_id = json.loads(latest.stdout)["id"]
+        before = self.events.read_bytes()
+
+        stale = self.run_ledger(["decide", "--expected-adoption-id", first_id], {**body, "decision": "hold"})
+        self.assertIn("expected adoption is no longer current", stale.stderr)
+        self.assertEqual(self.events.read_bytes(), before)
+
+        changed = self.run_ledger(["decide", "--expected-adoption-id", latest_id], {**body, "decision": "hold"})
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertTrue(json.loads(changed.stdout)["revoked"])
+        item, = json.loads(self.run_ledger(["list", "--json"]).stdout)["items"]
+        self.assertEqual(item["status"], "held")
+        revoke, hold = item["decisions"][-2:]
+        self.assertEqual([revoke["decision"], hold["decision"]], ["revoke", "hold"])
+        self.assertEqual(revoke["after_id"], latest_id)
+        self.assertEqual(hold["after_id"], revoke["id"])
 
     def test_invalid_transition_does_not_append(self) -> None:
         proposal_id = self.proposal()
@@ -326,8 +353,8 @@ class AdoptionLedgerTests(unittest.TestCase):
         adoption = json.loads(self.run_ledger(["decide"], {"proposal_id": proposal_id, "decision": "adopt",
                                                            "actor": "Eotel"}).stdout)["id"]
 
-        def record(outcome: str, actor: str, result: str) -> None:
-            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id, "decision_id": adoption,
+        def record(outcome: str, actor: str, result: str, decision_id: str = adoption) -> None:
+            recorded = self.run_ledger(["record"], {"proposal_id": proposal_id, "decision_id": decision_id,
                                                     "outcome": outcome, "actor": actor, "result": result})
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
 
@@ -348,6 +375,16 @@ class AdoptionLedgerTests(unittest.TestCase):
         done = owner()
         self.assertEqual(done[:4], [proposal_id, "adopted", "担当 next-lane", "指示書 なし"])
         self.assertRegex(done[4], r"^実施 済 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        record("failed", "triage-retro", "target skill is missing")
+        self.assertEqual(owner()[4], done[4])
+        held = self.run_ledger(["decide", "--expected-adoption-id", adoption], {
+            "proposal_id": proposal_id, "decision": "hold", "actor": "Eotel"})
+        self.assertEqual(held.returncode, 0, held.stderr)
+        revoke_id = json.loads(held.stdout)["after_id"]
+        record("failed", "triage-retro", "target skill is missing", revoke_id)
+        self.assertRegex(owner()[4], r"^実施 失敗 \d{4}-\d\d-\d\dT\d\d:\d\d$")
+        record("reverted", "triage-retro", "removed adopted line", revoke_id)
+        self.assertRegex(owner()[4], r"^実施 戻した \d{4}-\d\d-\d\dT\d\d:\d\d$")
         unknown = self.run_ledger(["owner", "00000000"])
         self.assertEqual((unknown.returncode, unknown.stdout), (1, ""))
         self.assertIn("00000000", unknown.stderr)

@@ -46,6 +46,7 @@ class Event(TypedDict, total=False):
     outcome: str
     closed: list[Event]
     confirmed: list[Event]
+    revoked: bool
 
 
 class Proposal(Event):
@@ -184,6 +185,7 @@ def all_rows(events: Path, imports: Path) -> list[Event]:
 
 def project(rows: list[Event]) -> list[Proposal]:
     proposals: dict[str, Proposal] = {}
+    execution_ids: dict[str, str] = {}
     for row in rows:
         proposal_id = row["proposal_id"]
         if row["type"] == "proposal":
@@ -239,7 +241,9 @@ def project(rows: list[Event]) -> list[Proposal]:
             item[DECISION_TIMES[decision]] = row["ts"]
             item["decisions"].append(row)
             item["latest_event_id"] = row["id"]
-            item["current_execution"] = None
+            if decision in {"adopt", "revoke"}:
+                execution_ids[proposal_id] = row["id"]
+                item["current_execution"] = None
         elif row["type"] == "execution":
             if proposal_id not in proposals:
                 raise ValueError(f"execution without proposal: {proposal_id}")
@@ -257,7 +261,7 @@ def project(rows: list[Event]) -> list[Proposal]:
                 raise ValueError(f"reversal without revocation: {proposal_id}")
             item["executions"].append(row)
             item["latest_event_id"] = row["id"]
-            if item["decisions"][-1]["id"] == decision["id"]:
+            if execution_ids.get(proposal_id) == decision["id"]:
                 if outcome == "applied":
                     item["implemented_at"] = row["ts"]
                 if outcome == "reverted":
@@ -284,7 +288,7 @@ def active_owner(item: Proposal, known: dict[str, Proposal], besides: str | None
 
 def consolidation_blocker(item: Proposal, known: dict[str, Proposal]) -> str | None:
     """Why a proposal cannot be merged or retired now; None when it is a consolidation candidate."""
-    if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"]:
+    if item["status"] not in {"pending", "held", "adopted"} or item["implemented_at"] and not item["reverted_at"]:
         return "is not open"
     owner = active_owner(item, known)
     return f"is already in open proposal {owner}" if owner else None
@@ -338,9 +342,10 @@ def owner_view(item: Proposal) -> dict:
     holder = next((run for run in reversed(runs) if run["outcome"] == "applied" or run in lanes), None)
     brief = found.group(1) if lanes and (found := BRIEF.search(lanes[-1]["result"])) else None
     current = item["current_execution"] or {}
+    active_failure = current.get("outcome") == "failed" and (item["status"] != "adopted" or not item["implemented_at"])
     state = (f"戻した {item['reverted_at'][:16]}" if item["reverted_at"]
-             else f"済 {item['implemented_at'][:16]}" if item["implemented_at"]
-             else f"失敗 {current['ts'][:16]}" if current.get("outcome") == "failed" else "未")
+             else f"失敗 {current['ts'][:16]}" if active_failure
+             else f"済 {item['implemented_at'][:16]}" if item["implemented_at"] else "未")
     return {"proposal_id": item["proposal_id"], "status": item["status"], "owner": holder and holder["actor"],
             "brief": brief, "state": state}
 
@@ -460,7 +465,7 @@ def validate_evidence(body: object) -> Event:
     return {**envelope("evidence", proposal_id), "source": source, "evidence": evidence}
 
 
-def append(events: Path, imports: Path, row: Event) -> Event:
+def append(events: Path, imports: Path, row: Event, *, expected_adoption_id: str | None = None) -> Event:
     events.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(events, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -468,6 +473,7 @@ def append(events: Path, imports: Path, row: Event) -> Event:
         items = project(all_rows(events, imports))
         known = {item["proposal_id"]: item for item in items}
         proposal_id = row["proposal_id"]
+        revocation = None
         if row["type"] == "proposal":
             if proposal_id in known:
                 raise ValueError(f"proposal already exists: {proposal_id}")
@@ -487,11 +493,22 @@ def append(events: Path, imports: Path, row: Event) -> Event:
         elif row["type"] == "decision":
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
-            previous = known[proposal_id]["status"]
+            item = known[proposal_id]
+            previous = item["status"]
             decision = row["decision"]
-            if decision == "revoke" and previous != "adopted":
+            if expected_adoption_id is not None:
+                if decision == "adopt":
+                    raise ValueError("expected adoption ID requires revoke, reject, or hold")
+                if previous != "adopted" or item["decisions"][-1]["id"] != expected_adoption_id:
+                    raise ValueError("expected adoption is no longer current")
+                if decision != "revoke":
+                    revocation = {key: row[key] for key in ("actor", "reason") if key in row}
+                    revocation.update({**envelope("decision", proposal_id), "decision": "revoke",
+                                       "after_id": item["latest_event_id"]})
+                    row.update(envelope("decision", proposal_id))
+            elif decision == "revoke" and previous != "adopted":
                 raise ValueError("only adopted proposals can be revoked")
-            if previous == "adopted" and decision in {"adopt", "reject", "hold"}:
+            elif previous == "adopted" and decision in {"adopt", "reject", "hold"}:
                 raise ValueError("revoke adoption before another decision")
             if decision in {"adopt", "hold"}:
                 # A rejected consolidation may come back only while no other one has taken its targets.
@@ -516,18 +533,22 @@ def append(events: Path, imports: Path, row: Event) -> Event:
             if proposal_id not in known:
                 raise ValueError(f"proposal not found: {proposal_id}")
         if row["type"] != "proposal":
-            row["after_id"] = known[proposal_id]["latest_event_id"]
+            row["after_id"] = revocation["id"] if revocation else known[proposal_id]["latest_event_id"]
         adopted = row["type"] == "decision" and row["decision"] == "adopt"
         closed = closing_decisions(known[proposal_id], known, row["actor"]) if adopted else []
         confirmed = confirming_executions(known[proposal_id], known, row["actor"]) if adopted else []
-        # One write keeps the adoption and the targets it closes or confirms together.
+        batch = (revocation, row) if revocation else (row, *closed, *confirmed)
         data = b"".join((json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-                        for event in (row, *closed, *confirmed))
+                        for event in batch)
+        previous_size = os.fstat(fd).st_size
         if os.write(fd, data) != len(data):
+            os.ftruncate(fd, previous_size)
             raise OSError("partial event write")
         os.fsync(fd)
     finally:
         os.close(fd)
+    if revocation:
+        return {**row, "revoked": True}
     return {**row, "closed": closed, "confirmed": confirmed} if adopted else row
 
 
@@ -674,7 +695,9 @@ def main() -> int:
     parser.add_argument("--decision-config", type=Path, default=DEFAULT_HOSTS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("propose", help="append one proposal from stdin JSON")
-    commands.add_parser("decide", help="append one decision from stdin JSON")
+    deciding = commands.add_parser("decide", help="append a decision from stdin JSON")
+    deciding.add_argument("--expected-adoption-id",
+                          help="require this current adoption; revoke it before a reject or hold")
     commands.add_parser("record", help="append one execution result from stdin JSON")
     commands.add_parser("support", help="append more source evidence to a proposal from stdin JSON")
     listing = commands.add_parser("list", help="read current proposals",
@@ -706,7 +729,11 @@ def main() -> int:
             print(json.dumps(append(args.events, args.imports, validate_proposal(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "decide":
             require_decision_writer(args.decision_config)
-            print(json.dumps(append(args.events, args.imports, validate_decision(json.load(sys.stdin))), ensure_ascii=False))
+            if args.expected_adoption_id is not None:
+                uuid.UUID(args.expected_adoption_id)
+            row = append(args.events, args.imports, validate_decision(json.load(sys.stdin)),
+                         expected_adoption_id=args.expected_adoption_id)
+            print(json.dumps(row, ensure_ascii=False))
         elif args.command == "record":
             print(json.dumps(append(args.events, args.imports, validate_execution(json.load(sys.stdin))), ensure_ascii=False))
         elif args.command == "support":
