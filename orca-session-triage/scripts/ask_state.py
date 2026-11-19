@@ -42,6 +42,8 @@ def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset
 def handoff_ref(ask_id: str | None, key: str, entries: list[dict],
                 questions: Iterable[dict] = ()) -> tuple[str, frozenset[int]] | None:
     explicit = reference(ask_id, entries) if ask_id else None
+    if ask_id and explicit is None:
+        return None
     named = reference(key, entries)
     if explicit and not explicit[1]:
         if named and explicit[0] == named[0]:

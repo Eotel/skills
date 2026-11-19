@@ -174,6 +174,14 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
     return reasons
 
 
+QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|明日|昨日|[月火水木金土日]曜"
+                                 r"|\d+(?:年|月|日|時|分|週)|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
+
+
+def question_conditions(value: str) -> list[str]:
+    return QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))
+
+
 def question_options_agree(left: dict, right: dict) -> bool:
     def choices(question: dict) -> dict[str, tuple[str, str]]:
         return {lane_input.option_key(option["label"]): (
@@ -195,6 +203,8 @@ def question_options_agree(left: dict, right: dict) -> bool:
             return False
         elif description == other_description:
             continue
+        if question_conditions(description) != question_conditions(other_description):
+            return False
         wording = SequenceMatcher(None, description, other_description, autojunk=False)
         if ALPHANUMERIC.findall(description) != ALPHANUMERIC.findall(other_description):
             return False
@@ -278,7 +288,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                and item.get("answer") is None and not item.get("withdrawn_at")]
         own = [item for item in mine if item.get("question") == text]
         if not own and header:
-            own = [item for item in mine if item.get("header") == header]
+            own = [item for item in mine if item.get("header") == header
+                   and question_conditions(item.get("question") or "") == question_conditions(text)]
         if own:
             matched = [max(own, key=lambda item: item.get("asked_at") or "")]
         else:
@@ -315,7 +326,8 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             if not shown and header:
                 links = set(QUESTION_URL.findall(presented))
                 shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
-                         if named_ids or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))]
+                         if named_ids or (links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))
+                                          and question_conditions(original.get("question") or "") == question_conditions(text))]
             if named_ids and len(shown) == 1:
                 refs = shown
             elif len(named_ids) == 1:

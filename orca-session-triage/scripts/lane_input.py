@@ -186,10 +186,17 @@ def candidate_answers(inbox: Path, path: Path, orca: str,
     entries = inbox_read.inbox_entries(inbox) if version is not None else []
     history = inbox_read.open_asks(entries, frozenset())
     answer_history = list(inbox_read.answer_entries(path))
+    local_host = os.environ.get("TRIAGE_HOST") or socket.gethostname()
+    exportable = {ask.report["id"] for ask in history if ask.report.get("host") == local_host}
+    saved: dict[str, list[dict]] = {}
     for record in answer_history:
-        if (wanted is not None and record.get("how") == inbox_read.TRANSCRIPT_ANSWER
-                and record["id"].partition(":")[0] in wanted):
-            continue
+        if wanted and record.get("how") == inbox_read.TRANSCRIPT_ANSWER:
+            ask_id = record["id"].partition(":")[0]
+            if ask_id in wanted and ask_id in exportable:
+                if isinstance(record.get("input"), str):
+                    saved.setdefault(record["id"], []).append(record)
+                else:
+                    continue
         previous = closed_at.setdefault(record["id"], None)
         if (at := inbox_read.asked_at(record)) and (previous is None or at < previous):
             closed_at[record["id"]] = at
@@ -232,9 +239,9 @@ def candidate_answers(inbox: Path, path: Path, orca: str,
                     "id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER, "note": label, "input": prompt,
                     "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
                 })
-    if choices and (version != inbox_version(inbox) or answer_history != list(inbox_read.answer_entries(path))):
+    if (choices or saved) and (version != inbox_version(inbox) or answer_history != list(inbox_read.answer_entries(path))):
         return {}
-    return choices
+    return choices | saved
 
 
 def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
@@ -247,8 +254,17 @@ def inferred_answers(inbox: Path, path: Path, orca: str, wanted: set[str] | None
 
 
 def reconcile_answers(inbox: Path, path: Path, orca: str) -> None:
-    if inferred_answers(inbox, path, orca):
-        write_inferred_answers(lambda: inferred_answers(inbox, path, orca), path)
+    events = inbox_read.events_path()
+    inputs = (inbox, events, events.with_name(events.name + ".delivery"))
+    versions = tuple(map(inbox_version, inputs))
+    previous = list(inbox_read.answer_entries(path))
+    if detected := inferred_answers(inbox, path, orca):
+        def unchanged() -> dict[str, dict]:
+            if tuple(map(inbox_version, inputs)) != versions or list(inbox_read.answer_entries(path)) != previous:
+                return {}
+            return detected
+
+        write_inferred_answers(unchanged, path)
 
 
 def write_inferred_answers(detected: dict[str, dict] | Callable[[], dict[str, dict]], path: Path) -> None:
@@ -266,5 +282,5 @@ def write_inferred_answers(detected: dict[str, dict] | Callable[[], dict[str, di
             source = (record["sender"]["worktree"], record["ts"], record["note"])
             if source not in used and answer_id not in answered and answer_id.partition(":")[0] not in answered:
                 inbox_read.record_answers(path, [answer_id], record["how"], record["note"],
-                                          at=record["ts"], sender=record["sender"])
+                                          at=record["ts"], sender=record["sender"], transcript_input=record.get("input"))
                 used.add(source)

@@ -541,14 +541,17 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual(handoff.returncode, 0, handoff.stderr)
         self.assertEqual({row["decision"] for row in json.loads(handoff.stdout)["settled"]}, {self.KEY, f"{self.KEY}:1"})
         new = {**ask, "id": "c1234567-1234-4567-8888-123456789abc", "ts": "2026-11-14T09:02:00+00:00"}
-        with self.inbox.open("a") as stream:
-            stream.write(json.dumps(new) + "\n")
         with self.handed.open("a") as stream:
             stream.write(json.dumps({"decision": self.KEY, "ask_id": new["id"], "handed_off_at": new["ts"]}) + "\n")
-        reopened = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
-                                  "--handed-off-file", str(self.handed), "--state-file", str(self.state))
-        self.assertEqual(reopened.returncode, 0, reopened.stderr)
-        self.assertEqual([row["decision"] for row in json.loads(reopened.stdout)["unanswered"]], [self.KEY])
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                if imported:
+                    with self.inbox.open("a") as stream:
+                        stream.write(json.dumps(new) + "\n")
+                reopened = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                         "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+                self.assertEqual(reopened.returncode, 0, reopened.stderr)
+                self.assertEqual([row["decision"] for row in json.loads(reopened.stdout)["unanswered"]], [self.KEY])
 
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
@@ -813,9 +816,12 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
                 self.assertIn("worker の回答「A」", reason)
                 self.assertEqual(json.loads(self.answers.read_text())["how"], "lane transcript")
+                transcript.write_text("")
                 relayed = self.run_tool("inbox_read.py", "lane-answers", self.ASK, "--candidates")
                 self.assertEqual(relayed.returncode, 0, relayed.stderr)
-                self.assertEqual(json.loads(relayed.stdout)[f"{self.ASK}:1"][0]["note"], "A")
+                sample = json.loads(relayed.stdout)[f"{self.ASK}:1"][0]
+                self.assertEqual((sample["note"], sample["input"]), ("A", "/ship A" if provider == "claude" else "A"))
+                self.write_lines(transcript, [{**row, "timestamp": self.AT}])
         state = json.loads(self.state.read_text())
         state["questions"]["voice-placement"] = {
             "row": "/w/worker", "decision": "voice-placement", "covers": [],
@@ -953,6 +959,24 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 guarded = self.hook()
                 self.assertEqual(guarded.returncode, 0, guarded.stderr)
                 self.assertEqual("worker の回答" in guarded.stdout, blocked)
+
+    def test_guard_allows_changed_dates_and_approval_conditions(self) -> None:
+        question = {**self.question, "context": "比較 https://example.test/options"}
+        approval = "監査の承認がある場合のみデプロイする"
+        for old, current, updated_approval in (
+                ("今週金曜にデプロイしますか？", "来週金曜にデプロイしますか？", approval),
+                ("デプロイしますか？", "デプロイを進めますか？", "監査の承認がない場合のみデプロイする"),
+        ):
+            with self.subTest(question=current):
+                pause = {"label": "B", "description": "調整する"}
+                self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "worktree": "worker", "questions": [
+                    {**question, "question": old, "options": [{"label": "A", "description": approval}, pause]}]}])
+                self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "A"}])
+                self.question = {**question, "question": current,
+                                 "options": [{"label": "A", "description": updated_approval}, pause]}
+                result = self.hook()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
         self.ask(key="remove:/w/old", covers=[])

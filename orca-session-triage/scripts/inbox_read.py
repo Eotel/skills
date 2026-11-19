@@ -694,7 +694,7 @@ def answer_sender() -> dict[str, str | None]:
 
 def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
                    sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
-                   answer_at: str | None = None) -> None:
+                   answer_at: str | None = None, transcript_input: str | None = None) -> None:
     """Append one line per answered id with its source worktree/session; lock concurrent writers' lines whole.
 
     Both send and `answered` use this writer, so handoff can identify this run's own delivered answers.
@@ -705,6 +705,7 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
     lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": source,
                                **({"note": note} if note else {}),
                                **({"sent_text": sent_text} if sent_text is not None else {}),
+                               **({"input": transcript_input} if transcript_input is not None else {}),
                                **({"answer_at": answer_at} if answer_at is not None else {})},
                                ensure_ascii=False) + "\n" for answer in ids]
     with writing(path, lines=lines) as write_file:
