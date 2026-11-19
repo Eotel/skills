@@ -1052,9 +1052,20 @@ def draft_excerpt(screen: dict) -> str:
     return said[:DRAFT_EXCERPT] + ("…" if len(said) > DRAFT_EXCERPT else "")
 
 
-def composer_empty(screen: dict) -> bool | None:
-    """Whether Claude's last input line between rules is bare; None when no composer is visible."""
+def composer_empty(screen: dict, agent: str | None = None) -> bool | None:
+    """Whether the visible input is empty. None means the composer was not visible."""
     lines = [line.strip() for line in screen_lines(screen)]
+    if agent == "codex":
+        prompts = [index for index, line in enumerate(lines) if line == "›" or line.startswith(CODEX_PROMPT)]
+        if not prompts:
+            return None
+        prompt = prompts[-1]
+        trailing = lines[prompt + 1:]
+        if last_codex_activity(trailing):
+            return None
+        return (lines[prompt] in ("›", "› Ask Codex to do anything") and
+                not any(line and line != "? for shortcuts" and not RULE.fullmatch(line)
+                        for line in trailing))
     rules = [index for index, line in enumerate(lines) if RULE.fullmatch(line)]
     for top, bottom in reversed(list(zip(rules, rules[1:]))):
         box = [line for line in lines[top + 1:bottom] if line]
@@ -1463,7 +1474,7 @@ def done_cards(agents: list[dict], terms: list[dict], screens: Screens | None = 
             "prompt": agent.get("prompt") or "", "last_message": agent.get("lastAssistantMessage") or "",
             "screen_tail": screen_tail(screen) if screen else [], "draft": has_draft(screen) if screen else None,
             "draft_text": draft_excerpt(screen) if screen else None,
-            "composer_empty": composer_empty(screen) if screen else None,
+            "composer_empty": composer_empty(screen, agent.get("agentType")) if screen else None,
         }
 
     return [card(a) for a in agents if a.get("state") == "done"]
@@ -1933,7 +1944,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 row["class"] = "stalled"
         drafts = [term["handle"] for term in terms if term.get("handle")
                   and (frame := rendered(screens.get((w.get("_environment"), term["handle"]))))
-                  and (has_draft(frame) or composer_empty(frame) is False)]
+                  and (has_draft(frame) or composer_empty(frame, term.get("agentIdentity")) is False)]
         if drafts:
             row["draft_tabs"] = drafts
         row["closable"] = [handle for handle in closable_terminals(agents_done(row), terms, now, shell_idle_minutes, screens)
@@ -2933,12 +2944,15 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                      if value}
         for ask in open_asks:
             report = ask.report
-            if report.get("host") and hostname(report["host"]) not in row_hosts:
-                continue
+            host_matches = not report.get("host") or hostname(report["host"]) in row_hosts
             handle = report.get("handle")
-            if handle in tabs or ((environment, handle) not in tabs_in_scan
-                                  and report.get("worktree") == Path(row["path"]).name
-                                  and (report.get("repo") or "") in row_repos(row)):
+            known_environments = {host for host, tab in tabs_in_scan if tab == handle}
+            if known_environments:
+                matches = handle in tabs and (len(known_environments) == 1 or host_matches)
+            else:
+                matches = (host_matches and report.get("worktree") == Path(row["path"]).name
+                           and (report.get("repo") or "") in row_repos(row))
+            if matches:
                 blockers.append(f"開いた ask {report['id']}")
         holds = [current_holds[(environment, tab)] for tab in sorted(tabs) if (environment, tab) in current_holds]
         if holds:
@@ -2972,12 +2986,19 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                  *(f"{not_before_label(item)}の約束の送り先: {promise_task(item)}" for item in early)]
         row["reasons"] = [*row.get("reasons", []), *dict.fromkeys(reason for reason in added
                                                                   if reason not in row.get("reasons", []))]
-        if environment:
-            primary = f"remove:{row_identity(row)}"
+        primary = f"remove:{row_identity(row)}" if environment else None
+        if primary:
             legacy_keys = {f"remove:{name}" for name in {*names, row["path"],
                            f"{row.get('repo')}/{Path(row['path']).name}"}} - {primary}
-            keys = {primary, *(key for key in legacy_keys if (answer := decisions.get(key)) and (
-                not answer.removal and KEEP_DECISION.search(answer.answer)))}
+            keys = {primary}
+            for key in legacy_keys:
+                if answer := decisions.get(key):
+                    if (answer.removal and answer.removal.after) or (
+                            not answer.removal and not removal_answer_approves({"answer": answer.answer})):
+                        keys.add(key)
+            saved_removal = row.get("removal_decision") or {}
+            if saved_removal.get("decision") in legacy_keys and not removal_answer_approves(saved_removal):
+                keys.add(saved_removal["decision"])
         else:
             keys = {f"remove:{row.get('repo')}/{Path(row['path']).name}", f"remove:{row['path']}",
                     f"remove:local::{row['path']}"}
@@ -2991,6 +3012,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                 by_key[key] = {
                     "decision": key, "answer": answer.answer, "decided_at": answer.decided_at,
                     "record_id": answer.id,
+                    **({"legacy_retain": True} if primary and key != primary else {}),
                     **({"after": answer.removal.after, "discard": list(answer.removal.discard),
                         "compose_down": answer.removal.compose_down} if answer.removal else {}),
                 }
@@ -3058,7 +3080,7 @@ def removal_answer_approves(decision: Mapping) -> bool:
     """An explicit removal answer; retaining or deferring in that answer takes precedence. An answer recorded with
     removal terms is decided by them, whatever conditions its words give: one with a PR condition (`after`) once that
     PR merged, and one with only cleanup (`discard`, `compose_down`), which rm-check-batch runs first, at once."""
-    if decision.get("cleanup_conflict"):
+    if decision.get("cleanup_conflict") or decision.get("legacy_retain"):
         return False
     if decision.get("after"):
         return decision.get("after_state") == "MERGED"
