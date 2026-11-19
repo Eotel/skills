@@ -4609,6 +4609,12 @@ class RmCheckTests(unittest.TestCase):
         sha = git(changed, "rev-parse", "--short=12", "HEAD")
         (changed / "app.txt").write_text("stash")
         git(changed, "stash", "push", "-q")
+        tagged = sandbox / "b-clone"
+        git(tagged, "checkout", "-q", "--detach")
+        git(tagged, "commit", "-q", "--allow-empty", "-m", "retained by tag")
+        tag_commit = git(tagged, "rev-parse", "--short=12", "HEAD")
+        git(tagged, "tag", "keep-tag")
+        git(tagged, "checkout", "-q", "-")
         (changed / ".env").write_text("EXTRA=fixture")
         (changed / "app.txt").write_text("dirty")
         (sandbox / "c-note").write_text("note")
@@ -4622,7 +4628,7 @@ class RmCheckTests(unittest.TestCase):
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
         for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
-                         "stash remains", "clone 外の設定: d-note.local.json"):
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: .env", tag_commit):
             self.assertIn(expected, reason)
         summary = held["clone"]["content_summary"]
         self.assertIn("c-note", summary)
