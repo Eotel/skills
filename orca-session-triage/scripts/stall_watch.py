@@ -542,8 +542,9 @@ def recovery(row: Mapping, records: Records, now: datetime, step: str | None) ->
 def error_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     stop = row.get("stop")
     interruptions = row.get("codex_interruptions") or ()
-    stops = [*([stop] if stop and (not interruptions or stop.get("kind") != "interrupted") else []),
-             *interruptions]
+    if interruptions and stop and stop.get("kind") == "interrupted":
+        stop = scan.api_stop_reason(dict(row))
+    stops = [*([stop] if stop else []), *interruptions]
     return [signal for item in stops if item.get("kind") in STOP_KINDS
             for signal in stop_signals(row, item, act, records, now)]
 
@@ -914,7 +915,7 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
         for stop in interruptions(row):
             screen = scan.rendered(screens.get((row.get("environment"), stop.get("tab"))))
             seen = scan.current_interruption(screen) if screen else None
-            if seen and (not seen[1] or not stop.get("screen_turn") or seen[1] == stop["screen_turn"]):
+            if seen and not scan.changed_interruption(seen, stop):
                 surviving.append(stop)
         if interruptions(row):
             stop = row.get("stop") or {}

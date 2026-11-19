@@ -808,6 +808,10 @@ def stop_reason(row: dict) -> StopReason | None:
         if (interruption.get("tab") != waiting_tab and (at := parse_time(interruption["stopped_at"]))
                 and not codex_moved_since(row, at, interruption.get("rollout"))):
             return interruption
+    return api_stop_reason(row)
+
+
+def api_stop_reason(row: dict) -> StopReason | None:
     if not (found := failure(row)):
         return None
     error, agent, tab = found
@@ -1065,6 +1069,13 @@ def current_interruption(screen: dict) -> tuple[str, str, int] | None:
     prompt = next((line for line in reversed(lines[previous + 1:position]) if line.startswith(CODEX_PROMPT)), "")
     turn = hashlib.sha256(prompt.encode()).hexdigest() if prompt else ""
     return lines[position], turn, len(positions)
+
+
+def changed_interruption(seen: tuple[str, str, int], previous: Mapping) -> bool:
+    _, prompt, count = seen
+    old_prompt = previous.get("screen_turn", "")
+    return bool(prompt and (count > previous.get("screen_marks", 1)
+                            or old_prompt and prompt != old_prompt))
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1866,11 +1877,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                 new_state = event_time is not None and last_stop is not None and event_time > last_stop
                 old_prompt = previous.get("screen_turn", "")
                 old_marks = previous.get("screen_marks", 1)
-                new_prompt = screen_turn and screen_turn != old_prompt and (old_prompt or screen_marks > 1)
-                output_at = parse_time(mtime)
-                repeat_prompt = (screen_turn and screen_marks > old_marks
-                                 and output_at is not None and last_stop is not None and output_at > last_stop)
-                if not (new_state or new_prompt or repeat_prompt):
+                changed = changed_interruption(interruption, previous)
+                if not (new_state or changed):
                     if screen_turn and not old_prompt:
                         previous["screen_turn"] = screen_turn
                     previous["screen_marks"] = max(old_marks, screen_marks)
@@ -1878,6 +1886,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     continue
                 if not new_state:
                     state_at = None
+                    if last_stop and (parse_time(mtime) or EPOCH) <= last_stop:
+                        mtime = frame.get("_observed_at") or scanned_at
             stopped_at = state_at or mtime
             stop: StopReason = {"kind": "interrupted", "action": "wake", "agent": "codex",
                                 "error": error, "resets": None, "tab": handle, "stopped_at": stopped_at,
@@ -3149,8 +3159,14 @@ def save_interruption_times(path: Path, observed: Mapping[str, str], stops: dict
         oldest = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         for key, observed_at in observed.items():
             entry = current.get(key, {})
-            if observed_at > entry.get("observed_at", ""):
-                current[key] = {"observed_at": observed_at, "stop": stops.get(key)}
+            observed_before = entry.get("observed_at", "")
+            if observed_at > observed_before:
+                stop = stops.get(key)
+                if stop and observed_before and not entry.get("stop"):
+                    cleared_at, stopped_at = parse_time(observed_before), parse_time(stop["stopped_at"])
+                    if cleared_at and stopped_at and stopped_at <= cleared_at:
+                        stop["stopped_at"] = observed_at
+                current[key] = {"observed_at": observed_at, "stop": stop}
         write_json_atomically(path, {key: entry for key, entry in current.items()
                                      if entry.get("stop") or entry.get("observed_at", "") >= oldest})
 
@@ -4076,6 +4092,9 @@ def main(argv: list[str] | None = None) -> int:
                                verdicts=verdicts, proposals=ledger_proposals)
     if interruption_observations:
         save_interruption_times(interruption_path, interruption_observations, interruption_times)
+        for row in rows:
+            if (stop := row.get("stop")) and stop.get("kind") == "interrupted" and row.get("class") == "stalled":
+                row["reasons"][0] = stop_line(stop)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():
