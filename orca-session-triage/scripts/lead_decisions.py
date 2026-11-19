@@ -86,7 +86,8 @@ class RemovalTerms:
         if not isinstance(approve, bool):
             raise ValueError("approve must be true or false")
         if not isinstance(archive_path, (list, tuple)) or not all(
-                isinstance(path, str) and inside(path) and PurePosixPath(path.strip()).parts[0].casefold() != ".git"
+                isinstance(path, str) and inside(path)
+                and all(part.casefold() != ".git" for part in PurePosixPath(path.strip()).parts)
                 for path in archive_path):
             raise ValueError("each archive_path must name a relative path inside the worktree, outside .git")
         if after is None and not discard and compose_down is False and not archive_path and not approve:

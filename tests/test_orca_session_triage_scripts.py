@@ -2951,12 +2951,18 @@ class ScanCommandTests(unittest.TestCase):
         records = (("approve", {"approve": True}), ("archive", {"archive_path": ["work notes"]}), ("legacy", None))
         write_jsonl(decisions, [{"id": name, "decision": f"remove:/w/app/{name}", "answer": "閉じる。",
                                  "decided_at": "2026-11-19T12:00:00Z", "removal": terms} for name, terms in records])
-        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+        with (patch.object(scan, "batch_help", return_value="recorded archive_path"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
             self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
         self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -", "/w/app/archive -"])
         self.assertIn("lead_decisions.py", err.getvalue())
-        self.assertIn("--decision remove:/w/app/legacy", err.getvalue())
+        self.assertIn("--decision remove:local::/w/app/legacy", err.getvalue())
         self.assertIn("--approve", err.getvalue())
+        with (patch.object(scan, "batch_help", return_value="--archive-path PATH"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -"])
+        self.assertIn("対応した Harness が必要", err.getvalue())
 
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"

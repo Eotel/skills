@@ -3007,6 +3007,11 @@ def removal_approved(row: dict) -> bool:
     return removal_answer_approves(row.get("removal_decision") or {})
 
 
+DEFER_REMOVAL = re.compile(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|削除禁止|"
+                           r"たら|れば|なら|次第|まで|から|後に|後で|消すか|消せない|(?:消す|削除する)な|"
+                           r"\b(?:keep|defer|do not remove|don't remove)\b", re.IGNORECASE)
+
+
 def removal_answer_approves(decision: Mapping) -> bool:
     """An explicit removal answer; retaining or deferring in that answer takes precedence. An answer recorded with
     removal terms is decided by them, whatever conditions its words give: one with a PR condition (`after`) once that
@@ -3021,9 +3026,7 @@ def removal_answer_approves(decision: Mapping) -> bool:
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
     text = re.sub(r"rm_check(?:\.py)?\s*(?:が\s*)?ok\s*なら|検査が通れば", "", text, flags=re.IGNORECASE)
     text = re.sub(r"タブを閉じてから|--archive-scratch\s*で(?:作業記録を|控えに)?移してから", "", text)
-    if re.search(r"残[すしさ]|保留|消さ(?:ない|ず)|消しては|削除しない|削除しては|"
-                 r"たら|れば|なら|次第|まで|から|後に|後で|消すか|消せない|(?:消す|削除する)な|"
-                 r"\b(?:keep|defer|do not remove|don't remove)\b", text, re.IGNORECASE):
+    if DEFER_REMOVAL.search(text):
         return False
     # English answers are whole commands: a substring cannot establish approval or its timing.
     if re.fullmatch(r"\s*(?:remove it|ready to remove)\s*[.!]?\s*", text, re.IGNORECASE):
@@ -3879,16 +3882,22 @@ def rm_spec(row: dict) -> str:
 
 
 @cache
-def batch_has_preview() -> bool:
-    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+def batch_help() -> str:
     try:
         help_text = subprocess.run([str(RM_CHECK_BATCH), "--help"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return help_text.returncode == 0 and re.search(r"(?<!\S)--preview\s", help_text.stdout) is not None
+        return ""
+    return help_text.stdout if help_text.returncode == 0 else ""
+
+
+def batch_has_preview() -> bool:
+    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+    return re.search(r"(?<!\S)--preview\s", batch_help()) is not None
 
 
 def batch_requirement(row: dict) -> str | None:
+    if (row.get("removal_decision") or {}).get("archive_path") and "recorded archive_path" not in batch_help():
+        return f"{row['path']}: 記録済みの --archive-path に対応した Harness が必要です"
     if any(char.isspace() for char in row["path"]) and not batch_has_preview():
         return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
     return None
@@ -4156,13 +4165,15 @@ def wake_line(row: dict, stop: StopReason) -> str:
 def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
     answer = row.get("removal_decision") or {}
     if (not answer.get("decision") or not answer.get("answer") or removal_approved(row)
-            or answer.get("after") or answer.get("cleanup_conflict") or row.get("cleanup_blockers")):
+            or answer.get("after") or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
+            or DEFER_REMOVAL.search(answer["answer"]) or re.search(r"タブ(?:だけ|のみ)", answer["answer"])):
         return
+    target = row_identity(row) if row.get("environment") else f"local::{row['path']}"
     command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), "--decisions-file",
-                          str(decisions_file.expanduser()), "record", "--decision", answer["decision"],
+                          str(decisions_file.expanduser()), "record", "--decision", f"remove:{target}",
                           "--answer-file", "/dev/stdin", "--approve"])
-    text = shlex.join(["printf", "%s\n", answer["answer"]])
-    print(f"{row_name(row)}: 条件も後始末も不要と判断して削除を承認する場合は {text} | {command}", file=sys.stderr)
+    print(f"{row_name(row)}: 削除を承認する場合は次のコマンドに新しい承認文を標準入力で渡してください\n{command}",
+          file=sys.stderr)
 
 
 def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path, decisions_file: Path) -> int:
