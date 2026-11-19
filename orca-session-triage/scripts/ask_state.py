@@ -104,7 +104,12 @@ def same_bound_ask(question: dict, target: HandoffBinding | str | None, key: str
     registered = question.get("ask_id")
     named = ASK_KEY.fullmatch(key)
     if not named:
-        return not registered or matching_ref(ask_id, registered)
+        if not registered or matching_ref(ask_id, registered):
+            return True
+        covers = question.get("covers") or []
+        return (question.get("decision") != key and key in covers and len(covers) > 1
+                and not (isinstance(target, HandoffBinding)
+                         and any(matching_ref(old, registered) for old in target.earlier)))
     named_id, part = named.groups()
     named_ref = f"{named_id}:{part}" if part else named_id
     if not registered or part and ":" not in registered and matching_ref(registered, named_id):
@@ -139,6 +144,10 @@ def covered(ref: tuple[str, frozenset[int]], ids: list[str], entries: list[dict]
 
 def overlaps(left: tuple[str, frozenset[int]], right: tuple[str, frozenset[int]]) -> bool:
     return left[0] == right[0] and (not left[1] or not right[1] or bool(left[1] & right[1]))
+
+
+def includes(outer: tuple[str, frozenset[int]], inner: tuple[str, frozenset[int]]) -> bool:
+    return outer[0] == inner[0] and (not outer[1] or bool(inner[1]) and inner[1] <= outer[1])
 
 
 def active(state: dict, decisions: Mapping[str, object] | None = None, *,

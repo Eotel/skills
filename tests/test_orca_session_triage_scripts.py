@@ -8604,13 +8604,16 @@ class HourlyReadTests(unittest.TestCase):
         hourly_read = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
-            initial = Barrier(11, timeout=5)
+            initial = Barrier(7, timeout=5)
             seen = []
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
                     text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
                 seen.append(args)
                 stale = "stale-asks" in args
-                if not stale:
+                reads_answers = any(command in args for command in ("lead-state", "unanswered", "pending", "--review-out"))
+                if reads_answers:
+                    self.assertTrue((next(directory.iterdir()) / "open-asks.json").is_file())
+                elif not stale:
                     initial.wait()
                 if Path(args[0]).name == "topic":
                     stderr.write("topic unavailable\n")

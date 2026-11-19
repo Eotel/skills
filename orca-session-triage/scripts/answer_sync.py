@@ -284,6 +284,10 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                         and how in inbox_read.DELIVERY_ANSWERS):
                     continue
                 if bindings:
+                    if (source and not any(ask_state.overlaps(source, ref) for value in bindings
+                                           if (ref := refs_by_key.get(value)))
+                            and not ask_state.covered(source, list(records), entries)):
+                        continue
                     available = {value: latest[value].answer for value in bindings if value in latest
                                  and not (value in handed_keys and latest[value].from_ask)
                                  and (datetime.fromisoformat(latest[value].decided_at)

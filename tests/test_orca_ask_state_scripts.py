@@ -70,8 +70,8 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result
 
-    def relay(self, text: str, at: str) -> None:
-        self.python(f"import answer_sync; answer_sync.record([{self.ASK!r}], {text!r}, 'send', at={at!r})")
+    def relay(self, text: str, at: str, *, ask: str | None = None) -> None:
+        self.python(f"import answer_sync; answer_sync.record([{ask or self.ASK!r}], {text!r}, 'send', at={at!r})")
 
     def test_unicode_line_separator_survives_batch_relay_and_decision_readers(self) -> None:
         asked = self.ask()
@@ -503,6 +503,33 @@ assert writer is not None and writer.wait(timeout=10) == 0
             else:
                 self.assertEqual(row["state"], "stopped_after_answer")
 
+    def test_relay_waits_for_the_other_ask_in_the_same_hourly_question(self) -> None:
+        original = json.loads(self.inbox.read_text())
+        second = "b1234567-1234-4567-8888-123456789abc"
+        self.write_lines(self.inbox, [original, {**original, "id": second, "worktree": "worker-b"}])
+        first_part, second_part = f"{self.ASK}:1", f"{second}:1"
+        registered = self.ask(key="publish", covers=["publish", "notify"])
+        state = json.loads(self.state.read_text())
+        state["questions"][registered["id"]]["ask_id"] = first_part
+        self.state.write_text(json.dumps(state))
+        self.write_lines(self.handed, [
+            {"decision": "publish", "ask_id": first_part, "handed_off_at": self.AT},
+            {"decision": "notify", "ask_id": second_part, "handed_off_at": self.AT},
+        ])
+
+        self.relay("公開する", "2026-11-14T09:02:00Z", ask=first_part)
+        state = json.loads(self.state.read_text())
+        self.assertIsNone(state["questions"][registered["id"]]["answer"])
+        self.assertEqual([item["id"] for item in json.loads(self.run_tool("hourly_state.py", "asking").stdout)],
+                         [registered["id"]])
+
+        self.relay("通知する", "2026-11-14T09:03:00Z", ask=second_part)
+        state = json.loads(self.state.read_text())
+        answer = state["questions"][registered["id"]]["answer"]
+        self.assertIn("公開する", answer)
+        self.assertIn("通知する", answer)
+        self.assertEqual(json.loads(self.run_tool("hourly_state.py", "asking").stdout), [])
+
     def test_lane_answer_does_not_settle_an_unrelated_decision_key(self) -> None:
         unrelated = "remove:/w/other"
         registered = self.ask(covers=[self.KEY, unrelated])
@@ -865,25 +892,33 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertEqual(self.hook().stdout, "")
 
     def test_guard_allows_another_pr_with_the_same_registered_question_header(self) -> None:
-        other_ask = "b1234567-1234-4567-8888-123456789abc"
-        original = {**self.question, "question": "skills #237 を公開しますか？ https://example.test/pr/237"}
-        self.question = {**self.question, "question": "skills #241 を公開しますか？ https://example.test/pr/241"}
+        self.env.update(CLAUDE_CODE_SESSION_ID="lead-session", ORCA_WORKTREE_ID="repo::/w/lead",
+                        ORCA_WORKTREE_PATH="/w/lead")
+        original = {**self.question, "question": "skills #237 を公開しますか？ https://example.test/pr/237",
+                    "context": "手順 https://example.test/release"}
         self.write_lines(self.inbox, [
             {"id": self.ASK, "ts": self.AT, "kind": "ask", "worktree": "worker",
              "text": original["question"], "questions": [original]},
-            {"id": other_ask, "ts": self.AT, "kind": "ask", "worktree": "worker-b",
-             "text": self.question["question"], "questions": [self.question]},
         ])
         scan = self.root / "scan.json"
         scan.write_text(json.dumps([{"path": "/w/worker", "repo": ""}]))
-        register = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
-                                 stdin=json.dumps({"ask": f"{self.ASK}:1", "decision": f"{self.KEY}:1",
-                                                   "covers": [f"{self.KEY}:1"], "header": original["header"],
-                                                   "question": original["question"], "asked_at": self.AT}))
-        self.assertEqual(register.returncode, 0, register.stderr)
         self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": "2026-11-14T09:03:00Z",
                                          "how": "triage-notify --answered", "note": "公開する"}])
-        self.assertEqual(self.hook().stdout, "")
+        for part in ("", ":1"):
+            with self.subTest(part=part):
+                self.state.unlink(missing_ok=True)
+                register = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
+                                         stdin=json.dumps({"ask": self.ASK + part, "decision": self.KEY + part,
+                                                           "covers": [self.KEY + part], "header": original["header"],
+                                                           "question": original["question"], "asked_at": self.AT}))
+                self.assertEqual(register.returncode, 0, register.stderr)
+                self.question = {**original, "question": "skills #241 を公開しますか？ https://example.test/pr/241"}
+                self.assertEqual(self.hook().stdout, "")
+        self.question = {**original, "question": f"ask {self.ASK}:1 skills #237 を公開しますか？",
+                         "context": "比較表 https://example.test/other-reference"}
+        reason = json.loads(self.hook().stdout)["hookSpecificOutput"]
+        self.assertEqual(reason["permissionDecision"], "deny")
+        self.assertIn("worker の回答「公開する」", reason["permissionDecisionReason"])
 
     def test_lane_choice_closes_the_ask_and_blocks_the_reworded_question(self) -> None:
         status = self.root / "last-status.db"

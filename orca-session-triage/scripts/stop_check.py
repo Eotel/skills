@@ -190,6 +190,7 @@ SAME_CONDITION = {"本日": "今日", "リスタート": "再起動", "productio
                   "staging": "ステージング", "stg": "ステージング"}
 DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
 ISSUE_NUMBER = re.compile(r"(?:#|＃)\s*(\d+)")
+ISSUE_LINK = re.compile(r"/(?:pull|pulls|pr|issues|view)/[^/?#\s]+(?:[/?#]|$)", re.I)
 
 
 def question_conditions(value: str) -> list[str]:
@@ -198,14 +199,17 @@ def question_conditions(value: str) -> list[str]:
             if (term := raw.strip())]
 
 
-def question_scope_agrees(original: dict, current: dict) -> bool:
+def question_scope_agrees(original: dict, current: dict, *, explicit: bool = False) -> bool:
     text = current.get("question") or ""
     original_text = original.get("question") or ""
     known_links = set(QUESTION_URL.findall(answer_evidence.shown_question(original)))
     shown_links = set(QUESTION_URL.findall(answer_evidence.shown_question(current)))
+    known_issues = {re.split(r"[?#]", link, maxsplit=1)[0].rstrip("/") for link in known_links if ISSUE_LINK.search(link)}
+    shown_issues = {re.split(r"[?#]", link, maxsplit=1)[0].rstrip("/") for link in shown_links if ISSUE_LINK.search(link)}
     known_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(original_text)))
     shown_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(text)))
-    if (known_links and shown_links and not known_links.intersection(shown_links)
+    if (known_issues and shown_issues and not known_issues.intersection(shown_issues)
+            or not explicit and known_links and shown_links and not known_links.intersection(shown_links)
             or known_numbers and shown_numbers and known_numbers != shown_numbers):
         return False
     annotations = "".join(f"{original[key]} " for key in ("context", "impact") if original.get(key))
@@ -333,7 +337,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
         own = [item for item in mine if item.get("question") == text]
         if not own and header:
             own = [item for item in mine if item.get("header") == header
-                   and question_conditions(item.get("question") or "") == question_conditions(text)]
+                   and question_scope_agrees(item, question)]
         if own:
             matched = [max(own, key=lambda item: item.get("asked_at") or "")]
         else:
@@ -344,9 +348,9 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
         refs = [ref for item in matched for ref in ask_state.references(item, entries, bindings=handoff_ids)]
         for ask_id, numbers in list(refs):
             original = inbox_read.questions_of(next(item for item in entries if item.get("id") == ask_id))
-            if numbers and original and all(0 < n <= len(original) and isinstance(original[n - 1], dict)
-                                           and (not question_options_agree(original[n - 1], question)
-                                                or not question_scope_agrees(original[n - 1], question)) for n in numbers):
+            parts = [original[n - 1] for n in numbers if 0 < n <= len(original)] if numbers else original
+            if parts and all(isinstance(part, dict) and (not question_options_agree(part, question)
+                                                         or not question_scope_agrees(part, question)) for part in parts):
                 refs.remove((ask_id, numbers))
                 matched = [item for item in matched
                            if (ask_id, numbers) not in ask_state.references(item, entries, bindings=handoff_ids)]
@@ -365,7 +369,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             original_parts = inbox_read.questions_of(next(e for e in entries if e.get("id") == ask_id))
             if any(isinstance(part := original_parts[number - 1], dict)
                    and (not question_options_agree(part, question)
-                        or not question_scope_agrees(part, question)) for number in numbers):
+                        or not question_scope_agrees(part, question, explicit=True)) for number in numbers):
                 continue
             refs = numbered[:1]
         elif named or not refs or any(not numbers for _, numbers in refs):
@@ -377,7 +381,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                          if isinstance(original, dict) and (named_ids or not header or original.get("header") == header)
                          and question_options_agree(original, question)
-                         and question_scope_agrees(original, question)
+                         and question_scope_agrees(original, question, explicit=bool(named_ids))
                          and (named_ids or entry["id"] not in withdrawn and f"{entry['id']}:{number}" not in withdrawn)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]

@@ -618,29 +618,38 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
     answers = lead_decisions.ask_answers(inbox_read.answers_path())
     resolved = {}
     for identifier, item in state["questions"].items():
-        if item.get("answer") is not None or item.get("withdrawn_at") or not ask_state.references(item, entries):
+        if item.get("answer") is not None or item.get("withdrawn_at"):
             continue
         refs = ask_state.references(item, entries, bindings=bindings)
         if not refs:
             continue
+        if not ask_state.references(item, entries):
+            lane = Path(item["row"].rsplit("::", 1)[-1]).name
+            if not all(asks[ask_id].get("worktree") == lane and asks[ask_id].get("text") == item.get("final_message")
+                       for ask_id, _ in refs):
+                continue
         manual = covering_answers(item, decisions, bindings)
         covered_keys = {answer.decision for answer in manual}
-        if any(key not in covered_keys and not ask_state.reference(key, entries)
-               and not ask_state.registered_ask_id(item, key) and key not in bindings
-               for key in item.get("covers") or []):
+        targets = {key: ask_state.handoff_target(key, bindings[key].ask_id if key in bindings else None,
+                                                entries, (item,))
+                   for key in (item["decision"], *(item.get("covers") or []))
+                   if ask_state.same_bound_ask(item, bindings.get(key), key)}
+        if any(key not in covered_keys and not targets.get(key) for key in item.get("covers") or []):
             continue
-        handed_refs = {target for key in (item["decision"], *(item.get("covers") or []))
-                       if (binding := bindings.get(key)) and ask_state.same_bound_ask(item, binding, key)
-                       and (target := ask_state.handoff_ref(binding.ask_id, key, entries, (item,)))}
+        handed_refs = [target for key, target in targets.items() if key in handoff_keys and target]
+        manual_refs = [target for key in covered_keys if (target := targets.get(key))]
         evidence = []
         for ref in refs:
+            if any(ask_state.includes(manual_ref, ref) for manual_ref in manual_refs):
+                continue
             proof = lead_decisions.ask_answer_for_handoff(ref, answers, asks)
             issued = scan_sessions.parse_time(asks[ref[0]].get("ts"))
             parts = proof.get("answers", [proof]) if proof else []
             parts = [part for part in parts
                      if (at := scan_sessions.parse_time(part.get("ts"))) and (not issued or at >= issued)
                      and (part.get("how") != "triage-notify --withdraws"
-                          or any(ask_state.overlaps(ref, handed) for handed in handed_refs))]
+                          or any(ask_state.includes(handed, ask_state.reference(part["id"], entries) or ref)
+                                 or ask_state.includes(handed, ref) for handed in handed_refs))]
             if not proof or len(parts) != len(proof.get("answers", [proof])):
                 break
             evidence.extend(lead_decisions.Decision(part["id"], item["decision"], part.get("note") or "回答済み",
