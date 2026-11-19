@@ -601,6 +601,26 @@ def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decisio
             and asked_at and (at := scan_sessions.parse_time(decisions[key].decided_at)) is not None and at > asked_at]
 
 
+def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision], dict[str, str]]:
+    decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
+    history = list(lead_decisions.handed_off(handoffs.expanduser()))
+    bindings = {item.decision: item.ask_id for item in history if item.ask_id}
+    derived = {item.decision for item in history if item.decision in decisions and decisions[item.decision].from_ask}
+    if derived:
+        asks = {item["id"]: item for item in inbox_entries() if item.get("id") and item.get("kind") == "ask"}
+        answers = lead_decisions.ask_answers(inbox_read.answers_path())
+        for key in derived:
+            previous = decisions.pop(key)
+            if proof := lead_decisions.bound_handoff_answer(key, bindings.get(key), answers, asks, state["questions"].values()):
+                parts = proof.get("answers", [proof])
+                times = [stamp for part in parts if (stamp := part.get("ts")) and scan_sessions.parse_time(stamp)]
+                notes = list(dict.fromkeys(note for part in parts if (note := part.get("note"))))
+                if times and notes:
+                    decided_at = max(times, key=datetime.fromisoformat)
+                    decisions[key] = lead_decisions.Decision(previous.id, key, "\n".join(notes), decided_at, from_ask=True)
+    return decisions, bindings
+
+
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
                handed: list[lead_decisions.HandOff],
@@ -2000,9 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": left_matches}
             elif args.action == "asking":
-                decided = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
-                bindings = {item.decision: item.ask_id for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
-                            if item.ask_id}
+                decided, bindings = current_decisions(data, args.decisions_file, args.handed_off_file)
                 result = ask_state.asking(data, decided, bindings)
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
@@ -2012,7 +2030,8 @@ def main(argv: list[str] | None = None) -> int:
                                      if item.get("asked_in"))
                 if lead := appointed_lead(data):
                     args.asked_in.append(lead)
-                result = pending(data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())),
+                decided, _ = current_decisions(data, args.decisions_file, lead_decisions.HANDED_OFF_LOG)
+                result = pending(data, decided,
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
                                  inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
             elif args.action == "get":
@@ -2079,7 +2098,7 @@ def main(argv: list[str] | None = None) -> int:
                                      f"{label}質問 ID {answer.question} を指定し、hourly_state.py {retry} で再実行してください。"
                                      f"{error}") from error
             if sync_answers:
-                answer_sync.update_corrected_keys(items)
+                answer_sync.update_corrected_keys(items, data["questions"].values())
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

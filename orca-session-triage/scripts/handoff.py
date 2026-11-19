@@ -70,7 +70,6 @@ import sys
 from typing import NamedTuple, Protocol
 
 import answer_evidence
-import ask_state
 from commitment_store import CommitmentWriteError
 import inbox_read
 import hourly_state
@@ -605,21 +604,20 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     answered = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
     keys = list(dict.fromkeys(args.decision))
     bound = decision_asks(args.decision_ask, keys)
-    previous = {item.decision: item.ask_id for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
-                if item.ask_id and item.decision in keys}
-    selected = {**previous, **bound}
+    history = [item for item in lead_decisions.handed_off(args.handed_off_file.expanduser()) if item.decision in keys]
+    selected = {**{item.decision: item.ask_id for item in history if item.ask_id}, **bound}
+    checked = {item.decision for item in history} | selected.keys()
     inbox = args.inbox.expanduser()
     asks = {row["id"]: row for row in inbox_read.inbox_entries(inbox)
-            if row.get("kind") == "ask" and row.get("id")} if selected else {}
+            if row.get("kind") == "ask" and row.get("id")} if checked else {}
     choices = lead_decisions.ask_answers(inbox_read.answers_path()) if asks else {}
     questions = hourly_state.read(args.state_file.expanduser())["questions"].values() if asks else ()
     settled = []
     for key in keys:
-        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), key in selected):
+        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), key in checked):
             settled.append(f"{key}: {answered[key].answer}")
-        elif key in selected and (ref := ask_state.handoff_ref(selected[key], key, list(asks.values()), questions)) \
-                and lead_decisions.ask_answer_for_handoff(ref, choices, asks):
-            settled.append(f"{key}: ask {selected[key]} の回答を記録済みです")
+        elif key in checked and (proof := lead_decisions.bound_handoff_answer(key, selected.get(key), choices, asks, questions)):
+            settled.append(f"{key}: ask {proof.get('id') or selected.get(key) or key} の回答を記録済みです")
     if settled:
         print("handoff: the lead already answered; follow each answer and drop it from the handoff:",
               *settled, sep="\n", file=sys.stderr)

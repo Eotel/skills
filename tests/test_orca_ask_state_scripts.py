@@ -583,6 +583,15 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.python(f"import answer_sync; answer_sync.record([{new_ref!r}], '公開する', 'send', at={self.AT!r})")
         questions = json.loads(self.state.read_text())["questions"]
         self.assertEqual(questions[selected]["answer"], "公開する")
+        for registration, correction, expected in ((original, "公開を見送る", "公開する"),
+                                                    (selected, "公開を延期する", "公開を延期する")):
+            corrected = self.run_tool("hourly_state.py", "answered-many", stdin=json.dumps(
+                {"id": registration, "answer": correction, "replace_reason": "本人が訂正した",
+                 "answered_at": "2026-11-14T09:05:00Z"}))
+            self.assertEqual(corrected.returncode, 0, corrected.stderr)
+            decisions = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "show")
+            self.assertEqual(decisions.returncode, 0, decisions.stderr)
+            self.assertEqual(next(item["answer"] for item in json.loads(decisions.stdout) if item["decision"] == key), expected)
 
     def test_stale_asks_keeps_only_questions_that_were_not_withdrawn(self) -> None:
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
