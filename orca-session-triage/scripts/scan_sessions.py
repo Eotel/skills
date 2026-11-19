@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -705,12 +705,14 @@ def failure(row: dict) -> tuple[str, str | None] | None:
     message names no agent.
     """
     running = {a.get("type") for a in row.get("agents") or [] if a.get("state") == "working" and a.get("turn") != "done"}
-    awaiting_approval = (row.get("prompt_waiting") or {}).get("question") in (CODEX_PERMISSION, CODEX_APPROVAL)
+    awaiting_approval = bool(row.get("codex_approval_tabs")) or (
+        (row.get("prompt_waiting") or {}).get("question") in (CODEX_PERMISSION, CODEX_APPROVAL))
     codex = row["codex"][-1] if row["codex"] else {}
     orca = " ".join(((row.get("orca_message") or {}).get("text") or "").split())
     found = [(None if running else row.get("codex_screen_error"), "codex"), (codex.get("api_error"), "codex"),
              ((row["claude"] or {}).get("api_error"), "claude"),
-             (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None, None)]
+             (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None,
+              (row.get("orca_message") or {}).get("agent"))]
     return next(((error, agent) for error, agent in found
                  if error and not (agent == "codex" and awaiting_approval)
                  and not (agent and running and agent not in running)), None)
@@ -1015,13 +1017,10 @@ def composer_empty(screen: dict) -> bool | None:
 PERMISSION_QUESTION = "Do you want to"
 CODEX_PERMISSION = "Would you like to run the following command?"
 CODEX_APPROVAL = "Codex approval"
-CODEX_PERMISSION_FOOTER = re.compile(r"press enter to confirm or esc to cancel(?: or .+ to open thread)?\.?", re.I)
+CODEX_PERMISSION_FOOTER = re.compile(r"press .+? to confirm or .+? to cancel(?: or .+? to open thread)?\.?", re.I)
 CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
 CODEX_CLIPPED = re.compile(r"\[… \d+ lines?\](?:\s.*)?")
 CODEX_BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
-CODEX_VALUE_FLAGS = frozenset(("-c", "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env",
-                               "-i", "--image", "-m", "--model", "--local-provider", "-p", "--profile", "-s",
-                               "--sandbox", "-C", "--cd", "--add-dir", "-a", "--ask-for-approval"))
 CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
 FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 # What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
@@ -1079,7 +1078,9 @@ def permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
 
 
 def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
-    lines = [line.strip() for line in screen_lines(screen) if line.strip()]
+    displayed = [line.strip() for line in screen_lines(screen)]
+    visible = [index for index, line in enumerate(displayed) if line]
+    lines = [displayed[index] for index in visible]
     footer = next((index for index in range(max(0, len(lines) - 5), len(lines))
                    if CODEX_PERMISSION_FOOTER.fullmatch(" ".join(lines[index:]))), None)
     if footer is None:
@@ -1107,13 +1108,14 @@ def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
             return {"tab": tab, "question": CODEX_APPROVAL, "choices": choices,
                     "target": "approval details omitted from terminal view"}
         return None
-    body = lines[heading_end + 1:first]
-    command = next((index for index, line in enumerate(body) if line.startswith("$ ")), None)
+    body = displayed[visible[heading_end] + 1:visible[first]]
+    command = next((index for index, line in enumerate(body)
+                    if line.startswith("$ ") and (index == 0 or not body[index - 1])), None)
     if command is None:
         target = "command omitted from terminal view"
     else:
         shown = body[command]
-        target = shown[:COMMAND_HEAD] + ("…" if len(shown) > COMMAND_HEAD or command + 1 < len(body) else "")
+        target = shown[:COMMAND_HEAD] + ("…" if len(shown) > COMMAND_HEAD or any(body[command + 1:]) else "")
     return {"tab": tab, "question": CODEX_PERMISSION, "choices": choices, "target": target}
 
 
@@ -1162,20 +1164,19 @@ def question_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     return {"tab": tab, "question": unwrapped(asked), "choices": [CHOICE.sub(r"\1", line) for line in choices]}
 
 
-def waiting_prompt(terms: list[dict], screens: Screens,
-                   environment: str | None) -> tuple[PromptWaiting, Literal["pending_call_at", "pending_question_at"] | None] | None:
-    """The first prompt a tab's screen waits on, with the transcript field that says when it was asked: a permission
+def waiting_prompts(terms: list[dict], screens: Screens,
+                    environment: str | None) -> Iterator[tuple[PromptWaiting, Literal["pending_call_at", "pending_question_at"] | None]]:
+    """Each prompt a tab's screen waits on, with the transcript field that says when it was asked: a permission
     prompt holds back the tool call it asks about, and a selector is an AskUserQuestion call."""
     for term in terms:
         if not term.get("handle") or not (screen := rendered(screens.get((environment, term["handle"])))):
             continue
         if term.get("agentIdentity") == "codex" and (prompt := codex_permission_prompt(screen, term["handle"])):
-            return prompt, None
-        if prompt := permission_prompt(screen, term["handle"]):
-            return prompt, "pending_call_at"
-        if prompt := question_prompt(screen, term["handle"]):
-            return prompt, "pending_question_at"
-    return None
+            yield prompt, None
+        elif prompt := permission_prompt(screen, term["handle"]):
+            yield prompt, "pending_call_at"
+        elif prompt := question_prompt(screen, term["handle"]):
+            yield prompt, "pending_question_at"
 
 
 def screen_tail(screen: dict) -> list[str]:
@@ -1711,10 +1712,16 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         if main and not w.get("agents"):
             continue
         terms = by_worktree.get((w.get("_environment"), w.get("worktreeId")), [])
+        agents_by_pane = {agent["paneKey"]: agent.get("agentType") for agent in w.get("agents") or []
+                          if agent.get("paneKey")}
+        terms = [term if term.get("agentIdentity") else
+                 {**term, "agentIdentity": agents_by_pane.get(hourly_runtime.pane_key(term))} for term in terms]
         screen_said = ""
         if remote and not orca_said(w):
             terms, screen_said = with_screen_agents(terms, screens, w.get("_environment"))
-        waiting = waiting_prompt(terms, screens, w.get("_environment"))
+        prompts = list(waiting_prompts(terms, screens, w.get("_environment")))
+        waiting = prompts[0] if prompts else None
+        codex_approvals = [prompt["tab"] for prompt, _ in prompts if prompt["question"] in (CODEX_PERMISSION, CODEX_APPROVAL)]
         row = {
             "path": w["path"], "main": main, "repo": w.get("repo"), "branch": w.get("branch"),
             "host_id": w.get("hostId"), "environment": w.get("_environment"),
@@ -1730,6 +1737,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                                         if (error := api_failure(t.get("preview")))), None),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
+            **({"codex_approval_tabs": codex_approvals} if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
@@ -1746,7 +1754,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             if spoken:
                 newest = max(spoken, key=lambda a: a.get("updatedAt") or 0)
                 row["orca_message"] = {"text": newest["lastAssistantMessage"],
-                                       "at": iso_time(newest.get("updatedAt"))}
+                                       "at": iso_time(newest.get("updatedAt")),
+                                       **({"agent": newest["agentType"]} if newest.get("agentType") else {})}
             elif screen_said:
                 row["orca_message"] = {"text": screen_said, "at": None, "from": "screen"}
         elif not row["codex"] and (codex_said := codex_tab_message(terms, screens))[0]:
@@ -1793,8 +1802,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
 
 
 def with_codex_permission_reasons(rows: list[dict]) -> None:
-    waiting = {row["prompt_waiting"]["tab"]: row for row in rows if not row.get("environment")
-               and (row.get("prompt_waiting") or {}).get("question") == CODEX_PERMISSION}
+    waiting = {tab: row for row in rows if not row.get("environment") for tab in row.get("codex_approval_tabs") or []}
     if not waiting:
         return
     codex_processes = {}
@@ -1804,32 +1812,12 @@ def with_codex_permission_reasons(rows: list[dict]) -> None:
                        if Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")), None)
         if binary is None:
             continue
-        options: set[str] = set()
-        arguments = iter(args[binary + 1:])
-        reopened = False
-        has_session = False
-        for token in arguments:
-            if not reopened and token in ("resume", "fork"):
-                reopened = True
-                continue
-            if token == "--":
-                break
-            if not token.startswith("-"):
-                if reopened and not has_session and "--last" not in options:
-                    has_session = True
-                    continue
-                break
-            option, equal, _ = token.partition("=")
-            options.add(option)
-            if option in CODEX_VALUE_FLAGS and not equal:
-                next(arguments, None)
-        else:
-            token = ""
-        if reopened or token not in ("app-server", "exec", "e", "exec-server", "review"):
+        options = args[binary + 1:]
+        if not options or options[0] not in ("app-server", "exec", "e", "exec-server", "review"):
             codex_processes[pid] = options
     for pid, handle in rm_check.process_handles(sorted(codex_processes)).items():
         if handle in waiting and CODEX_BYPASS_FLAGS.isdisjoint(codex_processes[pid]):
-            waiting[handle]["reasons"].append(f"Codex process {pid} was started without the approvals bypass flag")
+            waiting[handle]["reasons"].append(f"Codex process {pid} shows no approvals bypass flag in its process command")
 
 
 def github_slug(remote_url: str | None) -> str | None:
@@ -3086,10 +3074,13 @@ def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Col
         (None, w.get("worktreeId")) for w in worktrees if not w.get("_environment") and w["path"] not in codex_cwds}
     working_codex = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
                      if any(a.get("agentType") == "codex" and a.get("state") == "working" for a in w.get("agents") or [])}
+    codex_panes = {(w.get("_environment"), w.get("worktreeId"), a["paneKey"]) for w in worktrees
+                   for a in w.get("agents") or [] if a.get("agentType") == "codex" and a.get("paneKey")}
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
         or (key in untracked and t.get("agentIdentity"))
-        or (t.get("agentIdentity") == "codex" and (key in quiet_codex or key in working_codex))
+        or ((t.get("agentIdentity") == "codex" or (*key, hourly_runtime.pane_key(t)) in codex_panes)
+            and (key in quiet_codex or key in working_codex))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
             and t.get("lastOutputAt") is None))]
 

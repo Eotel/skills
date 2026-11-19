@@ -904,9 +904,9 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(rows[0]["class"], "waiting")
         self.assertEqual(rows[0]["prompt_waiting"], {"tab": "term_codex", "question": heading, "target": command,
                                                        "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
-        self.assertIn("Codex process 13 was started without the approvals bypass flag", rows[0]["reasons"])
+        self.assertIn("Codex process 13 shows no approvals bypass flag in its process command", rows[0]["reasons"])
         self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
-                         [f"Codex process {pid} was started without the approvals bypass flag" for pid in (13, 17, 18, 21)])
+                         [f"Codex process {pid} shows no approvals bypass flag in its process command" for pid in (13, 18)])
         self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
             *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
 
@@ -931,11 +931,18 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(len(prompt["choices"]), 3)
 
     def test_codex_can_request_command_approval_from_another_thread(self) -> None:
-        tail = ["Would you like to run the following command?", "Thread: Robie [explorer]", "$ echo hi",
+        tail = ["Would you like to run the following command?", "Thread: Robie [explorer]", "", "$ echo hi",
                 "› 1. Yes, proceed (y)", "2. No, and tell Codex what to do differently (esc)",
                 "Press enter to confirm or esc to cancel or o to open thread"]
         prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
         self.assertEqual(prompt["target"], "$ echo hi")
+
+    def test_codex_uses_the_command_block_and_configured_approval_keys(self) -> None:
+        tail = ["Would you like to run the following", "command?", "", "Reason: Compare",
+                "$ git diff --stat.", "", "$ git status --short", "", "› 1. Yes",
+                "2. No", "Press f6 to confirm or f7 to cancel"]
+        prompt = scan.codex_permission_prompt({"source": "screen", "tail": tail}, "term_codex")
+        self.assertEqual(prompt["target"], "$ git status --short")
 
     def test_codex_approval_choices_exclude_numbered_command_lines(self) -> None:
         tail = ["Would you like to run the following command?", "$ cat <<'EOF'", "1. command output",
@@ -2883,7 +2890,7 @@ class ScanCommandTests(unittest.TestCase):
             codex_row("2026-11-19T00:00:00Z", "session_meta", {"cwd": lane}),
         ])
         screen = {"source": "screen", "tail": ["Would you like to run the following command?",
-                                                "Environment: local", "Reason: Read Git status", "$ git status",
+                                                "Environment: local", "Reason: Read Git status", "", "$ git status",
                                                 "› 1. Yes, proceed (y)", "2. No (esc)",
                                                 "Press enter to confirm or esc to cancel"]}
         with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree], [term])),
@@ -2911,11 +2918,29 @@ class ScanCommandTests(unittest.TestCase):
                                                 "Press enter to confirm or esc to cancel"]}
         current = {"pending_requests": []}
         old = {"pending_requests": [], "api_error": "stream disconnected before completion"}
+        claude = terminal(lane, "claude", "term_claude")
+        claude_screen = {"source": "screen", "tail": ["Do you want to proceed?", "❯ 1. Yes", "2. No"]}
+        screens = {(None, term["handle"]): screen, (None, claude["handle"]): claude_screen}
         for rollouts in ([old, current], [current, old]):
-            with self.subTest(rollouts=rollouts):
-                row, = scan.build_inventory([tree], [term], self.dir, {lane: rollouts}, "要判断",
-                                            now=NOW, screens={(None, term["handle"]): screen})
-                self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
+            for terms in ([term, claude], [claude, term]):
+                with self.subTest(rollouts=rollouts, terms=terms):
+                    row, = scan.build_inventory([tree], terms, self.dir, {lane: rollouts}, "要判断", now=NOW, screens=screens)
+                    self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
+
+    def test_a_remote_codex_pane_with_an_old_error_is_read_for_approval(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        term = terminal(lane, None, "term_approval", preview="approval")
+        term["_environment"] = environment
+        tree["agents"][0].update(paneKey=scan.hourly_runtime.pane_key(term),
+                                  lastAssistantMessage="stream disconnected before completion")
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?", "$ git status",
+                                                "› 1. Yes", "2. No", "Press enter to confirm or esc to cancel"]}
+        self.assertEqual(scan.screen_targets([tree], [term]), [term])
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual((row["class"], scan.stop_reason(row)), ("waiting", None))
 
     def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
         # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
