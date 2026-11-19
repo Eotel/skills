@@ -514,6 +514,44 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertIn(unrelated, [item["decision"] for item in result["unanswered"]])
         self.assertIn(f"{self.KEY}:1", [item["decision"] for item in result["settled"]])
 
+    def test_an_ambiguous_handoff_stays_pending_until_its_selected_ask_is_answered(self) -> None:
+        original = json.loads(self.inbox.read_text())
+        new = {**original, "id": "b1234567-1234-4567-8888-123456789abc", "worktree": "new-worker"}
+        self.write_lines(self.inbox, [original, new])
+        key = "publish-notify"
+        scan = self.root / "scan.json"
+        rows = [{"path": f"/w/{report['worktree']}", "repo": "", "class": "waiting",
+                 "claude": {"final_text": report["text"], "final_at": report["ts"]}} for report in (original, new)]
+        scan.write_text(json.dumps(rows))
+        for report in (original, new):
+            registered = self.run_tool("hourly_state.py", "asked-many", "--no-comment", "--from", str(scan),
+                                       stdin=json.dumps({"ask": report["id"], "decision": key, "question": report["text"],
+                                                         "asked_at": self.AT}))
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+        old_answer = {"id": self.ASK, "ts": self.AT, "how": "triage-notify --answered", "note": "待つ"}
+        self.write_lines(self.answers, [old_answer])
+        handoff = {"decision": key, "handed_off_at": self.AT}
+        self.write_lines(self.handed, [handoff])
+        decision = ("lead_decisions.py", "--decisions-file", str(self.log), "unanswered")
+        pending = self.run_tool(*decision)
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertEqual([item["decision"] for item in json.loads(pending.stdout)["unanswered"]], [key])
+
+        self.write_lines(self.handed, [handoff, {**handoff, "ask_id": new["id"]}])
+        scan.write_text(json.dumps(rows[:1]))
+        stale = ("hourly_state.py", "stale-asks", "--from", str(scan), "--verdicts", str(self.root / "no-verdicts"))
+        rescan = self.run_tool(*stale)
+        self.assertEqual(rescan.returncode, 0, rescan.stderr)
+        self.assertEqual([(item["name"], item["decisions"]) for item in json.loads(rescan.stdout)
+                          if item["state"] == "unanswered"], [("new-worker", [key])])
+        display = self.run_tool("hourly_state.py", "asking")
+        self.assertEqual(display.returncode, 0, display.stderr)
+        self.assertEqual([item["row"] for item in json.loads(display.stdout)], ["/w/new-worker"])
+
+        self.write_lines(self.answers, [old_answer, {**old_answer, "id": new["id"], "note": "公開する"}])
+        self.assertEqual([item["state"] for item in json.loads(self.run_tool(*stale).stdout)], ["stopped_after_answer"])
+        self.assertEqual(json.loads(self.run_tool(*decision).stdout)["unanswered"], [])
+
     def test_stale_asks_keeps_only_questions_that_were_not_withdrawn(self) -> None:
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
         ask = json.loads(self.inbox.read_text())

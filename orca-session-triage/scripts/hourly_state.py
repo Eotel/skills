@@ -647,19 +647,21 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
     closed_ids = [*answered_ids, *withdrawn]
-    handoff_refs = {item.decision: ask_state.handoff_ref(item.ask_id, item.decision, known_asks,
-                                                        state.get("questions", {}).values()) for item in handed}
+    questions = state.get("questions", {}).values()
+    registered = [item["record"] for item in ask_state.active(state, latest_decisions)]
+    handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions,
+                                                          registered=registered) for item in handed}
     bound_asks = {item.decision: item.ask_id for item in handed if item.ask_id}
     handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
                          for item in handed}
     if closed_ids:
         def cover_resolved(cover: str, item: dict) -> bool:
-            if ask_state.reference(cover, known_asks):
-                return True
             if cover in handoff_refs:
                 ref = handoff_refs[cover]
-                return bool(ref and (not ask_state.same_bound_ask(item, bound_asks.get(cover))
-                                     or ask_state.covered(ref, closed_ids, known_asks)))
+                return (not ask_state.same_bound_ask(item, bound_asks.get(cover), cover)
+                        or bool(ref and ask_state.covered(ref, closed_ids, known_asks)))
+            if ask_state.reference(cover, known_asks):
+                return True
             bound = ask_state.registered_ask_id(item, cover)
             ref = ask_state.handoff_ref(bound, cover, known_asks, [item]) if bound else None
             return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
@@ -743,7 +745,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         view["waiting_reports"] = received
         if sources := scan_sessions.question_sources(row, entries):
             view["question_sources"] = sources
-        view["asking"] = ask_state.for_row(state, identity, latest_decisions, bindings=bound_asks)
+        view["asking"] = ask_state.asking(state, latest_decisions, bound_asks, row=identity)
         if undecided:
             view.update(undecided_proposals=undecided, undecided_count=len(undecided))
         if blocked_by_user(row):
@@ -819,6 +821,20 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         found.append((since, {**view, "state": "unasked", "since": prompt_at or final["at"] or since.isoformat(),
                               "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
+    listed = {key for _, item in found for key in item.get("decisions", [])}
+    for item in handed:
+        key, target = item.decision, item.ask_id
+        if not target or key in listed or not any(
+            key in (question.get("decision"), *(question.get("covers") or []))
+            and not ask_state.same_bound_ask(question, target, key) for question in registered
+        ):
+            continue
+        ask = ask_entries.get((handoff_refs[key] or (target.partition(":")[0], ()))[0])
+        since = scan_sessions.parse_time(item.handed_off_at) or now
+        found.append((since, {"row": None, "name": (ask or {}).get("worktree") or target,
+                              "state": "unanswered", "since": item.handed_off_at, "decisions": [key],
+                              "question": excerpt((ask or {}).get("text") or key),
+                              "ask": report_view(ask) if ask else None, "answer": None}))
     for item in rejected or []:
         asked = "\n".join(str(question.get("question") or "") for question in item["questions"]
                           if isinstance(question, dict))
@@ -1101,7 +1117,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, data["questions"][key]["row"]),
+    return {"id": key, **data["questions"][key], "asking": ask_state.asking(data, None, {}, row=data["questions"][key]["row"]),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1651,6 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
     asking = commands.add_parser("asking", help="list the rows and decision keys being asked, with workspace and time")
     asking.add_argument("--summary", action="store_true", help="one 伺い中 line per question")
     asking.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG)
+    asking.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG)
     pending_command = commands.add_parser(
         "pending", help="list open items with their ids (an unanswered question with the prs its #numbers name and the "
                         "later asks that withdrew its ask as reissued), settled questions with evidence, unrecorded "
@@ -1975,8 +1992,10 @@ def main(argv: list[str] | None = None) -> int:
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": left_matches}
             elif args.action == "asking":
-                result = [ask_state.view(item) for item in ask_state.active(
-                    data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())))]
+                decided = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
+                bindings = {item.decision: item.ask_id for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
+                            if item.ask_id}
+                result = ask_state.asking(data, decided, bindings)
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":

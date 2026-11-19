@@ -63,13 +63,30 @@ def registered_ask_id(question: dict, key: str) -> str | None:
     return None
 
 
-def same_bound_ask(question: dict, ask_id: str | None) -> bool:
-    if not ask_id or not (registered := question.get("ask_id")):
+def same_bound_ask(question: dict, ask_id: str | None, key: str = "") -> bool:
+    registered = question.get("ask_id")
+    if (named := ASK_KEY.fullmatch(key)) and (not registered or question.get("decision") != key):
+        named_id, part = named.groups()
+        if not registered or not same_bound_ask(question, named_id):
+            registered = f"{named_id}:{part}" if part else named_id
+        elif part and ":" not in registered:
+            registered = f"{named_id}:{part}"
+    if not ask_id or not registered:
         return True
     new, _, new_part = ask_id.partition(":")
     old, _, old_part = registered.partition(":")
     same = inbox_read.names(new, old) or inbox_read.names(old, new)
     return same and (not new_part or not old_part or bool(set(new_part.split("+")) & set(old_part.split("+"))))
+
+
+def handoff_target(key: str, ask_id: str | None, entries: list[dict], questions: Iterable[dict], *,
+                   registered: Iterable[dict]) -> tuple[str, frozenset[int]] | None:
+    named = reference(key, entries)
+    bindings = {ask_id} if ask_id else {source for question in registered
+                                        if (source := registered_ask_id(question, key))
+                                        and (not named or same_bound_ask(question, named[0]))}
+    refs = {handoff_ref(source, key, entries, questions) for source in (bindings or {None})}
+    return next(iter(refs)) if len(refs) == 1 else None
 
 
 def covered(ref: tuple[str, frozenset[int]], ids: list[str], entries: list[dict]) -> bool:
@@ -104,21 +121,21 @@ def view(item: dict) -> dict:
     return {key: value for key, value in item.items() if key != "record"}
 
 
-def for_row(state: dict, row: str, decisions: Mapping[str, object] | None = None, *,
-            bindings: Mapping[str, str | None] | None = None) -> list[dict]:
-    result = []
-    for item in active(state, decisions):
-        if item["row"] == row and (keys := [key for key in item["keys"]
-                                           if same_bound_ask(item["record"], (bindings or {}).get(key))]):
-            result.append({**view(item), "keys": keys})
-    return result
+def active_keys(item: dict, bindings: Mapping[str, str | None]) -> list[str]:
+    return [key for key in item["keys"] if key and same_bound_ask(item["record"], bindings.get(key), key)]
 
 
-def for_key(state: dict, key: str, entries: list[dict], ask_id: str | None = None) -> list[dict]:
+def asking(state: dict, decisions: Mapping[str, object] | None, bindings: Mapping[str, str | None], *,
+           row: str | None = None) -> list[dict]:
+    return [{**view(item), "keys": keys} for item in active(state, decisions)
+            if (row is None or item["row"] == row) and (keys := active_keys(item, bindings))]
+
+
+def for_key(state: dict, key: str, entries: list[dict], bindings: Mapping[str, str | None]) -> list[dict]:
     ref = reference(key, entries)
-    return [view(item) for item in active(state) if same_bound_ask(item["record"], ask_id) and (key in item["keys"] or ref and any(
-        other[0] == ref[0] and (not other[1] or not ref[1] or bool(other[1] & ref[1]))
-        for other in references(item["record"], entries)))]
+    return [{**view(item), "keys": keys} for item in active(state)
+            if (keys := active_keys(item, bindings)) and same_bound_ask(item["record"], bindings.get(key), key)
+            and (key in keys or ref and any(overlaps(ref, other) for other in references(item["record"], entries)))]
 
 
 def same_workspace(by: str, cwd: str) -> bool:

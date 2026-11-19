@@ -528,12 +528,11 @@ def ask_answer_for_handoff(ref: tuple[str, frozenset[int]], answers: Mapping[str
     return parts[0] if len(parts) == 1 else {"answers": parts}
 
 
-def handoff_bindings(key: str, ask_id: str | None, entries: list[dict], questions: Iterable[dict]) -> list[str]:
-    if ask_id:
-        return [ask_id]
-    named = ask_state.reference(key, entries)
-    return [ref for question in questions if (ref := ask_state.registered_ask_id(question, key))
-            and (not named or ask_state.same_bound_ask(question, named[0]))]
+def bound_handoff_answer(key: str, ask_id: str | None, answers: Mapping[str, dict], asks: Mapping[str, dict],
+                         questions: Iterable[dict], *, registered: Iterable[dict]) -> dict | None:
+    if ref := ask_state.handoff_target(key, ask_id, list(asks.values()), questions, registered=registered):
+        return ask_answer_for_handoff(ref, answers, asks)
+    return ask_answer(ask_id, answers, asks) if ask_id else None
 
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
@@ -559,14 +558,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         decision = decision_for_handoff(answered[key].view() if key in answered else None, latest_id)
         answer = decision
         if answer is None:
-            bindings = handoff_bindings(key, latest_id, ask_entries, (question["record"] for question in active))
-            refs = list(dict.fromkeys(ref for source in (bindings or [None])
-                                      if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
-            for ref in refs:
-                if answer := ask_answer_for_handoff(ref, answers, asks):
-                    break
-            if not refs:
-                answer = next((found for source in bindings if source and (found := ask_answer(source, answers, asks))), None)
+            answer = bound_handoff_answer(key, latest_id, answers, asks, questions,
+                                          registered=(question["record"] for question in active))
         delivered = answer is not None and (answer is decision or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})
@@ -587,7 +580,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         row = {"decision": key, "handed_off_at": at,
                "first_handed_off_at": history[key][0].handed_off_at if item else None,
                "handoff_count": len(history.get(key, [])), "prs": views}
-        if state is not None and (asking := ask_state.for_key(state, key, entries, bound_asks.get(key))):
+        if state is not None and (asking := ask_state.for_key(state, key, entries, bound_asks)):
             row["asking"] = asking
         candidates = [found for entry in history.get(key, [])
                       if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))
