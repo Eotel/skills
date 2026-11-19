@@ -481,13 +481,14 @@ def delivered_records(path: Path) -> dict[str, dict]:
 
 
 def answer_records(path: Path) -> dict[str, dict]:
-    """The answer and its corrections, independent of the text relayed or whether delivery succeeded."""
+    """Current answers in append order, independently of their delivery history."""
     found: dict[str, dict] = {}
     for record in answer_entries(path):
         previous = found.get(record["id"])
         how = record.get("how")
         if (previous is None or how == HOURLY_CORRECTION
                 or previous.get("how") not in SUBSTANTIVE_ANSWERS and how in SUBSTANTIVE_ANSWERS):
+            found.pop(record["id"], None)
             found[record["id"]] = record
     return found
 
@@ -500,11 +501,15 @@ def answer_parts(ask_id: str, numbers: Iterable[int], answers: Mapping[str, dict
         return [whole] if whole is not None else []
     parts = []
     for number in requested:
-        part = answers.get(f"{ask_id}:{number}")
-        if whole and (part is None or whole.get("how") == HOURLY_CORRECTION and (
-            datetime.fromisoformat(part["ts"]) <= datetime.fromisoformat(whole["ts"])
-        )):
+        part_key = f"{ask_id}:{number}"
+        part = answers.get(part_key)
+        if part is None:
             part = whole
+        elif whole and whole.get("how") == HOURLY_CORRECTION:
+            whole_at, part_at = datetime.fromisoformat(whole["ts"]), datetime.fromisoformat(part["ts"])
+            if whole_at > part_at or (whole_at == part_at and next(
+                    key for key in answers if key in (ask_id, part_key)) == part_key):
+                part = whole
         if part is not None:
             parts.append(part)
     return parts

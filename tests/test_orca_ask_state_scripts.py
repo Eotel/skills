@@ -108,6 +108,40 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual(handoff["answers"][0]["note"], "第一案は中止")
         self.assertEqual(delivered[self.ASK]["note"], "両方公開する")
 
+    def test_same_second_part_and_whole_corrections_follow_append_order(self) -> None:
+        self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [self.question, self.question]}])
+        whole = self.ask()
+        first = self.ask(key=f"{self.KEY}:1", covers=[f"{self.KEY}:1"])
+        self.relay("両方公開する", self.AT)
+        initial = {path: path.read_bytes() for path in (self.state, self.answers, self.log)}
+        at = "2026-11-14T10:00:00+00:00"
+        notes = ((whole["id"], "全体を保留"), (first["id"], "第一案は公開"))
+        for ordered, expected in ((notes, "第一案は公開\n全体を保留"), (notes[::-1], "全体を保留")):
+            with self.subTest(ordered=ordered):
+                for path, content in initial.items():
+                    path.write_bytes(content)
+                batch = "\n".join(json.dumps({"id": id, "answer": text, "replace_reason": "本人が訂正した",
+                                             "answered_at": at}) for id, text in ordered)
+                self.python(f"""
+import io
+import sys
+from unittest.mock import patch
+
+import hourly_state
+
+with patch.object(hourly_state, "stamp", return_value={at!r}), patch.object(sys, "stdin", io.StringIO({batch!r})):
+    assert hourly_state.main(["answered-many"]) == 0
+""")
+                decided = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "show")
+                self.assertEqual(decided.returncode, 0, decided.stderr)
+                keys = {item["decision"]: item["answer"] for item in json.loads(decided.stdout)}
+                self.assertEqual(keys[self.KEY], expected)
+                probe = self.python("import inbox_read, scan_sessions; "
+                                    "ask = inbox_read.inbox_entries(inbox_read.paths()[0])[0]; "
+                                    "print(scan_sessions.ask_answer(ask, scan_sessions.ask_answers("
+                                    "inbox_read.answers_path(), include_sources=True))['note'])")
+                self.assertEqual(probe.stdout.strip(), expected)
+
     def test_legacy_automatic_decision_needs_delivery_provenance(self) -> None:
         question = self.ask()
         self.relay("公開する", self.AT)
@@ -176,7 +210,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
         now = datetime.now(timezone(timedelta(hours=9)))
         stale = (now - timedelta(hours=2)).strftime("%H:%M")
         result = self.run_tool("inbox_read.py", "answered", self.ASK, "--note", "定時で回答",
-                               "--decision", f"{self.KEY}={stale} に回答")
+                               "--decision", f"{self.KEY}={stale} に回答", "--state-file", str(self.state),
+                               "--decisions-file", str(self.log), "--handed-off-file", str(self.handed),
+                               "--handoffs-dir", str(self.root / "handoffs"))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("minutes from answered_at", result.stderr)
         self.assertFalse(self.answers.exists())

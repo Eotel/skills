@@ -2408,8 +2408,8 @@ def ask_answers(path: Path, *, include_sources: bool = False) -> dict[str, dict]
     """Answers for the scan, with the current explicit wording and the latest relay time."""
     try:
         records = list(inbox_read.answer_entries(path))
-        explicit = {key: item for key, item in inbox_read.answer_records(path).items()
-                    if item.get("how") in inbox_read.HOURLY_ANSWERS}
+        current = inbox_read.answer_records(path)
+        explicit = {key: item for key, item in current.items() if item.get("how") in inbox_read.HOURLY_ANSWERS}
     except (OSError, UnicodeDecodeError):
         return {}
     timed = sorted(((at, record) for record in records if isinstance(record.get("id"), str)
@@ -2420,7 +2420,7 @@ def ask_answers(path: Path, *, include_sources: bool = False) -> dict[str, dict]
         source = explicit.get(key, record)
         found[key] = {"at": record["ts"], "note": source.get("note") or "",
                       **({"ts": source["ts"], "how": source.get("how")} if include_sources else {})}
-    return found
+    return {key: found[key] for key in current if key in found} if include_sources else found
 
 
 def ask_answer(item: dict, answers: dict[str, dict]) -> AnsweredAsk | None:

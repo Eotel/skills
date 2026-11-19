@@ -114,6 +114,7 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
             else:
                 continue
             grouped.setdefault((how, at), []).append(key)
+            recorded.pop(key, None)
             recorded[key] = {"note": item["answer"], "how": how, "ts": at}
         sender = item.get("answered_by") or {"worktree": None, "session": None}
         planned.extend(InboxAnswer(keys, how, item["answer"], at, item["id"], number, sender)
