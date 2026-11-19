@@ -171,8 +171,9 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
-    answers = inbox_read.answer_records(inbox_read.answers_path())
-    answers.update(lane_input.inferred_answers(entries, answers, orca))
+    path = inbox_read.answers_path()
+    answers = inbox_read.answer_records(path)
+    answers.update(lane_input.inferred_answers(entries, path, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
@@ -199,21 +200,32 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
         if not refs or any(not numbers for _, numbers in refs):
+            workers = {Path(row).name for item in matched if (row := item.get("row"))}
             originals = [(str(entry["id"]), number, original)
                          for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+                         and (not workers or entry.get("worktree") in workers)
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                          if isinstance(original, dict) and (not header or original.get("header") == header)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
-            if not shown and header and (labels_in_question := set(map(lane_input.option_key, lane_input.option_labels(question)))):
+            if not shown and header and (current_options := lane_input.option_labels(question)):
+                current_labels = {lane_input.option_key(value): lane_input.normalized(value) for value in current_options}
                 presented = answer_evidence.shown_question(question)
                 links = set(QUESTION_URL.findall(presented))
-                possible = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
-                            if labels_in_question == set(map(lane_input.option_key, lane_input.option_labels(original)))
-                            and (answer_evidence.names_id(presented, ask_id)
-                                 or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original))))]
-                if len(possible) == 1:
-                    shown = possible
+                explicit, linked = [], []
+                for ask_id, number, original in originals:
+                    choice = (ask_id, frozenset((number,)))
+                    original_labels = {lane_input.option_key(value): lane_input.normalized(value)
+                                       for value in lane_input.option_labels(original)}
+                    if original_labels.keys() != current_labels.keys():
+                        continue
+                    if answer_evidence.names_id(presented, ask_id):
+                        explicit.append(choice)
+                    elif (links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))
+                          and all(original_labels[key] in (key, current_labels[key]) or current_labels[key] == key
+                                  for key in original_labels)):
+                        linked.append(choice)
+                shown = explicit or linked
             if refs:
                 for index, (ask_id, numbers) in enumerate(refs):
                     candidates = [parts for original, parts in shown if original == ask_id]

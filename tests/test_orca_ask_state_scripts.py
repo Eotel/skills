@@ -776,6 +776,21 @@ assert writer is not None and writer.wait(timeout=10) == 0
         }
         self.state.write_text(json.dumps(state))
         self.assertIn("worker の回答「A」", self.hook().stdout)
+        state["questions"]["voice-placement"]["row"] = "/w/different-worker"
+        self.state.write_text(json.dumps(state))
+        self.assertEqual(self.hook().stdout, "")
+        old = {**ask, "id": "b1234567-1234-4567-8888-123456789abc"}
+        self.write_lines(self.inbox, [old, ask])
+        state["questions"] = {}
+        self.state.write_text(json.dumps(state))
+        unnamed = self.question
+        self.question = {**unnamed, "question": f"{unnamed['question']}（ask {self.ASK}）"}
+        self.assertIn("worker の回答「A」", self.hook().stdout)
+        self.question = unnamed
+        distinct = {**original, "options": [{**option, "label": f"{option['label']}: 公開案"}
+                                            for option in original["options"]]}
+        self.write_lines(self.inbox, [{**ask, "questions": [distinct]}])
+        self.assertEqual(self.hook().stdout, "")
         second = {**original, "header": "別の配置", "question": "別の欄は、どの配置で実装しますか？"}
         self.write_lines(self.inbox, [{**ask, "questions": [original, second]}])
         opened = self.run_tool("inbox_read.py", "open-asks", "--json")
@@ -788,29 +803,58 @@ assert writer is not None and writer.wait(timeout=10) == 0
         opened = self.run_tool("inbox_read.py", "open-asks", "--json")
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertEqual([item["id"] for item in json.loads(opened.stdout)], [another])
+        early = {"id": self.ASK, "ts": "2026-11-14T09:00:30Z", "how": "send", "note": "A"}
+        self.write_lines(self.answers, [early, {**early, "ts": "2026-11-14T09:02:00Z",
+                                               "how": "hourly_state.py corrected", "note": "B"}])
+        opened = self.run_tool("inbox_read.py", "open-asks", "--json")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual(json.loads(opened.stdout), [])
+        replacement = {**ask, "id": another, "ts": "2026-11-14T09:00:30Z", "withdraws": [f"{self.ASK}:1"]}
+        self.write_lines(self.inbox, [ask, replacement])
+        self.answers.write_text("")
+        evidence = self.run_tool("inbox_read.py", "lane-answers", another)
+        self.assertEqual(evidence.returncode, 0, evidence.stderr)
+        self.assertEqual(list(json.loads(evidence.stdout)), [f"{another}:1"])
 
     def test_correction_keeps_the_evidence_that_a_numbered_answer_was_delivered(self) -> None:
         second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
         ask = json.loads(self.inbox.read_text())
         self.write_lines(self.inbox, [{**ask, "questions": [self.question, second]}])
         number = f"{self.ASK}:1"
-        self.write_lines(self.answers, [
+        originals = [
             {"id": number, "ts": self.AT, "how": "lane transcript", "note": "公開する"},
             {"id": f"{self.ASK}:2", "ts": self.AT, "how": "send", "note": "本社"},
-        ])
+        ]
         key = f"{self.KEY}:1"
         self.write_lines(self.handed, [{"decision": key, "ask_id": number, "handed_off_at": self.AT},
                                       {"decision": self.KEY, "ask_id": self.ASK, "handed_off_at": self.AT}])
-        with self.answers.open("a") as stream:
-            stream.write(json.dumps({"id": number, "ts": "2026-11-14T09:02:00+00:00",
-                                     "how": "hourly_state.py corrected", "note": "待つ"}) + "\n")
+        for target in (number, self.ASK):
+            with self.subTest(target=target):
+                self.write_lines(self.answers, [*originals, {"id": target, "ts": "2026-11-14T09:02:00+00:00",
+                                                           "how": "hourly_state.py corrected", "note": "待つ"}])
+                result = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
+                                       "--handed-off-file", str(self.handed), "--state-file", str(self.state))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                settled = {item["decision"]: item for item in json.loads(result.stdout)["settled"]}
+                self.assertIn(key, settled)
+                self.assertIn(self.KEY, settled)
+                self.assertIn("待つ", json.dumps(settled, ensure_ascii=False))
+
+    def test_descriptive_handoff_key_keeps_its_numbered_question_scope(self) -> None:
+        key = "publish-first"
+        second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
+        ask = json.loads(self.inbox.read_text())
+        self.write_lines(self.inbox, [{**ask, "questions": [self.question, second]}])
+        self.ask(key=key, covers=[f"{self.KEY}:1"])
+        self.write_lines(self.handed, [{"decision": key, "ask_id": self.ASK, "handed_off_at": self.AT}])
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "lane transcript", "note": "公開する"}])
         result = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
                                "--handed-off-file", str(self.handed), "--state-file", str(self.state))
         self.assertEqual(result.returncode, 0, result.stderr)
-        settled = {item["decision"]: item for item in json.loads(result.stdout)["settled"]}
-        self.assertIn(key, settled)
-        self.assertIn(self.KEY, settled)
-        self.assertIn("待つ", json.dumps(settled, ensure_ascii=False))
+        self.assertIn(key, [item["decision"] for item in json.loads(result.stdout)["settled"]])
+        opened = self.run_tool("inbox_read.py", "open-asks", "--json")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual([item["number"] for item in json.loads(opened.stdout)[0]["open_questions"]], [2])
 
     def test_guard_allows_different_numbered_questions_from_the_same_worker(self) -> None:
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "questions": [

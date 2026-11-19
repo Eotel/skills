@@ -140,14 +140,30 @@ def option_labels(question: dict) -> list[str]:
             if isinstance(option, dict) and isinstance(label := option.get("label"), str) and label.strip()]
 
 
-def inferred_answers(entries: list[dict], answers: dict[str, dict], orca: str,
+def inferred_answers(entries: list[dict], path: Path, orca: str,
                      wanted: set[str] | None = None) -> dict[str, dict]:
-    pending = {ask.report["id"]: ask for ask in inbox_read.open_asks(entries, frozenset(answers))
+    closed_at: dict[str, datetime | None] = {}
+    history = inbox_read.open_asks(entries, frozenset())
+    by_id = {ask.report["id"]: ask for ask in history}
+    for record in inbox_read.answer_entries(path):
+        previous = closed_at.setdefault(record["id"], None)
+        if (at := inbox_read.asked_at(record)) and (previous is None or at < previous):
+            closed_at[record["id"]] = at
+    for report in entries:
+        if not report.get("withdraws") or not (at := inbox_read.asked_at(report)):
+            continue
+        for ref in report["withdraws"]:
+            if (not isinstance(ref, str) or not (ask := by_id.get(ref.partition(":")[0])) or not ask.at or ask.at > at
+                    or any(ask.report.get(key) != report.get(key) for key in ("host", "repo", "worktree"))):
+                continue
+            if (previous := closed_at.get(ref)) is None or at < previous:
+                closed_at[ref] = at
+    pending = {ask.report["id"]: ask for ask in inbox_read.open_asks(entries, frozenset(closed_at))
                if ask.report.get("handle") and ask.open_questions and (wanted is None or ask.report["id"] in wanted)}
     by_handle = {ask.report["handle"]: ask.report for ask in reversed(list(pending.values()))}
     prompts = direct_prompts(by_handle, orca, require_handle=True)
     matches: dict[tuple[str, datetime, str], list[tuple[str, str]]] = {}
-    for ask in inbox_read.open_asks(entries, frozenset()):
+    for ask in history:
         ask_id, handle = ask.report["id"], ask.report.get("handle")
         if not ask.at or handle not in prompts or by_handle[handle]["host"] != ask.report.get("host"):
             continue
@@ -155,8 +171,7 @@ def inferred_answers(entries: list[dict], answers: dict[str, dict], orca: str,
             if not isinstance(question, dict) or question.get("multiSelect"):
                 continue
             answer_id = f"{ask_id}:{number}"
-            closed = min((at for key in (ask_id, answer_id) if (record := answers.get(key))
-                          and (at := inbox_read.asked_at(record))), default=None)
+            closed = min((at for key in (ask_id, answer_id) if (at := closed_at.get(key))), default=None)
             labels = option_labels(question)
             for prompt, at in prompts[handle]:
                 if at <= ask.at or (closed and closed < at):
@@ -180,7 +195,7 @@ def inferred_answers(entries: list[dict], answers: dict[str, dict], orca: str,
 
 
 def reconcile_answers(entries: list[dict], path: Path, orca: str) -> None:
-    write_inferred_answers(inferred_answers(entries, inbox_read.answer_records(path), orca), path)
+    write_inferred_answers(inferred_answers(entries, path, orca), path)
 
 
 def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:

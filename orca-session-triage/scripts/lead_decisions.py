@@ -485,6 +485,12 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
             return {**part, "delivery": lane_answer}
         return lane_answer
 
+    def corrected_part(part: dict, part_key: str) -> dict:
+        previous = answers.get(part_key)
+        if part is whole and part.get("how") == inbox_read.HOURLY_CORRECTION and previous and genuine_answer(previous):
+            return {**part, "delivery": previous.get("delivery") or previous}
+        return part
+
     delivery = (whole.get("delivery") or whole) if whole else None
     if delivery and delivery.get("how") not in inbox_read.DELIVERY_ANSWERS:
         delivery = None
@@ -493,13 +499,14 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
             return None
         part = next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
         if part is not None:
-            part = with_lane_evidence(part)
+            part = with_lane_evidence(corrected_part(part, ask_id))
         return {**part, "delivery": delivery} if part and delivery and not genuine_answer(part) else part
     numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
     parts = inbox_read.answer_parts(whole_id, numbers, answers)
-    parts = [with_lane_evidence(part) for part in parts]
     if not parts or numbers and len(parts) != len(numbers):
         return None
+    parts = [with_lane_evidence(corrected_part(part, f"{whole_id}:{index}"))
+             for index, part in enumerate(parts, 1)]
     if not numbers or all(part is whole for part in parts):
         return whole
     return {"id": ask_id, "answers": parts, **({"delivery": delivery} if delivery else {})}
@@ -518,6 +525,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         *history, *(key for item in active for key in item["keys"] if key)]))
     asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
     ask_entries = list(asks.values())
+    questions = (state or {}).get("questions", {}).values()
     settled = []
     last = {}
     for key in keys:
@@ -528,7 +536,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
             bindings.extend(question["record"]["ask_id"] for question in active
                             if key == question["record"].get("decision") and question["record"].get("ask_id"))
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
-                                      if (ref := ask_state.handoff_ref(source, key, ask_entries))))
+                                      if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
             for ask, numbers in refs:
                 ids = [f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask]
                 parts = [ask_answer(ask_id, answers, asks) for ask_id in ids]

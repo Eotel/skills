@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
 import re
@@ -39,11 +39,17 @@ def references(question: dict, entries: list[dict]) -> list[tuple[str, frozenset
     return list(dict.fromkeys(found))
 
 
-def handoff_ref(ask_id: str | None, key: str, entries: list[dict]) -> tuple[str, frozenset[int]] | None:
+def handoff_ref(ask_id: str | None, key: str, entries: list[dict],
+                questions: Iterable[dict] = ()) -> tuple[str, frozenset[int]] | None:
     explicit = reference(ask_id, entries) if ask_id else None
     named = reference(key, entries)
-    if explicit and not explicit[1] and named and explicit[0] == named[0]:
-        return named
+    if explicit and not explicit[1]:
+        if named and explicit[0] == named[0]:
+            return named
+        matched = {ref for item in questions if item.get("decision") == key and not item.get("withdrawn_at")
+                   for ref in references(item, entries) if ref[0] == explicit[0] and ref[1]}
+        if len(matched) == 1:
+            return matched.pop()
     return explicit or named
 
 
