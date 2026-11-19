@@ -2910,9 +2910,13 @@ class ScanCommandTests(unittest.TestCase):
         state, log = self.dir / "state.json", self.dir / "decisions"
         row = {"path": "/w/app/held", "repo": "app", "class": "finished",
                "terminals": [{"handle": "term"}], "closable": ["term"], "meaningful_tabs": []}
-        hold = {"handle": "term", "created_at": 0.0, "released_at": None, "status": "releasing",
-                "condition_kind": "signal", "condition_value": "term_lead", "instruction": "follow-up"}
-        with patch.object(scan, "hold_rows", return_value=[hold]):
+        holds = self.dir / "releasing-hold.sqlite"
+        with closing(sqlite3.connect(holds)) as db:
+            db.execute("CREATE TABLE holds(handle, created_at, released_at, status, condition_kind, "
+                       "condition_value, instruction)")
+            db.execute("INSERT INTO holds VALUES ('term', 0, NULL, 'releasing', 'signal', 'term_lead', 'follow-up')")
+            db.commit()
+        with patch.dict(os.environ, {"TRIAGE_HOLDS": str(holds)}):
             [held] = scan.with_cleanup_constraints([row], state, log)
             with patch.object(close_tabs, "moved_after_scan", side_effect=AssertionError("protected tab was checked")):
                 closed, message = close_tabs.close_one(
