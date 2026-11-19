@@ -453,6 +453,7 @@ class Held(TypedDict):
     kind: str
     reason: str
     decision: str
+    content_summary: NotRequired[str]
 
 
 def record_kind(worktree: Path, rel: str) -> str | None:
@@ -488,24 +489,40 @@ def held_details(source: Path) -> str:
     return f"du {size}、先頭 {len(names)} 件: {', '.join(names) or 'なし'}"
 
 
-def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> Held:
+def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None,
+              clone_checks: dict[Path, CloneResult]) -> Held:
     """A setting, data, or unknown path that keeps the worktree, with why and what the lead decides; a .env
     names the keys its .env.example lacks, never their values."""
     where = "main と内容が違います" if in_main else "main にありません"
-    clones = []
+    clones: set[Path] = set()
+    files: list[Path] = []
     if source.is_dir() and not source.is_symlink():
-        for directory, children, _ in source.walk():
+        for folder, children, names in os.walk(source):
+            directory = Path(folder)
             if ".git" in children:
                 children.remove(".git")
                 if not (directory / ".git").is_symlink():
-                    clones.append(directory)
-    files = [] if clones else files_in(source)
+                    clones.add(directory)
+            if not any(parent in clones for parent in (directory, *directory.parents)):
+                files.extend(directory / name for name in names)
+                files.extend(directory / name for name in children if (directory / name).is_symlink())
+    else:
+        files.append(source)
     if clones:
         kind = "clone"
         reason = "。".join(
-            f"{PurePosixPath(rel) / clone.relative_to(source)}: {', '.join(clone_check(clone, details=True))}"
+            f"{PurePosixPath(rel) / clone.relative_to(source)}: {', '.join(clone_check(clone, clone_checks).details)}"
             for clone in sorted(clones))
         decision = "変更、未 push の commit、stash の保存先を確かめてください"
+        if files:
+            settings = [file.relative_to(source).as_posix() for file in files
+                        if file.name.startswith(".env") or ".local." in file.name]
+            data = [file.relative_to(source).as_posix() for file in files if file.suffix.lower() in DATA_SUFFIXES]
+            if settings:
+                reason += "。clone 外の設定: " + ", ".join(sorted(settings)[:3])
+            if data:
+                reason += "。clone 外のデータ: " + ", ".join(sorted(data)[:3])
+            decision += "。clone 外のファイルも残すか決めてください"
     elif any(file.name.startswith(".env") or ".local." in file.name for file in files):
         kind = "setting"
         reason = f"作業場だけの設定です（{where}）"
@@ -522,7 +539,9 @@ def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> 
         kind = "unknown"
         reason = f"再生成する元も用途も分かりません（{where}）"
         decision = "中身を開き、何のファイルかを確かめて、残すか捨てるかを決めてください"
-    return {"path": rel, "kind": kind, "reason": f"{reason}。{held_details(source)}", "decision": decision}
+    content = held_details(source)
+    return {"path": rel, "kind": kind, "reason": f"{reason}。{content}", "decision": decision,
+            "content_summary": content}
 
 
 class IgnoredPaths(NamedTuple):
@@ -552,23 +571,30 @@ def dependency_clones(worktree: Path, rel: str) -> list[Path]:
                                    and not (copy / ".git").is_symlink() for copy in copies) else []
 
 
-def clone_check(copy: Path, *, details: bool = False) -> list[str]:
+class CloneResult(NamedTuple):
+    blockers: list[str]
+    details: list[str]
+
+
+def clone_check(copy: Path, checked: dict[Path, CloneResult]) -> CloneResult:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
+    copy = copy.resolve()
+    if copy in checked:
+        return checked[copy]
     blockers = []
-    if details:
-        branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
-        blockers.append(f"branch {branch or '(detached HEAD)'}")
+    branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
+    details = [f"branch {branch or '(detached HEAD)'}"]
     status = git(copy, "status", "--porcelain", "--untracked-files=all")
     if status.returncode or status.stdout.strip():
         blockers.append("uncommitted changes or git status failed")
-    elif details:
-        blockers.append("uncommitted changes: none")
+    else:
+        details.append("uncommitted changes: none")
     stash = git(copy, "stash", "list")
     if stash.returncode or stash.stdout.strip():
         blockers.append("stash remains or could not be checked")
-    elif details:
-        blockers.append("stash: none")
-    ignored = ignored_paths(copy, None)
+    else:
+        details.append("stash: none")
+    ignored = ignored_paths(copy, None, clone_checks=checked)
     if ignored.review or ignored.nested or ignored.lock_holders:
         blockers.append("ignored paths or live locks to preserve: " + ", ".join(
             [*ignored.review, *(str(path) for path in ignored.nested), *map(str, ignored.lock_holders)]))
@@ -589,16 +615,19 @@ def clone_check(copy: Path, *, details: bool = False) -> list[str]:
         blockers.append("local branches and tags could not be checked")
     tips = [("HEAD", git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()),
             *(line.split(" ", 1) for line in local.stdout.splitlines())]
-    unsaved = [f"{name} ({oid[:12] or '?'})" if details else name
-               for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
+    unsaved = [f"{name} ({oid[:12] or '?'})" for name, oid in tips
+               if not oid or refs is None or not remote_contains(copy, oid, refs)]
     if unsaved:
         blockers.append("local refs are on no verified remote branch or tag: " + ", ".join(unsaved))
-    elif details:
-        blockers.append("commits absent from origin: none")
-    return blockers
+    else:
+        details.append("commits absent from origin: none")
+    result = CloneResult(blockers, [*details, *blockers])
+    checked[copy] = result
+    return result
 
 
-def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths:
+def ignored_paths(worktree: str | Path, main: str | Path | None, *,
+                  clone_checks: dict[Path, CloneResult] | None = None) -> IgnoredPaths:
     """(review, regenerable, nested, notes, lock_holders, records, held): ignored paths that hold something and are
     neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
     test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
@@ -609,6 +638,8 @@ def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths
     directory deep inside an otherwise untracked tree is seen by its own path.
     """
     review, regenerable, nested, notes, holders = [], [], [], [], []
+    if clone_checks is None:
+        clone_checks = {}
     records: list[Record] = []
     held: list[Held] = []
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
@@ -631,10 +662,12 @@ def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths
             continue
         if clones := dependency_clones(Path(worktree), rel):
             for clone in clones:
-                if blockers := clone_check(clone):
-                    review.append("%s (%s)" % (clone, "; ".join(blockers)))
+                examined = clone_check(clone, clone_checks)
+                if examined.blockers:
+                    review.append("%s (%s)" % (clone, "; ".join(examined.blockers)))
+                    content = held_details(clone)
                     held.append({"path": str(clone), "kind": "clone",
-                                 "reason": f"{'。'.join(blockers)}。{held_details(clone)}",
+                                 "reason": f"{'。'.join(examined.details)}。{content}", "content_summary": content,
                                  "decision": "変更と stash を保存し、HEAD が remote にあることを確かめてください"})
                 else:
                     regenerable.append(str(clone.relative_to(worktree)))
@@ -664,7 +697,7 @@ def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths
         if kind := record_kind(Path(worktree), rel):
             records.append({"path": rel, "kind": kind})
         else:
-            held.append(held_file(source, rel, copy is not None and copy.exists(), keys))
+            held.append(held_file(source, rel, copy is not None and copy.exists(), keys, clone_checks))
     return IgnoredPaths(review, regenerable, nested, notes, holders, records, held)
 
 
@@ -1074,11 +1107,12 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
     changes, bytecode = working_changes(worktree)
     clone_notes = []
+    clone_checks: dict[Path, CloneResult] = {}
     for rel in changes[:]:
         if clones := dependency_clones(Path(worktree), rel):
             if tracked(Path(worktree), PurePosixPath(rel)):
                 continue
-            checked = [(clone, clone_check(clone)) for clone in clones]
+            checked = [(clone, clone_check(clone, clone_checks).blockers) for clone in clones]
             for clone, problems in checked:
                 if problems:
                     blockers.append("%s (%s)" % (clone, "; ".join(problems)))

@@ -4610,8 +4610,10 @@ class RmCheckTests(unittest.TestCase):
         (changed / "app.txt").write_text("stash")
         git(changed, "stash", "push", "-q")
         (changed / ".env").write_text("EXTRA=fixture")
+        (changed / "app.txt").write_text("dirty")
         (sandbox / "c-note").write_text("note")
-        (sandbox / "d-note").write_text("another note")
+        (sandbox / "d-note.local.json").write_text("a local setting")
+        (sandbox / "e-note").write_text("another note")
         (self.wt / "data").mkdir()
         (self.wt / "data" / "report.db").write_text("report")
 
@@ -4619,10 +4621,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
-        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes", "stash",
-                         "du ", "c-note"):
+        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
+                         "stash remains", "clone 外の設定: d-note.local.json", "du ", "c-note"):
             self.assertIn(expected, reason)
-        self.assertNotIn("d-note", reason)
+        self.assertNotIn("e-note", reason)
+        self.assertNotIn("du 不明", reason)
         self.assertIn("du ", held["data"]["reason"])
         self.assertIn("report.db", held["data"]["reason"])
         self.assertTrue(any(reason in line for line in result["reasons"]))
