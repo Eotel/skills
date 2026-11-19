@@ -1007,6 +1007,24 @@ def current_question(data: dict, asking: Asking) -> str | None:
                  and not item.get("withdrawn_at")), None)
 
 
+def reuse_question_rows(data: dict, askings: list[Asking], rows: list[dict]) -> None:
+    for asking in askings:
+        if current_question(data, asking) is not None:
+            continue
+        for item in reversed(list(data["questions"].values())):
+            if item["decision"] != asking.decision or item.get("withdrawn_at"):
+                continue
+            old = item["row"]
+            environment, separator, path = old.partition("::")
+            if Path(path if separator else old).is_absolute():
+                continue
+            matches = scan_sessions.matching_rows(rows, old)
+            if (len(matches) == 1 and matches[0].get("environment") == (environment if separator else None)
+                    and scan_sessions.row_identity(matches[0]) == asking.row):
+                item["row"] = asking.row
+                break
+
+
 def new_references(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
     """By key, the issues and PRs each question not yet recorded names (question_references)."""
     return question_references({asking.key: {"row": asking.row, "question": asking.question}
@@ -1183,6 +1201,11 @@ def asking_line(raw: str, inbox: Inbox) -> Asking:
         raise ValueError("an ask gives the final message; leave final_message out")
     row, message, ask = (inbox.lane(line_text(item, "ask")) if "ask" in item
                          else (line_text(item, "row"), line_text(item, "final_message"), {}))
+    if "row" in item and inbox.scan is not None:
+        try:
+            row = owner_name(row)
+        except ValueError:
+            row = selected_worktree(row, inbox.rows, "row")
     covers = item.get("covers", [])
     if not isinstance(covers, list) or not all(isinstance(key, str) and key.strip() for key in covers):
         raise ValueError("covers must be a list of lead decision keys")
@@ -1431,14 +1454,8 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
         asking = Asking(row=args.row, decision=decision, final_message=file_text(args.final_message_file),
                         question=file_text(args.question_file), asked_at=recorded_at(args.asked_at),
                         covers=tuple(args.covers), session=args.session, header=args.header)
-        if selected_rows is not None and current_question(data, asking) is None:
-            for item in reversed(list(data["questions"].values())):
-                if item["decision"] != decision or item.get("withdrawn_at"):
-                    continue
-                matches = scan_sessions.matching_rows(selected_rows, item["row"])
-                if len(matches) == 1 and scan_sessions.row_identity(matches[0]) == asking.row:
-                    item["row"] = asking.row
-                    break
+        if selected_rows is not None:
+            reuse_question_rows(data, [asking], selected_rows)
         return record_question(data, asking, new_references(data, [asking]))
     if args.action == "answered":
         return record_answer(data, Answering(
@@ -1907,7 +1924,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "asked-many":
                 inbox = Inbox(args.from_file)
                 askings = checked_lines(given, lambda raw: asking_line(raw, inbox))
-                references = new_references(data, [line for _, line in askings if isinstance(line, Asking)])
+                planned = [line for _, line in askings if isinstance(line, Asking)]
+                if inbox.scan is not None:
+                    reuse_question_rows(data, planned, inbox.rows)
+                references = new_references(data, planned)
                 result = record_lines(askings, lambda asking: record_question(data, asking, references))
                 # record_lines returned, so every line was read: the results follow the lines.
                 unrecorded = [f"記録しなかった: 行 {number}（問いの #番号がすべて閉じている: " + "、".join(

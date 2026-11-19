@@ -6712,15 +6712,33 @@ class HourlyStateTests(unittest.TestCase):
         args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
         _, original = self.call("asked", "--row", "/w/app/lane", *args)
         previous = json.loads(self.state.read_text())
-        previous["questions"][original["id"]]["row"] = "app/lane"
+        old_id = hourly_state.identifier("app/lane", "publish")
+        previous["questions"][old_id] = {**previous["questions"].pop(original["id"]), "row": "app/lane"}
         self.state.write_text(json.dumps(previous))
         saved = self.source("scan.json", json.dumps([{"path": "/w/app/lane", "repo": "app"}]))
 
         _, asked = self.call("asked", "--row", "app/lane", "--from", saved, *args)
 
-        self.assertEqual((asked["id"], asked["row"]), (original["id"], "/w/app/lane"))
+        self.assertEqual((asked["id"], asked["row"]), (old_id, "/w/app/lane"))
+        batch = self.source("asked.jsonl", json.dumps({"row": "app/lane", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        _, asked_batch = self.call("asked-many", "--from", saved, "--file", batch, "--no-comment")
+        self.assertEqual(asked_batch[0]["id"], old_id)
         result, answer = self.call("answered", "--decision", "publish", "--answer-file", message)
-        self.assertEqual((result, answer["id"]), (0, original["id"]))
+        self.assertEqual((result, answer["id"]), (0, old_id))
+
+    def test_a_remote_scan_never_moves_an_existing_local_question(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, local = self.call("asked", "--row", "/w/app/lane", *args)
+        self.call("answered", "--id", local["id"], "--answer-file", message)
+        saved = self.source("scan.json", json.dumps([{"path": "/w/app/lane", "repo": "app", "environment": "mac-b"}]))
+
+        _, remote = self.call("asked", "--row", "mac-b::lane", "--from", saved, *args)
+
+        self.assertNotEqual(remote["id"], local["id"])
+        self.assertIsNone(remote["answer"])
+        self.assertEqual(self.call("get", local["id"])[1]["row"], "/w/app/lane")
 
     def test_a_relative_path_in_a_saved_scan_cannot_be_recorded_as_owner(self) -> None:
         saved = self.source("scan.json", json.dumps([{"path": "lane", "repo": "app"}]))
