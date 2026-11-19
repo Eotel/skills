@@ -3051,6 +3051,20 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
         self.assertEqual(row["terminals"][0]["agent"], "codex")
 
+    def test_screen_targets_keep_a_working_codex_approval_with_stale_identity_and_no_pane_key(self) -> None:
+        lane, environment = str(self.dir / "remote"), "mbp16"
+        tree = worktree(lane, "working", agent="codex")
+        tree["_environment"] = environment
+        tree["agents"][0]["lastAssistantMessage"] = "Checking the build."
+        term = {**terminal(lane, "claude", preview="Earlier Claude reply"), "_environment": environment}
+        screen = {"source": "screen", "tail": [
+            scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm",
+        ]}
+        self.assertEqual(scan.screen_targets([tree], [term], set()), [term])
+        row, = scan.build_inventory([tree], [term], self.dir, {}, "要判断", now=NOW,
+                                    screens={(environment, term["handle"]): screen})
+        self.assertEqual((row["class"], row["prompt_waiting"]["target"]), ("waiting", "$ git status"))
+
     def test_stale_codex_error_uses_its_own_approval_capture_time(self) -> None:
         lane = str(self.dir / "local")
         tree = worktree(lane, "working", agent="codex")
