@@ -155,8 +155,14 @@ question headers and the recorded questions' `covers` keys. An answered ask,
 another workspace's claim, or another tab's unanswered hourly question blocks
 the call, naming the question, workspace, and time. Direct input in the asking
 lane's tab on this Mac after an open ask blocks once per ask and prompt timestamp.
-If the prompt answers the ask, have the lane record it with the
-`triage-notify --answered <id>[:<n>]` command the reason names.
+The hook treats a direct choice as an answer when the input matches one option
+of exactly one pending single-select question in that tab. It accepts a bare
+choice or `/ship A` when the choice is `A`. The Board digest and `inbox open-asks`
+record choices from local transcripts. The controller imports choices from
+reporter Macs when it pulls their inboxes. Keep the original header,
+options, and a shared source link or the ask ID when rephrasing a question.
+For other replies, have the lane record the answer with
+`triage-notify --answered <id>[:<n>]` as the hook reason indicates.
 Its own claim and the current tab's question record permit the call. Keep the
 appointed lead current with `hourly_state.py appoint-lead`.
 

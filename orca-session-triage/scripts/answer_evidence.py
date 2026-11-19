@@ -7,7 +7,7 @@ An answer is one of:
 - an answer `send --ask <id>[:<n>]` delivered, with or without --decision (`send --decision` or `send` in
   ask-answers.jsonl).
 - an explicit answer or correction `hourly_state.py answered` recorded under the linked ask id.
-- an answer the asking lane received in its own tab and recorded with `triage-notify --answered`.
+- an answer the asking lane received in its own tab and recorded from the local transcript or with `triage-notify --answered`.
 
 Only an answer that came after the ask and names it is proof: one delivered to it, or for an ask without
 structured questions one naming its id (in full or its first 8 or more characters), and for an ask with them one

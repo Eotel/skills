@@ -463,7 +463,9 @@ DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
 HOURLY_ANSWER = "hourly_state.py answered"
 HOURLY_CORRECTION = "hourly_state.py corrected"
 LANE_ANSWER = "triage-notify --answered"
-HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION, LANE_ANSWER))
+TRANSCRIPT_ANSWER = "lane transcript"
+LANE_ANSWERS = frozenset((LANE_ANSWER, TRANSCRIPT_ANSWER))
+HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION)) | LANE_ANSWERS
 SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
 
 
@@ -1122,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
                               help="atomically write JSON to FILE instead of stdout (implies --json)")
     open_command.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                               help="transcripts used to check whether a claimed question is still being asked")
+    lane_answers = actions.add_parser("lane-answers", help="report transcript evidence for the specified local asks")
+    lane_answers.add_argument("ids", nargs="+", metavar="ASK_ID")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
                                                    "or no longer asked); send --decision --ask records its own")
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
@@ -1184,8 +1188,19 @@ def main(argv: list[str] | None = None) -> int:
                 hold_seconds=args.hold_seconds if args.hold_seconds is not None
                 else WAKING_HOLD_SECONDS if args.exit_on_event else 0))
             return 0
+        if args.action == "lane-answers":
+            import lane_input
+            wanted = set(args.ids)
+            asks = open_asks([item for item in inbox_entries(inbox) if item.get("id") in wanted], frozenset())
+            print(json.dumps(lane_input.inferred_answers(asks, os.environ.get("ORCA_CLI_COMMAND", "orca")),
+                             ensure_ascii=False))
+            return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
             entries = inbox_entries(inbox)
+            if args.action in ("open-asks", "questions"):
+                import lane_input
+                lane_input.reconcile_answers(entries, answers_path(), getattr(args, "orca", None)
+                                             or os.environ.get("ORCA_CLI_COMMAND", "orca"))
             asks = open_asks(entries, answered_ids(answers_path()))
             open_keys = frozenset(key for ask in asks for key in (
                 ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))

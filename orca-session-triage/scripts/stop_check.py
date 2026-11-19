@@ -71,6 +71,7 @@ VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finish
 
 JAPANESE = ("HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
             "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
+QUESTION_URL = re.compile(r"https?://[^\s<>()（）「」、。]+")
 
 
 def in_japanese(question: dict[str, Any]) -> bool:
@@ -171,6 +172,7 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
     answers = inbox_read.answer_records(inbox_read.answers_path())
+    answers.update(lane_input.inferred_answers(inbox_read.open_asks(entries, frozenset(answers)), orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
@@ -196,24 +198,40 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 matched = []
         refs = [ref for item in matched for ref in ask_state.references(item, entries)]
         if not matched or any(not numbers for _, numbers in refs):
-            shown = [(str(entry["id"]), frozenset((number,)))
-                     for entry in entries if entry.get("kind") == "ask" and entry.get("id")
-                     for number, original in enumerate(inbox_read.questions_of(entry), start=1)
-                     if text in (original.get("question"), answer_evidence.shown_question(original))
-                     and (not header or original.get("header") == header)]
+            originals = [(str(entry["id"]), number, original)
+                         for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+                         for number, original in enumerate(inbox_read.questions_of(entry), start=1)
+                         if isinstance(original, dict) and (not header or original.get("header") == header)]
+            shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
+                     if text in (original.get("question"), answer_evidence.shown_question(original))]
+            if not shown and header and (labels_in_question := lane_input.option_labels(question)):
+                presented = answer_evidence.shown_question(question)
+                links = set(QUESTION_URL.findall(presented))
+                possible = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
+                            if labels_in_question.keys() == lane_input.option_labels(original).keys()
+                            and (answer_evidence.names_id(presented, ask_id)
+                                 or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original))))]
+                if len(possible) == 1:
+                    shown = possible
             if matched:
-                refs = [(ask_id, numbers or frozenset(number for original, parts in shown if original == ask_id
-                                                      for number in parts)) for ask_id, numbers in refs]
-            elif len({ref[0] for ref in shown}) == 1:
+                for index, (ask_id, numbers) in enumerate(refs):
+                    candidates = [parts for original, parts in shown if original == ask_id]
+                    if not numbers and len(candidates) == 1:
+                        refs[index] = ask_id, candidates[0]
+            elif len(shown) == 1:
                 refs.extend(shown)
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
             ask = next(entry for entry in entries if entry.get("id") == ask_id)
             if ask_state.covered(ref, list(answers), entries):
                 part_ids = {f"{ask_id}:{number}" for number in numbers}
-                times = [record.get("ts") or "時刻不明" for key, record in answers.items()
-                         if key == ask_id or key in part_ids or (not numbers and key.startswith(ask_id + ":"))]
-                reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
+                covered = [record for key, record in answers.items()
+                           if key == ask_id or key in part_ids or (not numbers and key.startswith(ask_id + ":"))]
+                facts = [f"{ask.get('worktree') or ask_id} の回答「{record['note']}」"
+                         if record.get("how") in inbox_read.LANE_ANSWERS and record.get("note")
+                         else record.get("ts") or "時刻不明" for record in covered]
+                reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{'、'.join(facts)}）。"
+                               "記録された回答を確認してください。")
             else:
                 uncovered[ask_id] = ask
                 labels.setdefault(ask_id, []).append(text or header)

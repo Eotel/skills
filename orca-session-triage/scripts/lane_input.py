@@ -7,6 +7,7 @@ import re
 import socket
 import subprocess
 from typing import Any
+import unicodedata
 
 import hourly_runtime
 import inbox_read
@@ -17,10 +18,13 @@ import scan_sessions
 INJECTED = re.compile(r"<(?P<tag>task-notification|system-reminder|environment_context|image|local-command-stdout"
                       r"|local-command-caveat)\b[^>]*>.*?</(?P=tag)>", re.S)
 SENT_WITHIN = timedelta(minutes=2)
+CLAUDE_SHIP = re.compile(r"\s*<command-message>ship</command-message>\s*<command-name>/ship</command-name>\s*"
+                         r"<command-args>(.*?)</command-args>\s*", re.S)
+OPTION_CODE = re.compile(r"^([a-z0-9])\s*:\s*\S")
 
 
 def user_prompt(row: dict[str, Any]) -> str:
-    if row.get("isMeta") or row.get("isCompactSummary"):
+    if row.get("isMeta") or row.get("isCompactSummary") or row.get("isSidechain"):
         return ""
     if row.get("type") == "user":
         text = scan_sessions.user_text(row) or ""
@@ -31,15 +35,18 @@ def user_prompt(row: dict[str, Any]) -> str:
         text = scan_sessions.message_text(payload)
         if text.lstrip().startswith("# AGENTS.md instructions"):
             return ""
-    return " ".join(INJECTED.sub("", text).split())
+    clean = INJECTED.sub("", text)
+    if command := CLAUDE_SHIP.fullmatch(clean):
+        clean = f"/ship {command[1]}"
+    return " ".join(clean.split())
 
 
 def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str, Any]],
-                 handles: dict[str, str]) -> tuple[set[str], list[tuple[str, datetime]]]:
+                 handles: dict[str, str], *, require_handle: bool = False) -> tuple[set[str], list[tuple[str, datetime]]]:
     lane, handle, repo = ask.get("worktree"), ask.get("handle"), ask.get("repo")
     suffix = Path(lane).parts if lane else ()
     chosen = [pane for pane, terminal in handles.items() if terminal == handle]
-    if not chosen:
+    if not chosen and not require_handle:
         chosen = [pane for pane, entry in panes.items()
                   if suffix and (parts := Path((entry.get("worktreeId") or "").split("::", 1)[-1]).parts)[-len(suffix):] == suffix
                   and (not repo or repo in parts)]
@@ -59,7 +66,8 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
     return targets, prompts
 
 
-def direct_prompts(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, list[tuple[str, datetime]]]:
+def direct_prompts(asks: dict[str, dict[str, Any]], orca: str, *,
+                   require_handle: bool = False) -> dict[str, list[tuple[str, datetime]]]:
     host = os.environ.get("TRIAGE_HOST") or socket.gethostname()
     local = {ask_id: (ask, at) for ask_id, ask in asks.items()
              if ask.get("host") == host and (at := inbox_read.asked_at(ask))}
@@ -72,14 +80,14 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, list
         return {}
     try:
         terminals = scan_sessions.orca_result(orca, ["terminal", "list", "--environment", "local"],
-                                              "terminals", None, timeout=1)
+                                              "terminals", None, timeout=3)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         terminals = []
     handles = {hourly_runtime.pane_key(term): term["handle"] for term in terminals if term.get("handle")}
     candidates = {}
     for ask_id, (ask, at) in local.items():
         try:
-            targets, prompts = lane_prompts(ask, at, panes, handles)
+            targets, prompts = lane_prompts(ask, at, panes, handles, require_handle=require_handle)
         except (OSError, RuntimeError, ValueError, AttributeError, TypeError):
             continue
         if prompts:
@@ -108,3 +116,60 @@ def direct_prompts(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, list
         return {}
     return {ask_id: sorted(prompts, key=lambda pair: pair[1])
             for ask_id, (_, prompts) in candidates.items() if prompts}
+
+
+def option_key(value: str) -> str:
+    label = unicodedata.normalize("NFKC", value).strip().casefold()
+    if code := OPTION_CODE.match(label):
+        return code[1]
+    return label.removesuffix("(推奨)").removesuffix("(recommended)").strip()
+
+
+def option_labels(question: dict) -> dict[str, str]:
+    return {key: label for option in question.get("options") or []
+            if isinstance(option, dict) and isinstance(label := option.get("label"), str)
+            and (key := option_key(label))}
+
+
+def inferred_answers(asks: list[inbox_read.OpenAsk], orca: str) -> dict[str, dict]:
+    pending = {ask.report["id"]: ask for ask in asks if ask.report.get("handle") and ask.open_questions}
+    prompts = direct_prompts({ask_id: ask.report for ask_id, ask in pending.items()}, orca, require_handle=True)
+    matches: dict[tuple[str, datetime, str], list[tuple[str, str]]] = {}
+    for ask_id, inputs in prompts.items():
+        ask = pending[ask_id]
+        questions = inbox_read.questions_of(ask.report)
+        for number in ask.open_questions:
+            question = questions[number - 1]
+            if not isinstance(question, dict) or question.get("multiSelect"):
+                continue
+            labels = option_labels(question)
+            for prompt, at in inputs:
+                choice = unicodedata.normalize("NFKC", prompt.removeprefix("/ship ")).strip().casefold()
+                if label := labels.get(choice):
+                    key = (ask.report["handle"], at, prompt)
+                    matches.setdefault(key, []).append((f"{ask_id}:{number}", label))
+    choices: dict[str, dict[str, datetime]] = {}
+    for (_, at, _), matches_for_input in matches.items():
+        if len(matches_for_input) == 1:
+            answer_id, label = matches_for_input[0]
+            choices.setdefault(answer_id, {}).setdefault(label, at)
+    return {answer_id: {"id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER,
+                        "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
+                        "note": label}
+            for answer_id, selected in choices.items() if len(selected) == 1 for label, at in selected.items()}
+
+
+def reconcile_answers(entries: list[dict], path: Path, orca: str) -> None:
+    write_inferred_answers(inferred_answers(inbox_read.open_asks(entries, inbox_read.answered_ids(path)), orca), path)
+
+
+def write_inferred_answers(detected: dict[str, dict], path: Path) -> None:
+    if not detected:
+        return
+    path = path.resolve()
+    with retro.locked(path.with_name(path.name + ".lane-answer.lock")):
+        answered = inbox_read.answered_ids(path)
+        for answer_id, record in detected.items():
+            if answer_id not in answered and answer_id.partition(":")[0] not in answered:
+                inbox_read.record_answers(path, [answer_id], record["how"], record["note"],
+                                          at=record["ts"], sender=record["sender"])
