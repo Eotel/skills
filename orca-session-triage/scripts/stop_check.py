@@ -174,12 +174,13 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
     return reasons
 
 
-QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|明日|昨日|[月火水木金土日]曜"
+QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
                                  r"|\d+(?:年|月|日|時|分|週)|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
 
 
 def question_conditions(value: str) -> list[str]:
-    return QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))
+    return ["今日" if term == "本日" else term
+            for term in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))]
 
 
 def question_options_agree(left: dict, right: dict) -> bool:

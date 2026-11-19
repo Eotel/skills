@@ -543,6 +543,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
         new = {**ask, "id": "c1234567-1234-4567-8888-123456789abc", "ts": "2026-11-14T09:02:00+00:00"}
         with self.handed.open("a") as stream:
             stream.write(json.dumps({"decision": self.KEY, "ask_id": new["id"], "handed_off_at": new["ts"]}) + "\n")
+        still_answered = self.run_tool(*args)
+        self.assertEqual(still_answered.returncode, 0, still_answered.stderr)
+        self.assertNotIn("unanswered", [row["state"] for row in json.loads(still_answered.stdout)])
         for imported in (False, True):
             with self.subTest(imported=imported):
                 if imported:
@@ -963,9 +966,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
     def test_guard_allows_changed_dates_and_approval_conditions(self) -> None:
         question = {**self.question, "context": "比較 https://example.test/options"}
         approval = "監査の承認がある場合のみデプロイする"
-        for old, current, updated_approval in (
-                ("今週金曜にデプロイしますか？", "来週金曜にデプロイしますか？", approval),
-                ("デプロイしますか？", "デプロイを進めますか？", "監査の承認がない場合のみデプロイする"),
+        for old, current, updated_approval, blocked in (
+                ("今週金曜にデプロイしますか？", "来週金曜にデプロイしますか？", approval, False),
+                ("今日中にデプロイしますか？", "本日中にデプロイを進めますか？", approval, True),
+                ("デプロイしますか？", "デプロイを進めますか？", "監査の承認がない場合のみデプロイする", False),
         ):
             with self.subTest(question=current):
                 pause = {"label": "B", "description": "調整する"}
@@ -976,7 +980,7 @@ assert writer is not None and writer.wait(timeout=10) == 0
                                  "options": [{"label": "A", "description": updated_approval}, pause]}
                 result = self.hook()
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "")
+                self.assertEqual("worker の回答" in result.stdout, blocked)
 
     def test_current_binding_does_not_inherit_an_unrelated_answer_with_identical_wording(self) -> None:
         self.ask(key="remove:/w/old", covers=[])

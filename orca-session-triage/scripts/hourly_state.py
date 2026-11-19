@@ -648,6 +648,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     closed_ids = [*answered_ids, *withdrawn]
     handoff_refs = {item.decision: ask_state.handoff_ref(item.ask_id, item.decision, known_asks,
                                                         state.get("questions", {}).values()) for item in handed}
+    handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
+                         for item in handed}
     if closed_ids:
         handed = [item for item in handed if not ((ref := handoff_refs[item.decision])
                                                   and ask_state.covered(ref, closed_ids, known_asks))]
@@ -689,8 +691,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 and (item.get("repo") or "") in scan_sessions.row_repos(row)
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
         keys = {item["id"]: [handoff.decision for handoff in handed
-                            if (key := (handoff_refs[handoff.decision] or
-                                        (answer_evidence.key_ask_id(handoff.decision), ()))[0])
+                            if (key := (handoff_refs[handoff.decision] or (handoff_fallbacks[handoff.decision], ()))[0])
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
                 for _, item in lane if item.get("kind") == "ask" and item.get("id")}
         shared_pending = [dict(id=key, **item) for key, item in state.get("questions", {}).items()
