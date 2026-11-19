@@ -473,23 +473,56 @@ def record_kind(worktree: Path, rel: str) -> str | None:
     return kinds.pop() if len(kinds) == 1 else "mixed"
 
 
+def held_details(source: Path) -> str:
+    size = "不明"
+    try:
+        usage = subprocess.run(["du", "-sh", str(source.absolute())], capture_output=True, text=True, timeout=10)
+        if usage.returncode == 0 and usage.stdout.strip():
+            size = usage.stdout.split()[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if source.is_dir() and not source.is_symlink():
+        names = sorted(child.name for child in source.iterdir())[:3]
+    else:
+        names = [source.name]
+    return f"du {size}、先頭 {len(names)} 件: {', '.join(names) or 'なし'}"
+
+
 def held_file(source: Path, rel: str, in_main: bool, keys: list[str] | None) -> Held:
     """A setting, data, or unknown path that keeps the worktree, with why and what the lead decides; a .env
     names the keys its .env.example lacks, never their values."""
-    files = files_in(source)
     where = "main と内容が違います" if in_main else "main にありません"
-    if any(file.name.startswith(".env") or ".local." in file.name for file in files):
+    clones = []
+    if source.is_dir() and not source.is_symlink():
+        for directory, children, _ in source.walk():
+            if ".git" in children:
+                children.remove(".git")
+                if not (directory / ".git").is_symlink():
+                    clones.append(directory)
+    files = [] if clones else files_in(source)
+    if clones:
+        kind = "clone"
+        reason = "。".join(
+            f"{PurePosixPath(rel) / clone.relative_to(source)}: {', '.join(clone_check(clone, details=True))}"
+            for clone in sorted(clones))
+        decision = "変更、未 push の commit、stash の保存先を確かめてください"
+    elif any(file.name.startswith(".env") or ".local." in file.name for file in files):
+        kind = "setting"
+        reason = f"作業場だけの設定です（{where}）"
         if keys:
-            return {"path": rel, "kind": "setting",
-                    "reason": "作業場だけの設定です（%s）。.env.example にない値があります: %s" % (where, ", ".join(keys)),
-                    "decision": "値を main の .env か秘密の置き場へ移すか、捨ててよいかを決めてください"}
-        return {"path": rel, "kind": "setting", "reason": "作業場だけの設定です（%s）" % where,
-                "decision": "main へ写すか、捨ててよいかを決めてください"}
-    if all(file.suffix.lower() in DATA_SUFFIXES for file in files):
-        return {"path": rel, "kind": "data", "reason": "作業場で作ったデータです（%s）" % where,
-                "decision": "残す場所を決めて移すか、捨ててよいかを決めてください"}
-    return {"path": rel, "kind": "unknown", "reason": "再生成する元も用途も分かりません（%s）" % where,
-            "decision": "中身を開き、何のファイルかを確かめて、残すか捨てるかを決めてください"}
+            reason += "。.env.example にない値があります: " + ", ".join(keys)
+            decision = "値を main の .env か秘密の置き場へ移すか、捨ててよいかを決めてください"
+        else:
+            decision = "main へ写すか、捨ててよいかを決めてください"
+    elif all(file.suffix.lower() in DATA_SUFFIXES for file in files):
+        kind = "data"
+        reason = f"作業場で作ったデータです（{where}）"
+        decision = "残す場所を決めて移すか、捨ててよいかを決めてください"
+    else:
+        kind = "unknown"
+        reason = f"再生成する元も用途も分かりません（{where}）"
+        decision = "中身を開き、何のファイルかを確かめて、残すか捨てるかを決めてください"
+    return {"path": rel, "kind": kind, "reason": f"{reason}。{held_details(source)}", "decision": decision}
 
 
 class IgnoredPaths(NamedTuple):
@@ -519,15 +552,22 @@ def dependency_clones(worktree: Path, rel: str) -> list[Path]:
                                    and not (copy / ".git").is_symlink() for copy in copies) else []
 
 
-def clone_check(copy: Path) -> list[str]:
+def clone_check(copy: Path, *, details: bool = False) -> list[str]:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
     blockers = []
+    if details:
+        branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
+        blockers.append(f"branch {branch or '(detached HEAD)'}")
     status = git(copy, "status", "--porcelain", "--untracked-files=all")
     if status.returncode or status.stdout.strip():
         blockers.append("uncommitted changes or git status failed")
+    elif details:
+        blockers.append("uncommitted changes: none")
     stash = git(copy, "stash", "list")
     if stash.returncode or stash.stdout.strip():
         blockers.append("stash remains or could not be checked")
+    elif details:
+        blockers.append("stash: none")
     ignored = ignored_paths(copy, None)
     if ignored.review or ignored.nested or ignored.lock_holders:
         blockers.append("ignored paths or live locks to preserve: " + ", ".join(
@@ -549,9 +589,12 @@ def clone_check(copy: Path) -> list[str]:
         blockers.append("local branches and tags could not be checked")
     tips = [("HEAD", git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()),
             *(line.split(" ", 1) for line in local.stdout.splitlines())]
-    unsaved = [name for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
+    unsaved = [f"{name} ({oid[:12] or '?'})" if details else name
+               for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
     if unsaved:
         blockers.append("local refs are on no verified remote branch or tag: " + ", ".join(unsaved))
+    elif details:
+        blockers.append("commits absent from origin: none")
     return blockers
 
 
@@ -590,7 +633,8 @@ def ignored_paths(worktree: str | Path, main: str | Path | None) -> IgnoredPaths
             for clone in clones:
                 if blockers := clone_check(clone):
                     review.append("%s (%s)" % (clone, "; ".join(blockers)))
-                    held.append({"path": str(clone), "kind": "clone", "reason": "; ".join(blockers),
+                    held.append({"path": str(clone), "kind": "clone",
+                                 "reason": f"{'。'.join(blockers)}。{held_details(clone)}",
                                  "decision": "変更と stash を保存し、HEAD が remote にあることを確かめてください"})
                 else:
                     regenerable.append(str(clone.relative_to(worktree)))

@@ -4594,6 +4594,39 @@ class FakeWorktreeNotes:
 
 
 class RmCheckTests(unittest.TestCase):
+    def test_held_directory_reports_clone_branches_changes_stash_and_size(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\ndata/\n")
+        sandbox = self.wt / "sandbox"
+        sandbox.mkdir()
+        for name in ("a-clone", "b-clone"):
+            clone = sandbox / name
+            git(self.main, "clone", "-q", str(self.main), str(clone))
+            git(clone, "config", "user.email", "t@example.com")
+            git(clone, "config", "user.name", "t")
+        changed = sandbox / "a-clone"
+        git(changed, "checkout", "-q", "-b", "draft")
+        git(changed, "commit", "-q", "--allow-empty", "-m", "local")
+        sha = git(changed, "rev-parse", "--short=12", "HEAD")
+        (changed / "app.txt").write_text("stash")
+        git(changed, "stash", "push", "-q")
+        (changed / ".env").write_text("EXTRA=fixture")
+        (sandbox / "c-note").write_text("note")
+        (sandbox / "d-note").write_text("another note")
+        (self.wt / "data").mkdir()
+        (self.wt / "data" / "report.db").write_text("report")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["ok"]), (1, False))
+        held = {item["kind"]: item for item in result["held"]}
+        reason = held["clone"]["reason"]
+        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes", "stash",
+                         "du ", "c-note"):
+            self.assertIn(expected, reason)
+        self.assertNotIn("d-note", reason)
+        self.assertIn("du ", held["data"]["reason"])
+        self.assertIn("report.db", held["data"]["reason"])
+        self.assertTrue(any(reason in line for line in result["reasons"]))
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         binary = Path(self.tmp.name) / "orca-bin/orca"
