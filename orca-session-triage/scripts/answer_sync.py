@@ -225,6 +225,8 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             if key in latest and latest[key].answer != text and (datetime.fromisoformat(latest[key].decided_at)
                                                                 > datetime.fromisoformat(when)):
                 raise ValueError(f"{key} has a newer lead decision; the delivered answer was not replayed over it")
+            if key not in explicit and key in latest and not latest[key].from_ask:
+                keys[key] = latest[key].answer
         changed = []
         for key, item in data["questions"].items():
             if item.get("withdrawn_at"):

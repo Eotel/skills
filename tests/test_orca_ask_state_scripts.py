@@ -323,6 +323,17 @@ class AskStateTests(unittest.TestCase):
         self.assertIn("newer lead decision", replay.stderr)
         self.assertEqual(self.log.read_text(), before)
 
+    def test_an_existing_explicit_decision_is_used_for_the_linked_hourly_answer(self) -> None:
+        question = self.ask()
+        self.write_lines(self.log, [{"id": "decision", "decision": self.KEY, "answer": "待つ", "decided_at": self.AT}])
+        command = (f"import answer_sync; answer_sync.record([{self.ASK!r}], '公開する', 'send', "
+                   "at='2026-11-14T10:01:00+00:00')")
+        result = subprocess.run([sys.executable, "-c", command], cwd=SCRIPTS, env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.state.read_text())["questions"][question["id"]]["answer"], "待つ")
+        self.assertEqual(json.loads(self.log.read_text())["answer"], "待つ")
+
     def test_keyed_handoff_requires_each_answer_and_writes_nothing_on_missing_key(self) -> None:
         text = "merge:repo#1\nkeep:/w/a\n—— 送る直前に道具が足した事実 ——"
         self.write_lines(self.inbox, [{"id": self.ASK, "kind": "ask", "text": text}])

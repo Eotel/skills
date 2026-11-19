@@ -467,7 +467,7 @@ SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
 
 
 def answer_entries(path: Path) -> Iterator[dict]:
-    for line in "".join(read_lines(path)).splitlines():
+    for line in "".join(read_lines(path)).split("\n"):
         try:
             record = json.loads(line)
         except ValueError:
