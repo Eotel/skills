@@ -60,7 +60,9 @@ remove:… --after pr-merged:<PR URL>` approves the row once the scan reads that
 words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` or `--archive-path PATH`
 (both repeatable, relative to the worktree) or `--compose-down`, the scan approves the row whatever the
 words give. `rm-check-batch --from SCAN_JSON --remove-ok` closes the scanned tabs, runs the recorded cleanup,
-verifies any requested archives, and checks again before removal. Run that cleanup on the worktree's Mac.
+verifies any requested archives, and checks again before removal. A named path is archived even if the removal
+check already passes without it. Tracked files and paths inside a symlinked directory are kept. Run that cleanup
+on the worktree's Mac.
 Use `--approve` for an explicit approval without conditions or cleanup. If an answer has no structured values,
 the scan reads its text. For a short closure instruction such as `閉じる。` or `close it`, it prints a command to
 record an explicit approval. A live summary asks for a saved scan before displaying a removal command.
