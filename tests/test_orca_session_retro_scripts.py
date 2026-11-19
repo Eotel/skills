@@ -301,7 +301,17 @@ class RetroTests(unittest.TestCase):
                 decision = ledger.call("decide", {"proposal_id": proposal_id, "decision": next_decision,
                                                   "actor": "human"}, "--expected-adoption-id", adoption["id"])
 
-                self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+                if next_decision == "hold":
+                    with (mock.patch.object(ledger, "record",
+                                            side_effect=subprocess.TimeoutExpired("ledger record", 30)),
+                          self.assertRaises(subprocess.TimeoutExpired)):
+                        retro.sync_decisions(ledger, data, self.root, self.state)
+                    self.assertFalse(facts.exists())
+                    data = retro.load(self.state)
+                    with mock.patch.object(retro, "skill_target", return_value=None):
+                        self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
+                else:
+                    self.assertEqual(retro.sync_decisions(ledger, data, self.root, self.state), 1)
                 item = next(row for row in ledger.list() if row["proposal_id"] == proposal_id)
                 self.assertEqual(item["status"], expected_status)
                 receipt = item["executions"][-1]
