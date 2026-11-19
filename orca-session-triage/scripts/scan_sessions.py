@@ -3576,7 +3576,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "they are read again only when the PR's updatedAt moves (default: %(default)s)")
     parser.add_argument("--state-file", type=Path, default=HOURLY_STATE,
                         help="shared hourly state; undelivered destinations stay open")
-    parser.add_argument("--decisions-file", type=Path, default=LEAD_DECISIONS,
+    parser.add_argument("--decisions-file", type=Path,
+                        default=Path(os.environ.get("TRIAGE_LEAD_DECISIONS") or LEAD_DECISIONS),
                         help="lead answers; rows with remove answers are left out of automatic removal")
     args = parser.parse_args(argv)
     if args.from_file and args.review_out:
@@ -3608,7 +3609,7 @@ def write_review_queue(path: str, rows: list[dict], verdicts: dict | None = None
 
 
 def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = False,
-                  scan_file: Path | None = None) -> None:
+                  scan_file: Path | None = None, decisions_file: Path = LEAD_DECISIONS) -> None:
     # The class --rows --class keeps (the verdict's, else the scan's), with the scan's own count where it differs.
     shown = Counter((row.get("verdict") or {}).get("class") or row["class"] for row in rows)
     scanned = Counter(row["class"] for row in rows)
@@ -3628,13 +3629,13 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
         if not row.get("open_pr_cleanup") and not removal_blocker(row):
-            print("    " + rm_check_command(row, scan_file))
+            print("    " + rm_check_command(row, scan_file, decisions_file=decisions_file))
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
         if not removal_blocker(row):
-            print("    " + rm_check_command(row, scan_file))
-            print("    " + rm_check_command(row, scan_file, remove_ok=True))
+            print("    " + rm_check_command(row, scan_file, decisions_file=decisions_file))
+            print("    " + rm_check_command(row, scan_file, remove_ok=True, decisions_file=decisions_file))
     for row in rows:
         if blockers := row.get("cleanup_blockers"):
             print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
@@ -3972,7 +3973,14 @@ def batch_requirement(row: dict) -> str | None:
     return None
 
 
-def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
+def decision_environment(decisions_file: Path) -> list[str]:
+    if decisions_file.expanduser().absolute() == LEAD_DECISIONS.expanduser():
+        return []
+    return ["env", f"TRIAGE_LEAD_DECISIONS={decisions_file.expanduser().absolute()}"]
+
+
+def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False,
+                     decisions_file: Path = LEAD_DECISIONS) -> str:
     """A one-line check for this row, using the saved scan's timestamp when available."""
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
@@ -3985,13 +3993,16 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     if not batch_has_preview():
         options = from_scan if remove_ok else []
     if remove_ok:
+        if (row.get("removal_decision") or {}).get("archive_path") and not scan_file:
+            return "記録済みのアーカイブを照合するには走査を保存し、--from で指定してください"
         options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
         options.extend(("--preview", "--detach-nested"))
-    return shlex.join([str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
+    return shlex.join([*(decision_environment(decisions_file) if scan_file else []), str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
-def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
+def card_lines(row: dict, scan_file: Path | None = None, *,
+               decisions_file: Path = LEAD_DECISIONS) -> list[str]:
     """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown.
 
     With the saved scan's path, a row with closable tabs includes the close_tabs.py command that closes them
@@ -4026,7 +4037,7 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
             (row.get("verdict") or {}).get("class") or row["class"]) == "finished"):
         if row.get("environment") and batch_has_preview():
             lines.append(f"{lead} | {REMOTE_CHECK_RELEASE}")
-        lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
+        lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file, decisions_file=decisions_file))
     return lines
 
 
@@ -4240,7 +4251,9 @@ def print_removal_approval_hint(row: dict, decisions_file: Path) -> None:
     answer = row.get("removal_decision") or {}
     if (not answer.get("decision") or not answer.get("answer") or removal_approved(row)
             or answer.get("after") or answer.get("cleanup_conflict") or row.get("cleanup_blockers")
-            or DEFER_REMOVAL.search(answer["answer"]) or re.search(r"タブ(?:だけ|のみ)", answer["answer"])):
+            or DEFER_REMOVAL.search(answer["answer"]) or KEEP_DECISION.search(answer["answer"])
+            or re.search(r"タブ(?:だけ|のみ)|後[、。\s]|\b(?:if|until|after|before|unless|not|only)\b",
+                         answer["answer"], re.IGNORECASE)):
         return
     target = row_identity(row) if row.get("environment") else f"local::{row['path']}"
     command = shlex.join([str(Path(__file__).with_name("lead_decisions.py")), "--decisions-file",
@@ -4272,7 +4285,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path, decision
         elif requirement := batch_requirement(row):
             why = requirement
         elif row.get("environment"):
-            why = "on another Mac: " + rm_check_command(row, scan_file)
+            why = "on another Mac: " + rm_check_command(row, scan_file, decisions_file=decisions_file)
             remote_preview = remote_preview or batch_has_preview()
         else:
             specs.append(rm_spec(row))
@@ -4282,17 +4295,18 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path, decision
         print_removal_approval_hint(row, decisions_file)
     if remote_preview:
         print(REMOTE_CHECK_RELEASE, file=sys.stderr)
-    print_rm_specs(specs, scan_file)
+    print_rm_specs(specs, scan_file, decisions_file)
     return 1 if left_out else 0
 
 
-def print_rm_specs(specs: list[str], scan_file: Path) -> None:
+def print_rm_specs(specs: list[str], scan_file: Path, decisions_file: Path) -> None:
     """Keep stdout usable as specs; give the executable next command on stderr after them."""
     for spec in specs:
         print(spec)
     if specs:
         sys.stdout.flush()
-        print(shlex.join([str(RM_CHECK_BATCH), "--from", str(scan_file), "--remove-ok", "--summary", *specs]),
+        print(shlex.join([*decision_environment(decisions_file), str(RM_CHECK_BATCH), "--from", str(scan_file),
+                          "--remove-ok", "--summary", *specs]),
               file=sys.stderr)
 
 
@@ -4331,7 +4345,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
                     remote += 1
                 else:
                     specs.append(rm_spec(row))
-        print_rm_specs(specs, Path(args.from_file).expanduser().absolute())
+        print_rm_specs(specs, Path(args.from_file).expanduser().absolute(), args.decisions_file)
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
                   file=sys.stderr)
@@ -4344,11 +4358,12 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         for row in rows:
             if blockers := row.get("cleanup_blockers"):
                 print(f"{row_name(row)}: {'。'.join(blockers)}", file=sys.stderr)
-            for line in card_lines(row, scan_file):
+            for line in card_lines(row, scan_file, decisions_file=args.decisions_file):
                 print(line)
     elif args.summary:
         print_summary(rows, verdicts, force_review=bool(args.only),
-                      scan_file=Path(args.from_file).expanduser().absolute() if args.from_file else None)
+                      scan_file=Path(args.from_file).expanduser().absolute() if args.from_file else None,
+                      decisions_file=args.decisions_file)
     else:
         json.dump(rows, sys.stdout, ensure_ascii=False, indent=2)
         print()

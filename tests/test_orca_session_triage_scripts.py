@@ -3004,6 +3004,32 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -"])
         self.assertIn("対応した Harness が必要", err.getvalue())
 
+    def test_archive_approval_requires_a_saved_scan_and_reuses_its_decisions_log(self) -> None:
+        saved, decisions = self.dir / "scan.json", self.dir / "custom decisions"
+        row = {"path": "/w/app/archive", "repo": "app", "class": "stalled", "terminals": [],
+               "open_pr_cleanup": True,
+               "removal_decision": {"archive_path": [".cache/notes.txt"], "answer": "削除してよい。",
+                                    "decided_at": "2026-11-19T12:00:00Z"}}
+        with patch.object(scan, "batch_help", return_value="--preview  recorded archive_path"):
+            with redirect_stdout(io.StringIO()) as out:
+                scan.print_summary([row], {})
+            self.assertNotIn("--remove-ok", out.getvalue())
+            self.assertIn("--from", out.getvalue())
+            saved.write_text(json.dumps([row]))
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            self.assertIn("TRIAGE_LEAD_DECISIONS=" + str(decisions), shlex.split(command))
+
+    def test_unstructured_keep_and_conditional_answers_get_no_approval_command(self) -> None:
+        for answer in ("保持してください。", "アーカイブ後、閉じる。", "not ready to remove",
+                       "remove it after the experiment finishes", "タブだけ閉じる。"):
+            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as err:
+                scan.print_removal_approval_hint(
+                    {"path": "/w/app/test", "repo": "app", "removal_decision":
+                     {"decision": "remove:/w/app/test", "answer": answer}}, self.dir / "decisions")
+                self.assertEqual(err.getvalue(), "")
+
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",
