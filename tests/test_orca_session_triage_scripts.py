@@ -2994,19 +2994,23 @@ class ScanCommandTests(unittest.TestCase):
 
     def test_an_approval_keeps_a_failure_from_an_unidentified_codex_pane(self) -> None:
         lane = str(self.dir / "local")
-        tree = worktree(lane, "working", agent="codex")
-        pending = terminal(lane, "codex", "term_pending")
-        other = terminal(lane, None, "term_other")
-        screens = {
-            (None, pending["handle"]): {"source": "screen", "tail": [
-                scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
-            (None, other["handle"]): {"source": "screen", "tail": [
-                "› check the build", "• Checking the build.", "■ stream disconnected before completion"]},
-        }
-        self.assertEqual(scan.screen_targets([tree], [pending, other], {lane}), [pending, other])
-        row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
-        self.assertIsNotNone(row["stop"])
-        self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
+        for environment, rollouts in ((None, {lane}), (None, set()), ("mbp16", set())):
+            with self.subTest(environment=environment, rollouts=rollouts):
+                tree = worktree(lane, "working", agent="codex")
+                tree["_environment"] = environment
+                tree["agents"][0]["lastAssistantMessage"] = "Checking git status."
+                pending = {**terminal(lane, "codex", "term_pending"), "_environment": environment}
+                other = {**terminal(lane, None, "term_other", preview="Checking the build."), "_environment": environment}
+                screens = {
+                    (environment, pending["handle"]): {"source": "screen", "tail": [
+                        scan.CODEX_PERMISSION, "$ git status", "› 1. Yes", "2. No", "Press enter to confirm"]},
+                    (environment, other["handle"]): {"source": "screen", "tail": [
+                        "› check the build", "• Checking the build.", "■ stream disconnected before completion"]},
+                }
+                self.assertEqual(scan.screen_targets([tree], [pending, other], rollouts), [pending, other])
+                row, = scan.build_inventory([tree], [pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+                self.assertIsNotNone(row["stop"])
+                self.assertEqual((row["stop"]["action"], row["stop"]["tab"]), ("wake", other["handle"]))
 
     def test_a_remote_codex_pane_with_an_old_error_is_read_for_approval(self) -> None:
         lane, environment = str(self.dir / "remote"), "mbp16"

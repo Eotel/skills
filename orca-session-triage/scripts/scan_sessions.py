@@ -3156,9 +3156,9 @@ ORCA_TIMEOUT = 60
 
 def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Collection[str] | None = None) -> list[dict]:
     """Tabs of done or waiting worktrees, agent tabs of worktrees Orca keeps no agent for (a background
-    session's hooks do not reach it), remote worktrees with no agent message, working Codex tabs and local Codex
-    tabs with no rollout, and remote shells without output metadata: read their cards, permission prompts,
-    questions, final replies, and bare prompts."""
+    session's hooks do not reach it), remote worktrees with no agent message, Codex and unidentified tabs
+    in working Codex worktrees, local Codex tabs with no rollout, and remote shells without output metadata:
+    read their cards, permission prompts, questions, final replies, and bare prompts."""
     worktrees, terminals = one_per_path(worktrees, terminals)
     idle = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if any(a.get("state") in ("done", "waiting") for a in w.get("agents") or [])}
@@ -3176,7 +3176,7 @@ def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Col
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
         or (key in untracked and (t.get("agentIdentity") or key in rollout_tabs))
-        or (key in working_codex and key in rollout_tabs and not t.get("agentIdentity"))
+        or (key in working_codex and not t.get("agentIdentity"))
         or ((t.get("agentIdentity") == "codex" or (*key, hourly_runtime.pane_key(t)) in codex_panes)
             and (key in quiet_codex or key in working_codex))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
