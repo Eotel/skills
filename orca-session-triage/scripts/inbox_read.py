@@ -1217,7 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
                 lane_input.reconcile_answers(inbox, answers_path(), getattr(args, "orca", None)
                                              or os.environ.get("ORCA_CLI_COMMAND", "orca"))
             entries = inbox_entries(inbox)
-            asks = open_asks(entries, answered_ids(answers_path()))
+            asks = open_asks(entries, answered_ids(answers_path()) | set(withdrawal_times(entries)))
             open_keys = frozenset(key for ask in asks for key in (
                 ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
             claims = {key: claim for key, claim in read_claims(claims_path()).items() if key in open_keys}

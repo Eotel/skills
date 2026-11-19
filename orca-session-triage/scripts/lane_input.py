@@ -72,9 +72,11 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
 def delivery_events(path: Path, recipients: set[str]) -> dict[str, list[tuple[datetime, str, bool]]]:
     pending: dict[str, tuple[str, datetime, str]] = {}
     deliveries: dict[str, list[tuple[datetime, str, bool]]] = {}
-    with path.open("rb") as stream:
-        for raw in stream:
-            event = inbox_read.entry(raw)
+    journal = path.with_name(path.name + ".delivery")
+    for source in (journal, path):
+        if not source.is_file():
+            continue
+        for event in inbox_read.inbox_entries(source):
             if not event:
                 continue
             if event.get("type") == "send-refused" and isinstance(intent := event.get("intent_id"), str):
@@ -99,6 +101,8 @@ def delivery_events(path: Path, recipients: set[str]) -> dict[str, list[tuple[da
                 if queued and planned and planned[0] == recipient and planned[2] == sent:
                     at = planned[1]
             deliveries.setdefault(recipient, []).append((at, sent, queued))
+    if not journal.is_file() and not path.is_file():
+        raise FileNotFoundError(path)
     for recipient, at, sent in pending.values():
         deliveries.setdefault(recipient, []).append((at, sent, True))
     return deliveries
@@ -183,6 +187,9 @@ def candidate_answers(inbox: Path, path: Path, orca: str,
     history = inbox_read.open_asks(entries, frozenset())
     answer_history = list(inbox_read.answer_entries(path))
     for record in answer_history:
+        if (wanted is not None and record.get("how") == inbox_read.TRANSCRIPT_ANSWER
+                and record["id"].partition(":")[0] in wanted):
+            continue
         previous = closed_at.setdefault(record["id"], None)
         if (at := inbox_read.asked_at(record)) and (previous is None or at < previous):
             closed_at[record["id"]] = at

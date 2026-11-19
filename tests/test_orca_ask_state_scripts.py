@@ -802,6 +802,9 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
                 self.assertIn("worker の回答「A」", reason)
                 self.assertEqual(json.loads(self.answers.read_text())["how"], "lane transcript")
+                relayed = self.run_tool("inbox_read.py", "lane-answers", self.ASK, "--candidates")
+                self.assertEqual(relayed.returncode, 0, relayed.stderr)
+                self.assertEqual(json.loads(relayed.stdout)[f"{self.ASK}:1"][0]["note"], "A")
         state = json.loads(self.state.read_text())
         state["questions"]["voice-placement"] = {
             "row": "/w/worker", "decision": "voice-placement", "covers": [],
