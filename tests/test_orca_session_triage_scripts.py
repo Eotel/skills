@@ -2795,6 +2795,13 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(args[args.index("--from") + 1], str(saved))
         self.assertIn("/w/app/finished 10", args)
 
+        row, = json.loads(saved.read_text())
+        saved.write_text(json.dumps([{**row, "environment": "mbp16", "automation_blocker": "automation uses this worktree"}]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        self.assertNotIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
+        self.assertNotIn("rm-check-batch", out.getvalue())
+
     def test_the_existing_harness_can_check_local_and_remote_paths_it_accepts(self) -> None:
         saved = self.dir / "scan.json"
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
@@ -2802,12 +2809,16 @@ class ScanCommandTests(unittest.TestCase):
         with patch.object(scan, "batch_has_preview", return_value=False):
             local = shlex.split(scan.rm_check_command(row, saved))
             remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
+            remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
             spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
         self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
         self.assertEqual(remote[-1], "/w/app/案件 10")
         self.assertNotIn("--preview", remote)
         self.assertNotIn("--detach-nested", remote)
         self.assertNotIn("--summary", remote)
+        self.assertNotIn("--from", remote)
+        self.assertNotIn("--summary", remove)
+        self.assertIn("--from", remove)
         self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
