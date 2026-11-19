@@ -2063,6 +2063,68 @@ class ClassifyTests(unittest.TestCase):
                     self.assertEqual(row["stop"]["action"], "wake")
                     self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
 
+    def test_codex_interruption_keeps_its_time_through_a_redraw_and_feedback(self) -> None:
+        message = "■ Conversation interrupted - tell the model what to do differently."
+        times: dict[str, scan.StopReason] = {}
+        path = "/w/cut"
+        for tail, quiet, stopped in (
+            ([message, "› "], 30, 30),
+            ([message, "• Feedback uploaded. Please open an issue", "› "], 1, 30),
+            ([message, "› Continue work", "• Working (1s)", message, "› "], 1, 1),
+            (["› Continue work", "• Working (1s)", message, "› "], 0, 1),
+            ([message, "› Continue work", message, "› Continue work", message, "› "], 0, 0),
+            ([message, "› Continue work", "› "], 0, None),
+        ):
+            with self.subTest(quiet=quiet):
+                [row] = scan.build_inventory(
+                    [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=quiet)],
+                    self.projects, {}, "要判断", now=NOW,
+                    screens={(None, "term_1"): {"source": "screen", "tail": tail}}, interruption_times=times)
+                stop = row["stop"]
+                self.assertEqual(bool(stop), stopped is not None)
+                if stop and stopped is not None:
+                    self.assertEqual(stop["stopped_at"], scan.iso_time((NOW - 60 * stopped) * 1000))
+                    self.assertEqual(stop["stopped_by"], "agent_state")
+
+    def test_codex_interruption_uses_the_tab_state_time_even_when_a_redraw_is_newer(self) -> None:
+        rollout = self.projects / "rollout.jsonl"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        write_jsonl(rollout, [
+            {"type": "session_meta", "payload": {"cwd": "/w/cut"}},
+            {"type": "event_msg", "timestamp": stopped,
+             "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ])
+        path, event = scan.summarize_rollout(rollout)
+        self.assertEqual(path, "/w/cut")
+        [row] = scan.build_inventory(
+            [{**worktree("/w/cut"), "agents": [done_agent("codex", "tab1:leaf1", minutes_ago=30, interrupted=True)]}],
+            [in_pane(terminal("/w/cut", "codex"), "tab1:leaf1")],
+            self.projects, {"/w/cut": [event]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual((row["stop"]["stopped_at"], row["stop"]["stopped_by"]), (stopped, "agent_state"))
+
+    def test_older_screen_cannot_bring_back_a_cleared_interruption(self) -> None:
+        path = self.projects / "stops.json"
+        key = '[null, "term_a"]'
+        old = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+        new = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        stop = {"kind": "interrupted", "stopped_at": old}
+        scan.save_interruption_times(path, {key: new}, {})
+        scan.save_interruption_times(path, {key: old}, {key: stop})
+        self.assertIsNone(json.loads(path.read_text())[key]["stop"])
+
+    def test_unmatched_rollout_does_not_hide_an_interruption_in_a_different_tab(self) -> None:
+        path = "/w/cut"
+        stopped = scan.iso_time((NOW - 1800) * 1000)
+        rollout = {"rollout": "/tmp/closed-tab.jsonl", "interrupted_at": stopped,
+                   "turn_started_at": scan.iso_time((NOW - 120) * 1000), "pending_requests": []}
+        [row] = scan.build_inventory(
+            [worktree(path, "done", agent="codex")], [terminal(path, "codex", quiet_minutes=5)],
+            self.projects, {path: [rollout]}, "要判断", now=NOW,
+            screens={(None, "term_1"): {"source": "screen", "tail": ["■ Conversation interrupted", "› "]}})
+        self.assertEqual(row["class"], "stalled")
+        self.assertEqual(row["stop"]["stopped_at"], scan.iso_time((NOW - 300) * 1000))
+
     def test_one_shot_schedule_lost_with_its_session_is_reported_but_fired_and_cancelled_jobs_are_not(self) -> None:
         self.claude_says("/w/scheduled", user("go"),
             assistant({"type": "tool_use", "id": "cron1", "name": "CronCreate",
@@ -2891,6 +2953,47 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_a_saved_finished_verdict_does_not_close_waiting_or_draft_tabs(self) -> None:
+        saved = self.dir / "scan.json"
+        cases = [
+            {"agents": [{"type": "codex", "state": "waiting"}]},
+            {"agents": [{"type": "codex", "state": "working", "turn": "done"}]},
+            {"unread_mail": [{"from": "worker"}]},
+            {"codex": [{"pending_requests": [{"answered_in_chat_later": False}]}]},
+            {"done_cards": [{"handle": "term", "agent": "codex", "draft": True}]},
+        ]
+        saved.write_text(json.dumps([
+            {"path": f"/w/app/{index}", "repo": "app", "class": "stalled",
+             "terminals": [{"handle": "term", "agent": "codex"}], "meaningful_tabs": ["term"],
+             "verdict": {"class": "finished"}, **case} for index, case in enumerate(cases)]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_hold_releasing_retains_checkout_and_release_restores_saved_tab_counts(self) -> None:
+        state, log = self.dir / "state.json", self.dir / "decisions"
+        row = {"path": "/w/app/held", "repo": "app", "class": "finished",
+               "terminals": [{"handle": "term"}], "closable": ["term"], "meaningful_tabs": []}
+        holds = self.dir / "releasing-hold.sqlite"
+        with closing(sqlite3.connect(holds)) as db:
+            db.execute("CREATE TABLE holds(handle, created_at, released_at, status, condition_kind, "
+                       "condition_value, instruction)")
+            db.execute("INSERT INTO holds VALUES ('term', 0, NULL, 'releasing', 'signal', 'term_lead', 'follow-up')")
+            db.commit()
+        with patch.dict(os.environ, {"TRIAGE_HOLDS": str(holds)}):
+            [held] = scan.with_cleanup_constraints([row], state, log)
+            with patch.object(close_tabs, "moved_after_scan", side_effect=AssertionError("protected tab was checked")):
+                closed, message = close_tabs.close_one(
+                    [held], "term", close_tabs.OrcaTabs("unused"), self.dir, self.dir / "inbox",
+                    close_tabs.Caller.from_environment(), state)
+                self.assertFalse(closed)
+                self.assertIn("保留中のタブ", message)
+        self.assertEqual((held["class"], held["closable"]), ("blocked", []))
+        with patch.object(scan, "hold_rows", return_value=[]):
+            [released] = scan.with_cleanup_constraints([held], state, log)
+        self.assertEqual((released["class"], released["closable"], released["meaningful_tabs"]),
+                         ("finished", ["term"], []))
+
     def test_saved_verdicts_recount_agent_tabs_and_apply_removal_specs(self) -> None:
         saved = self.dir / "scan.json"
         names = ("finished", "blocked", "waiting", "needs-user")
@@ -2922,7 +3025,7 @@ class ScanCommandTests(unittest.TestCase):
         write_jsonl(decisions, [{"id": str(index), "decision": f"{kind}:/w/app/{name}", "answer": text,
                                  "decided_at": f"2026-11-19T10:0{index}:00Z"}
                                 for index, (kind, name, text) in enumerate((
-                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで残す"),
+                                    ("remove", "owner", "消してよい"), ("owner", "owner", "集計が終わるまで削除しない"),
                                     ("owner", "cleared", "残す"), ("remove", "cleared", "消してよい")))])
         holds = [{"handle": "term_held", "environment": None, "created_at": 0.0, "released_at": None,
                   "status": "active", "condition_kind": "time", "condition_value": "2026-11-20T10:00:00Z",
@@ -2937,7 +3040,7 @@ class ScanCommandTests(unittest.TestCase):
                 else:
                     self.assertIn("/w/app/cleared", out.getvalue())
                     self.assertNotIn("/w/app/held", out.getvalue())
-                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで残す",
+                for reason in ("指揮の作業場", "structured-agent-session", "集計が終わるまで削除しない",
                                "開いた ask ask1", "未解決の request req1", "保留中", "follow-up:check1"):
                     self.assertIn(reason, err.getvalue())
             with redirect_stdout(io.StringIO()) as out:
@@ -2951,12 +3054,51 @@ class ScanCommandTests(unittest.TestCase):
         records = (("approve", {"approve": True}), ("archive", {"archive_path": ["work notes"]}), ("legacy", None))
         write_jsonl(decisions, [{"id": name, "decision": f"remove:/w/app/{name}", "answer": "閉じる。",
                                  "decided_at": "2026-11-19T12:00:00Z", "removal": terms} for name, terms in records])
-        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+        with (patch.object(scan, "batch_help", return_value="recorded archive_path"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
             self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
         self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -", "/w/app/archive -"])
         self.assertIn("lead_decisions.py", err.getvalue())
-        self.assertIn("--decision remove:/w/app/legacy", err.getvalue())
+        self.assertIn("--decision remove:local::/w/app/legacy", err.getvalue())
         self.assertIn("--approve", err.getvalue())
+        with (patch.object(scan, "batch_help", return_value="--archive-path PATH"),
+              redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+            self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", "--decisions-file", str(decisions)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["/w/app/approve -"])
+        self.assertIn("対応した Harness が必要", err.getvalue())
+
+    def test_archive_approval_requires_a_saved_scan_and_reuses_its_decisions_log(self) -> None:
+        saved, decisions = self.dir / "scan.json", self.dir / "custom decisions"
+        row = {"path": "/w/app/archive", "repo": "app", "class": "stalled", "terminals": [],
+               "open_pr_cleanup": True,
+               "removal_decision": {"archive_path": [".cache/notes.txt"], "answer": "削除してよい。",
+                                    "decided_at": "2026-11-19T12:00:00Z"}}
+        with patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"):
+            with redirect_stdout(io.StringIO()) as out:
+                scan.print_summary([row], {})
+            self.assertNotIn("--remove-ok", out.getvalue())
+            self.assertIn("--from", out.getvalue())
+            saved.write_text(json.dumps([row]))
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
+            with patch.object(scan, "LEAD_DECISIONS", decisions), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", str(saved), "--summary", "--decisions-file", str(decisions)]), 0)
+            command = next(line.strip() for line in out.getvalue().splitlines() if "--remove-ok" in line)
+            args = shlex.split(command)
+            self.assertEqual(args[args.index("--decisions-file") + 1], str(decisions))
+
+    def test_unstructured_keep_and_conditional_answers_get_no_approval_command(self) -> None:
+        for answer in ("保持してください。", "アーカイブ後、閉じる。", "not ready to remove",
+                       "remove it after the experiment finishes", "タブだけ閉じる。",
+                       "作業記録をアーカイブして、閉じる。", "タブを閉じて。作業場はそのまま。"):
+            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as err:
+                scan.print_removal_approval_hint(
+                    {"path": "/w/app/test", "repo": "app", "removal_decision":
+                     {"decision": "remove:/w/app/test", "answer": answer}}, self.dir / "decisions")
+                self.assertEqual(err.getvalue(), "")
 
     def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
@@ -3022,19 +3164,21 @@ class ScanCommandTests(unittest.TestCase):
         saved = self.dir / "scan.json"
         row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
                "open_pr_cleanup": True, "pr": {"number": 10}}
-        with patch.object(scan, "batch_has_preview", return_value=False):
-            local = shlex.split(scan.rm_check_command(row, saved))
+        with (patch.object(scan, "batch_has_preview", return_value=False),
+              patch.object(scan, "batch_help", return_value="")):
+            local = shlex.split(scan.rm_check_command(row, saved, decisions_file=scan.LEAD_DECISIONS))
             remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
             remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
             spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
-        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
+        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary",
+                                 "--decisions-file", str(scan.LEAD_DECISIONS), "/w/app/案件", "10"])
         self.assertEqual(remote[-1], "/w/app/案件 10")
         self.assertNotIn("--preview", remote)
         self.assertNotIn("--detach-nested", remote)
         self.assertNotIn("--summary", remote)
         self.assertNotIn("--from", remote)
-        self.assertNotIn("--summary", remove)
-        self.assertIn("--from", remove)
+        self.assertIn("Harness", remove)
+        self.assertNotIn("--remove-ok", remove)
         self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
@@ -3049,9 +3193,11 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
                          patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
                          patch.object(scan, "batch_has_preview", return_value=True),
+                         patch.object(scan, "batch_help", return_value="--preview  --decisions-file LOG  recorded archive_path"),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
-                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
+                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity")),
+                         patch.object(scan, "CODEX_INTERRUPTIONS", self.dir / "codex-interruptions.json")):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
@@ -4050,9 +4196,11 @@ class ScanCommandTests(unittest.TestCase):
                         options.extend(("--preview", "--detach-nested"))
                     spec = f"{row['path']} {number or '-'}"
                     if row.get("open_pr_cleanup") or host:
-                        expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
+                        expected = [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    *host, *options, spec]
                     else:
-                        expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
+                        expected = [str(scan.RM_CHECK), *options, "--decisions-file", str(scan.LEAD_DECISIONS),
+                                    row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
@@ -4070,16 +4218,16 @@ class ScanCommandTests(unittest.TestCase):
                 code = scan.main(["--from", str(saved), "--rm-specs", *(f"--row={name}" for name in names)])
             return code, out.getvalue(), err.getvalue()
 
-        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                               "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
+        expected = shlex.join([str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                               "--from", str(saved.absolute()), "--remove-ok", "--summary", "/w/app/tabs 7"]) + "\n"
         self.assertEqual(specs("tabs", "app/tabs"), (0, "/w/app/tabs 7\n", expected))
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
         self.assertEqual(err.count(scan.REMOTE_CHECK_RELEASE), 1)
         self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
-            str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
-            "--summary", "/w/app/far -"]), err)
+            str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+            "--host", "mbp16", "--from", str(saved.absolute()), "--summary", "/w/app/far -"]), err)
         self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
 
     def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
@@ -4102,8 +4250,8 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(scan.main(["--from", str(saved), "--rm-specs", *named]), 0)
             specs = out.getvalue().splitlines()
             self.assertEqual(specs, ["/w/app/one 7", "/w/app/two -"])
-            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                                                         "--remove-ok", "--summary", *specs])
+            self.assertEqual(shlex.split(err.getvalue()), [str(scan.RM_CHECK_BATCH), "--decisions-file", str(scan.LEAD_DECISIONS),
+                                                         "--from", str(saved.absolute()), "--remove-ok", "--summary", *specs])
 
     def test_automation_workspaces_are_left_out_even_with_removal_approval(self) -> None:
         rows = [{"path": "/w/app/scheduled", "repo": "app", "class": "finished", "open_pr_cleanup": True,
@@ -4609,9 +4757,28 @@ class RmCheckTests(unittest.TestCase):
         sha = git(changed, "rev-parse", "--short=12", "HEAD")
         (changed / "app.txt").write_text("stash")
         git(changed, "stash", "push", "-q")
-        (changed / ".env").write_text("EXTRA=fixture")
+        tagged = sandbox / "b-clone"
+        git(tagged, "checkout", "-q", "--detach")
+        git(tagged, "commit", "-q", "--allow-empty", "-m", "retained by tag")
+        tag_commit = git(tagged, "rev-parse", "--short=12", "HEAD")
+        git(tagged, "tag", "keep-tag")
+        git(tagged, "checkout", "-q", "-")
+        (changed / ".git/info/exclude").write_text(".env\n")
+        (changed / "backend").mkdir()
+        (changed / "backend/.env").write_text("EXTRA=fixture")
+        for name in (".env.app.example", ".env.db.example", ".env.test.example"):
+            (changed / name).write_text("VARIABLE=")
+        outside = self.wt.parent / "external-linked"
+        git(tagged, "worktree", "add", "-q", "--detach", str(outside))
+        git(outside, "commit", "-q", "--allow-empty", "-m", "external detached commit")
+        linked_commit = git(outside, "rev-parse", "--short=12", "HEAD")
+        modules = changed / ".git/modules/stored"
+        modules.mkdir(parents=True)
+        git(modules, "init", "-q", "--bare")
+        (changed / "app.txt").write_text("dirty")
         (sandbox / "c-note").write_text("note")
-        (sandbox / "d-note").write_text("another note")
+        (sandbox / "d-note.local.json").write_text("a local setting")
+        (sandbox / "e-note").write_text("another note")
         (self.wt / "data").mkdir()
         (self.wt / "data" / "report.db").write_text("report")
 
@@ -4619,13 +4786,38 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         held = {item["kind"]: item for item in result["held"]}
         reason = held["clone"]["reason"]
-        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes", "stash",
-                         "du ", "c-note"):
+        for expected in ("a-clone", "b-clone", "branch draft", sha, "uncommitted changes or git status failed",
+                         "stash remains", "clone 外の設定: d-note.local.json", "clone 内の設定: backend/.env", "submodule のリポジトリが残っています",
+                         tag_commit, linked_commit, str(outside)):
             self.assertIn(expected, reason)
-        self.assertNotIn("d-note", reason)
-        self.assertIn("du ", held["data"]["reason"])
-        self.assertIn("report.db", held["data"]["reason"])
-        self.assertTrue(any(reason in line for line in result["reasons"]))
+        summary = held["clone"]["content_summary"]
+        self.assertIn("c-note", summary)
+        self.assertNotIn("e-note", summary)
+        self.assertNotIn("du 不明", summary)
+        self.assertIn("du ", held["data"]["content_summary"])
+        self.assertIn("report.db", held["data"]["content_summary"])
+        self.assertTrue(any(reason in line and summary in line for line in result["reasons"]))
+
+    def test_held_clone_with_external_git_settings_keeps_its_worktree(self) -> None:
+        (self.main / ".git/info/exclude").write_text("sandbox/\n")
+        clone = self.wt / "sandbox"
+        git(self.main, "clone", "-q", str(self.main), str(clone))
+        git(clone, "config", "filter.local.clean", "/does-not-exist")
+        tracked_status = rmcheck.git
+
+        def git_without_external_programs(cwd: str | Path, *args: str,
+                                          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == clone and ("status" in args or "ls-remote" in args):
+                self.fail(f"used clone configuration to run {args[0]}")
+            return tracked_status(cwd, *args, env=env)
+
+        empty = self.wt / "empty-git-config"
+        empty.write_text("")
+        with (patch.object(rmcheck, "git", side_effect=git_without_external_programs),
+              patch.dict(os.environ, {"GIT_CONFIG": str(empty)})):
+            held = rmcheck.held_file(clone, "sandbox", False, None)
+        self.assertEqual(held["kind"], "clone")
+        self.assertIn("未確認", held["reason"])
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -4696,6 +4888,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(comment, " ".join(result["blockers"]))
         self.assertIn(key, " ".join(result["blockers"]))
+
+        lead_decisions.append(log, lead_decisions.Decision(
+            "retain", f"remove:local::{self.wt.resolve()}", "保留してください。", "2026-10-27T00:00:00Z"))
+        code, result = self.run_main("--decisions-file", str(log), notes=notes)
+        self.assertEqual((code, result["ok"]), (1, False))
 
         lead_decisions.append(log, lead_decisions.Decision("allow", key, "消してよい", "2026-10-28T00:00:00Z"))
         code, result = self.run_main("--decisions-file", str(log), notes=notes)
