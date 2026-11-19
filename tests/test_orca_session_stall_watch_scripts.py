@@ -370,6 +370,21 @@ class BusyWithoutProgressTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_a_new_rollout_error_is_not_hidden_by_the_previous_approval_screen(self) -> None:
+        earlier = NOW - timedelta(minutes=1)
+        row = {"path": "/w/lane", "claude": None,
+               "codex_approvals": [{"tab": "term_a"}], "approval_observed_at": earlier.isoformat(),
+               "codex": [], "terminals": [{"handle": "term_a", "agent": "codex"}]}
+        for at, stopped in ((earlier - timedelta(seconds=1), None), (NOW, "wake")):
+            rollout = {"api_error": "stream disconnected before completion", "api_error_at": at.isoformat()}
+            with self.subTest(at=at), patch.multiple(
+                stall.scan, running_claude_transcripts=lambda *args: {}, read_claude=lambda *args: None,
+                claude_session_dirs=lambda: [], process_table=lambda: {}, expand_roots=lambda roots: [],
+                read_codex=lambda *args: {"/w/lane": [rollout]}, worktree_processes=lambda *args: {},
+            ):
+                fresh, = stall.refreshed([row], NOW)
+                self.assertEqual((fresh["stop"] or {}).get("action"), stopped)
+
     """A stopped lane is recovered by its cause, and a work recovered twice is replanned (pstack's orchestrate)."""
 
     def stopped(self, kind: str) -> dict:

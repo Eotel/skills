@@ -501,7 +501,7 @@ def api_failure(text: str | None) -> str | None:
 def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
-    last_assistant = last_assistant_at = api_error = None
+    last_assistant = last_assistant_at = api_error = api_error_at = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
@@ -511,11 +511,12 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
         if row.get("type") == "event_msg" and kind in ("error", "stream_error"):
             message = payload.get("message") or payload.get("error")
             if isinstance(message, str) and API_FAILURE.search(message):
-                api_error = message.strip()
+                api_error, api_error_at = message.strip(), row.get("timestamp")
         # A task the service ended (a usage limit) completes with its error and no message.
         if row.get("type") == "event_msg" and kind == "task_complete" and isinstance(payload.get("error"), dict):
             message = payload["error"].get("message")
-            api_error = message.strip() if isinstance(message, str) and message.strip() else api_error
+            if isinstance(message, str) and message.strip():
+                api_error, api_error_at = message.strip(), row.get("timestamp")
         if kind in ("function_call", "custom_tool_call") and "user_input" in (payload.get("name") or ""):
             try:
                 questions = json.loads(payload.get("arguments") or "{}").get("questions")
@@ -528,12 +529,14 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
             value = message_text(payload)
             if value and not value.lstrip().startswith(("<", "# AGENTS.md instructions")):
                 # A new request starts a turn the earlier failure did not end.
-                last_user, last_role, api_error = (row.get("timestamp"), value), "user", None
+                last_user, last_role = (row.get("timestamp"), value), "user"
+                api_error = api_error_at = None
         elif kind == "message" and payload.get("role") == "assistant":
             value = message_text(payload)
             if value:
                 last_assistant, last_assistant_at, last_role = value, row.get("timestamp"), "assistant"
                 api_error = api_failure(value)
+                api_error_at = row.get("timestamp") if api_error else None
     pending = []
     for call_id, ask in asks.items():
         if call_id in outputs:
@@ -548,6 +551,7 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
         "last_assistant_at": last_assistant_at,
         "last_role": last_role,
         "api_error": api_error,
+        **({"api_error_at": api_error_at} if api_error_at else {}),
         "pending_requests": pending,
     }
 
@@ -694,8 +698,8 @@ def latest_message(row: dict) -> tuple[str, str] | None:
     return "claude", claude["final_text"]
 
 
-def failure(row: dict) -> tuple[str, str | None] | None:
-    """(error, agent) of the API failure that ended the last Claude or Codex turn, or None.
+def failure(row: dict) -> tuple[str, str | None, str | None] | None:
+    """(error, agent, handle) of the API failure that ended the last Claude or Codex turn, or None.
 
     Claude Code does not resume such a turn, and a monitor it left running keeps
     Orca at working, so only the transcript shows the agent stopped mid-task.
@@ -710,18 +714,31 @@ def failure(row: dict) -> tuple[str, str | None] | None:
     codex = row["codex"][-1] if row["codex"] else {}
     message = row.get("orca_message") or {}
     orca = " ".join((message.get("text") or "").split())
-    found = [(None if running else row.get("codex_screen_error"), "codex", row.get("codex_screen_error_tab")),
-             (codex.get("api_error"), "codex", None), ((row["claude"] or {}).get("api_error"), "claude", None),
+    screen_tab = row.get("codex_screen_error_tab")
+    found = [*row.get("pane_errors", []),
+             (row.get("codex_screen_error") if not running or approval_tabs and screen_tab else None,
+              "codex", screen_tab, None),
+             (codex.get("api_error"), "codex", None, codex.get("api_error_at")),
+             ((row["claude"] or {}).get("api_error"), "claude", None, None),
              (orca if not (row["claude"] or row["codex"]) and API_ENDED.match(orca) else None,
-              message.get("agent"), message.get("tab"))]
-    return next(((error, agent) for error, agent, tab in found
-                 if error and not (agent == "codex" and (tab in approval_tabs if tab else single_approval))
-                 and not (agent and running and agent not in running)), None)
+              message.get("agent"), message.get("tab"), message.get("at"))]
+    observed = parse_time(row.get("approval_observed_at") or row.get("scanned_at"))
+    for error, agent, tab, at in found:
+        if not error:
+            continue
+        same_approval = agent == "codex" and (tab in approval_tabs if tab else single_approval)
+        if same_approval and (not observed or (parse_time(at) or EPOCH) <= observed):
+            continue
+        if agent and running and agent not in running and not (tab and approval_tabs):
+            continue
+        return error, agent, tab
+    return None
 
 
 def cut_off(row: dict) -> str | None:
     """The API error that ended the last Claude or Codex turn (failure), or None."""
-    return (failure(row) or (None, None))[0]
+    found = failure(row)
+    return found[0] if found else None
 
 
 # The line an API failure leaves as an agent's whole last output, read from Orca's copy when no transcript is here.
@@ -745,6 +762,7 @@ class StopReason(TypedDict):
     agent: str | None
     error: str
     resets: str | None
+    tab: NotRequired[str]
 
 
 def stop_reason(row: dict) -> StopReason | None:
@@ -754,19 +772,20 @@ def stop_reason(row: dict) -> StopReason | None:
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
     if not (found := failure(row)):
         return None
-    error, agent = found
+    error, agent, tab = found
+    source = {"tab": tab} if tab else {}
     tag = (row.get("claude") or {}).get("api_error_kind") if agent == "claude" else None
     if tag == "rate_limit" or USAGE_LIMIT.search(error):
         resets = RESETS.search(error)
         return {"kind": "usage_limit", "action": "wait", "agent": agent, "error": error,
-                "resets": resets[1] if resets else None}
+                "resets": resets[1] if resets else None, **source}
     if tag == "authentication_failed" or LOGIN_EXPIRED.search(error):
-        return {"kind": "login", "action": "human", "agent": agent, "error": error, "resets": None}
+        return {"kind": "login", "action": "human", "agent": agent, "error": error, "resets": None, **source}
     if CONTEXT_LIMIT.search(error):
-        return {"kind": "context_limit", "action": "new_lane", "agent": agent, "error": error, "resets": None}
+        return {"kind": "context_limit", "action": "new_lane", "agent": agent, "error": error, "resets": None, **source}
     if tag not in (None, "server_error") or tag is None and NOT_RETRYABLE.search(error):
-        return {"kind": "other", "action": "human", "agent": agent, "error": error, "resets": None}
-    return {"kind": "connection", "action": "wake", "agent": agent, "error": error, "resets": None}
+        return {"kind": "other", "action": "human", "agent": agent, "error": error, "resets": None, **source}
+    return {"kind": "connection", "action": "wake", "agent": agent, "error": error, "resets": None, **source}
 
 
 def stop_line(stop: StopReason) -> str:
@@ -1023,7 +1042,6 @@ CODEX_PERMISSION = "Would you like to run the following command?"
 CODEX_APPROVAL = "Codex approval"
 CODEX_PERMISSION_FOOTER = re.compile(
     r"press (?:.+? to confirm(?: or .+? to cancel)?|.+? to cancel)(?: or .+? to open thread)?\.?", re.I)
-CODEX_APPROVAL_METADATA = ("Thread:", "Environment:", "Reason:", "Permission rule:", "Input:")
 CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
 CODEX_CLIPPED = re.compile(r"\[… \d+ lines?\](?:\s.*)?")
 CODEX_BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
@@ -1118,12 +1136,10 @@ def codex_permission_prompt(screen: dict, tab: str) -> PromptWaiting | None:
     command = next((index for index, line in enumerate(body)
                     if line.startswith("$ ") and (index == 0 or not body[index - 1])), None)
     if command is None and all(body):
-        # Orca's screen projection strips blank rows. Only use a unique command marker after the
-        # header fields when the reason and a multiline command cannot be distinguished.
-        metadata_end = max((index for index, line in enumerate(body) if line.startswith(CODEX_APPROVAL_METADATA)),
-                           default=-1)
-        candidates = [index for index in range(metadata_end + 1, len(body)) if body[index].startswith("$ ")]
-        if len(candidates) == 1 and (metadata_end < 0 or not body[metadata_end].startswith("Input:")):
+        # Orca's screen projection removes blank rows. Competing markers or a clipped body leave the target unknown.
+        candidates = [index for index, line in enumerate(body) if line.startswith("$ ")]
+        clipped = any(CODEX_CLIPPED.fullmatch(line) or line.startswith("Input:") for line in body)
+        if len(candidates) == 1 and not clipped:
             command = candidates[0]
     if command is None:
         target = "command omitted from terminal view"
@@ -1758,7 +1774,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
             "codex_screen_error_tab": screen_error[1],
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
             "prompt_waiting": waiting[0] if waiting else None,
-            **({"codex_approvals": codex_approvals} if codex_approvals else {}),
+            **({"codex_approvals": codex_approvals,
+                "approval_observed_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
+               if codex_approvals else {}),
             "claude": None if remote else read_claude(claude_root, w["path"], (live_transcripts or {}).get(w["path"], [])),
             "codex": [] if remote else codex_by_cwd.get(w["path"], []),
         }
@@ -1778,6 +1796,12 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                             and bool(API_ENDED.match(" ".join(agent["lastAssistantMessage"].split()))))
 
                 current = [agent for agent in spoken if not approval_error(agent)]
+                if approval_tabs:
+                    row["pane_errors"] = [
+                        (error, agent.get("agentType"), tab, iso_time(agent.get("updatedAt")))
+                        for agent in sorted(current, key=lambda item: item.get("updatedAt") or 0, reverse=True)
+                        if (tab := pane_handles.get(agent.get("paneKey")))
+                        and API_ENDED.match(error := " ".join(agent["lastAssistantMessage"].split()))]
                 newest = max(current or spoken, key=lambda a: a.get("updatedAt") or 0)
                 row["orca_message"] = {"text": newest["lastAssistantMessage"],
                                        "at": iso_time(newest.get("updatedAt")),
@@ -2865,7 +2889,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
             return True
         merged = (row.get("pr") or {}).get("state") == "MERGED"
         judged = row.get("jev") is not None and row["class"] in READ_CLASSES
-        if not (judged or row["class"] == "unsure" or (row["class"] == "stalled" and merged)):
+        if not (row.get("codex_approvals") or judged or row["class"] == "unsure" or (row["class"] == "stalled" and merged)):
             return False
         return current_verdict(row, verdicts) is None
 
@@ -3103,13 +3127,15 @@ def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Col
             if w.get("_environment") and not orca_said(w)}
     quiet_codex = set() if codex_cwds is None else {
         (None, w.get("worktreeId")) for w in worktrees if not w.get("_environment") and w["path"] not in codex_cwds}
+    rollout_tabs = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
+                    if codex_cwds is not None and not w.get("_environment") and w["path"] in codex_cwds}
     working_codex = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
                      if any(a.get("agentType") == "codex" and a.get("state") == "working" for a in w.get("agents") or [])}
     codex_panes = {(w.get("_environment"), w.get("worktreeId"), a["paneKey"]) for w in worktrees
                    for a in w.get("agents") or [] if a.get("agentType") == "codex" and a.get("paneKey")}
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
-        or (key in untracked and t.get("agentIdentity"))
+        or (key in untracked and (t.get("agentIdentity") or key in rollout_tabs))
         or ((t.get("agentIdentity") == "codex" or (*key, hourly_runtime.pane_key(t)) in codex_panes)
             and (key in quiet_codex or key in working_codex))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
@@ -3614,9 +3640,12 @@ def row_line(view: dict) -> str:
     sessions = "; ".join(" ".join(f"{key}={session.get(key) if session.get(key) is not None else '-'}"
                                   for key in ("pid", "ORCA_TERMINAL_HANDLE", "status", "waitingFor"))
                          for session in view.get("claude_sessions") or [])
+    approvals = " ; ".join(f"{item['tab']} {item.get('target') or item['question']} [{'; '.join(item['choices'])}]"
+                           for item in view.get("codex_approvals") or [])
     return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
             f" | reasons {reasons} | git.dirty {dirty} | git.unpushed {unpushed}"
-            + (f" | Claude sessions {sessions}" if sessions else ""))
+            + (f" | Claude sessions {sessions}" if sessions else "")
+            + (f" | Codex approvals {approvals}" if approvals else ""))
 
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
@@ -3732,7 +3761,9 @@ def main(argv: list[str] | None = None) -> int:
     scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     if args.only:
-        choices = [{"path": w["path"], "repo": w.get("repo"), "environment": w.get("_environment")}
+        worktrees, terminals = one_per_path(worktrees, terminals)
+        choices = [{"path": w["path"], "repo": w.get("repo"), "environment": w.get("_environment"),
+                    "other_repos": w.get("_other_repos")}
                    for w in worktrees]
         try:
             selected = select_row(choices, args.only, "--only")
@@ -3851,7 +3882,9 @@ def wake_line(row: dict, stop: StopReason) -> str:
     tabs = [t["handle"] for t in row.get("terminals") or [] if t.get("handle") and t.get("agent")
             and (stop["agent"] is None or t["agent"] == stop["agent"])]
     tab = tabs[0] if len(tabs) == 1 else f"不明（{', '.join(tabs)}）" if tabs else None
-    if len(tabs) > 1 and stop["agent"] == "claude":
+    if stop.get("tab"):
+        tab = stop["tab"]
+    elif len(tabs) > 1 and stop["agent"] == "claude":
         tab = stopped_claude_tab(row, tabs) or tab
     action = (f"利用上限: {stop['resets'] or '戻る時刻は不明'} まで待つ" if stop["kind"] == "usage_limit"
               else WAKE_ACTIONS[stop["kind"]])

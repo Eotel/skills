@@ -956,6 +956,11 @@ class ClassifyTests(unittest.TestCase):
         ambiguous = {**screen, "tail": [*body[:5], "  $ quoted from reason", *body[5:]]}
         self.assertEqual(scan.codex_permission_prompt(ambiguous, "term_codex")["target"],
                          "command omitted from terminal view")
+        for snippet in (["$ cat <<'EOF'", "Reason: example", "$ git status", "EOF"],
+                        ["Reason: Compare the output of", "$ git diff --stat", "[… 12 lines]"]):
+            changed = {**screen, "tail": [body[0], *snippet, *body[-3:]]}
+            self.assertEqual(scan.codex_permission_prompt(changed, "term_codex")["target"],
+                             "$ cat <<'EOF'…" if snippet[0].startswith("$") else "command omitted from terminal view")
 
     def test_codex_approval_choices_exclude_numbered_command_lines(self) -> None:
         tail = ["Would you like to run the following command?", "$ cat <<'EOF'", "1. command output",
@@ -2906,7 +2911,8 @@ class ScanCommandTests(unittest.TestCase):
                                                 "Environment: local", "Reason: Read Git status", "", "$ git status",
                                                 "› 1. Yes, proceed (y)", "2. No (esc)",
                                                 "Press enter to confirm or esc to cancel"]}
-        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree], [term])),
+        duplicate = {**tree, "repo": "other", "worktreeId": "duplicate", "agents": []}
+        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree, duplicate], [term])),
               patch.object(scan, "read_screens", return_value={(None, term["handle"]): screen}) as screens,
               patch.object(scan, "read_mail", return_value={}),
               patch.object(scan, "worktree_processes", return_value={}),
@@ -2916,7 +2922,8 @@ class ScanCommandTests(unittest.TestCase):
               patch.object(scan.rm_check, "process_table", return_value={}),
               redirect_stdout(io.StringIO()) as out):
             self.assertEqual(scan.main(["--orca", "orca", "--codex-sessions", str(rollouts), "--since-hours", "0",
-                                        "--claude-projects", str(self.dir / "claude"), "--row", lane]), 0)
+                                        "--claude-projects", str(self.dir / "claude"), "--only", "other/codex-lane",
+                                        "--row", lane]), 0)
         screens.assert_called_once_with("orca", [term])
         row = json.loads(out.getvalue())
         self.assertEqual(row["class"], "waiting")
@@ -2965,6 +2972,8 @@ class ScanCommandTests(unittest.TestCase):
         }])
         other = {**with_agent, "worktreeId": original_id, "agents": [], "createdAt": 10, "repo": "original"}
         self.assertEqual(scan.screen_targets([with_agent, other], [term], {lane}), [term])
+        untracked = {**other, "agents": []}
+        self.assertEqual(scan.screen_targets([untracked], [term], {lane}), [term])
 
     def test_remote_approvals_include_every_tab_and_do_not_hide_another_panes_failure(self) -> None:
         lane, environment = str(self.dir / "remote"), "mbp16"
@@ -2984,10 +2993,12 @@ class ScanCommandTests(unittest.TestCase):
         self.assertEqual(row["class"], "waiting")
         self.assertEqual(row["prompt_waiting"]["tab"], claude["handle"])
         self.assertEqual([prompt["target"] for prompt in row["codex_approvals"]], ["$ git status", "$ git diff"])
-        self.assertEqual(scan.review_queue([row], force=True)[0]["codex_approvals"], row["codex_approvals"])
+        self.assertEqual(scan.review_queue([row])[0]["codex_approvals"], row["codex_approvals"])
         view = scan.row_view(row)
         self.assertIn("term_other:", view["question"])
         self.assertEqual(view["codex_approvals"][1]["choices"], ["1. Yes", "2. No"])
+        self.assertIn("term_pending $ git status [1. Yes; 2. No]", scan.row_line(view))
+        self.assertIn("term_other $ git diff [1. Yes; 2. No]", scan.row_line(view))
 
         tree["agents"] = [{"agentType": "codex", "state": "working", "paneKey": scan.hourly_runtime.pane_key(term),
                             "lastAssistantMessage": "stream disconnected before completion", "updatedAt": timestamp}
@@ -2996,6 +3007,15 @@ class ScanCommandTests(unittest.TestCase):
         row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
         self.assertEqual(row["stop"]["action"], "wake")
         self.assertEqual(row["orca_message"]["tab"], other["handle"])
+        self.assertEqual(row["stop"]["tab"], other["handle"])
+        self.assertIn(" | term_other | ", scan.wake_line(row, row["stop"]))
+
+        tree["agents"][0]["lastAssistantMessage"] = "Checking the change."
+        tree["agents"][1].update(agentType="claude", state="done", lastAssistantMessage="API Error: connection error")
+        other["agentIdentity"] = "claude"
+        row, = scan.build_inventory([tree], [claude, pending, other], self.dir, {}, "要判断", now=NOW, screens=screens)
+        self.assertEqual((row["orca_message"]["tab"], row["stop"]["tab"]), (pending["handle"], other["handle"]))
+        self.assertEqual(row["stop"]["agent"], "claude")
 
     def test_a_row_without_transcripts_shows_its_inbox_question_and_why_none_are_listed(self) -> None:
         # A Codex lane's question was only its Orca comment's summary; the amounts were in the lane's info.
