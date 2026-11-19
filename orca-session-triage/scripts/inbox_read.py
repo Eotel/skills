@@ -485,8 +485,12 @@ def delivered_records(path: Path) -> dict[str, dict]:
 
 def answer_records(path: Path) -> dict[str, dict]:
     """Current answers in append order, independently of their delivery history."""
+    return current_answers(answer_entries(path))
+
+
+def current_answers(records: Iterable[dict]) -> dict[str, dict]:
     found: dict[str, dict] = {}
-    for record in answer_entries(path):
+    for record in records:
         previous = found.get(record["id"])
         how = record.get("how")
         if (previous is None or how == HOURLY_CORRECTION

@@ -463,14 +463,22 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 def ask_answers(path: Path) -> dict[str, dict]:
     """A handoff's current answer and the last delivery when its wording differs."""
-    current = inbox_read.answer_records(path)
+    return handoff_answer_records(inbox_read.answer_entries(path))
+
+
+def handoff_answer_records(rows: Iterable[dict]) -> dict[str, dict]:
+    records = [row for row in rows if isinstance(row.get("id"), str)]
+    current = inbox_read.current_answers(records)
     delivered = {}
-    for record in inbox_read.answer_entries(path):
+    withdrawn = {}
+    for record in records:
         key, how = record["id"], record.get("how")
         if how in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
             delivered[key] = record
-        if how == "triage-notify --withdraws" and current.get(key, {}).get("how") not in inbox_read.SUBSTANTIVE_ANSWERS:
-            current[key] = record
+        elif how == "triage-notify --withdraws":
+            withdrawn[key] = record
+    for key in withdrawn.keys() - delivered.keys():
+        current[key] = withdrawn[key]
     return {key: {**answer, "delivery": delivered[key]} if key in delivered and answer != delivered[key] else answer
             for key, answer in current.items()}
 

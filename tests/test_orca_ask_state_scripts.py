@@ -640,6 +640,20 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertEqual(reopened.returncode, 0, reopened.stderr)
                 self.assertEqual([row["decision"] for row in json.loads(reopened.stdout)["unanswered"]], [self.KEY])
 
+    def test_a_withdrawal_settles_the_part_with_an_undelivered_lead_answer(self) -> None:
+        ask = json.loads(self.inbox.read_text())
+        self.write_lines(self.inbox, [{**ask, "questions": [self.question, self.question]}])
+        self.write_lines(self.handed, [{"decision": f"{self.KEY}:1", "handed_off_at": self.AT},
+                                      {"decision": f"{self.KEY}:2", "handed_off_at": self.AT}])
+        part = {"id": f"{self.ASK}:1", "ts": self.AT}
+        self.write_lines(self.answers, [{**part, "how": "hourly_state.py answered", "note": "公開する"},
+                                        {**part, "how": "triage-notify --withdraws", "note": "取り下げ"}])
+        output = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered")
+        self.assertEqual(output.returncode, 0, output.stderr)
+        result = json.loads(output.stdout)
+        self.assertEqual([item["decision"] for item in result["unanswered"]], [f"{self.KEY}:2"])
+        self.assertEqual(result["settled"][0]["answer"]["how"], "triage-notify --withdraws")
+
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
         other = "b1234567-1234-4567-8888-123456789abc"
