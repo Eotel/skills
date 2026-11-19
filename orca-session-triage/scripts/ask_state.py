@@ -33,7 +33,10 @@ def references(question: dict, entries: list[dict], *,
     found = []
     for value in values:
         target = (bindings or {}).get(value)
-        if same_bound_ask(question, target, value) and (ref := reference(target or value, entries)):
+        if not same_bound_ask(question, target, value):
+            continue
+        ref = handoff_ref(target, value, entries, (question,)) if target else reference(value, entries)
+        if ref:
             found.append(ref)
     source = reference(question.get("ask_id") or "", entries)
     if source and source[1]:
