@@ -217,12 +217,12 @@ def candidate_answers(inbox: Path, path: Path, orca: str,
                     matches.setdefault(key, []).append((answer_id, label))
     choices: dict[str, list[dict]] = {}
     available = {f"{ask_id}:{number}" for ask_id, ask in pending.items() for number in ask.open_questions}
-    for (_, at, _), matches_for_input in matches.items():
+    for (_, at, prompt), matches_for_input in matches.items():
         if len(matches_for_input) == 1:
             answer_id, label = matches_for_input[0]
             if answer_id in available and answer_id not in multi_select:
                 choices.setdefault(answer_id, []).append({
-                    "id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER, "note": label,
+                    "id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER, "note": label, "input": prompt,
                     "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
                 })
     if choices and (version != inbox_version(inbox) or answer_history != list(inbox_read.answer_entries(path))):
