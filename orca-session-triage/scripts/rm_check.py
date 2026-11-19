@@ -1514,6 +1514,16 @@ def confirm_gone(worktree: Path, orca: str, wait: float) -> dict:
         time.sleep(GONE_POLL_SECONDS)
 
 
+def print_check(result: dict, summary: bool) -> None:
+    if summary:
+        details = [*result["reasons"], *result.get("notes", []),
+                   *(f"Compose {item['project']} {item['status']}" for item in result.get("containers", []))]
+        print(f"{result['worktree']} | ok={str(result['ok']).lower()} | "
+              + (" | ".join(" ".join(detail.splitlines()) for detail in details) or "-"))
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNotes()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", metavar="PATH", help="worktree path to check, the same as --worktree")
@@ -1559,7 +1569,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "nothing beyond a named path inside it counts as that path")
     parser.add_argument("--archive-dir", type=Path, default=ARCHIVE_DIR,
                         help="where --archive-scratch and --archive-path move them (default: %(default)s)")
-    parser.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--summary", action="store_true",
+                        help="print one line with ok, reasons, notes, and Compose status instead of JSON")
+    output.add_argument("--confirm-gone", type=float, nargs="?", const=GONE_WAIT_SECONDS, metavar="SECONDS",
                         help="instead of checking, confirm after `orca worktree rm` that no row of this Mac's "
                              "`orca worktree ps` has the path and the disk lacks it, reading again for up to SECONDS "
                              "(default: %(const)s); print {worktree, gone, in_orca (null when Orca could not be "
@@ -1599,9 +1612,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if inside.stdout.strip() != "true":
         blockers = ["not a git worktree: git rev-parse exited %d: %s"
                     % (inside.returncode, inside.stderr.strip() or "(no stderr)")]
-        json.dump({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers},
-                  sys.stdout, ensure_ascii=False)
-        print()
+        print_check({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers}, args.summary)
         return 2
     since = args.since
     if since is None and args.from_file:
@@ -1783,9 +1794,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["notes"] = notes
     if automation_blockers:
         result["automation_blocker"] = "; ".join(automation_blockers)
-    json.dump({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),
-               **result}, sys.stdout, ensure_ascii=False, indent=2)
-    print()
+    print_check({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),
+                 **result}, args.summary)
     return 0 if result["ok"] else 1
 
 

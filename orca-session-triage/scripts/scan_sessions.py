@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
-from functools import partial
+from functools import cache, partial
 from itertools import dropwhile, takewhile
 import hashlib
 import http.client
@@ -2724,6 +2724,16 @@ def removal_approved(row: dict) -> bool:
                           r"削除(?:する|して(?:よい|いい|ください)))(?=$|[\s。、（()）」])", text))
 
 
+def removal_blocker(row: dict) -> str | None:
+    if blocker := row.get("automation_blocker"):
+        return blocker
+    if row.get("pending_handoffs"):
+        return "未配信の約束の送り先"
+    if (answer := row.get("removal_decision")) and not removal_approved(row):
+        return f"removal decision {answer['decided_at']} {answer['answer']}"
+    return None
+
+
 def removal_facts(row: dict) -> str:
     """The scan values used when explaining why a row was left out."""
     shown = (row.get("verdict") or {}).get("class") or row["class"]
@@ -3198,16 +3208,21 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     for row in queue:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
     finished = [row for row in rows if ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"]
+    open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
+
+    if any(row.get("environment") and not removal_blocker(row)
+           for row in (*finished, *open_pr_cleanup)) and batch_has_preview():
+        print(REMOTE_CHECK_RELEASE)
     print(f"finished: {len(finished)} worktrees, {sum(len(row['terminals']) for row in finished)} tabs")
     for row in finished:
         print(f"  {row['repo']}/{Path(row['path']).name} ({len(row['terminals'])} tabs)")
-        if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
+        if not row.get("open_pr_cleanup") and not removal_blocker(row):
             print("    " + rm_check_command(row, scan_file))
-    open_pr_cleanup = [row for row in rows if row.get("open_pr_cleanup")]
     print(f"open PR cleanup: {len(open_pr_cleanup)} worktrees")
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
-        if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
+        if not removal_blocker(row):
+            print("    " + rm_check_command(row, scan_file))
             print("    " + rm_check_command(row, scan_file, remove_ok=True))
     for row in rows:
         if blocker := row.get("automation_blocker"):
@@ -3501,33 +3516,60 @@ def row_line(view: dict) -> str:
 
 CLOSE_TABS = Path(__file__).absolute().with_name("close_tabs.py")
 RM_CHECK = Path(__file__).absolute().with_name("rm_check.py")
-# Runs rm_check.py on another Mac over ssh; see references/cleanup.md.
 RM_CHECK_BATCH = Path.home() / ".local/share/eotel-harness/current/bin/rm-check-batch"
+REMOTE_CHECK_RELEASE = "Remote checks require the same harness release on both Macs."
 
 
 def pr_number(row: dict) -> int | None:
     return (row.get("pr") or {}).get("number") or (row.get("linked_pr") or {}).get("number")
 
 
+def rm_spec(row: dict) -> str:
+    path = row["path"]
+    name = shlex.quote(path) if any(char.isspace() for char in path) else path
+    return f"{name} {pr_number(row) or '-'}"
+
+
+@cache
+def batch_has_preview() -> bool:
+    """The same harness capability introduces read-only cleanup planning and quoted specs."""
+    try:
+        help_text = subprocess.run([str(RM_CHECK_BATCH), "--help"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return help_text.returncode == 0 and re.search(r"(?<!\S)--preview\s", help_text.stdout) is not None
+
+
+def batch_requirement(row: dict) -> str | None:
+    if any(char.isspace() for char in row["path"]) and not batch_has_preview():
+        return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
+    return None
+
+
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
-    """The rm_check.py command for a row; with the saved scan, its scanned_at bounds what may move after it.
-    Another Mac's row is checked on that Mac through rm-check-batch --host."""
-    pr = pr_number(row)
-    if row.get("open_pr_cleanup") and remove_ok:
-        return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
-                           *(["--from", str(scan_file)] if scan_file else []),
-                           "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {pr or '-'}"])
-    if row.get("environment"):
-        return shlex.join([str(RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {pr or '-'}"])
-    return shlex.join([str(RM_CHECK), "--worktree", row["path"], *(["--pr", str(pr)] if pr else []),
-                       *(["--from", str(scan_file)] if scan_file else [])])
+    """A one-line check for this row, using the saved scan's timestamp when available."""
+    environment = row.get("environment")
+    from_scan = ["--from", str(scan_file)] if scan_file else []
+    options = [*from_scan, "--summary"]
+    plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
+    if not remove_ok and not plan_cleanup and not environment:
+        return shlex.join([str(RM_CHECK), *options, row["path"], str(pr_number(row) or "-")])
+    if requirement := batch_requirement(row):
+        return requirement
+    if not batch_has_preview():
+        options = from_scan if remove_ok else []
+    if remove_ok:
+        options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
+    elif plan_cleanup:
+        options.extend(("--preview", "--detach-nested"))
+    return shlex.join([str(RM_CHECK_BATCH), *(["--host", environment] if environment else []), *options, rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     """A line per done card, closable tab, and meaningful tab; a scan saved before cards had screens reads as unknown.
 
     With the saved scan's path, a row with closable tabs includes the close_tabs.py command that closes them
-    once nothing moved after the scan. Finished and open_pr_cleanup rows include their rm_check.py command.
+    once nothing moved after the scan. Finished and open_pr_cleanup rows include a removal check command.
     """
     lead = f"{row_name(row)} | {class_label((row.get('verdict') or {}).get('class') or row['class'], row['class'])}"
     where = ["--environment", row["environment"]] if row.get("environment") else []
@@ -3554,8 +3596,10 @@ def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
     if scan_file and row.get("closable"):
         lines.append(f"{lead} | close: " + shlex.join([str(CLOSE_TABS), "--from", str(scan_file),
                                                       *row["closable"]]))
-    if not row.get("automation_blocker") and (row.get("open_pr_cleanup") or (
+    if not removal_blocker(row) and (row.get("open_pr_cleanup") or (
             (row.get("verdict") or {}).get("class") or row["class"]) == "finished"):
+        if row.get("environment") and batch_has_preview():
+            lines.append(f"{lead} | {REMOTE_CHECK_RELEASE}")
         lines.append(f"{lead} | rm-check: " + rm_check_command(row, scan_file))
     return lines
 
@@ -3754,25 +3798,27 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         print(error, file=sys.stderr)
         return 1
     left_out = 0
+    remote_preview = False
     specs = []
     # A row named twice (by name and by path) is printed once.
     for row in {id(row): row for row in selected}.values():
         shown = (row.get("verdict") or {}).get("class") or row["class"]
-        if blocker := row.get("automation_blocker"):
+        if blocker := removal_blocker(row):
             why = blocker
-        elif row.get("pending_handoffs"):
-            why = "未配信の約束の送り先"
-        elif (answer := row.get("removal_decision")) and not removal_approved(row):
-            why = f"removal decision {answer['decided_at']} {answer['answer']}"
         elif not (removal_approved(row) or row.get("open_pr_cleanup") or shown == "finished"):
             why = f"class {class_label(shown, row['class'])} is neither finished nor open PR cleanup"
+        elif requirement := batch_requirement(row):
+            why = requirement
         elif row.get("environment"):
             why = "on another Mac: " + rm_check_command(row, scan_file)
+            remote_preview = remote_preview or batch_has_preview()
         else:
-            specs.append(f"{row['path']} {pr_number(row) or '-'}")
+            specs.append(rm_spec(row))
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
+    if remote_preview:
+        print(REMOTE_CHECK_RELEASE, file=sys.stderr)
     print_rm_specs(specs, scan_file)
     return 1 if left_out else 0
 
@@ -3810,19 +3856,17 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
         specs = []
         for row in rows:
             finished = ((row.get("verdict") or {}).get("class") or row["class"]) == "finished"
-            if blocker := row.get("automation_blocker"):
-                print(f"{row_name(row)}: {blocker}", file=sys.stderr)
-                continue
-            if row.get("pending_handoffs"):
-                continue
-            if row.get("removal_decision") and not removal_approved(row):
-                print(f"{row_name(row)}: {removal_facts(row)}", file=sys.stderr)
+            if blocker := removal_blocker(row):
+                if not row.get("pending_handoffs") or row.get("automation_blocker"):
+                    print(f"{row_name(row)}: {blocker} | {removal_facts(row)}", file=sys.stderr)
                 continue
             if removal_approved(row) or row.get("open_pr_cleanup") or finished and not row.get("meaningful_tabs"):
-                if row.get("environment"):
+                if requirement := batch_requirement(row):
+                    print(requirement, file=sys.stderr)
+                elif row.get("environment"):
                     remote += 1
                 else:
-                    specs.append(f"{row['path']} {pr_number(row) or '-'}")
+                    specs.append(rm_spec(row))
         print_rm_specs(specs, Path(args.from_file).expanduser().absolute())
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",

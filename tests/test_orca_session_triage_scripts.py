@@ -2774,20 +2774,84 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
-    def test_open_pr_cleanup_summary_provides_one_batch_command_with_nested_and_scratch_options(self) -> None:
+    def test_open_pr_cleanup_summary_provides_a_preview_and_a_removal_command(self) -> None:
         saved = self.dir / "scan.json"
-        saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "stalled",
+        saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "finished",
                                       "open_pr_cleanup": True, "pr": {"number": 10}, "terminals": [],
                                       "claude": None, "codex": [], "reasons": []}]))
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
-        command = next(line.strip() for line in out.getvalue().splitlines() if "rm-check-batch" in line)
+        commands = [line.strip() for line in out.getvalue().splitlines() if "rm-check-batch" in line]
+        self.assertEqual(len(commands), 2)
+        preview = shlex.split(commands[0])
+        self.assertIn("--preview", preview)
+        self.assertIn("--detach-nested", preview)
+        self.assertNotIn("--remove-ok", preview)
+        command = commands[1]
         args = shlex.split(command)
         self.assertIn("--detach-nested", args)
         self.assertIn("--archive-scratch", args)
         self.assertIn("--remove-ok", args)
         self.assertEqual(args[args.index("--from") + 1], str(saved))
         self.assertIn("/w/app/finished 10", args)
+
+        row, = json.loads(saved.read_text())
+        saved.write_text(json.dumps([{**row, "environment": "mbp16", "automation_blocker": "automation uses this worktree"}]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        self.assertNotIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
+        self.assertNotIn("rm-check-batch", out.getvalue())
+
+    def test_remote_cleanup_hides_commands_for_keep_and_pending_handoff(self) -> None:
+        saved = self.dir / "scan.json"
+        base = {"path": "/w/app/remote", "repo": "app", "class": "finished", "terminals": [],
+                "environment": "mbp16", "open_pr_cleanup": True}
+        for absent in (
+            {"removal_decision": {"answer": "残す", "decided_at": "2026-11-19T10:00:00+09:00"}},
+            {"pending_handoffs": [{"after": "2026-11-19T16:00:00+09:00"}]},
+        ):
+            row = {**base, **absent}
+            with self.subTest(absent=absent), redirect_stdout(io.StringIO()) as out:
+                scan.print_summary([row], {}, scan_file=saved)
+            for display in (out.getvalue(), "\n".join(scan.card_lines(row, saved))):
+                self.assertNotIn(scan.REMOTE_CHECK_RELEASE, display)
+                self.assertNotIn("rm-check-batch", display)
+
+    def test_old_batch_rm_specs_omit_unsupported_paths_from_stdout_and_command(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([
+            {"path": "/w/app/standard", "repo": "app", "class": "finished"},
+            {"path": "/w/app/with two spaces", "repo": "app", "class": "finished"},
+        ]))
+        opts = ["--from", str(saved), "--rm-specs"]
+        for selected in ([], ["--row=standard", "--row=with two spaces"]):
+            with (self.subTest(selected=selected), patch.object(scan, "batch_has_preview", return_value=False),
+                  redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err):
+                self.assertEqual(scan.main([*opts, *selected]), int(bool(selected)))
+            self.assertEqual(out.getvalue().splitlines(), ["/w/app/standard -"])
+            warning, command = err.getvalue().splitlines()
+            self.assertIn("require the harness release with --preview", warning)
+            self.assertNotIn("with two spaces", command)
+            self.assertEqual(shlex.split(command)[-1], "/w/app/standard -")
+
+    def test_the_existing_harness_can_check_local_and_remote_paths_it_accepts(self) -> None:
+        saved = self.dir / "scan.json"
+        row = {"path": "/w/app/案件", "repo": "app", "class": "finished",
+               "open_pr_cleanup": True, "pr": {"number": 10}}
+        with patch.object(scan, "batch_has_preview", return_value=False):
+            local = shlex.split(scan.rm_check_command(row, saved))
+            remote = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved))
+            remove = shlex.split(scan.rm_check_command({**row, "environment": "mbp16"}, saved, remove_ok=True))
+            spaced = scan.rm_check_command({**row, "path": "/w/app/two words", "environment": "mbp16"}, saved)
+        self.assertEqual(local, [str(scan.RM_CHECK), "--from", str(saved), "--summary", "/w/app/案件", "10"])
+        self.assertEqual(remote[-1], "/w/app/案件 10")
+        self.assertNotIn("--preview", remote)
+        self.assertNotIn("--detach-nested", remote)
+        self.assertNotIn("--summary", remote)
+        self.assertNotIn("--from", remote)
+        self.assertNotIn("--summary", remove)
+        self.assertIn("--from", remove)
+        self.assertIn("require the harness release with --preview", spaced)
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -2799,6 +2863,7 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "JEV_KEY_FILE", str(self.dir / "no-key")),
                          patch.object(scan, "HOURLY_STATE", self.dir / "no-state.json"),
                          patch.object(scan, "LEAD_DECISIONS", self.dir / "no-decisions.jsonl"),
+                         patch.object(scan, "batch_has_preview", return_value=True),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
                          patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
@@ -3386,16 +3451,18 @@ class ScanCommandTests(unittest.TestCase):
         for view in ("--summary", "--cards"):
             with self.subTest(view=view), redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(scan.main(["--from", str(saved), view]), 0)
+                self.assertIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
                 for row in rows:
                     number = (row.get("pr") or row.get("linked_pr") or {}).get("number")
-                    if view == "--summary" and row.get("open_pr_cleanup"):
-                        expected = [str(scan.RM_CHECK_BATCH), "--from", str(saved.absolute()),
-                                    "--detach-nested", "--archive-scratch", "--remove-ok", f"{row['path']} {number or '-'}"]
-                    elif row.get("environment"):
-                        expected = [str(scan.RM_CHECK_BATCH), "--host", row["environment"], f"{row['path']} {number or '-'}"]
+                    options = ["--from", str(saved.absolute()), "--summary"]
+                    host = ["--host", row["environment"]] if row.get("environment") else []
+                    if row.get("open_pr_cleanup"):
+                        options.extend(("--preview", "--detach-nested"))
+                    spec = f"{row['path']} {number or '-'}"
+                    if row.get("open_pr_cleanup") or host:
+                        expected = [str(scan.RM_CHECK_BATCH), *host, *options, spec]
                     else:
-                        expected = [str(SCRIPTS / "rm_check.py"), "--worktree", row["path"],
-                                    *(["--pr", str(number)] if number else []), "--from", str(saved.absolute())]
+                        expected = [str(scan.RM_CHECK), *options, row["path"], str(number or "-")]
                     self.assertIn(shlex.join(expected), out.getvalue())
 
     def test_rm_specs_for_named_rows_include_finished_rows_whose_tabs_remain(self) -> None:
@@ -3419,7 +3486,10 @@ class ScanCommandTests(unittest.TestCase):
         code, out, err = specs("tabs", "busy", "mbp16::far")
         self.assertEqual((code, out), (1, "/w/app/tabs 7\n"))
         self.assertIn("busy: left out: class stalled is neither finished nor open PR cleanup", err)
-        self.assertIn(f"mbp16::far: left out: on another Mac: {scan.RM_CHECK_BATCH} --host mbp16 '/w/app/far -'", err)
+        self.assertEqual(err.count(scan.REMOTE_CHECK_RELEASE), 1)
+        self.assertIn("mbp16::far: left out: on another Mac: " + shlex.join([
+            str(scan.RM_CHECK_BATCH), "--host", "mbp16", "--from", str(saved.absolute()),
+            "--summary", "/w/app/far -"]), err)
         self.assertEqual(specs("tabs", "nothing")[:2], (1, ""))
 
     def test_summary_counts_the_class_rows_class_keeps_beside_the_scans_count(self) -> None:
@@ -4868,6 +4938,16 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["containers"], [{"project": "app-wt", "status": "running(2)"}])
+        with patch.object(rmcheck, "compose_projects", return_value=projects), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(rmcheck.main(["--worktree", str(self.wt), "--base", "main", "--summary"]), 0)
+        self.assertIn("Compose app-wt running(2)", out.getvalue())
+
+    def test_summary_keeps_spaces_in_the_paths_it_reports(self) -> None:
+        with redirect_stdout(io.StringIO()) as out:
+            rmcheck.print_check({"worktree": str(self.wt), "ok": False,
+                                 "reasons": ["open 'notes  draft.md'\nthen check again"]}, summary=True)
+        self.assertEqual(len(out.getvalue().splitlines()), 1)
+        self.assertIn("'notes  draft.md' then check again", out.getvalue())
 
     def test_docker_timeout_blocks_only_a_worktree_with_a_compose_definition(self) -> None:
         real_run = subprocess.run
