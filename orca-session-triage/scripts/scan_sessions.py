@@ -4104,7 +4104,8 @@ def main(argv: list[str] | None = None) -> int:
             tabs = [json.dumps([row.get("environment"), tab["handle"]]) for tab in row["terminals"]]
             if not any(key in interruption_observations for key in tabs):
                 continue
-            current = [interruption_times[key] for key in tabs if key in interruption_times]
+            current = [interruption_times[key] for key in tabs
+                       if key in interruption_times and key in interruption_observations]
             previous = row.pop("codex_interruptions", None)
             if current:
                 row["codex_interruptions"] = sorted(current, key=lambda stop: stop["stopped_at"], reverse=True)

@@ -3039,7 +3039,8 @@ class ScanCommandTests(unittest.TestCase):
                          patch.object(scan, "batch_has_preview", return_value=True),
                          patch.object(scan, "INBOX_FILE", str(self.dir / "no-inbox.jsonl")),
                          patch.object(scan, "VERDICTS_FILE", str(self.dir / "verdicts.json")),
-                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity"))):
+                         patch.object(scan, "PR_ACTIVITY_DIR", str(self.dir / "pr-activity")),
+                         patch.object(scan, "CODEX_INTERRUPTIONS", self.dir / "codex-interruptions.json")):
             hermetic.start()
             self.addCleanup(hermetic.stop)
 
