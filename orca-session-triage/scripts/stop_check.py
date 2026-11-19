@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from functools import cache
 import json
 import os
 from pathlib import Path
@@ -192,12 +193,27 @@ def question_options_agree(left: dict, right: dict) -> bool:
         if key not in (label, other_label) or not description or not other_description:
             return False
         if (description != other_description and SequenceMatcher(None, description, other_description,
-                                                                 autojunk=False).find_longest_match().size < 10):
+                                                                 autojunk=False).find_longest_match().size < 24):
             return False
     return True
 
 
-def worker_scope(entry: dict, rows: set[str], remote_hosts: dict) -> bool:
+@cache
+def workspace_repo_matches(location: Path, environment: str, repo: str, orca: str) -> bool:
+    if location.parent.name == repo:
+        return True
+    try:
+        if not environment:
+            origin = subprocess.check_output(["git", "-C", str(location), "remote", "get-url", "origin"],
+                                             text=True, stderr=subprocess.DEVNULL, timeout=2).strip()
+            return origin.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git") == repo
+        worktrees = orca_result(orca, "worktree", "list", "--environment", environment, "--repo", f"name:{repo}")["worktrees"]
+        return any(item.get("path") == str(location) for item in worktrees)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return False
+
+
+def worker_scope(entry: dict, rows: set[str], remote_hosts: dict, orca: str) -> bool:
     if not rows:
         return True
     local = os.environ.get("TRIAGE_HOST") or socket.gethostname()
@@ -206,12 +222,25 @@ def worker_scope(entry: dict, rows: set[str], remote_hosts: dict) -> bool:
         location = Path(workspace)
         if location.name != entry.get("worktree"):
             continue
-        if entry.get("repo") not in (None, "", location.parent.name):
-            continue
         host = (remote_hosts.get(environment) or {}).get("report_host") if environment else local
-        if host and entry.get("host") in (None, host):
+        repo = entry.get("repo")
+        if host and entry.get("host") in (None, host) and (not repo or workspace_repo_matches(location, environment, repo, orca)):
             return True
     return False
+
+
+def registered_scope(question: dict, entries: list[dict]) -> list[tuple[str, frozenset[int]]]:
+    scoped = []
+    for ask_id, numbers in ask_state.references(question, entries):
+        if not numbers:
+            original = next(entry for entry in entries if entry.get("id") == ask_id)
+            matched = [number for number, part in enumerate(inbox_read.questions_of(original), 1)
+                       if isinstance(part, dict) and question.get("question")
+                       in (part.get("question"), answer_evidence.shown_question(part))]
+            if len(matched) == 1:
+                numbers = frozenset(matched)
+        scoped.append((ask_id, numbers))
+    return scoped
 
 
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
@@ -220,6 +249,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
     answers = inbox_read.answer_records(path)
     answers.update(lane_input.inferred_answers(inbox_read.paths()[0], path, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
+    withdrawn = inbox_read.withdrawal_times(entries)
     remote_config = Path(os.environ.get("TRIAGE_PULL_CONFIG") or "~/.cache/orca-briefs/remote-inboxes.json").expanduser()
     remote_data = read_json(remote_config)
     remote_hosts = remote_data.get("hosts", {}) if isinstance(remote_data, dict) else {}
@@ -265,11 +295,11 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             named_ids = {ref[0] for ref in named}
             originals = [(str(entry["id"]), number, original)
                          for entry in entries if entry.get("kind") == "ask" and entry.get("id")
-                         and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts))
+                         and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts, orca))
                          for number, original in enumerate(inbox_read.questions_of(entry), start=1)
                          if isinstance(original, dict) and (not header or original.get("header") == header)
                          and question_options_agree(original, question)
-                         and (named_ids or not any(item.covers(number) for item in inbox_read.reissues(entry["id"], entries)))]
+                         and (named_ids or entry["id"] not in withdrawn and f"{entry['id']}:{number}" not in withdrawn)]
             shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
                      if text in (original.get("question"), answer_evidence.shown_question(original))]
             if not shown and header:
@@ -289,7 +319,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 refs.extend(shown)
         if named:
             matched = [item for item in matched if any(ask_state.overlaps(ref, other) for ref in refs
-                       for other in ask_state.references(item, entries))]
+                       for other in registered_scope(item, entries))]
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
             ask = next(entry for entry in entries if entry.get("id") == ask_id)
@@ -322,7 +352,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             same = ask_state.same_workspace(item["by"], cwd)
             if same and (not item["session"] or item["session"] == session):
                 continue
-            bindings = ask_state.references(item["record"], entries)
+            bindings = registered_scope(item["record"], entries) if named else ask_state.references(item["record"], entries)
             overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
             if item["record"] in matched or related.intersection(item["keys"]) or overlap:
                 reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")

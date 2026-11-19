@@ -511,6 +511,26 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertIn(unrelated, [item["decision"] for item in result["unanswered"]])
         self.assertIn(f"{self.KEY}:1", [item["decision"] for item in result["settled"]])
 
+    def test_stale_asks_keeps_only_questions_that_were_not_withdrawn(self) -> None:
+        second = {**self.question, "header": "宛先", "question": "宛先を選びますか？"}
+        ask = json.loads(self.inbox.read_text())
+        withdrawal = {**ask, "id": "b1234567-1234-4567-8888-123456789abc", "ts": self.AT,
+                      "kind": "info", "questions": [], "text": "第一問を取り下げます", "withdraws": [f"{self.ASK}:1"]}
+        self.write_lines(self.inbox, [{**ask, "questions": [self.question, second]}, withdrawal])
+        scan = self.root / "scan.json"
+        scan.write_text(json.dumps([{"path": "/w/worker", "repo": "", "class": "waiting",
+                                     "claude": {"final_text": ask["text"], "final_at": ask["ts"]}}]))
+        args = ("hourly_state.py", "stale-asks", "--from", str(scan),
+                "--verdicts", str(self.root / "no-verdicts"), "--claude-projects", str(self.root / "projects"))
+        pending = self.run_tool(*args)
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertEqual(json.loads(pending.stdout)[0]["ask"]["question_numbers"], [2])
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:2", "ts": self.AT,
+                                        "how": "triage-notify --answered", "note": "本社"}])
+        resolved = self.run_tool(*args)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual([row["state"] for row in json.loads(resolved.stdout)], ["stopped_after_answer"])
+
     def test_a_partial_relay_preserves_the_hourly_answer_and_records_an_explicit_key(self) -> None:
         self.env["ORCA_TERMINAL_HANDLE"] = "term_fixture"
         other = "b1234567-1234-4567-8888-123456789abc"
@@ -761,7 +781,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 sending = self.run_tool("inbox_read.py", "open-asks", "--json")
                 self.assertEqual(sending.returncode, 0, sending.stderr)
                 self.assertEqual(len(json.loads(sending.stdout)), 1)
-                self.write_lines(events, [])
+                with events.open("a") as stream:
+                    stream.write(json.dumps({"type": "send-refused", "intent_id": "fixture-intent"}) + "\n")
                 guarded = self.hook()
                 reason = json.loads(guarded.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
                 self.assertIn("worker の回答「A」", reason)

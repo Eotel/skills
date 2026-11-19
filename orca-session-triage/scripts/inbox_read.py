@@ -567,6 +567,21 @@ def open_asks(entries: list[dict], answered: frozenset[str]) -> list[OpenAsk]:
     return sorted(found, key=lambda ask: (ask.at is None, ask.at or datetime.min.replace(tzinfo=timezone.utc)))
 
 
+def withdrawal_times(entries: list[dict]) -> dict[str, datetime]:
+    asks = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    withdrawn: dict[str, datetime] = {}
+    for report in entries:
+        if not report.get("withdraws") or not (at := asked_at(report)):
+            continue
+        for ref in report["withdraws"]:
+            if (not isinstance(ref, str) or not (ask := asks.get(ref.partition(":")[0]))
+                    or not (opened := asked_at(ask)) or opened > at
+                    or any(ask.get(key) != report.get(key) for key in ("host", "repo", "worktree"))):
+                continue
+            withdrawn[ref] = min(at, withdrawn.get(ref, at))
+    return withdrawn
+
+
 def ledger_owners(proposal_ids: list[str]) -> dict[str, str]:
     """The lane holding each proposal that has one, by adoption-triage's `ledger.py owner`; ADOPTION_TRIAGE_SCRIPT,
     ADOPTION_TRIAGE_EVENTS, and ADOPTION_TRIAGE_IMPORTS select another ledger, as adoption_handoff.py does."""
@@ -1126,6 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
                               help="transcripts used to check whether a claimed question is still being asked")
     lane_answers = actions.add_parser("lane-answers", help="report transcript evidence for the specified local asks")
     lane_answers.add_argument("ids", nargs="+", metavar="ASK_ID")
+    lane_answers.add_argument("--candidates", action="store_true", help="return all inputs for controller delivery matching")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
                                                    "or no longer asked); send --decision --ask records its own")
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
@@ -1190,8 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "lane-answers":
             import lane_input
-            records = lane_input.inferred_answers(inbox, answers_path(),
-                                                  os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
+            candidates = lane_input.candidate_answers(inbox, answers_path(),
+                                                       os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
+            records = candidates if args.candidates else lane_input.unambiguous_answers(candidates)
             print(json.dumps(records, ensure_ascii=False))
             return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):

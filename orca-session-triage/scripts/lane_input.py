@@ -75,7 +75,12 @@ def delivery_events(path: Path, recipients: set[str]) -> dict[str, list[tuple[da
     with path.open("rb") as stream:
         for raw in stream:
             event = inbox_read.entry(raw)
-            if not event or event.get("type") not in ("send", "send-intent"):
+            if not event:
+                continue
+            if event.get("type") == "send-refused" and isinstance(intent := event.get("intent_id"), str):
+                pending.pop(intent, None)
+                continue
+            if event.get("type") not in ("send", "send-intent"):
                 continue
             recipient = event.get("to") or event.get("lane")
             text = event.get("text")
@@ -170,27 +175,20 @@ def inbox_version(path: Path) -> tuple[int, int, int] | None:
     return info.st_ino, info.st_size, info.st_mtime_ns
 
 
-def inferred_answers(inbox: Path, path: Path, orca: str,
-                     wanted: set[str] | None = None) -> dict[str, dict]:
+def candidate_answers(inbox: Path, path: Path, orca: str,
+                      wanted: set[str] | None = None) -> dict[str, list[dict]]:
     closed_at: dict[str, datetime | None] = {}
     version = inbox_version(inbox)
     entries = inbox_read.inbox_entries(inbox) if version is not None else []
     history = inbox_read.open_asks(entries, frozenset())
-    by_id = {ask.report["id"]: ask for ask in history}
     answer_history = list(inbox_read.answer_entries(path))
     for record in answer_history:
         previous = closed_at.setdefault(record["id"], None)
         if (at := inbox_read.asked_at(record)) and (previous is None or at < previous):
             closed_at[record["id"]] = at
-    for report in entries:
-        if not report.get("withdraws") or not (at := inbox_read.asked_at(report)):
-            continue
-        for ref in report["withdraws"]:
-            if (not isinstance(ref, str) or not (ask := by_id.get(ref.partition(":")[0])) or not ask.at or ask.at > at
-                    or any(ask.report.get(key) != report.get(key) for key in ("host", "repo", "worktree"))):
-                continue
-            if (previous := closed_at.get(ref)) is None or at < previous:
-                closed_at[ref] = at
+    for ref, at in inbox_read.withdrawal_times(entries).items():
+        if (previous := closed_at.get(ref)) is None or at < previous:
+            closed_at[ref] = at
     pending = {ask.report["id"]: ask for ask in inbox_read.open_asks(entries, frozenset(closed_at))
                if ask.report.get("handle") and ask.open_questions and (wanted is None or ask.report["id"] in wanted)}
     by_handle = {ask.report["handle"]: ask.report for ask in reversed(list(pending.values()))}
@@ -217,41 +215,47 @@ def inferred_answers(inbox: Path, path: Path, orca: str,
                 for label in (selected or [label for label in labels if option_key(label) == choice]):
                     key = (handle, at, prompt)
                     matches.setdefault(key, []).append((answer_id, label))
-    choices: dict[str, dict[str, datetime]] = {}
+    choices: dict[str, list[dict]] = {}
     available = {f"{ask_id}:{number}" for ask_id, ask in pending.items() for number in ask.open_questions}
     for (_, at, _), matches_for_input in matches.items():
         if len(matches_for_input) == 1:
             answer_id, label = matches_for_input[0]
             if answer_id in available and answer_id not in multi_select:
-                choices.setdefault(answer_id, {}).setdefault(label, at)
+                choices.setdefault(answer_id, []).append({
+                    "id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER, "note": label,
+                    "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
+                })
     if choices and (version != inbox_version(inbox) or answer_history != list(inbox_read.answer_entries(path))):
         return {}
-    return {answer_id: {"id": answer_id, "ts": at.isoformat(), "how": inbox_read.TRANSCRIPT_ANSWER,
-                        "sender": {"worktree": pending[answer_id.partition(":")[0]].report.get("worktree"), "session": None},
-                        "note": label}
-            for answer_id, selected in choices.items() if len(selected) == 1 for label, at in selected.items()}
+    return choices
+
+
+def unambiguous_answers(choices: dict[str, list[dict]]) -> dict[str, dict]:
+    return {answer_id: min(records, key=lambda record: datetime.fromisoformat(record["ts"]))
+            for answer_id, records in choices.items() if len({record["note"] for record in records}) == 1}
+
+
+def inferred_answers(inbox: Path, path: Path, orca: str, wanted: set[str] | None = None) -> dict[str, dict]:
+    return unambiguous_answers(candidate_answers(inbox, path, orca, wanted))
 
 
 def reconcile_answers(inbox: Path, path: Path, orca: str) -> None:
-    version = inbox_version(inbox)
-    history = list(inbox_read.answer_entries(path))
-    write_inferred_answers(inferred_answers(inbox, path, orca), path,
-                           still_current=lambda: version == inbox_version(inbox)
-                           and history == list(inbox_read.answer_entries(path)))
+    if inferred_answers(inbox, path, orca):
+        write_inferred_answers(lambda: inferred_answers(inbox, path, orca), path)
 
 
-def write_inferred_answers(detected: dict[str, dict], path: Path,
-                           *, still_current: Callable[[], bool] | None = None) -> None:
+def write_inferred_answers(detected: dict[str, dict] | Callable[[], dict[str, dict]], path: Path) -> None:
     if not detected:
         return
     path = path.resolve()
     with retro.locked(path.with_name(path.name + ".lane-answer.lock")):
-        if still_current is not None and not still_current():
+        records = detected if isinstance(detected, dict) else detected()
+        if not records:
             return
         answered = inbox_read.answer_records(path)
         used = {((record.get("sender") or {}).get("worktree"), record.get("ts"), record.get("note"))
                 for record in answered.values() if record.get("how") == inbox_read.TRANSCRIPT_ANSWER}
-        for answer_id, record in detected.items():
+        for answer_id, record in records.items():
             source = (record["sender"]["worktree"], record["ts"], record["note"])
             if source not in used and answer_id not in answered and answer_id.partition(":")[0] not in answered:
                 inbox_read.record_answers(path, [answer_id], record["how"], record["note"],

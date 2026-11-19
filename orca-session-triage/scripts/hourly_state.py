@@ -639,17 +639,21 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
     ask_entries = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
     known_asks = list(ask_entries.values())
+    withdrawn = inbox_read.withdrawal_times(entries)
+    retained_questions = {key: [number for number in range(1, len(questions) + 1) if f"{key}:{number}" not in withdrawn]
+                          for key, ask in ask_entries.items() if (questions := inbox_read.questions_of(ask))}
     answered_ids = [answer.ask_id for answer in answers if answer.source in inbox_read.SUBSTANTIVE_ANSWERS
                     and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
+    closed_ids = [*answered_ids, *withdrawn]
     handoff_refs = {item.decision: ask_state.handoff_ref(item.ask_id, item.decision, known_asks,
                                                         state.get("questions", {}).values()) for item in handed}
-    if answered_ids:
+    if closed_ids:
         handed = [item for item in handed if not ((ref := handoff_refs[item.decision])
-                                                  and ask_state.covered(ref, answered_ids, known_asks))]
+                                                  and ask_state.covered(ref, closed_ids, known_asks))]
         pending = {key: item for key, item in state.get("questions", {}).items()
                    if not (refs := ask_state.references(item, known_asks))
-                   or not all(ask_state.covered(ref, answered_ids, known_asks) for ref in refs)
+                   or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
                    or any(not ask_state.reference(cover, known_asks)
                           and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
                           for cover in item.get("covers") or [])}
@@ -696,8 +700,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         in_progress = (row.get("verdict") or {}).get("class") == "in_progress"
         progress_question = in_progress and bool(row.get("prompt_waiting") or
                                                   (row.get("claude") or {}).get("pending_questions"))
-        counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
+        counted = [(at, item, answer_evidence.answers_to(item, answers, retained_questions.get(item["id"]), shared))
+                   for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
+                   and item["id"] not in withdrawn and retained_questions.get(item["id"]) != []
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
         # The ledger settles only the proposals the lane waited on, not a question it is asking now.
         if settled and not (row.get("prompt_waiting") or (row.get("claude") or {}).get("pending_questions")
@@ -737,7 +743,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
                 remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask), 1)
-                             if not ask_state.covered((ask["id"], frozenset((number,))), answered_ids, known_asks)]
+                             if not ask_state.covered((ask["id"], frozenset((number,))), closed_ids, known_asks)]
                 asked = "\n".join(question for _, question in remaining) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
