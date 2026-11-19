@@ -3208,6 +3208,7 @@ def print_summary(rows: list[dict], verdicts: dict, *, force_review: bool = Fals
     for row in open_pr_cleanup:
         print(f"  {row['repo']}/{Path(row['path']).name} [{row['class']}]")
         if not row.get("automation_blocker") and (not row.get("removal_decision") or removal_approved(row)):
+            print("    " + rm_check_command(row, scan_file))
             print("    " + rm_check_command(row, scan_file, remove_ok=True))
     for row in rows:
         if blocker := row.get("automation_blocker"):
@@ -3507,14 +3508,17 @@ def pr_number(row: dict) -> int | None:
     return (row.get("pr") or {}).get("number") or (row.get("linked_pr") or {}).get("number")
 
 
+def rm_spec(row: dict) -> str:
+    return shlex.join([row["path"], str(pr_number(row) or "-")])
+
+
 def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: bool = False) -> str:
     """A one-line check for this row, using the saved scan's timestamp when available."""
-    pr = pr_number(row)
     return shlex.join([str(RM_CHECK_BATCH), *(["--host", row["environment"]] if row.get("environment") else []),
                        *(["--from", str(scan_file)] if scan_file else []), "--summary",
                        *(["--detach-nested", "--archive-scratch", "--remove-ok"]
                          if row.get("open_pr_cleanup") and remove_ok else []),
-                       f"{row['path']} {pr or '-'}"])
+                       rm_spec(row)])
 
 
 def card_lines(row: dict, scan_file: Path | None = None) -> list[str]:
@@ -3763,7 +3767,7 @@ def named_rm_specs(rows: list[dict], names: list[str], scan_file: Path) -> int:
         elif row.get("environment"):
             why = "on another Mac: " + rm_check_command(row, scan_file)
         else:
-            specs.append(f"{row['path']} {pr_number(row) or '-'}")
+            specs.append(rm_spec(row))
             continue
         left_out += 1
         print(f"{row_name(row)}: left out: {why} | {removal_facts(row)}", file=sys.stderr)
@@ -3816,7 +3820,7 @@ def print_rows(args: argparse.Namespace, rows: list[dict], verdicts: dict) -> in
                 if row.get("environment"):
                     remote += 1
                 else:
-                    specs.append(f"{row['path']} {pr_number(row) or '-'}")
+                    specs.append(rm_spec(row))
         print_rm_specs(specs, Path(args.from_file).expanduser().absolute())
         if remote:
             print(f"{remote} rows on another Mac left out: --summary prints their rm-check-batch --host commands",
