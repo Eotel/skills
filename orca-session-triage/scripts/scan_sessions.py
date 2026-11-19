@@ -1014,6 +1014,7 @@ PERMISSION_QUESTION = "Do you want to"
 CODEX_PERMISSION = "Would you like to run the following command?"
 CODEX_PERMISSION_FOOTER = "press enter to confirm or esc to cancel"
 CODEX_PERMISSION_CHOICE = re.compile(r"(?:[›❯]\s*)?(\d+\.\s+.+)")
+CODEX_BYPASS_FLAGS = frozenset(("--dangerously-bypass-approvals-and-sandbox", "--yolo"))
 CHOICE = re.compile(r"(?:❯\s*)?(\d+\.\s+.+)")
 FIRST_CHOICE = re.compile(r"(?:❯\s*)?1\.\s+.+")
 # What Claude Code prints when a restart dropped the background jobs a turn was waiting on.
@@ -1762,21 +1763,20 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
 
 
 def with_codex_permission_reasons(rows: list[dict]) -> None:
-    waiting = {row["path"]: row for row in rows if not row.get("environment")
+    waiting = {row["prompt_waiting"]["tab"]: row for row in rows if not row.get("environment")
                and (row.get("prompt_waiting") or {}).get("question") == CODEX_PERMISSION}
     if not waiting:
         return
     codex_processes = {}
     for pid, (_, command) in (rm_check.process_table() or {}).items():
         args = command.split()
-        if any(Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")
-               for token in args[:2]):
+        if ("app-server" not in args and "exec" not in args
+                and any(Path(token).name in ("codex", "codex.js") or Path(token).name.startswith("codex-aarch64-")
+                        for token in args[:2])):
             codex_processes[pid] = args
-    if not codex_processes:
-        return
-    for pid, cwd in (rm_check.process_cwds(codex_processes.keys()) or {}).items():
-        if cwd in waiting and "--dangerously-bypass-approvals-and-sandbox" not in codex_processes[pid]:
-            waiting[cwd]["reasons"].append(f"Codex process {pid} was started without the approvals bypass flag")
+    for pid, handle in rm_check.process_handles(sorted(codex_processes)).items():
+        if handle in waiting and CODEX_BYPASS_FLAGS.isdisjoint(codex_processes[pid]):
+            waiting[handle]["reasons"].append(f"Codex process {pid} was started without the approvals bypass flag")
 
 
 def github_slug(remote_url: str | None) -> str | None:
@@ -3021,9 +3021,9 @@ ORCA_TIMEOUT = 60
 
 def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Collection[str] | None = None) -> list[dict]:
     """Tabs of done or waiting worktrees, agent tabs of worktrees Orca keeps no agent for (a background
-    session's hooks do not reach it), remote worktrees with no agent message, Codex tabs of local worktrees with
-    no Codex rollout in `codex_cwds`, and remote shells without output metadata: read their cards, permission
-    prompts, questions, final replies, and bare prompts."""
+    session's hooks do not reach it), remote worktrees with no agent message, working Codex tabs and local Codex
+    tabs with no rollout, and remote shells without output metadata: read their cards, permission prompts,
+    questions, final replies, and bare prompts."""
     idle = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
             if any(a.get("state") in ("done", "waiting") for a in w.get("agents") or [])}
     untracked = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees if not w.get("agents")}
@@ -3031,10 +3031,12 @@ def screen_targets(worktrees: list[dict], terminals: list[dict], codex_cwds: Col
             if w.get("_environment") and not orca_said(w)}
     quiet_codex = set() if codex_cwds is None else {
         (None, w.get("worktreeId")) for w in worktrees if not w.get("_environment") and w["path"] not in codex_cwds}
+    working_codex = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees
+                     if any(a.get("agentType") == "codex" and a.get("state") == "working" for a in w.get("agents") or [])}
     return [t for t in terminals if t.get("handle") and (
         (key := (t.get("_environment"), t.get("worktreeId"))) in idle or key in bare
         or (key in untracked and t.get("agentIdentity"))
-        or (key in quiet_codex and t.get("agentIdentity") == "codex")
+        or (t.get("agentIdentity") == "codex" and (key in quiet_codex or key in working_codex))
         or (t.get("_environment") and not t.get("agentIdentity") and not t.get("preview")
             and t.get("lastOutputAt") is None))]
 

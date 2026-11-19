@@ -891,15 +891,18 @@ class ClassifyTests(unittest.TestCase):
         screens = {(None, "term_codex"): {"source": "screen", "tail": tail}}
         rows = scan.build_inventory([tree], [term], self.projects, {}, "要判断", now=NOW, screens=screens)
 
-        with patch.object(scan.rm_check, "process_table", return_value={13: (1, "codex"), 14: (1, "codex")}), \
-             patch.object(scan.rm_check, "process_cwds", return_value={13: tree["path"], 14: "/w/other"}):
+        processes = {13: (1, "codex"), 14: (1, "codex"), 15: (1, "codex --yolo"), 16: (1, "codex app-server")}
+        handles = {13: "term_codex", 14: "term_other", 15: "term_codex", 16: "term_codex"}
+        with patch.object(scan.rm_check, "process_table", return_value=processes), \
+             patch.object(scan.rm_check, "process_handles", side_effect=lambda pids: {pid: handles[pid] for pid in pids}):
             scan.with_codex_permission_reasons(rows)
 
         self.assertEqual(rows[0]["class"], "waiting")
         self.assertEqual(rows[0]["prompt_waiting"], {"tab": "term_codex", "question": heading, "target": command,
                                                        "choices": ["1. Yes, proceed (y)", "2. No (esc)"]})
         self.assertIn("Codex process 13 was started without the approvals bypass flag", rows[0]["reasons"])
-        self.assertFalse(any("process 14" in reason for reason in rows[0]["reasons"]))
+        self.assertEqual([reason for reason in rows[0]["reasons"] if reason.startswith("Codex process")],
+                         ["Codex process 13 was started without the approvals bypass flag"])
         self.assertIsNone(scan.codex_permission_prompt({"source": "screen", "tail": [
             *tail, "• Ran command", "  └ clean", "› Ask Codex to do anything", "gpt-6-sol"]}, "term_codex"))
 
@@ -1933,7 +1936,8 @@ class ClassifyTests(unittest.TestCase):
         busy = [worktree("/w/uv", "working", agent="codex")]
         self.assertEqual([t["handle"] for t in scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], set())],
                          ["term_u"])
-        self.assertEqual(scan.screen_targets(busy, [terminal("/w/uv", "codex", "term_u")], {"/w/uv"}), [])
+        self.assertEqual([t["handle"] for t in scan.screen_targets(
+            busy, [terminal("/w/uv", "codex", "term_u")], {"/w/uv"})], ["term_u"])
 
     def test_another_macs_lane_read_from_orcas_copy_is_told_apart_by_its_text(self) -> None:
         # Orca's copy of a remote lane's last message carries no Claude Code error tag.
@@ -2796,6 +2800,35 @@ class NextStepFactTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
+    def test_a_live_scan_reads_a_working_codex_tab_with_an_existing_rollout(self) -> None:
+        lane = str(self.dir / "codex-lane")
+        tree = worktree(lane, "working", agent="codex")
+        term = terminal(lane, "codex", "term_approval")
+        rollouts = self.dir / "rollouts"
+        rollouts.mkdir()
+        write_jsonl(rollouts / "rollout-approval.jsonl", [
+            codex_row("2026-11-19T00:00:00Z", "session_meta", {"cwd": lane}),
+        ])
+        screen = {"source": "screen", "tail": ["Would you like to run the following command?",
+                                                "Environment: local", "Reason: Read Git status", "$ git status",
+                                                "› 1. Yes, proceed (y)", "2. No (esc)",
+                                                "Press enter to confirm or esc to cancel"]}
+        with (patch.object(scan, "collect_worktrees_and_terminals", return_value=([tree], [term])),
+              patch.object(scan, "read_screens", return_value={(None, term["handle"]): screen}) as screens,
+              patch.object(scan, "read_mail", return_value={}),
+              patch.object(scan, "worktree_processes", return_value={}),
+              patch.object(scan, "with_automation_workspaces", side_effect=lambda rows, _: rows),
+              patch.object(scan, "running_claude_transcripts", return_value={}),
+              patch.object(scan, "process_table", return_value={}),
+              patch.object(scan.rm_check, "process_table", return_value={}),
+              redirect_stdout(io.StringIO()) as out):
+            self.assertEqual(scan.main(["--orca", "orca", "--codex-sessions", str(rollouts), "--since-hours", "0",
+                                        "--claude-projects", str(self.dir / "claude"), "--row", lane]), 0)
+        screens.assert_called_once_with("orca", [term])
+        row = json.loads(out.getvalue())
+        self.assertEqual(row["class"], "waiting")
+        self.assertEqual(row["prompt_waiting"]["target"], "$ git status")
+
     def test_open_pr_cleanup_summary_provides_one_batch_command_with_nested_and_scratch_options(self) -> None:
         saved = self.dir / "scan.json"
         saved.write_text(json.dumps([{"path": "/w/app/finished", "repo": "app", "class": "stalled",
