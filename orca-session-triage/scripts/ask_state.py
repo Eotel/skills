@@ -57,6 +57,12 @@ def handoff_ref(ask_id: str | None, key: str, entries: list[dict],
     return explicit or named
 
 
+def registered_ask_id(question: dict, key: str) -> str | None:
+    if question.get("decision") == key or question.get("covers") == [key]:
+        return question.get("ask_id")
+    return None
+
+
 def covered(ref: tuple[str, frozenset[int]], ids: list[str], entries: list[dict]) -> bool:
     """Whether the supplied answers cover this reference, including all numbered parts of a whole ask."""
     ask_id, numbers = ref

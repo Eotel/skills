@@ -551,8 +551,9 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         answer = decision
         if answer is None:
             latest_id = bound.ask_id if bound else None
-            bindings = [latest_id] if latest_id else [question["record"]["ask_id"] for question in active
-                        if key in question["keys"] and question["record"].get("ask_id")]
+            bindings = [latest_id] if latest_id else []
+            if not bindings and ask_state.reference(key, ask_entries) is None:
+                bindings = [ref for question in active if (ref := ask_state.registered_ask_id(question["record"], key))]
             refs = list(dict.fromkeys(ref for source in (bindings or [None])
                                       if (ref := ask_state.handoff_ref(source, key, ask_entries, questions))))
             for ref in refs:

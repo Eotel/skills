@@ -498,7 +498,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
 
     def test_lane_answer_does_not_settle_an_unrelated_decision_key(self) -> None:
         unrelated = "remove:/w/other"
-        self.ask(covers=[self.KEY, unrelated])
+        registered = self.ask(covers=[self.KEY, unrelated])
+        state = json.loads(self.state.read_text())
+        state["questions"][registered["id"]]["ask_id"] = self.ASK
+        self.state.write_text(json.dumps(state))
         self.write_lines(self.handed, [{"decision": f"{self.KEY}:1", "ask_id": self.ASK, "handed_off_at": self.AT}])
         self.write_lines(self.answers, [
             {"id": f"{self.ASK}:1", "ts": self.AT, "how": "inbox_read.py answered", "note": "読んだ"},
