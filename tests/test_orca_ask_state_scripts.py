@@ -465,20 +465,21 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.write_lines(self.inbox, [{**ask, "questions": questions}])
         state_questions = [self.ask(key=f"{self.KEY}:{number}", covers=[f"{self.KEY}:{number}"])
                            for number in (1, 2)]
-        self.write_lines(self.handed, [{"decision": f"{self.KEY}:{number}", "ask_id": f"{self.ASK}:{number}",
-                                      "handed_off_at": self.AT} for number in (1, 2)])
         scan = self.root / "scan.json"
         scan.write_text(json.dumps([{"path": "/w/worker", "repo": "", "class": "waiting",
                                      "claude": {"final_text": "公開しますか？", "final_at": ask["ts"]}}]))
         for answered in (1, 2):
+            how = "triage-notify --answered" if answered == 1 else "send"
             with self.answers.open("a") as stream:
                 stream.write(json.dumps({"id": f"{self.ASK}:{answered}", "ts": "2026-11-14T09:02:00Z",
-                                         "how": "triage-notify --answered", "note": "回答確認"}) + "\n")
+                                         "how": how, "note": "回答確認"}) + "\n")
             pending = self.run_tool("lead_decisions.py", "--decisions-file", str(self.log), "unanswered",
                                     "--handed-off-file", str(self.handed), "--state-file", str(self.state))
             self.assertEqual(pending.returncode, 0, pending.stderr)
             self.assertEqual([item["decision"] for item in json.loads(pending.stdout)["unanswered"]],
                              [f"{self.KEY}:2"] if answered == 1 else [])
+            self.write_lines(self.handed, [{"decision": f"{self.KEY}:{number}", "handed_off_at": self.AT}
+                                          for number in (1, 2)])
             stale = self.run_tool("hourly_state.py", "stale-asks", "--from", str(scan),
                                   "--verdicts", str(self.root / "no-verdicts"), "--claude-projects",
                                   str(self.root / "projects"), "--handed-off-file", str(self.handed))
@@ -488,6 +489,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
                 self.assertEqual(row["state"], "unanswered")
                 self.assertEqual(row["decisions"], [f"{self.KEY}:2"])
                 self.assertNotIn(state_questions[0]["id"], [item["id"] for item in row["asking"]])
+                self.assertIn(questions[1]["question"], row["question"])
+                self.assertNotIn(questions[0]["question"], row["question"])
             else:
                 self.assertEqual(row["state"], "stopped_after_answer")
 
@@ -652,6 +655,10 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.assertIn(prompt, decision["permissionDecisionReason"])
         self.assertIn(f"triage-notify --answered {self.ASK}:1 <", decision["permissionDecisionReason"])
         self.assertEqual(self.hook().stdout, "")
+        first = self.question
+        self.question = second
+        self.assertIn(f"triage-notify --answered {self.ASK}:2 <", self.hook().stdout)
+        self.question = first
 
         sent = {"type": "user", "timestamp": "2026-11-14T09:02:00Z",
                 "message": {"role": "user", "content": "状況を確認して\n  報告してください。"}}
@@ -659,8 +666,15 @@ assert writer is not None and writer.wait(timeout=10) == 0
         self.state.write_text(json.dumps({**state, "questions": {}}))
         self.write_lines(self.inbox, [{**ask, "id": "b1234567-1234-4567-8888-123456789abc"}])
         self.write_lines(transcript, [sent])
-        self.write_lines(events, [{"type": "send", "ts": sent["timestamp"], "to": "term_worker",
+        self.write_lines(events, [{"type": "send", "ts": "2026-11-14T08:58:00Z", "to": "term_worker",
+                                   "delivery": ["input_accepted"],
                                    "text": "状況を確認して 報告してください。"}])
+        self.assertEqual(self.hook().stdout, "")
+        self.write_lines(transcript, [sent, {**sent, "timestamp": "2026-11-14T09:02:40Z"},
+                        {**typed, "timestamp": "2026-11-14T09:03:00Z"}])
+        guarded = self.hook()
+        self.assertIn("状況を確認して 報告してください。", guarded.stdout)
+        self.assertIn(prompt, guarded.stdout)
         self.assertEqual(self.hook().stdout, "")
 
     def test_guard_matches_a_reworded_question_by_its_cover_and_allows_an_unrelated_reused_header(self) -> None:

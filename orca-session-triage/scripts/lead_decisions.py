@@ -498,9 +498,11 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     history: dict[str, list[HandOff]] = {}
     for item in handed:
         history.setdefault(item.decision, []).append(item)
+    active = ask_state.active(state or {}, answered)
     keys = list(dict.fromkeys(decisions)) if decisions else list(dict.fromkeys([
-        *history, *(key for item in ask_state.active(state or {}, answered) for key in item["keys"] if key)]))
+        *history, *(key for item in active for key in item["keys"] if key)]))
     asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    ask_entries = list(asks.values())
     settled = []
     last = {}
     for key in keys:
@@ -508,6 +510,16 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         answer = (answered[key].view() if key in answered else
                   next((found for entry in reversed(history.get(key, []))
                         if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
+        if answer is None:
+            ref = ask_state.reference(key, ask_entries)
+            refs = [ref] if ref else list(dict.fromkeys(
+                ref for question in active if key in question["keys"]
+                for ref in ask_state.references(question["record"], ask_entries)))
+            parts = [ask_answer(ask_id, answers, asks)
+                     for ask, numbers in refs
+                     for ask_id in ([f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask])]
+            if parts and all(part is not None and genuine_answer(part) for part in parts):
+                answer = parts[0] if len(parts) == 1 else {"answers": parts}
         delivered = answer is not None and (key in answered or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})

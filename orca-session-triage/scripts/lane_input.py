@@ -38,11 +38,12 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
                  handles: dict[str, str]) -> tuple[set[str], list[tuple[str, datetime]]]:
     lane, handle, repo = ask.get("worktree"), ask.get("handle"), ask.get("repo")
     suffix = Path(lane).parts if lane else ()
-    chosen = [pane for pane in panes if handle and handles.get(pane) == handle] or [
-        pane for pane, entry in panes.items()
-        if suffix and (parts := Path((entry.get("worktreeId") or "").split("::", 1)[-1]).parts)[-len(suffix):] == suffix
-        and (not repo or repo in parts)]
-    if len(chosen) != 1:
+    chosen = [pane for pane, terminal in handles.items() if terminal == handle]
+    if not chosen:
+        chosen = [pane for pane, entry in panes.items()
+                  if suffix and (parts := Path((entry.get("worktreeId") or "").split("::", 1)[-1]).parts)[-len(suffix):] == suffix
+                  and (not repo or repo in parts)]
+    if len(chosen) != 1 or chosen[0] not in panes:
         return set(), []
     pane = chosen[0]
     path = (panes[pane].get("providerSession") or {}).get("transcriptPath")
@@ -58,7 +59,7 @@ def lane_prompts(ask: dict[str, Any], after: datetime, panes: dict[str, dict[str
     return targets, prompts
 
 
-def latest(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, tuple[str, datetime]]:
+def direct_prompts(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, list[tuple[str, datetime]]]:
     host = os.environ.get("TRIAGE_HOST") or socket.gethostname()
     local = {ask_id: (ask, at) for ask_id, ask in asks.items()
              if ask.get("host") == host and (at := inbox_read.asked_at(ask))}
@@ -95,10 +96,15 @@ def latest(asks: dict[str, dict[str, Any]], orca: str) -> dict[str, tuple[str, d
                     continue
                 sent = " ".join(text.split())
                 recipient = event.get("to") or event.get("lane")
-                for ask_id, (targets, prompts) in candidates.items():
+                stages = event.get("delivery")
+                queued = isinstance(stages, list) and "input_accepted" in stages and "turn_started" not in stages
+                for targets, prompts in candidates.values():
                     if isinstance(recipient, str) and recipient in targets:
-                        candidates[ask_id] = targets, [(prompt, at) for prompt, at in prompts
-                                                       if prompt != sent or abs(at - sent_at) > SENT_WITHIN]
+                        matches = [(abs(at - sent_at), index) for index, (prompt, at) in enumerate(prompts)
+                                   if prompt == sent and (abs(at - sent_at) <= SENT_WITHIN or queued and at > sent_at)]
+                        if matches:
+                            prompts.pop(min(matches)[1])
     except (OSError, RuntimeError):
         return {}
-    return {ask_id: max(prompts, key=lambda pair: pair[1]) for ask_id, (_, prompts) in candidates.items() if prompts}
+    return {ask_id: sorted(prompts, key=lambda pair: pair[1])
+            for ask_id, (_, prompts) in candidates.items() if prompts}

@@ -131,7 +131,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
 
 def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], numbers: dict[str, set[int]],
                          state_dir: Path, orca: str) -> list[str]:
-    prompts = lane_input.latest(asks, orca)
+    prompts = lane_input.direct_prompts(asks, orca)
     if not prompts:
         return []
     path = state_dir / "ask-lane-input-shown.json"
@@ -142,18 +142,22 @@ def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], nu
                 shown = json.loads(path.read_text(encoding="utf-8"))
             except FileNotFoundError:
                 shown = {}
-            for ask_id, (prompt, at) in prompts.items():
-                times = shown.setdefault(ask_id, [])
-                if at.isoformat() in times:
+            for ask_id, inputs in prompts.items():
+                has_parts = bool(inbox_read.questions_of(asks[ask_id]))
+                refs = [f"{ask_id}:{number}" for number in sorted(numbers[ask_id])]
+                keys = refs or [f"{ask_id}:?" if has_parts else ask_id]
+                seen = [shown.setdefault(key, []) for key in keys]
+                new_inputs = [(prompt, at) for prompt, at in inputs if any(at.isoformat() not in times for times in seen)]
+                if not new_inputs:
                     continue
-                times.append(at.isoformat())
+                for times in seen:
+                    times.extend(at.isoformat() for _, at in new_inputs if at.isoformat() not in times)
                 questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
                 lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
-                ref = ",".join(f"{ask_id}:{number}" for number in sorted(numbers[ask_id]))
-                if not ref:
-                    ref = f"{ask_id}:<質問番号>" if inbox_read.questions_of(asks[ask_id]) else ask_id
-                reasons.append(f"{questions}（ask {ask_id}）の後、{at.astimezone():%m/%d %H:%M} に {lane} のタブへ"
-                               f"入力がありました:「{prompt[:80]}」。三浦さんの回答なら、伺わずに担当へ "
+                ref = ",".join(refs) or (f"{ask_id}:<質問番号>" if has_parts else ask_id)
+                excerpts = "、".join(f"{at.astimezone():%m/%d %H:%M}「{prompt[:80]}」" for prompt, at in new_inputs)
+                reasons.append(f"{questions}（ask {ask_id}）の後、{lane} のタブに入力がありました（{excerpts}）。"
+                               "三浦さんの回答なら、伺わずに担当へ "
                                f"`triage-notify --answered {ref} <答えの要約>` での記録を頼んでください。"
                                "複数の問いがある場合は、回答のあった番号だけを指定してください。"
                                "回答でなければ、同じ AskUserQuestion をもう一度呼ぶと通ります。")
@@ -206,9 +210,9 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
             ask_id, numbers = ref
             ask = next(entry for entry in entries if entry.get("id") == ask_id)
             if ask_state.covered(ref, list(answers), entries):
+                part_ids = {f"{ask_id}:{number}" for number in numbers}
                 times = [record.get("ts") or "時刻不明" for key, record in answers.items()
-                         if key == ask_id or key.startswith(ask_id + ":")
-                         and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
+                         if key == ask_id or key in part_ids or (not numbers and key.startswith(ask_id + ":"))]
                 reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
             else:
                 uncovered[ask_id] = ask
