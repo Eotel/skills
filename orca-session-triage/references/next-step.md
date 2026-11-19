@@ -52,6 +52,10 @@ Read the row's `git`, `pr`, Orca comment, and latest message, then propose:
 
 ## Recovering a stopped lane
 
+For `stop.kind: interrupted`, check whether the original instruction still
+stands before sending a continuation. Stall Watch suppresses the signal once
+it sees a newer Codex turn or a send to the interrupted tab.
+
 Recover a lane that stopped mid-work by what stopped it. `stall_watch.py`
 names the step in each signal's 「立て直し」:
 

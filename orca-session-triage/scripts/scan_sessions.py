@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from functools import cache, partial
 from itertools import dropwhile, takewhile
+import fcntl
 import hashlib
 import http.client
 import json
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -62,6 +63,7 @@ BARE_PROMPTS = ("❯", "➜", "✗", "$", "%")
 Screens = dict[tuple[str | None, str], dict]
 HOURLY_STATE = Path("~/.cache/orca-session-triage/hourly-state.json")
 LEAD_DECISIONS = Path("~/.cache/orca-session-triage/lead-decisions.jsonl")
+CODEX_INTERRUPTIONS = Path("~/.cache/orca-session-triage/codex-interruptions.json")
 
 
 class PromptWaiting(TypedDict):
@@ -502,12 +504,18 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
     last_assistant = last_assistant_at = api_error = api_error_at = None
+    interrupted_at = turn_started_at = None
     for row in load_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
         cwd = cwd or payload.get("cwd")
         kind = payload.get("type")
+        if row.get("type") == "event_msg":
+            if kind == "turn_aborted" and payload.get("reason") == "interrupted":
+                interrupted_at = row.get("timestamp")
+            elif kind in ("task_started", "turn_started"):
+                turn_started_at = row.get("timestamp")
         if row.get("type") == "event_msg" and kind in ("error", "stream_error"):
             message = payload.get("message") or payload.get("error")
             if isinstance(message, str) and API_FAILURE.search(message):
@@ -552,6 +560,8 @@ def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
         "last_role": last_role,
         "api_error": api_error,
         **({"api_error_at": api_error_at} if api_error_at else {}),
+        **({"interrupted_at": interrupted_at} if interrupted_at else {}),
+        **({"turn_started_at": turn_started_at} if turn_started_at else {}),
         "pending_requests": pending,
     }
 
@@ -772,11 +782,19 @@ class StopReason(TypedDict):
     resets: str | None
     tab: NotRequired[str]
     stopped_at: NotRequired[str]
+    stopped_by: NotRequired[Literal["rollout", "agent_state"]]
+    rollout: NotRequired[str]
+    turn_key: NotRequired[str]
+    screen_turn: NotRequired[str]
+    screen_marks: NotRequired[int]
 
 
-def codex_moved_since(row: Mapping, stopped_at: datetime) -> bool:
+def codex_moved_since(row: Mapping, stopped_at: datetime, resume_rollout: str | None) -> bool:
+    if not resume_rollout:
+        return False
     return any(at > stopped_at for rollout in row.get("codex") or []
-               for key in ("last_user_at", "last_assistant_at", "api_error_at")
+               if rollout.get("rollout") == resume_rollout
+               for key in ("last_user_at", "last_assistant_at", "api_error_at", "turn_started_at")
                if (at := parse_time(rollout.get(key))))
 
 
@@ -785,11 +803,15 @@ def stop_reason(row: dict) -> StopReason | None:
     expired login a person has to renew, a full context window a new lane with a smaller scope gets past, or
     another error a person reads (a safeguard flag, an invalid request), which waking would only repeat. Claude Code tags its error message (`server_error`, `rate_limit`,
     `authentication_failed`, `invalid_request`); Codex and Orca's copy are read by their text."""
-    interruption = row.get("codex_interruption")
-    if interruption and not row.get("prompt_waiting") and not row.get("screen_progress"):
-        at = parse_time(interruption["stopped_at"])
-        if at and not codex_moved_since(row, at):
+    waiting_tab = (row.get("prompt_waiting") or {}).get("tab")
+    for interruption in row.get("codex_interruptions", ()):
+        if (interruption.get("tab") != waiting_tab and (at := parse_time(interruption["stopped_at"]))
+                and not codex_moved_since(row, at, interruption.get("rollout"))):
             return interruption
+    return api_stop_reason(row)
+
+
+def api_stop_reason(row: dict) -> StopReason | None:
     if not (found := failure(row)):
         return None
     error, agent, tab = found
@@ -1029,6 +1051,31 @@ def last_codex_activity(lines: list[str]) -> str | None:
     return next((line for raw in reversed(lines) if (line := raw.strip())
                  and (line.startswith(CODEX_REPLY) or CODEX_TURN_END.fullmatch(line)
                       or CODEX_INTERRUPTED.match(line) or api_failure(line))), None)
+
+
+def current_interruption(screen: dict) -> tuple[str, str, int] | None:
+    lines = [line.strip() for line in screen_lines(screen)]
+    positions = [i for i, line in enumerate(lines) if CODEX_INTERRUPTED.match(line)]
+    if not positions:
+        return None
+    position = positions[-1]
+    later = lines[position + 1:]
+    prompts = [line for line in later if line == "›" or line.startswith(CODEX_PROMPT)]
+    if len(prompts) > 1 or any(CODEX_TURN_END.fullmatch(line) or api_failure(line)
+                               or (line.startswith(CODEX_REPLY) and not line.startswith("• Feedback uploaded."))
+                               for line in later):
+        return None
+    previous = positions[-2] if len(positions) > 1 else -1
+    prompt = next((line for line in reversed(lines[previous + 1:position]) if line.startswith(CODEX_PROMPT)), "")
+    turn = hashlib.sha256(prompt.encode()).hexdigest() if prompt else ""
+    return lines[position], turn, len(positions)
+
+
+def changed_interruption(seen: tuple[str, str, int], previous: Mapping) -> bool:
+    _, prompt, count = seen
+    old_prompt = previous.get("screen_turn", "")
+    return bool(prompt and (count > previous.get("screen_marks", 1)
+                            or old_prompt and prompt != old_prompt))
 
 
 def rendered(screen: dict | None) -> dict | None:
@@ -1391,7 +1438,7 @@ def resumed_after_error(row: dict, claude_screens: list[dict]) -> ResumedTurn | 
     Claude tab shows a later turn, and none shows the notice as its last word. A lane resumed in another account
     writes a transcript elsewhere, so the one read here still ends at the error. A connection error needs
     a later reply/tool call and a running status line; a limit also accepts a completed later turn."""
-    stop = stop_reason(row)
+    stop = api_stop_reason(row)
     if not (stop and stop["kind"] in ("usage_limit", "connection") and stop["agent"] == "claude"):
         return None
     later = [(line, screen) for screen in claude_screens if (line := turn_after_error(screen, stop["error"]))
@@ -1745,7 +1792,9 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                     mail: dict | None = None, screens: Screens | None = None,
                     live_transcripts: dict[str, list[Path]] | None = None,
                     processes: dict[str, list[WorktreeProcess]] | None = None,
-                    live_sessions: dict[str, list[dict]] | None = None) -> list[dict]:
+                    live_sessions: dict[str, list[dict]] | None = None,
+                    interruption_times: dict[str, StopReason] | None = None,
+                    interruption_observations: dict[str, str] | None = None) -> list[dict]:
     """Join Orca worktrees with their terminals and transcripts and classify each one.
 
     `judge(message)` returns Jev's verdict on the newest final message, a dict of
@@ -1762,6 +1811,8 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
     A repository's main checkout is read only while it hosts an agent (`main`).
     """
     screens = screens or {}
+    if interruption_times is None:
+        interruption_times = {}
     now = time.time() if now is None else now
     worktrees, terminals = one_per_path(worktrees, terminals)
     by_worktree = {}
@@ -1818,16 +1869,44 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
         interruptions: list[StopReason] = []
         for term in terms:
             handle = term.get("handle")
-            activity = codex_activity.get(handle)
-            if not handle or not activity or not CODEX_INTERRUPTED.match(activity) or handle in approval_tabs:
+            frame = rendered(screens.get((w.get("_environment"), handle)))
+            if not handle or not frame or handle not in codex_activity:
+                continue
+            key = json.dumps([w.get("_environment"), handle])
+            if interruption_observations is not None:
+                interruption_observations[key] = frame.get("_observed_at") or scanned_at
+            interruption = current_interruption(frame)
+            if not interruption or handle in approval_tabs:
+                interruption_times.pop(key, None)
                 continue
             agent = agents_by_pane.get(hourly_runtime.pane_key(term)) or {}
-            stopped_ms = ((agent.get("stateStartedAt") if agent.get("interrupted") else None)
-                          or term.get("lastOutputAt"))
-            if stopped_ms is not None:
-                stopped_at = datetime.fromtimestamp(stopped_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
-                interruptions.append({"kind": "interrupted", "action": "wake", "agent": "codex",
-                                      "error": activity, "resets": None, "tab": handle, "stopped_at": stopped_at})
+            state_at = iso_time(agent.get("stateStartedAt")) if agent.get("interrupted") else None
+            mtime = iso_time(term.get("lastOutputAt")) or scanned_at
+            error, screen_turn, screen_marks = interruption
+            previous = interruption_times.get(key)
+            if previous:
+                last_stop = parse_time(previous["stopped_at"])
+                event_time = parse_time(state_at)
+                new_state = event_time is not None and last_stop is not None and event_time > last_stop
+                old_prompt = previous.get("screen_turn", "")
+                old_marks = previous.get("screen_marks", 1)
+                changed = changed_interruption(interruption, previous)
+                if not (new_state or changed):
+                    if screen_turn and not old_prompt:
+                        previous["screen_turn"] = screen_turn
+                    previous["screen_marks"] = max(old_marks, screen_marks)
+                    interruptions.append(previous)
+                    continue
+                if not new_state:
+                    state_at = None
+                    if changed:
+                        mtime = frame.get("_observed_at") or mtime
+            stopped_at = state_at or mtime
+            stop: StopReason = {"kind": "interrupted", "action": "wake", "agent": "codex",
+                                "error": error, "resets": None, "tab": handle, "stopped_at": stopped_at,
+                                "stopped_by": "agent_state", "screen_turn": screen_turn, "screen_marks": screen_marks}
+            interruption_times[key] = stop
+            interruptions.append(stop)
         screen_error: tuple[str | None, str | None] = (None, None)
         for term in terms:
             handle = term.get("handle")
@@ -1872,7 +1951,7 @@ def build_inventory(worktrees: list[dict], terminals: list[dict], claude_root: s
                            "title": t.get("title")} for t in terms],
             "codex_screen_error": screen_error[0],
             "codex_screen_error_tab": screen_error[1],
-            **({"codex_interruption": max(interruptions, key=lambda stop: stop["stopped_at"])}
+            **({"codex_interruptions": sorted(interruptions, key=lambda stop: stop["stopped_at"], reverse=True)}
                if interruptions else {}),
             **({"pane_errors": pane_errors} if pane_errors else {}),
             "done_cards": done_cards(w.get("agents") or [], terms, screens, w.get("_environment")),
@@ -3198,6 +3277,35 @@ def write_json_atomically(path: Path, data: object) -> None:
         raise
 
 
+def save_interruption_times(path: Path, observed: Mapping[str, str], stops: dict[str, StopReason]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stored = read_json_file(path)
+        current = stored if isinstance(stored, dict) else {}
+        oldest = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        for key, observed_at in observed.items():
+            entry = current.get(key, {})
+            observed_before = entry.get("observed_at", "")
+            stop = stops.get(key)
+            saved = entry.get("stop")
+            if observed_at <= observed_before:
+                if saved is None:
+                    stops.pop(key, None)
+                else:
+                    stops[key] = saved
+                continue
+            if stop and observed_before:
+                stopped_at = parse_time(stop["stopped_at"])
+                if saved and stopped_at and (saved_at := parse_time(saved["stopped_at"])) and stopped_at < saved_at:
+                    stop["stopped_at"] = saved["stopped_at"]
+                elif not saved and stopped_at and (cleared_at := parse_time(observed_before)) and stopped_at <= cleared_at:
+                    stop["stopped_at"] = observed_at
+            current[key] = {"observed_at": observed_at, "stop": stop}
+        write_json_atomically(path, {key: entry for key, entry in current.items()
+                                     if entry.get("stop") or entry.get("observed_at", "") >= oldest})
+
+
 def load_verdicts(store_path: str | Path) -> dict[str, dict]:
     """The verdict store as a dict; a damaged one is moved aside to `<name>.bad`, never overwritten."""
     store = Path(store_path).expanduser()
@@ -4147,13 +4255,37 @@ def main(argv: list[str] | None = None) -> int:
               if t.get("handle") and not t.get("_environment") and t.get("worktreeId") in local},
         session_details=live_sessions)
     verdicts = absorb_verdicts(args.verdicts, write=bool(args.review_out))
+    interruption_path = CODEX_INTERRUPTIONS.expanduser()
+    cached_times = read_json_file(interruption_path) if screens else None
+    interruption_times: dict[str, StopReason] = {}
+    if isinstance(cached_times, dict):
+        interruption_times = {key: cast(StopReason, dict(stop)) for key, entry in cached_times.items()
+                              if isinstance(entry, dict) and (stop := entry.get("stop"))
+                              and isinstance(stop.get("stopped_at"), str)}
+    interruption_observations: dict[str, str] = {}
     rows = add_next_step_facts(build_inventory(worktrees, terminals, claude_root,
                                                codex, args.decision_marker,
                                                shell_idle_minutes=args.shell_idle_minutes, judge=judge,
                                                mail=read_mail(args), screens=screens, live_transcripts=live,
-                                               processes=processes, live_sessions=live_sessions),
+                                               processes=processes, live_sessions=live_sessions,
+                                               interruption_times=interruption_times,
+                                               interruption_observations=interruption_observations),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
                                verdicts=verdicts, proposals=ledger_proposals)
+    if interruption_observations:
+        save_interruption_times(interruption_path, interruption_observations, interruption_times)
+        for row in rows:
+            tabs = [json.dumps([row.get("environment"), tab["handle"]]) for tab in row["terminals"]]
+            if not any(key in interruption_observations for key in tabs):
+                continue
+            current = [interruption_times[key] for key in tabs
+                       if key in interruption_times and key in interruption_observations]
+            previous = row.pop("codex_interruptions", None)
+            if current:
+                row["codex_interruptions"] = sorted(current, key=lambda stop: stop["stopped_at"], reverse=True)
+            if previous or current:
+                row["stop"] = stop_reason(row)
+                row["class"], row["reasons"] = classify(row, args.decision_marker)
     if not args.ps_json:
         with_codex_permission_reasons(rows)
     if down := reach.down():
@@ -4176,7 +4308,7 @@ def main(argv: list[str] | None = None) -> int:
     return print_rows(args, rows, verdicts)
 
 
-WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 同じ作業を再開する",
+WAKE_ACTIONS = {"connection": "通信断: 起こす", "interrupted": "中断: 再開してよいか確認する",
                 "login": "ログイン切れ: 人が /login する",
                 "context_limit": "文脈の上限: 範囲を小さくして新しい担当に渡す", "other": "その他: 人が読む"}
 
