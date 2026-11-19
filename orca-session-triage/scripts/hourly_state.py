@@ -1025,8 +1025,7 @@ def reuse_question_rows(data: dict, askings: list[Asking], rows: list[dict]) -> 
             old = item["row"]
             scoped = same_environment_rows(rows, old)
             matches = scan_sessions.matching_rows(scoped, old)
-            if any(scan_sessions.row_identity(row) == asking.row for row in matches):
-                scan_sessions.select_row(scoped, old)
+            if len(matches) == 1 and scan_sessions.row_identity(matches[0]) == asking.row:
                 item["row"] = asking.row
                 item["row_alias"] = old
                 break

@@ -6730,6 +6730,28 @@ class HourlyStateTests(unittest.TestCase):
         result, answer = self.call("answered", "--decision", "publish", "--answer-file", message)
         self.assertEqual((result, answer["id"]), (0, old_id))
 
+    def test_an_ambiguous_old_alias_does_not_block_either_asked_path(self) -> None:
+        message = self.source("message.txt", "Ready.")
+        args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
+        _, original = self.call("asked", "--row", "lane", *args)
+        self.call("answered", "--id", original["id"], "--answer-file", message)
+        previous = self.state.read_bytes()
+        saved = self.source("scan.json", json.dumps([{"path": f"/w/{repo}/lane", "repo": repo}
+                                                    for repo in ("app", "other")]))
+        batch = self.source("asked.jsonl", json.dumps({"row": "/w/app/lane", "decision": "publish",
+                                                        "final_message": "Ready.", "question": "Ready."}))
+        for command in (("asked", "--row", "/w/app/lane", "--from", saved, *args),
+                        ("asked-many", "--from", saved, "--file", batch, "--no-comment")):
+            with self.subTest(command=command[0]):
+                self.state.write_bytes(previous)
+                code, result = self.call(*command)
+                self.assertEqual(code, 0)
+                asked = result[0] if isinstance(result, list) else result
+                self.assertNotEqual(asked["id"], original["id"])
+                self.assertEqual((asked["row"], asked["answer"]), ("/w/app/lane", None))
+                stored = self.call("get", original["id"])[1]
+                self.assertEqual((stored["row"], stored["answer"]), ("lane", "Ready."))
+
     def test_a_remote_scan_never_moves_an_existing_local_question(self) -> None:
         message = self.source("message.txt", "Ready.")
         args = ("--decision", "publish", "--no-comment", "--final-message-file", message, "--question-file", message)
@@ -6755,6 +6777,7 @@ class HourlyStateTests(unittest.TestCase):
         batch = self.source("asked.jsonl", json.dumps({"row": "/second", "decision": "publish",
                                                         "final_message": "Ready.", "question": "Ready."}))
         _, recorded = self.call("asked-many", "--from", saved, "--file", batch, "--no-comment")
+        self.assertEqual(recorded[0]["row"], "/w/second")
         message = self.source("message.txt", "Ready.")
         _, asked = self.call("asked", "--row", "/second", "--decision", "publish", "--from", saved, "--no-comment",
                              "--final-message-file", message, "--question-file", message)
