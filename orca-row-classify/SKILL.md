@@ -36,10 +36,10 @@ judge each row from its own facts.
 - `pr`: the worktree's PR as GitHub reports it now (`state` OPEN / MERGED /
   CLOSED, `review`, `latest_human_activity` from a person other than the PR author,
   `requested` reviewers, `checks`), or null.
-- `git`: `dirty` (uncommitted paths) and `unpushed` (commits ahead of the
-  branch's upstream). Both are unknown on a remote Mac until its checkout is
-  inspected there. An open PR whose head matches HEAD has that commit even if
-  `unpushed` is positive because the branch tracks the PR's base.
+- `git`: `dirty` counts uncommitted paths and `unpushed` counts commits absent
+  from every remote-tracking ref. Both are unknown on a remote Mac until its
+  checkout is inspected there. Matching a PR head proves HEAD reached that PR
+  even if the local remote-tracking refs have not been fetched.
 - `reasons`, `jev`: why the scan could not settle the row.
 - `prompt_waiting`: a permission question the tab's screen shows now (`tab`,
   `question`, `choices`), or null.

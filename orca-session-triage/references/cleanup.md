@@ -10,8 +10,8 @@ comment contains 「消さない」 or 「残す」: its reasons quote the comme
 A HEAD commit or review-pr log (`~/.cache/orca-briefs/review/out/<owner>-<repo>-<PR>.log`) under
 thirty minutes old also keeps it, with the reason 「別の担当が使用中（時刻）」: another lane works there
 without an agent in its tabs.
-HEAD matching the PR head proves it was pushed to that PR; `git.unpushed` may
-still be positive when the branch tracks the PR's base. Remove these checkouts after `rm_check.py` clears
+HEAD matching the PR head proves it was pushed to that PR even when local
+remote-tracking refs are stale. Remove these checkouts after `rm_check.py` clears
 them, even when their class is `waiting` or a readable shell tab remains. Relay
 any pending question or result before removal; the removal itself needs no
 question. For a remote row, check the current agent, HEAD, PR head, and local
@@ -62,7 +62,8 @@ words give (`removal_decision` shows `after` and `after_state`). With `--discard
 words give. `rm-check-batch --from SCAN_JSON --remove-ok` closes the scanned tabs, runs the recorded cleanup,
 verifies any requested archives, and checks again before removal. Run that cleanup on the worktree's Mac.
 Use `--approve` for an explicit approval without conditions or cleanup. If an answer has no structured values,
-the scan reads its text and prints a command to record an explicit approval when the text is insufficient.
+the scan reads its text. For a short closure instruction such as `閉じる。` or `close it`, it prints a command to
+record an explicit approval. A live summary asks for a saved scan before displaying a removal command.
 
 When the latest answers under different removal keys share a timestamp, keep the worktree
 unless every answer approves removal and specifies the same archive, discard, and Compose cleanup.

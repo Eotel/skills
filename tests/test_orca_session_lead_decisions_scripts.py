@@ -41,7 +41,7 @@ class LeadDecisionsTests(unittest.TestCase):
         result = self.run_tool("record-many", stdin=json.dumps(archives) + "\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)[0]["removal"]["archive_path"], [".notes", "logs/data"])
-        for path in ("../outside", ".git/index"):
+        for path in ("../outside", ".git/index", "vendor/clone/.GIT/index"):
             rejected = self.run_tool("record-many", stdin=json.dumps({**archives, "archive_path": [path]}) + "\n")
             self.assertNotEqual(rejected.returncode, 0)
 
