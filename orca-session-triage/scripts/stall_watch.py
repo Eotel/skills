@@ -899,7 +899,7 @@ def refreshed(rows: list[dict], now: datetime) -> list[dict]:
     live = scan.running_claude_transcripts(paths, scan.claude_session_dirs(), projects, scan.process_table(),
                                            scan.process_cwds)
     codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS),
-                            (now - CODEX_SINCE).timestamp())
+                            (now - CODEX_SINCE).timestamp(), worktree_paths=set(paths))
     jobs = scan.worktree_processes(paths, CPU_FILE, now.timestamp())
     def interruptions(row: dict) -> list[dict]:
         if candidates := row.get("codex_interruptions"):
@@ -1046,7 +1046,8 @@ def last_activity(paths: Sequence[str], now: datetime) -> dict[str, Activity]:
     projects = HOME / ".claude/projects"
     live = scan.running_claude_transcripts(paths, scan.claude_session_dirs(), projects, scan.process_table(),
                                            scan.process_cwds)
-    codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS), (now - CODEX_SINCE).timestamp())
+    codex = scan.read_codex(scan.expand_roots(scan.DEFAULT_CODEX_SESSIONS),
+                            (now - CODEX_SINCE).timestamp(), worktree_paths=set(paths))
     transcripts = {path: scan.newest_claude_transcript(projects, path, live.get(path, [])) for path in paths}
     return {path: activity({"path": path, "claude": {"transcript": str(found)} if (found := transcripts[path]) else None,
                             "codex": codex.get(path, [])}, records, live=True) for path in paths}

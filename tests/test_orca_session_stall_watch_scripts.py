@@ -370,6 +370,28 @@ class BusyWithoutProgressTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_refresh_reads_only_rollouts_for_the_worktrees_under_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("active", "unrelated"):
+                rollout = root / f"rollout-{name}.jsonl"
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": row(name)["path"]}}) + "\n")
+                with rollout.open("ab") as handle:
+                    if name == "active":
+                        message = {"type": "message", "role": "assistant", "content": [{"text": "Done."}]}
+                        handle.write((json.dumps({"payload": message}) + "\n").encode())
+                    else:
+                        handle.write(b" " * 16384 + b"\xff\n")
+                os.utime(rollout, (NOW.timestamp(), NOW.timestamp()))
+
+            with patch.object(stall, "HOME", root), patch.multiple(
+                stall.scan, running_claude_transcripts=lambda *args: {}, claude_session_dirs=lambda: [],
+                process_table=lambda: {}, expand_roots=lambda roots: [str(root)], worktree_processes=lambda *args: {},
+            ):
+                [fresh] = stall.refreshed([row("active")], NOW)
+
+        self.assertEqual([session["last_assistant"] for session in fresh["codex"]], ["Done."])
+
     def test_refresh_checks_the_remote_screen_before_signaling_an_interruption(self) -> None:
         lane = row("cut", environment="remote", stop={"kind": "interrupted", "tab": "term_cut"})
         screens = {("remote", "term_cut"): {"source": "screen", "tail": [
@@ -377,7 +399,7 @@ class RecoveryTests(unittest.TestCase):
         ]}}
         with patch.multiple(
             stall.scan, running_claude_transcripts=lambda *args: {}, claude_session_dirs=lambda: [],
-            process_table=lambda: {}, expand_roots=lambda roots: [], read_codex=lambda *args: {},
+            process_table=lambda: {}, expand_roots=lambda roots: [],
             worktree_processes=lambda *args: {}, read_screens=lambda *args: screens,
         ):
             [fresh] = stall.refreshed([lane], NOW)
@@ -420,7 +442,7 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(at=at), patch.multiple(
                 stall.scan, running_claude_transcripts=lambda *args: {}, read_claude=lambda *args: None,
                 claude_session_dirs=lambda: [], process_table=lambda: {}, expand_roots=lambda roots: [],
-                read_codex=lambda *args: {"/w/lane": [rollout]}, worktree_processes=lambda *args: {},
+                read_codex=lambda *args, **kwargs: {"/w/lane": [rollout]}, worktree_processes=lambda *args: {},
             ):
                 fresh, = stall.refreshed([row], NOW)
                 self.assertEqual((fresh["stop"] or {}).get("action"), stopped)
