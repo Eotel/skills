@@ -117,8 +117,7 @@ def find_claude_dir(projects_root: str | Path, worktree_path: str) -> Path:
     return exact
 
 
-def load_jsonl(path: str | Path) -> list[dict]:
-    rows = []
+def iter_jsonl(path: str | Path) -> Iterator[dict]:
     with Path(path).open(encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -126,8 +125,11 @@ def load_jsonl(path: str | Path) -> list[dict]:
             except json.JSONDecodeError:
                 continue
             if isinstance(row, dict):
-                rows.append(row)
-    return rows
+                yield row
+
+
+def load_jsonl(path: str | Path) -> list[dict]:
+    return list(iter_jsonl(path))
 
 
 def message_of(entry: dict) -> dict:
@@ -500,16 +502,19 @@ def api_failure(text: str | None) -> str | None:
     return None
 
 
-def summarize_rollout(path: str | Path) -> tuple[str | None, dict]:
+def summarize_rollout(path: str | Path, *, worktree_paths: set[str] | None = None) -> tuple[str | None, dict]:
     """Return (cwd, summary) for one Codex rollout file."""
     cwd, asks, outputs, last_user, last_role = None, {}, set(), None, None
     last_assistant = last_assistant_at = api_error = api_error_at = None
     interrupted_at = turn_started_at = None
-    for row in load_jsonl(path):
+    for row in iter_jsonl(path):
         payload = row.get("payload")
         if not isinstance(payload, dict):
             continue
-        cwd = cwd or payload.get("cwd")
+        if not cwd:
+            cwd = payload.get("cwd")
+            if cwd and worktree_paths is not None and cwd not in worktree_paths:
+                return None, {}
         kind = payload.get("type")
         if row.get("type") == "event_msg":
             if kind == "turn_aborted" and payload.get("reason") == "interrupted":
@@ -3418,17 +3423,20 @@ def with_verdicts(rows: list[dict], verdicts: dict[str, dict], *,
     return [marked(row) for row in rows]
 
 
-def read_codex(session_roots: Sequence[str | Path], since: float | None = None) -> dict[str, list[dict]]:
+def read_codex(session_roots: Sequence[str | Path], since: float | None = None, *,
+               worktree_paths: set[str] | None = None) -> dict[str, list[dict]]:
     """Group Codex rollout summaries by the cwd each session ran in.
 
-    Rollouts last modified before `since` (epoch seconds) are skipped.
+    Skip rollouts last modified before `since` (epoch seconds) or outside `worktree_paths`.
     """
+    if worktree_paths is not None and not worktree_paths:
+        return {}
     by_cwd = {}
     for root in session_roots:
         for path in sorted(Path(root).glob("**/rollout-*.jsonl")):
             if since is not None and path.stat().st_mtime < since:
                 continue
-            cwd, summary = summarize_rollout(path)
+            cwd, summary = summarize_rollout(path, worktree_paths=worktree_paths)
             if cwd:
                 by_cwd.setdefault(cwd, []).append(summary)
     return by_cwd
@@ -4279,7 +4287,8 @@ def main(argv: list[str] | None = None) -> int:
         ids = {(w.get("_environment"), w.get("worktreeId")) for w in worktrees}
         terminals = [t for t in terminals if (t.get("_environment"), t.get("worktreeId")) in ids]
     since = time.time() - args.since_hours * 3600 if args.since_hours else None
-    codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since)
+    codex = read_codex(expand_roots(args.codex_sessions or DEFAULT_CODEX_SESSIONS), since,
+                       worktree_paths={w["path"] for w in worktrees if not w.get("_environment")})
     key = jev_key(os.environ, args.jev_key_file)
     if key is None:
         print(f"TYPESAFE_API_KEY is unset and {args.jev_key_file} is missing or unreadable: "
