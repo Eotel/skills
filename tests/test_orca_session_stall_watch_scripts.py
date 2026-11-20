@@ -585,6 +585,34 @@ class RunTests(unittest.TestCase):
                          {("answer_undelivered", "open", asks[0]["id"], ("term_left",)),
                           ("idle_after_report", "open", asks[0]["id"], ("term_left",))})
 
+    def test_tool_notifications_do_not_count_as_lane_reports(self) -> None:
+        briefs = self.dir / ".cache" / "orca-briefs"
+        reported_at = (NOW - timedelta(hours=3)).isoformat()
+        self.scan.write_text(json.dumps([
+            row("orca-briefs", path=str(briefs), repo="orca-briefs"),
+            row("worker"),
+        ]))
+        self.inbox.write_text("".join(json.dumps(item) + "\n" for item in (
+            {"id": "tool-info", "kind": "info", "ts": reported_at, "repo": ".cache",
+             "worktree": "orca-briefs", "handle": "", "text": "指示書の受理は未確認"},
+            {"id": "queue-info", "kind": "info", "ts": reported_at, "repo": ".cache",
+             "worktree": "orca-briefs", "handle": "term_launcher", "text": "【順番待ちの起動結果】"},
+            {"id": "tool-ask", "kind": "ask", "ts": reported_at, "repo": ".cache",
+             "worktree": "orca-briefs", "handle": "", "text": "【指示書・選択が必要】"},
+            {"id": "worker-info", "kind": "info", "ts": reported_at, "repo": "app",
+             "worktree": "worker", "handle": "", "text": "確認中です。"},
+        )))
+        (self.dir / "answers.jsonl").write_text(json.dumps({
+            "id": "tool-ask", "ts": (NOW - timedelta(hours=2)).isoformat(), "how": "inbox_read.py answered",
+        }) + "\n")
+
+        with patch.object(stall, "BRIEFS", briefs):
+            self.assertEqual(self.run_watch(NOW), 0)
+
+        checks = json.loads((self.dir / "work-checks.json").read_text())
+        self.assertEqual([(item["work"], item["signal"]) for item in checks],
+                         [("app/worker", "idle_after_report")])
+
     def test_a_lane_woken_after_two_earlier_signals_is_replanned_on_the_third(self) -> None:
         (self.dir / "work-checks.json").write_text(json.dumps([
             {"work": "app/answer-left", "signal": "idle_after_report", "fingerprint": f"earlier-{number}",
