@@ -181,6 +181,7 @@ class CommitmentRoutingTests(unittest.TestCase):
             "TRIAGE_INBOX": str(self.root / "triage-inbox.jsonl"),
             "TRIAGE_ASK_ANSWERS": str(self.root / "ask-answers.jsonl"),
             "TRIAGE_ASK_CLAIMS": str(self.root / "ask-claims.jsonl"),
+            "TRIAGE_HOURLY_STATE": str(self.root / "hourly-state.json"),
         })
         environment.start()
         self.addCleanup(environment.stop)
@@ -440,6 +441,35 @@ def hold_rows(path: Path) -> list[dict]:
         self.assertFalse((self.root / "hourly-state.json").exists())
         self.assertFalse((self.root / "ask-answers.jsonl").exists())
         self.assertFalse((self.root / "ask-claims.jsonl").exists())
+
+    def test_presented_retries_a_sqlite_write_lock_and_names_the_key_on_failure(self) -> None:
+        self.install_component()
+        component = self.bin / "orca_board_commitments.py"
+        component.write_text(component.read_text().replace(
+            "    before = path.read_bytes()", """    import sqlite3
+    from contextlib import closing
+    try:
+        with closing(sqlite3.connect(path.with_suffix('.db'), timeout=0)) as db:
+            db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as error:
+        raise CommitmentWriteError(str(error)) from error
+    before = path.read_bytes()"""))
+        state = self.root / "hourly-state.json"
+        question = self.root / "question.txt"
+        question.write_text("いつ実施しますか？")
+        args = ["--state-file", str(state), "presented", "--key", "merge:owner/repo#42",
+                "--text-file", str(question), "--since", "2026-11-19T00:00:00Z"]
+        with closing(sqlite3.connect(state.with_suffix(".db"))) as db:
+            db.execute("BEGIN IMMEDIATE")
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err, \
+                    patch("time.sleep"):
+                self.assertEqual(hourly_state.main(args), 1)
+            self.assertIn("database is locked", err.getvalue())
+            self.assertIn("merge:owner/repo#42", err.getvalue())
+            self.assertFalse(state.exists())
+            with redirect_stdout(io.StringIO()), patch("time.sleep", side_effect=lambda _: db.rollback()):
+                self.assertEqual(hourly_state.main(args), 0)
+        self.assertIn("merge:owner/repo#42", hourly_state.read(state)["presented"])
 
     def test_db_only_claim_conflict_is_checked_against_mirror(self) -> None:
         self.install_component()
@@ -2254,6 +2284,28 @@ class JevTests(unittest.TestCase):
 
 
 class NextStepFactTests(unittest.TestCase):
+    def test_pr_head_proof_survives_stale_refs_and_branch_aliases_and_precedes_origin_for_forks(self) -> None:
+        head = "a" * 40
+        rows: list[dict] = [{"path": f"/w/{name}", "repo": "app", "class": "stalled", "linked_pr": linked, "reasons": []}
+                for name, linked in (("pushed", None), ("alias", None), ("fork", {"number": 58}))]
+        gits = {row["path"]: {"branch": Path(row["path"]).name, "github": "acme/app",
+                              "head": head, "dirty": 0, "unpushed": 3} for row in rows}
+        gits["/w/pushed"]["fetch_error"] = "git fetch origin failed: denied"
+        gits["/w/fork"]["upstream"] = "upstream/app"
+        merged = {"number": 1153, "state": "MERGED", "head_oid": head}
+        fork_pr = {"number": 58, "state": "OPEN", "head_oid": head}
+
+        def prs(slug: str, refs: list) -> dict:
+            return {ref: ((fork_pr if slug == "upstream/app" else merged)
+                          if ref not in ("alias", 58) else {"number": 58, "state": "MERGED", "head_oid": "b" * 40}
+                          if ref == 58 else None) for ref in refs}
+
+        pushed, alias, fork = scan.add_next_step_facts(rows, git_lookup=gits.get, pr_lookup=prs)
+        self.assertEqual(pushed["git"]["unpushed"], 0)
+        self.assertIn("PR head と同じ", pushed["reasons"])
+        self.assertIn("git fetch origin failed: denied", pushed["reasons"])
+        self.assertEqual(scan.rm_spec(alias), "/w/alias 1153")
+        self.assertEqual(scan.rm_spec(fork), "/w/fork upstream/app#58")
     def test_graphql_retries_transient_failures_and_reports_stderr_when_exhausted(self) -> None:
         success = subprocess.CompletedProcess([], 0, '{"data":{"repository":{"name":"app"}}}', '')
         for failure in (subprocess.CompletedProcess([], 1, '', 'connection reset'),
@@ -5252,6 +5304,30 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(lookups[0][:5], ["gh", "pr", "list", "--head", "feature"])
         self.assertEqual((other_code, other["blockers"]), (1, ["HEAD %s is not in main" % head[:8]]))
 
+    def test_removal_uses_the_open_upstream_pr_at_head_instead_of_the_origin_number(self) -> None:
+        git(self.main, "remote", "add", "origin", "git@github.com:fork/app.git")
+        git(self.main, "remote", "add", "upstream", "git@github.com:upstream/app.git")
+        (self.wt / "app.txt").write_text("upstream PR\n")
+        git(self.wt, "commit", "-q", "-am", "change")
+        head = git(self.wt, "rev-parse", "HEAD")
+        run = subprocess.run
+
+        def commands(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["gh", "pr"]:
+                if "--repo" in cmd and cmd[cmd.index("--repo") + 1] == "upstream/app":
+                    payload = [{"number": 58, "state": "OPEN", "headRefOid": head, "baseRefName": "main"}]
+                else:
+                    payload = {"number": 58, "state": "MERGED", "headRefOid": "b" * 40}
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
+            return run(cmd, **kwargs)
+
+        with patch.object(rmcheck.subprocess, "run", side_effect=commands):
+            for args in ((), ("--pr", "58"), ("--pr", "upstream/app#58")):
+                with self.subTest(args=args):
+                    code, result = self.run_main(*args)
+                    self.assertEqual((code, result["ok"]), (0, True), result)
+                    self.assertIn("PR upstream/app#58 is OPEN at HEAD", result["notes"])
+
     def test_archive_scratch_moves_only_untracked_exec_plan_markdown_absent_from_a_merged_pr_base(self) -> None:
         plan = self.wt / "docs/exec-plans/active/remaining.md"
         plan.parent.mkdir(parents=True)
@@ -6556,14 +6632,19 @@ class RmCheckConfirmGoneTests(unittest.TestCase):
         self.dir = Path(tmp.name).resolve()
         self.removed = self.dir / "workspaces" / "fix-login"
 
-    def run_confirm(self, *rows: dict) -> tuple[int, dict]:
+    def run_confirm(self, *rows: dict, positional: bool = False) -> tuple[int, dict]:
         orca = self.dir / "orca"
         payload = {"ok": True, "result": {"worktrees": list(rows), "truncated": False}}
         orca.write_text(f"#!{sys.executable}\nprint({json.dumps(json.dumps(payload))})\n")
         orca.chmod(0o755)
         with redirect_stdout(io.StringIO()) as out:
-            code = rmcheck.main(["--worktree", str(self.removed), "--confirm-gone", "0", "--orca", str(orca)])
+            target = [str(self.removed)] if positional else ["--worktree", str(self.removed)]
+            code = rmcheck.main(["--confirm-gone", "0", *target, "--orca", str(orca)])
         return code, json.loads(out.getvalue())
+
+    def test_confirm_gone_accepts_the_positional_worktree(self) -> None:
+        code, result = self.run_confirm(positional=True)
+        self.assertEqual((code, result["worktree"], result["gone"]), (0, str(self.removed), True))
 
     def test_a_removed_worktree_named_only_in_another_rows_tab_output_is_gone(self) -> None:
         # 2026-10-29: matching the name anywhere in `orca worktree ps --json` called a removed worktree present.
@@ -7805,6 +7886,38 @@ class HourlyStateTests(unittest.TestCase):
         line = next(line for line in out.getvalue().splitlines() if "id=user:lane::prod-login" in line)
         self.assertIn(" | 解消の候補: info0001 info0001: 本番にログインして確かめました"
                       " | 解消の候補: done0001 done0001: 本番にログインして確かめました", line)
+
+    def test_presented_candidates_use_batched_pr_states_and_only_matching_transcript_answers(self) -> None:
+        projects = self.root / "projects"
+        saved = self.root / "scan.json"
+        saved.write_text("[]")
+        (self.root / "inbox.jsonl").write_text("")
+        latest = None
+        for key, question in (("merge:acme/app#11", "PR 11 をマージしますか？"),
+                              ("merge:acme/app#12", "PR 12 をマージしますか？"),
+                              ("user:decision", "公開日を変更しますか？"),
+                              ("user:unrelated", "公開日を延期しますか？")):
+            code, latest = self.call("presented", "--key", key,
+                "--text-file", self.source("item.txt", question), "--owner", "/w/lane",
+                "--since", "2026-11-19T00:00:00Z")
+            self.assertEqual(code, 0)
+        at = (datetime.fromisoformat(latest["presented_at"]) + timedelta(seconds=1)).isoformat()
+        transcript = projects / "-w-lane" / "conversation.jsonl"
+        write_jsonl(transcript, [{"timestamp": at, "toolUseResult": {
+            "answers": {"公開日を変更しますか？": "変更する"}, "questions": []}}])
+        states = {11: hourly_state.lead_decisions.PrState("MERGED", at), 12: hourly_state.lead_decisions.PrState("OPEN", at)}
+        for args in (["pending"], ["stale-asks", "--from", str(saved)]):
+            with patch.object(hourly_state.lead_decisions, "github_pr_states", return_value=states) as read:
+                code, result = self.call(*args, "--claude-projects", str(projects))
+            self.assertEqual(code, 0)
+            read.assert_called_once_with("acme/app", [11, 12])
+            items = result["presented"] if isinstance(result, dict) else result
+            kept = {item["id"]: item for item in items}
+            self.assertIn("merge:acme/app#11", kept["merge:acme/app#11"]["close_command"])
+            self.assertEqual(kept["merge:acme/app#11"]["resolution_candidates"][0]["state"], "MERGED")
+            self.assertEqual(kept["user:decision"]["resolution_candidates"][0]["text"], "変更する")
+            self.assertFalse(kept["merge:acme/app#12"].get("resolution_candidates"))
+            self.assertFalse(kept["user:unrelated"].get("resolution_candidates"))
 
     def test_stale_asks_marks_an_ask_the_lead_spoke_past_without_its_transcripts_naming_it(self) -> None:
         saved = self.root / "scan.json"
@@ -9348,7 +9461,8 @@ class HourlyTabCleanupTests(unittest.TestCase):
     def test_detached_scheduled_tabs_match_recorded_panes_and_transcripts(self) -> None:
         for run_pane, run_status in (("old:leaf", "completed"), (None, "completed"),
                                      ("old:leaf", "dispatch_failed"), (None, "dispatch_failed")):
-            for final in ("作業を終えました。", "どちらの案にしますか？"):
+            for final in ("作業を終えました。", "どちらの案にしますか？",
+                          "差分を確認しました。\n\n進めるかどうかは三浦さんに決めていただく必要があります。"):
                 with self.subTest(run_pane=run_pane, final=final), tempfile.TemporaryDirectory() as root:
                     home = Path(root)
                     transcript = home / "profile/projects/-w-triage/session-1.jsonl"
@@ -9402,8 +9516,12 @@ class HourlyTabCleanupTests(unittest.TestCase):
                     self.assertEqual(closed, [
                         ["test-orca", "terminal", "close", "--terminal", "old-handle", "--json"]])
                     lines = out.getvalue().splitlines()
-                    carried = ["carry: old-handle: 2026-10-26T09:02:00Z [前日以前]: どちらの案にしますか？"] if "？" in final else []
+                    ending = final.rsplit("\n\n", 1)[-1]
+                    carried = [f"carry: old-handle: 2026-10-26T09:02:00Z [前日以前]: {ending}"] if final != "作業を終えました。" else []
                     self.assertEqual(lines[:len(carried)], carried)
+                    if carried:
+                        [presented] = hourly_state.read(home / "state.json")["presented"].values()
+                        self.assertEqual(presented["text"], ending)
                     self.assertIn("closed: old-handle", lines[len(carried)])
                     self.assertIn(f"run {run_status}", lines[len(carried)])
                     due = datetime.fromtimestamp(1793005140).strftime("%m/%d %H:%M")
@@ -9685,9 +9803,63 @@ class InboxReadTests(unittest.TestCase):
         answers = tempfile.TemporaryDirectory()
         self.addCleanup(answers.cleanup)
         external = patch.dict(os.environ, {"ORCA_CLI_COMMAND": "missing-orca-for-offline-tests", "ORCA_PANE_KEY": "",
-                                           "TRIAGE_ASK_ANSWERS": str(Path(answers.name) / "answers.jsonl")})
+                                           "TRIAGE_ASK_ANSWERS": str(Path(answers.name) / "answers.jsonl"),
+                                           "TRIAGE_HOURLY_STATE": str(Path(answers.name) / "hourly-state.json")})
         external.start()
         self.addCleanup(external.stop)
+
+    def test_claim_refuses_when_the_lead_already_sent_to_the_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            inbox, state, events, claims = (base / name for name in ("inbox", "state.json", "events", "claims"))
+            at = "2026-11-20T10:07:00+09:00"
+            write_jsonl(inbox, [{"id": "aaaabbbb", "kind": "ask", "worktree": "lane", "handle": "term_lane"}])
+            state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+                                         "lead": {"worktree": "/w/lead", "appointed_at": at}}))
+            write_jsonl(events, [{"type": "send", "source": "send", "worktree": "lead", "from": "term_lead",
+                                  "to": "term_lane", "ts": at, "text": "A の修正を進めてください"}])
+
+            def orca(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                data = ({"worktrees": [{"path": "/w/lead", "worktreeId": "repo::/w/lead"}]}
+                        if command[1:3] == ["worktree", "ps"] else {"terminals": []})
+                return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "result": data}), "")
+
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_HOURLY_STATE": str(state),
+                                         "TRIAGE_ASK_CLAIMS": str(claims), "ORCA_BOARD_EVENTS": str(events),
+                                         "CLAUDE_CONFIG_DIR": str(base)}), \
+                    patch.object(hourly_state, "DEFAULT_STATE", str(state)), patch("subprocess.run", side_effect=orca), \
+                    redirect_stderr(io.StringIO()) as err:
+                code = inbox_read.main(["claim", "aaaabbbb", "--by", "/w/hourly",
+                                        "--since", "2026-11-20T10:01:00+09:00"])
+            self.assertEqual(code, 1, err.getvalue())
+            self.assertIn(at, err.getvalue())
+            self.assertIn("A の修正", err.getvalue())
+            self.assertFalse(claims.exists())
+
+    def test_read_id_shows_the_answers_even_in_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            inbox, answers = base / "inbox.jsonl", base / "answers.jsonl"
+            at = "2026-11-20T09:20:00+09:00"
+            write_jsonl(inbox, [{"id": "aaaabbbb", "kind": "ask", "worktree": "lane",
+                "questions": [{"header": "merge"}, {"header": "base"}]}])
+            write_jsonl(answers, [
+                {"id": "aaaabbbb:1", "ts": at, "how": "send", "note": "merge を承認",
+                 "sent_text": "確認しました。merge を承認", "sender": {"worktree": "/w/lead"},
+                 "hold_id": "hold-1", "hold_due_at": "2026-11-20T10:00:00+09:00"},
+                {"id": "aaaabbbb:2", "ts": at, "how": "send"},
+            ])
+            with patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers),
+                                         "TRIAGE_READ_OFFSET": str(base / "read.offset")}):
+                for flags in ([], ["--summary"]):
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(inbox_read.main(["read", "--id", "aaaabbbb", *flags]), 0)
+                    self.assertIn("確認しました。merge を承認", out.getvalue())
+                    self.assertIn("回答: merge を承認", out.getvalue())
+                    self.assertIn("/w/lead", out.getvalue())
+                    self.assertIn("hold-1", out.getvalue())
+                    self.assertIn("2026-11-20T10:00:00+09:00", out.getvalue())
+                    self.assertIn(f"timeline.py --lane lane --since {at}", out.getvalue())
 
     def test_read_names_the_scheduled_runs_after_this_tab_s_run_before_the_entries(self) -> None:
         # 11/12: the 10:00 run worked past noon; the 11:00 run was skipped for it and the 12:00 run began unseen.
@@ -9884,6 +10056,10 @@ class InboxReadTests(unittest.TestCase):
                     self.assertIn("before the cursor: 3", error)
                     self.assertIn("id=latest", error)
                     self.assertIn("2026-11-04T10:00:00+09:00", error)
+                    self.assertIn("inbox --since 2026-11-04T08:00:00+09:00", error)
+                    self.assertIn("--wt a", error)
+                    self.assertIn("--kind ask", error)
+                    self.assertIn("--full", error)
             self.assertIn("before the cursor: 0", run("--source", "missing")[2])
             self.assertEqual(cursor.read_text(), acknowledged)
 
@@ -11324,6 +11500,17 @@ class VerdictStoreTests(unittest.TestCase):
             "author": "reviewer", "state": "CHANGES_REQUESTED",
             "submitted_at": "2026-10-21T02:00:00Z"}})
         self.assertEqual([row["path"] for row in scan.review_queue([changed], verdicts)], [read["path"]])
+
+    def test_current_review_rejects_a_verdict_blocked_on_the_reviewer(self) -> None:
+        row = self.row("/w/fix", pr={"state": "OPEN", "number": 42, "head_oid": "abc"})
+        queued = {**row, "read": scan.read_key(row),
+                  "review": {"head_matches": True, "changes_requested": True}}
+        verdict = {"path": row["path"], "class": "blocked", "waits_on": "reviewer"}
+        self.write_session("review", "g1", [queued], "g1", [verdict])
+        self.assertEqual(scan.absorb_verdicts(self.store), {})
+        self.write_session("corrected-review", "g2", [queued], "g2", [
+            {**verdict, "class": "in_progress", "next_step": "指摘を直す", "waits_on": None}])
+        self.assertEqual(scan.absorb_verdicts(self.store)[row["path"]]["next_step"], "指摘を直す")
 
     def test_remote_and_local_rows_with_the_same_path_keep_separate_verdicts(self) -> None:
         local = self.row("/same/path")

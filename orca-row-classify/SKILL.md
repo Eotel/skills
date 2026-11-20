@@ -75,6 +75,10 @@ judge each row from its own facts.
    order from this flag alone.
 2. **Who must act decides the class.** When several fit, the first one in this
    list wins.
+   If `review.head_matches` and `review.changes_requested` are true, the
+   current head needs fixes. Use `in_progress` and `next_step: 指摘を直す`
+   when the agent can fix them. The scan rejects a verdict that waits for
+   another review of that head.
    - `waiting`: the message or comment asks **the user who runs the triage** to
      decide, approve, or do something (`要判断`, "どうしますか", "教えてください",
      a choice offered to them), or a kind (b) leftover below is left. Put the

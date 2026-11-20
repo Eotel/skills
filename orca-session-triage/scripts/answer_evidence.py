@@ -60,6 +60,7 @@ class Answer:
     ask_id: str | None = None  # the `<id>` or `<id>:<n>` a delivered answer names exactly
     answered: tuple[str, ...] = ()  # the questions an AskUserQuestion answer answered, as it showed them
     free_text: bool = False  # a user's ordinary message is a candidate, never proof
+    selections: tuple[tuple[str, str], ...] = ()
 
 
 def key_ask_id(key: str) -> str | None:
@@ -204,7 +205,8 @@ def asked_user(transcripts: Iterable[Path]) -> Iterator[Answer]:
                            for option in question.get("options") or [] if isinstance(option, dict)),
                          *result["answers"].values(), *notes]
                 yield Answer(at, f"AskUserQuestion {path.name}", "\n".join(str(line) for line in lines if line),
-                             answered=tuple(str(question) for question in result["answers"]))
+                             answered=tuple(str(question) for question in result["answers"]),
+                             selections=tuple((str(question), str(value)) for question, value in result["answers"].items()))
 
 
 def rejected_questions(transcripts: Iterable[Path], since: datetime | None) -> list[dict]:

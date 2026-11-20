@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import cache
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,7 @@ import hourly_runtime
 import lane_input
 import lead_decisions
 import retro
+import scan_sessions
 
 STATE_DIR = os.environ.get("TRIAGE_STATE_DIR", "~/.cache/orca-session-triage")
 HOURLY_STATE = hourly_state.DEFAULT_STATE
@@ -96,8 +98,10 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     workspace = hook_input["cwd"]
     state = read_json(state_dir / "hourly-state.json")
     lead = (state.get("lead") or {}).get("worktree") if isinstance(state, dict) else None
+    bindings: dict[int, list[str]] = {}
     if isinstance(state, dict) and lead and ask_state.same_workspace(lead, workspace):
-        return duplicate_question(hook_input, state, state_dir, orca)
+        return duplicate_question(hook_input, state, state_dir, orca, bindings) or claim_call(
+            hook_input, state_dir, bindings)
     try:
         if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
                    for automation in triage_automations(orca, workspace)):
@@ -110,12 +114,12 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     reasons = []
-    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca):
+    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca, bindings):
         reasons.append(duplicated["hookSpecificOutput"]["permissionDecisionReason"])
     if not all(in_japanese(question) for question in questions):
         reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
     if not (isinstance(state, dict) and (state.get("lead") or {}).get("worktree")):
-        return deny(reasons)
+        return deny(reasons) or claim_call(hook_input, state_dir, bindings)
     pane = os.environ.get("ORCA_PANE_KEY")
     started = next((run.get("startedAt") for run in runs
                     if pane and run.get("terminalPaneKey") == pane), None)
@@ -133,7 +137,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
             reasons.append("最後の引き継ぎはこの回の開始前です。質問の前に handoff.py send で引き継ぎを送ってください。")
     except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
         reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
-    return deny(reasons)
+    return deny(reasons) or claim_call(hook_input, state_dir, bindings)
 
 
 def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], numbers: dict[str, set[int]],
@@ -317,7 +321,8 @@ def registered_scope(question: dict, entries: list[dict],
     return scoped
 
 
-def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
+def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str,
+                       bindings: dict[int, list[str]] | None = None) -> dict | None:
     entries = hourly_state.inbox_entries()
     path = inbox_read.answers_path()
     answers = inbox_read.answer_records(path)
@@ -336,7 +341,7 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
     labels: dict[str, list[str]] = {}
     asked_numbers: dict[str, set[int]] = {}
     unmatched: set[str] = set()
-    for question in questions:
+    for index, question in enumerate(questions):
         text, header = question.get("question") or "", question.get("header") or ""
         recorded = list(state.get("questions", {}).values())
         mine = [item for item in recorded if item.get("session") == session
@@ -431,6 +436,9 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 asked_numbers.setdefault(ask_id, set()).update(numbers)
                 if not numbers and inbox_read.questions_of(ask):
                     unmatched.add(ask_id)
+                elif bindings is not None:
+                    ids = [f"{ask_id}:{number}" for number in sorted(numbers)] if numbers else [ask_id]
+                    bindings.setdefault(index, []).extend(ids)
             parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
             candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
                           if parts else [claims.get(ask_id)])
@@ -454,6 +462,63 @@ def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str
                 reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(keys)}、問い {item['id']}）。重ねて伺わないでください。")
     reasons.extend(direct_input_reasons(uncovered, labels, asked_numbers, unmatched, state_dir, orca))
     return deny(list(dict.fromkeys(reasons)))
+
+
+def binding_file(hook_input: dict, state_dir: Path) -> Path | None:
+    session, call = (hook_input.get(key) for key in ("session_id", "tool_use_id"))
+    if not isinstance(session, str) or not session or not isinstance(call, str) or not call:
+        return None
+    key = hashlib.sha256(f"{session}\n{call}".encode()).hexdigest()
+    return state_dir / "ask-tool-bindings" / f"{key}.json"
+
+
+def claim_call(hook_input: dict, state_dir: Path, bindings: dict[int, list[str]]) -> dict | None:
+    if not bindings or (path := binding_file(hook_input, state_dir)) is None:
+        return None
+    cwd = str(Path(hook_input["cwd"]).resolve())
+    entries = hourly_state.inbox_entries()
+    answered = inbox_read.answered_ids(inbox_read.answers_path()) | frozenset(inbox_read.withdrawal_times(entries))
+    open_asks = inbox_read.open_asks(entries, answered)
+    open_keys = frozenset(key for ask in open_asks for key in (
+        ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+    wanted = list(dict.fromkeys(key for keys in bindings.values() for key in keys))
+    if any(key not in open_keys for key in wanted):
+        return deny(["ask の状態が変わりました。受信箱で回答と取り下げを確認してください。"])
+    if taken := inbox_read.record_claims(inbox_read.claims_path(), wanted, cwd, open_keys):
+        return deny([f"ask {claim.id} は {inbox_read.claim_label(claim)}。重ねて伺わないでください。" for claim in taken])
+    scan_sessions.write_json_atomically(path, {"cwd": cwd, "parts": bindings})
+    return None
+
+
+def record_call_answers(hook_input: dict, state_dir: Path, entries: list[dict]) -> None:
+    response = hook_input.get("tool_response")
+    if (not isinstance(response, dict) or not isinstance(response.get("answers"), dict)
+            or (path := binding_file(hook_input, state_dir)) is None or not path.is_file()):
+        return
+    binding = read_json(path)
+    cwd = str(Path(hook_input["cwd"]).resolve())
+    if not isinstance(binding, dict) or cwd != binding.get("cwd"):
+        return
+    log = inbox_read.answers_path()
+    recorded = inbox_read.answered_ids(log)
+    withdrawn = inbox_read.withdrawal_times(entries)
+    claims = inbox_read.read_claims(inbox_read.claims_path())
+    questions = response.get("questions") or (hook_input.get("tool_input") or {}).get("questions") or []
+    annotations = response.get("annotations") or {}
+    for index, question in enumerate(questions):
+        wording = question.get("question")
+        answer = response["answers"].get(wording)
+        if not isinstance(answer, str) or not answer.strip():
+            continue
+        note = (annotations.get(wording) or {}).get("notes") if isinstance(annotations, dict) else None
+        text = f"{answer}\n{note}" if note else answer
+        keys = [key for key in binding["parts"].get(str(index), ()) if key not in recorded
+                and (whole := key.partition(":")[0]) not in recorded and key not in withdrawn
+                and whole not in withdrawn and (claim := claims.get(key)) is not None
+                and ask_state.same_workspace(claim.by, cwd)]
+        if keys:
+            inbox_read.record_answers(log, keys, inbox_read.HOURLY_ANSWER, text,
+                                      sender={"worktree": cwd, "session": hook_input["session_id"]})
 
 
 # An option that sends something out of this session: a post, merge, send, push, or production change.
@@ -645,14 +710,17 @@ def follow_watch(line: bytes, urls: dict[str, None]) -> None:
 
 def unclassed(session: Path, queue: dict) -> str | None:
     """Why to stay while a row of this scan's review queue has no verdict, or None."""
-    queued = [row["path"] for row in queue.get("rows") or [] if isinstance(row, dict) and row.get("path")]
+    queued = {row.get("identity") or row["path"]: row for row in queue.get("rows") or []
+              if isinstance(row, dict) and row.get("path")}
     if not queued:
         return None
     result = read_json(session / "review-result.json")
     classed = set()
     if isinstance(result, dict) and result.get("queue_generated_at") == queue.get("generated_at"):
-        classed = {row.get("path") for row in result.get("rows") or []
-                   if isinstance(row, dict) and row.get("class") in VERDICT_CLASSES}
+        classed = {identity for row in result.get("rows") or []
+                   if isinstance(row, dict) and row.get("class") in VERDICT_CLASSES
+                   and (identity := row.get("identity") or row.get("path")) in queued
+                   and not scan_sessions.blocked_on_review(queued[identity], row)}
     missing = [path for path in queued if path not in classed]
     if not missing:
         return None
@@ -708,6 +776,11 @@ def main(handoffs_dir: Path | None = None) -> int:
         except (OSError, AttributeError):
             entries = []
         decision = answer_decision(hook_input, Path(HOURLY_STATE).expanduser(), entries)
+        if decision is None and hook_input.get("tool_name") == "AskUserQuestion":
+            try:
+                record_call_answers(hook_input, Path(STATE_DIR).expanduser(), entries)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f"stop_check: ask の回答を記録できません: {error}", file=sys.stderr)
         if decision:
             json.dump(decision, sys.stdout, ensure_ascii=False)
         return 0

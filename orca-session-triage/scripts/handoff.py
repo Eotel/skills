@@ -67,11 +67,13 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import NamedTuple, Protocol
+from typing import NamedTuple, Protocol, cast
 
 import answer_evidence
+import ask_state
 from commitment_store import CommitmentWriteError
 import inbox_read
+import hourly_runtime
 import hourly_state
 import json_output
 import lead_decisions
@@ -208,9 +210,8 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
     return found
 
 
-def unseen(reasons: list[Reason], seen: list[str]) -> list[str]:
-    """The lines of the reasons no --seen value names (inbox_read.names: an exact id or an 8+ character prefix)."""
-    return [reason.line for reason in reasons if not reason.own
+def unseen(reasons: list[Reason], seen: list[str]) -> list[Reason]:
+    return [reason for reason in reasons if not reason.own
             and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
 
 
@@ -248,6 +249,44 @@ def handed_work(board: list[dict], reports: list[dict], lead: str, since: dateti
             for event in timeline.board_events(board, window, lanes)
             if event.kind in (timeline.SENT, timeline.STARTED) and event.lane == name and event.to
             and (event.to in targets or re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(event.to)}(?![A-Za-z0-9_-])", body))]
+
+
+def require_lead_stopped(targets: set[str], since: str | None = None, *, allow_lead: str | None = None,
+                         state_file: Path | None = None, projects: Path | None = None,
+                         orca: str | None = None) -> str | None:
+    state = hourly_state.read(state_file or Path(os.environ.get("TRIAGE_HOURLY_STATE") or hourly_state.DEFAULT_STATE).expanduser())
+    lead = hourly_state.appointed_lead(state)
+    if lead is None:
+        return None if allow_lead else "共有の定時状態に指揮の作業場が登録されていません"
+    if allow_lead and ask_state.same_workspace(allow_lead, str(lead)):
+        return None
+    folder = Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser() / "projects"
+    try:
+        cutoff = inbox_read.since_time(since) if since else last_sent_at(HANDOFFS.expanduser())
+        details = lead_details(projects or folder, str(lead), orca or os.environ.get("ORCA_CLI_COMMAND", "orca"),
+                               HANDOFFS.expanduser(), state=state)
+    except (argparse.ArgumentTypeError, LookupError, subprocess.SubprocessError) as error:
+        raise ValueError(str(error)) from error
+    if cutoff is not None:
+        board = timeline.entries(Path(os.environ.get("ORCA_BOARD_EVENTS") or timeline.BOARD_EVENTS).expanduser())
+        sources = {tab["handle"] for tab in cast(list[dict], details["terminals"])}
+        inbox, _ = inbox_read.paths()
+        names = timeline.recorded_names(inbox_read.inbox_entries(inbox) if inbox.is_file() else [], board)
+        wanted = targets | {Path(target).name for target in targets}
+        relevant = [(at, event) for event in board
+                    if event.get("type") == "send" and event.get("source") == "send"
+                    and (event.get("from") in sources or event.get("worktree") == lead.name)
+                    and (event.get("to") in wanted or names.get(str(event.get("to"))) in wanted)
+                    and (at := scan_sessions.parse_time(event.get("ts"))) is not None and at >= cutoff]
+        if relevant:
+            at, event = max(relevant, key=lambda entry: entry[0])
+            return f"{at.isoformat()} 指揮 → {event['to']}: {excerpt(event.get('text'))}"
+    if (details.get("api_error")
+            or any(not question.get("answered_elsewhere") for call in cast(list[dict], details["pending_questions"])
+                   for question in call.get("questions") or [])
+            or any(not item.get("handled_at") for item in cast(list[dict], details["queued_input"]))):
+        return None
+    return f"指揮 {lead.name} に未回答の質問・未配信の入力・API エラーがありません"
 
 
 def search(directory: Path, words: list[str], since: datetime | None) -> int:
@@ -626,11 +665,15 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
     before, after, end = inbox_around(inbox, args.since)
-    if not args.force and (later := inbox_read.later_run_notes(args.orca, "handoff")):
-        print("handoff: not sent: a later scheduled run of this workspace began, or was skipped because this run was "
-              "still working. Leave the handoff to the run that owns the read position; --force sends it as written:",
-              *later, sep="\n", file=sys.stderr)
-        return 1
+    if not args.force:
+        later = inbox_read.later_runs(args.orca, "handoff")
+        if any(run.get("status") != "skipped_precheck" for run in later):
+            print("handoff: not sent: a later scheduled run began. Leave the handoff to the run "
+                  "that owns the read position; --force sends it as written:",
+                  *(hourly_runtime.later_run_note(run) for run in later), sep="\n", file=sys.stderr)
+            return 1
+        for run in later:
+            print(hourly_runtime.later_run_note(run), file=sys.stderr)
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
     found.extend(removal_reports(keys, after))
@@ -645,7 +688,9 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
               "worktree the body or a remove: key names. Read each one in full (inbox_read.py read --id ID; a send "
               "or spawn-lane with timeline.py --since HH:MM --lane NAME --json) and fix the body; then pass --seen ID "
               "for each one the body reflects, or --force to send it as written:",
-              *left, sep="\n", file=sys.stderr)
+              *(reason.line for reason in left),
+              " ".join(f"--seen {shlex.quote(reason_id)}" for reason_id in
+                       dict.fromkeys(reason.id for reason in left)), sep="\n", file=sys.stderr)
         return 1
     reports = late_reports(after)
     facts = ["—— 送る直前に道具が足した事実 ——",

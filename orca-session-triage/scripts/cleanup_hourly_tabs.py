@@ -9,18 +9,23 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Iterable, Iterator
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
 import hourly_runtime
+import hourly_state
 from commitment_store import read_document
 import orca_agent_status
 import scan_sessions
@@ -32,6 +37,7 @@ BUSY = ("esc to interrupt", "Working (", "Enter to select", "Enter to confirm", 
 QUESTION = re.compile(r"[?？]|ください|お願いします|ご判断|ご回答|選んで|教えて|"
                       r"(?:です|ます|でしょう|よろしい|します)か|"
                       r"\b(?:please|let me know|should I|would you)\b", re.IGNORECASE)
+DECISION_PENDING = re.compile(r"決めていただく必要|(?:判断|承認|回答)が必要|要判断|要承認")
 ENDED_RUNS = frozenset(("completed", "dispatch_failed"))
 
 
@@ -178,11 +184,11 @@ def newest_activity(transcript: Path) -> datetime | None:
     return newest
 
 
-def latest_exchange(transcript: Path) -> tuple[str | None, bool, str | None]:
-    """The latest exchange's final text, and whether an AskUserQuestion in it still has no answer."""
+def latest_exchange(transcript: Path) -> tuple[str | None, bool, str | None, bool]:
     final_text = None
     final_at = None
     pending_tools = set()
+    used_selector = False
     with transcript.open(encoding="utf-8", errors="replace") as stream:
         for raw in stream:
             try:
@@ -198,6 +204,7 @@ def latest_exchange(transcript: Path) -> tuple[str | None, bool, str | None]:
                     and block.get("type") == "text")
                 if spoken.strip() and not spoken.lstrip().startswith("<"):
                     final_text, pending_tools, final_at = None, set(), None
+                    used_selector = False
             for block in blocks:
                 if not isinstance(block, dict):
                     continue
@@ -207,9 +214,10 @@ def latest_exchange(transcript: Path) -> tuple[str | None, bool, str | None]:
                         final_at = entry.get("timestamp")
                     elif block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
                         pending_tools.add(block.get("id"))
+                        used_selector = True
                 elif block.get("type") == "tool_result":
                     pending_tools.discard(block.get("tool_use_id"))
-    return final_text, bool(pending_tools), final_at
+    return final_text, bool(pending_tools), final_at, used_selector
 
 
 def requests(text: str) -> list[str]:
@@ -222,7 +230,7 @@ def close_blockers(term: dict, transcript: Path, screen: dict, min_idle_minutes:
     newest = newest_activity(transcript)
     if newest is None or (now - newest).total_seconds() < min_idle_minutes * 60:
         problems.append("recent or unknown transcript activity")
-    final_text, asking, _ = latest_exchange(transcript)
+    final_text, asking, _, _ = latest_exchange(transcript)
     if asking or not final_text:
         problems.append("unanswered conversation question")
     return problems + screen_blockers(term, screen)
@@ -414,10 +422,29 @@ def main(argv: list[str] | None = None) -> int:
                       + f" | draft_text={scan_sessions.draft_excerpt(screen)!r}, "
                         f"composer_empty={scan_sessions.composer_empty(screen)}")
                 continue
-            final_text, _, final_at = latest_exchange(transcript)
+            final_text, _, final_at, used_selector = latest_exchange(transcript)
             when = scan_sessions.parse_time(final_at)
             old = " [前日以前]" if when and when.astimezone().date() < datetime.now().astimezone().date() else ""
-            for line in requests(final_text or ""):
+            final = final_text or ""
+            carried = requests(final)
+            if not used_selector:
+                ending = re.split(r"\n\s*\n", final.strip())[-1]
+                if QUESTION.search(ending) or DECISION_PENDING.search(ending):
+                    key = "carry:" + hashlib.sha256(f"{transcript}:{final_at}:{ending}".encode()).hexdigest()[:16]
+                    with tempfile.TemporaryDirectory() as folder:
+                        source = Path(folder) / "carry.txt"
+                        source.write_text(ending, encoding="utf-8")
+                        with redirect_stdout(io.StringIO()):
+                            code = hourly_state.main(["--state-file", str(args.state_file), "presented", "--key", key,
+                                                      "--text-file", str(source), "--since",
+                                                      (when or datetime.now(timezone.utc)).isoformat(),
+                                                      "--owner", args.workspace])
+                    if code:
+                        print(f"keep: {label}: presented {key} を記録できません")
+                        continue
+                    carried = [line for line in carried if line not in ending.splitlines()]
+                    carried.append(" ".join(ending.splitlines()))
+            for line in carried:
                 print(f"carry: {term['handle']}: {final_at or '日時不明'}{old}: {line}")
             hourly_runtime.orca_result(args.orca, "terminal", "close", "--terminal", term["handle"])
             print(f"closed: {label}: idle transcript and empty composer")

@@ -28,9 +28,12 @@ from operator import itemgetter
 import os
 from pathlib import Path
 import re
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Protocol
 import uuid
 
@@ -424,6 +427,58 @@ def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], 
                       else [],
                       "age_minutes": int((now - since).total_seconds() // 60)})
     return items
+
+
+def presented_resolutions(items: list[dict], data: dict, projects: Path, state_file: Path) -> None:
+    selected: dict[str, list[lead_decisions.PullRequest]] = {}
+    by_repo: dict[str, set[int]] = {}
+    for item in items:
+        if item.get("state") != PRESENTED:
+            continue
+        key = item["id"]
+        link = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)/?", item.get("link") or "")
+        refs = lead_decisions.pull_requests(key)
+        if link:
+            refs.append(lead_decisions.PullRequest(link[1], int(link[2])))
+        selected[key] = list(dict.fromkeys(refs))
+        for ref in refs:
+            by_repo.setdefault(ref.repo.casefold(), set()).add(ref.number)
+    states = {repo: lead_decisions.github_pr_states(repo, sorted(numbers)) or {}
+              for repo, numbers in by_repo.items()}
+    transcripts: dict[Path, list[answer_evidence.Answer]] = {}
+    lead = appointed_lead(data)
+    shared = answer_evidence.shared_questions(
+        {"questions": [{"question": item["text"]}]} for key, item in data["presented"].items() if key in selected)
+    for item in items:
+        if (key := item.get("id")) not in selected:
+            continue
+        refs = selected[key]
+        resolved = [(ref, states[ref.repo.casefold()].get(ref.number)) for ref in refs]
+        candidates = [{"source": "GitHub", "pr": f"{ref.repo}#{ref.number}", "state": state.state,
+                       "at": state.closed_at or state.updated_at,
+                       "text": "PR がマージ済み" if state.state == "MERGED" else "PR がクローズ済み"}
+                      for ref, state in resolved if state and state.state in CLOSED_STATES]
+        if len(candidates) != len(refs):
+            candidates = []
+        text = data["presented"][key]["text"]
+        check = {"id": key, "ts": item["presented_at"], "questions": [{"question": text}]}
+        local_owner = item.get("owner")
+        spaces = {Path(owner) for owner in (local_owner, lead) if owner and str(owner).startswith("/")}
+        for workspace in sorted(spaces):
+            if workspace not in transcripts:
+                try:
+                    transcripts[workspace] = [answer for answer in answer_evidence.asked_user(
+                        answer_evidence.transcripts_of(projects, [workspace])) if answer.answered]
+                except (OSError, ValueError) as error:
+                    print(f"hourly state: {workspace} の回答を確認できません: {error}", file=sys.stderr)
+                    transcripts[workspace] = []
+            for answer in answer_evidence.answers_to(check, transcripts[workspace], shared=shared):
+                candidates.append({"source": answer.source, "workspace": str(workspace),
+                                   "at": answer.at.isoformat(), "text": dict(answer.selections).get(text, answer.text)})
+        if candidates:
+            item["resolution_candidates"] = candidates
+            item["close_command"] = shlex.join(["hourly_state.py", "--state-file", str(state_file), "presented-close",
+                                                "--key", key, "--evidence-file", "evidence.txt"])
 
 
 def check_line(check: dict) -> str:
@@ -946,6 +1001,21 @@ def read(path: Path) -> dict:
 
 def save(path: Path, data: dict) -> None:
     document = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    for retry_after in (0.1, 0.25, None):
+        try:
+            save_document(path, document)
+            return
+        except CommitmentWriteError as error:
+            cause = error.__cause__
+            while cause is not None and not isinstance(cause, sqlite3.Error):
+                cause = cause.__cause__
+            code = getattr(cause, "sqlite_errorcode", 0)
+            if retry_after is None or code & 255 not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            time.sleep(retry_after)
+
+
+def save_document(path: Path, document: str) -> None:
     with writing(path, document=document) as write_file:
         if not write_file:
             return
@@ -1707,6 +1777,10 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
         for report in item.get("waiting_reports") or []:
             line += (f" | 解消の候補: {report['id'][:8]} {headline(report['text'])}" if item.get("state") == PRESENTED
                      else f" | 待ち先から届いた（{report['ts']}・報告 {report['id']}・{report['worktree']}）")
+        for candidate in item.get("resolution_candidates") or []:
+            line += f" | 解消の候補: {candidate.get('pr') or candidate['source']} {candidate['at']} {headline(candidate['text'])}"
+        if item.get("close_command"):
+            line += f" | {item['close_command']}"
         if item.get("lead_unseen"):
             line += " | 指揮が未読"
         if item.get("waits_on"):
@@ -1994,6 +2068,7 @@ def main(argv: list[str] | None = None) -> int:
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
                 data, {key: items[-1] for key, items in decided.items()}, datetime.now(timezone.utc),
                 entries, presented_answers)], key=lambda item: -item["age_minutes"])
+            presented_resolutions(result, data, args.claude_projects.expanduser(), path)
             unseen: set[str] = set()
             if lead := appointed_lead(data):
                 try:
@@ -2080,6 +2155,7 @@ def main(argv: list[str] | None = None) -> int:
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
                                  inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces),
                                  bindings=bindings, resolved=resolved)
+                presented_resolutions(result["presented"], data, args.claude_projects.expanduser(), path)
             elif args.action == "get":
                 key = args.id or args.item_id
                 result = next(({"id": key, **data[kind][key]} for kind in
@@ -2164,7 +2240,8 @@ def main(argv: list[str] | None = None) -> int:
                     notices.append(f"記録しなかった: 既存 {item['id']}（取り下げ済み）"
                                    + (f"。置き換え先: {item['replaced_by']}" if item.get("replaced_by") else ""))
     except (*READ_ERRORS, CommitmentWriteError) as error:
-        print(f"hourly state: {error}", file=sys.stderr)
+        key = getattr(args, "key", None) or getattr(args, "id", None) or getattr(args, "decision", None)
+        print(f"hourly state: {args.action}{f' {key}' if key else ''}: {error}", file=sys.stderr)
         return 1
     if args.action == "asking" and args.summary and isinstance(result, list):
         for item in result:
