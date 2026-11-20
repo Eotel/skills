@@ -117,6 +117,8 @@ or an AskUserQuestion answer (in the transcripts of the current directory's
 worktree and each `--asked-in` worktree) that names the ask's id or quotes each
 open question, or a delivered answer. It names the rest with the answers that
 mention only the lane or its PR numbers: confirm each one, then mark it by id.
+When rephrasing a lane's question for AskUserQuestion, include its ask ID in the
+question. Use `<ask id>:<number>` for a specific question in a multi-question ask.
 When `send --ask` delivers an answer, it records the same answer and time in
 each hourly question whose `covers` names that ask and each known
 `answer:<lane>::<ask id>` decision key. Numbered answers settle only the
@@ -153,9 +155,18 @@ an AskUserQuestion PreToolUse hook. It applies in the hourly workspace and the
 appointed lead's workspace even when this skill is not active. It matches inbox
 question headers and the recorded questions' `covers` keys. An answered ask,
 another workspace's claim, or another tab's unanswered hourly question blocks
-the call, naming the question, workspace, and time. Its own claim and the current
-tab's question record permit the call. Keep the appointed lead current with
-`hourly_state.py appoint-lead`.
+the call, naming the question, workspace, and time. Direct input in the asking
+lane's tab on this Mac after an open ask blocks once per ask and prompt timestamp.
+The hook treats a direct choice as an answer when the input matches one option
+of exactly one pending single-select question in that tab. It accepts a bare
+choice or `/ship A` when the choice is `A`. The Board digest and `inbox open-asks`
+record choices from local transcripts. The controller imports choices from
+reporter Macs when it pulls their inboxes. Keep the original header,
+options, and a shared source link or the ask ID when rephrasing a question.
+For other replies, have the lane record the answer with
+`triage-notify --answered <id>[:<n>]` as the hook reason indicates.
+Its own claim and the current tab's question record permit the call. Keep the
+appointed lead current with `hourly_state.py appoint-lead`.
 
 The same settings register `scripts/lead_compact.py` for PreCompact,
 SessionStart (startup and compact) and PostCompact, so the appointed lead keeps

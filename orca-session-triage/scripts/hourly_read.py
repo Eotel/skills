@@ -292,8 +292,14 @@ def main(argv: list[str] | None = None) -> int:
             loaded = False
         timeout = args.timeout * LOAD_TIMEOUT_FACTOR if loaded else args.timeout
         tasks = tasks_for(args, directory)
+        reads_answers = {"lead-state", "unanswered", "pending", "scan"}
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            results = list(pool.map(lambda task: read_with_retry(task, directory, timeout, loaded), tasks))
+            futures = {task.name: pool.submit(read_with_retry, task, directory, timeout, loaded)
+                       for task in tasks if task.name not in reads_answers}
+            futures["open-asks"].result()
+            futures.update({task.name: pool.submit(read_with_retry, task, directory, timeout, loaded)
+                            for task in tasks if task.name in reads_answers})
+            results = [futures[task.name].result() for task in tasks]
         scan = next(item for item in results if item["name"] == "scan")
         if scan["exit_code"] == 0:
             stale_file = directory / "stale-asks.partial.json"

@@ -481,9 +481,24 @@ def decision_reports(key: str, prs: list[PullRequest], handed_off_at: str | None
 
 def ask_answers(path: Path) -> dict[str, dict]:
     """A handoff's current answer and the last delivery when its wording differs."""
-    delivered = inbox_read.delivered_records(path)
+    return handoff_answer_records(inbox_read.answer_entries(path))
+
+
+def handoff_answer_records(rows: Iterable[dict]) -> dict[str, dict]:
+    records = [row for row in rows if isinstance(row.get("id"), str)]
+    current = inbox_read.current_answers(records)
+    delivered = {}
+    withdrawn = {}
+    for record in records:
+        key, how = record["id"], record.get("how")
+        if how in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
+            delivered[key] = record
+        elif how == "triage-notify --withdraws":
+            withdrawn[key] = record
+    for key in withdrawn.keys() - delivered.keys():
+        current[key] = withdrawn[key]
     return {key: {**answer, "delivery": delivered[key]} if key in delivered and answer != delivered[key] else answer
-            for key, answer in inbox_read.answer_records(path).items()}
+            for key, answer in current.items()}
 
 
 def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict]) -> dict | None:
@@ -491,6 +506,25 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
     ask), or one for every question of a structured ask."""
     whole_id, _, number = ask_id.partition(":")
     whole = answers.get(whole_id)
+    lane_answer = (whole.get("delivery") or whole) if whole else None
+    if lane_answer and lane_answer.get("how") not in inbox_read.LANE_ANSWERS:
+        lane_answer = None
+
+    def with_lane_evidence(part: dict) -> dict:
+        if whole and whole.get("how") == "triage-notify --withdraws" and not genuine_answer(part):
+            return whole
+        if not lane_answer or genuine_answer(part):
+            return part
+        if part.get("how") == inbox_read.HOURLY_CORRECTION:
+            return {**part, "delivery": lane_answer}
+        return lane_answer
+
+    def corrected_part(part: dict, part_key: str) -> dict:
+        previous = answers.get(part_key)
+        if part is whole and part.get("how") == inbox_read.HOURLY_CORRECTION and previous and genuine_answer(previous):
+            return {**part, "delivery": previous.get("delivery") or previous}
+        return part
+
     delivery = (whole.get("delivery") or whole) if whole else None
     if delivery and delivery.get("how") not in inbox_read.DELIVERY_ANSWERS:
         delivery = None
@@ -498,14 +532,35 @@ def ask_answer(ask_id: str, answers: Mapping[str, dict], asks: Mapping[str, dict
         if not number.isdecimal():
             return None
         part = next(iter(inbox_read.answer_parts(whole_id, (int(number),), answers)), None)
+        if part is not None:
+            part = with_lane_evidence(corrected_part(part, ask_id))
         return {**part, "delivery": delivery} if part and delivery and not genuine_answer(part) else part
     numbers = range(1, len(inbox_read.questions_of(asks.get(whole_id) or {})) + 1)
     parts = inbox_read.answer_parts(whole_id, numbers, answers)
     if not parts or numbers and len(parts) != len(numbers):
         return None
+    parts = [with_lane_evidence(corrected_part(part, f"{whole_id}:{index}"))
+             for index, part in enumerate(parts, 1)]
     if not numbers or all(part is whole for part in parts):
         return whole
     return {"id": ask_id, "answers": parts, **({"delivery": delivery} if delivery else {})}
+
+
+def ask_answer_for_handoff(ref: tuple[str, frozenset[int]], answers: Mapping[str, dict],
+                           asks: Mapping[str, dict]) -> dict | None:
+    ask, numbers = ref
+    ids = [f"{ask}:{number}" for number in sorted(numbers)] if numbers else [ask]
+    parts = [ask_answer(ask_id, answers, asks) for ask_id in ids]
+    if any(part is None or not genuine_answer(part) for part in parts):
+        return None
+    return parts[0] if len(parts) == 1 else {"answers": parts}
+
+
+def bound_handoff_answer(key: str, ask_id: str | None, answers: Mapping[str, dict], asks: Mapping[str, dict],
+                         questions: Iterable[dict]) -> dict | None:
+    if ref := ask_state.handoff_target(key, ask_id, list(asks.values()), questions):
+        return ask_answer_for_handoff(ref, answers, asks)
+    return ask_answer(ask_id, answers, asks) if ask_id else None
 
 
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
@@ -516,17 +571,24 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     history: dict[str, list[HandOff]] = {}
     for item in handed:
         history.setdefault(item.decision, []).append(item)
+    active = ask_state.active(state or {}, answered)
     keys = list(dict.fromkeys(decisions)) if decisions else list(dict.fromkeys([
-        *history, *(key for item in ask_state.active(state or {}, answered) for key in item["keys"] if key)]))
+        *history, *(key for item in active for key in item["keys"] if key)]))
     asks = {str(item["id"]): item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    ask_entries = list(asks.values())
+    questions = (state or {}).get("questions", {}).values()
     settled = []
     last = {}
+    bound_asks = ask_state.handoff_bindings((key, item.ask_id) for key, items in history.items()
+                                           for item in items if item.ask_id)
     for key in keys:
         item = history[key][-1] if key in history else None
-        answer = (answered[key].view() if key in answered else
-                  next((found for entry in reversed(history.get(key, []))
-                        if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))), None))
-        delivered = answer is not None and (key in answered or genuine_answer(answer))
+        latest_id = binding.ask_id if (binding := bound_asks.get(key)) else None
+        decision = decision_for_handoff(answered[key].view() if key in answered else None, item is not None)
+        answer = decision
+        if answer is None:
+            answer = bound_handoff_answer(key, latest_id, answers, asks, questions)
+        delivered = answer is not None and (answer is decision or genuine_answer(answer))
         if delivered:
             settled.append({"decision": key, "answer": answer})
         else:
@@ -546,7 +608,7 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
         row = {"decision": key, "handed_off_at": at,
                "first_handed_off_at": history[key][0].handed_off_at if item else None,
                "handoff_count": len(history.get(key, [])), "prs": views}
-        if state is not None and (asking := ask_state.for_key(state, key, entries)):
+        if state is not None and (asking := ask_state.for_key(state, key, entries, bound_asks)):
             row["asking"] = asking
         candidates = [found for entry in history.get(key, [])
                       if entry.ask_id and (found := ask_answer(entry.ask_id, answers, asks))
@@ -559,9 +621,15 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     return {"unanswered": unanswered, "settled": settled}
 
 
+def decision_for_handoff(answer: dict | None, handed_off: bool) -> dict | None:
+    return None if answer and answer.get("from_ask") and handed_off else answer
+
+
 def genuine_answer(answer: dict) -> bool:
-    """A delivered answer has substance; a note marking a handoff read does not settle its decisions."""
-    if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS:
+    """A delivery, direct answer or withdrawal settles the corresponding handoff."""
+    if answer.get("how") in inbox_read.LANE_ANSWERS or answer.get("how") == "triage-notify --withdraws":
+        return True
+    if (answer.get("delivery") or answer).get("how") in inbox_read.DELIVERY_ANSWERS | inbox_read.LANE_ANSWERS:
         return True
     parts = answer.get("answers")
     return isinstance(parts, list) and bool(parts) and all(genuine_answer(part) for part in parts)
@@ -659,7 +727,7 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
         "unanswered", help="print unanswered keys with hand-off history and PR facts, and settled keys with answers; "
                            "without --decision, include every handed-off key")
     unanswered.add_argument("--decision", action="append", help="repeat once per question")
-    unanswered.add_argument("--state-file", type=Path, default=Path("~/.cache/orca-session-triage/hourly-state.json"),
+    unanswered.add_argument("--state-file", type=Path, default=Path(handoff.hourly_state.DEFAULT_STATE),
                             help="hourly questions being asked, with workspace and time")
     unanswered.add_argument("--handed-off-file", type=Path, default=HANDED_OFF_LOG,
                             help="the keys handoff.py handed off (default: %(default)s)")

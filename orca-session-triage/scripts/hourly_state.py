@@ -381,7 +381,8 @@ def user_waits_now(data: dict, now: datetime) -> list[dict]:
     return items
 
 
-def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, lead_decisions.Decision]) -> str:
+def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, lead_decisions.Decision],
+                    answer_at: datetime | None = None) -> str:
     """"settled" once closed, or once a question asked under KEY (or covering it) is answered or the lead decides KEY
     after the item's first listing; "asked" while an open question (ask_state.active) asks KEY; else "open"."""
     listed = scan_sessions.parse_time(item["presented_at"])
@@ -389,7 +390,7 @@ def presented_state(data: dict, key: str, item: dict, decisions: Mapping[str, le
         *(question.get("answered_at") for question in data["questions"].values()
           if not question.get("withdrawn_at") and (key == question["decision"] or key in question.get("covers", ()))),
         getattr(decisions.get(key), "decided_at", None)) if at]
-    if item["closed_at"] is not None or listed is None or any(at and at >= listed for at in settled_at):
+    if item["closed_at"] is not None or listed is None or any(at and at >= listed for at in [*settled_at, answer_at]):
         return "settled"
     if any(key in question["keys"] for question in ask_state.active(data, decisions)):
         return "asked"
@@ -405,13 +406,13 @@ def owner_reports(owner: str, since: datetime | None, entries: list[dict]) -> li
 
 
 def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], now: datetime,
-                  entries: list[dict] | None = None) -> list[dict]:
+                  entries: list[dict] | None = None, answers: Mapping[str, datetime] | None = None) -> list[dict]:
     """Each item an hourly report listed that is still open (presented_state), as a stale-asks item. A `user:` item
     (the user's own action) lists in `waiting_reports` the done and info its owner sent after its `since` from the
     inbox `entries`: candidates that it is settled (2026-11-17 20:00, two login waits the lanes had reported done)."""
     items = []
     for key, item in data["presented"].items():
-        if presented_state(data, key, item, decisions) != "open":
+        if presented_state(data, key, item, decisions, (answers or {}).get(key)) != "open":
             continue
         since = scan_sessions.parse_time(item["since"]) or now
         items.append({"id": key, "row": item["owner"], "owner": item["owner"],
@@ -594,15 +595,73 @@ def with_issue_states(items: list[dict]) -> None:
         item["related_issues_closed"] = bool(shown) and all(ref["state"] in CLOSED_STATES for ref in shown)
 
 
-def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision]) -> list[lead_decisions.Decision]:
-    asked_at = scan_sessions.parse_time(question.get("asked_at"))
+def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decision],
+                     bindings: Mapping[str, ask_state.HandoffBinding] | None = None) -> list[lead_decisions.Decision]:
+    asked_at = question.get("asked_at")
     return [decisions[key] for key in question.get("covers") or [] if key in decisions
-            and asked_at and (at := scan_sessions.parse_time(decisions[key].decided_at)) is not None and at > asked_at]
+            and ask_state.same_bound_ask(question, (bindings or {}).get(key), key)
+            and asked_at and ask_state.answer_follows_question(decisions[key], asked_at)]
+
+
+def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision],
+                                                                       dict[str, ask_state.HandoffBinding],
+                                                                       dict[str, list[lead_decisions.Decision]]]:
+    decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
+    history = list(lead_decisions.handed_off(handoffs.expanduser()))
+    bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id)
+    handoff_keys = {item.decision for item in history}
+    decisions = {key: value for key, value in decisions.items() if key not in handoff_keys or not value.from_ask}
+    if not state["questions"]:
+        return decisions, bindings, {}
+    asks = {item["id"]: item for item in inbox_entries() if item.get("id") and item.get("kind") == "ask"}
+    entries = list(asks.values())
+    answers = lead_decisions.ask_answers(inbox_read.answers_path())
+    resolved = {}
+    for identifier, item in state["questions"].items():
+        if item.get("answer") is not None or item.get("withdrawn_at"):
+            continue
+        manual = covering_answers(item, decisions, bindings)
+        refs = ask_state.references(item, entries, bindings=bindings)
+        if not refs:
+            if manual and len(manual) == len(item.get("covers") or []):
+                resolved[identifier] = manual
+            continue
+        covered_keys = {answer.decision for answer in manual}
+        targets = {key: ask_state.handoff_target(key, bindings[key].ask_id if key in bindings else None,
+                                                entries, (item,))
+                   for key in (item["decision"], *(item.get("covers") or []))
+                   if ask_state.same_bound_ask(item, bindings.get(key), key)}
+        if any(key not in covered_keys and not targets.get(key) for key in item.get("covers") or []):
+            continue
+        handed_parts = [f"{ask_id}:{number}" if number else ask_id
+                        for key, target in targets.items() if key in handoff_keys and target
+                        for ask_id, numbers in (target,) for number in numbers or (0,)]
+        manual_refs = [target for key in covered_keys if (target := targets.get(key))]
+        evidence = []
+        for ref in refs:
+            if any(ask_state.includes(manual_ref, ref) for manual_ref in manual_refs):
+                continue
+            proof = lead_decisions.ask_answer_for_handoff(ref, answers, asks)
+            issued = scan_sessions.parse_time(asks[ref[0]].get("ts"))
+            parts = proof.get("answers", [proof]) if proof else []
+            parts = [part for part in parts
+                     if (at := scan_sessions.parse_time(part.get("ts"))) and (not issued or at >= issued)
+                     and (part.get("how") != "triage-notify --withdraws"
+                          or ask_state.covered(ref, handed_parts, entries)
+                          or ":" in part["id"] and part["id"] in handed_parts)]
+            if not proof or len(parts) != len(proof.get("answers", [proof])):
+                break
+            evidence.extend(lead_decisions.Decision(part["id"], item["decision"], part.get("note") or "回答済み",
+                                                    part["ts"], from_ask=True) for part in parts)
+        else:
+            resolved[identifier] = [*manual, *evidence]
+    return decisions, bindings, resolved
 
 
 def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                answers: list[answer_evidence.Answer], now: datetime, *, state: dict,
                handed: list[lead_decisions.HandOff],
+               bindings: dict[str, ask_state.HandoffBinding] | None = None,
                claimed: dict[str, inbox_read.Claim] | None = None,
                decided: dict[str, list[lead_decisions.Decision]] | None = None,
                rejected: list[dict] | None = None,
@@ -637,6 +696,43 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
     entries = [item for item in entries if not inbox_read.is_handoff(item)]
     shared = answer_evidence.shared_questions(entries)
     latest_decisions = {key: items[-1] for key, items in (decided or {}).items() if items}
+    ask_entries = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    known_asks = list(ask_entries.values())
+    withdrawn = inbox_read.withdrawal_times(entries)
+    retained_questions = {key: [number for number in range(1, len(questions) + 1) if f"{key}:{number}" not in withdrawn]
+                          for key, ask in ask_entries.items() if (questions := inbox_read.questions_of(ask))}
+    answered_ids = [answer.ask_id for answer in answers if answer.source in inbox_read.SUBSTANTIVE_ANSWERS
+                    and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
+                    and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
+    closed_ids = [*answered_ids, *withdrawn]
+    questions = state.get("questions", {}).values()
+    handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions)
+                    for item in handed}
+    bound_asks = bindings if bindings is not None else ask_state.handoff_bindings(
+        (item.decision, item.ask_id) for item in handed if item.ask_id)
+    handoff_fallbacks = {item.decision: None if item.ask_id else answer_evidence.key_ask_id(item.decision)
+                         for item in handed}
+    if closed_ids:
+        def cover_resolved(cover: str, item: dict) -> bool:
+            if cover in handoff_refs:
+                ref = handoff_refs[cover]
+                return (not ask_state.same_bound_ask(item, bound_asks.get(cover), cover)
+                        or bool(ref and ask_state.covered(ref, closed_ids, known_asks)))
+            if ask_state.reference(cover, known_asks):
+                return True
+            bound = ask_state.registered_ask_id(item, cover)
+            ref = ask_state.handoff_ref(bound, cover, known_asks, [item]) if bound else None
+            return bool(ref and ask_state.covered(ref, closed_ids, known_asks))
+
+        handed = [item for item in handed if not ((ref := handoff_refs[item.decision])
+                                                  and ask_state.covered(ref, closed_ids, known_asks))]
+        pending = {key: item for key, item in state.get("questions", {}).items()
+                   if not (refs := ask_state.references(item, known_asks, bindings=bound_asks))
+                   or not all(ask_state.covered(ref, closed_ids, known_asks) for ref in refs)
+                   or any(not cover_resolved(cover, item)
+                          and cover not in {answer.decision for answer in covering_answers(item, latest_decisions)}
+                          for cover in item.get("covers") or [])}
+        state = {**state, "questions": pending}
     for row in rows:
         identity = scan_sessions.row_identity(row)
         own_handle = os.environ.get("ORCA_TERMINAL_HANDLE")
@@ -667,7 +763,8 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         lane = [(at, item) for item in entries if item.get("worktree") == name
                 and (item.get("repo") or "") in scan_sessions.row_repos(row)
                 and (at := scan_sessions.parse_time(item.get("ts"))) is not None]
-        keys = {item["id"]: [handoff.decision for handoff in handed if (key := answer_evidence.key_ask_id(handoff.decision))
+        keys = {item["id"]: [handoff.decision for handoff in handed
+                            if (key := (handoff_refs[handoff.decision] or (handoff_fallbacks[handoff.decision], ()))[0])
                             and answer_evidence.names_ask_id(key, str(item["id"]))]
                 for _, item in lane if item.get("kind") == "ask" and item.get("id")}
         shared_pending = [dict(id=key, **item) for key, item in state.get("questions", {}).items()
@@ -677,8 +774,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         in_progress = (row.get("verdict") or {}).get("class") == "in_progress"
         progress_question = in_progress and bool(row.get("prompt_waiting") or
                                                   (row.get("claude") or {}).get("pending_questions"))
-        counted = [(at, item, answer_evidence.answers_to(item, answers, shared=shared)) for at, item in lane
+        counted = [(at, item, answer_evidence.answers_to(item, answers, retained_questions.get(item["id"]), shared))
+                   for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
+                   and retained_questions.get(item["id"]) != []
                    and (item["id"] in open_ids or keys.get(item["id"]) or began is not None and at >= began)]
         # The ledger settles only the proposals the lane waited on, not a question it is asking now.
         if settled and not (row.get("prompt_waiting") or (row.get("claude") or {}).get("pending_questions")
@@ -704,7 +803,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         view["waiting_reports"] = received
         if sources := scan_sessions.question_sources(row, entries):
             view["question_sources"] = sources
-        view["asking"] = ask_state.for_row(state, identity, latest_decisions)
+        view["asking"] = ask_state.asking(state, latest_decisions, bound_asks, row=identity)
         if undecided:
             view.update(undecided_proposals=undecided, undecided_count=len(undecided))
         if blocked_by_user(row):
@@ -717,7 +816,9 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             for asked_at, ask in unanswered:
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
-                asked = "\n".join(answer_evidence.questions_of(ask)) or ask.get("text")
+                remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask), 1)
+                             if not ask_state.covered((ask["id"], frozenset((number,))), closed_ids, known_asks)]
+                asked = "\n".join(question for _, question in remaining) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
                     "question": excerpt(asked) or view["question"],
@@ -725,6 +826,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     "decisions": keys.get(ask["id"], []), "related_issues": related_issues(ask),
                     "reissued": withdrawn_by((ask["id"], frozenset()), entries),
                     "ask": {**report_view(ask), "marked": ask["id"] not in open_ids,
+                            "question_numbers": [number for number, _ in remaining],
                             "claimed": (claim.view() if (claim := (claimed or {}).get(ask["id"])) else None)},
                     "candidates": [answer_view(answer) for answer in answer_evidence.related_to(ask, answers)[-3:]]}))
             continue
@@ -777,6 +879,29 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         found.append((since, {**view, "state": "unasked", "since": prompt_at or final["at"] or since.isoformat(),
                               "candidates": [answer_view(answer) for answer in asked_directly[-3:]],
                               "choices_in_info": choices}))
+    listed = {key for _, item in found for key in item.get("decisions", [])}
+    registered = [question for question in questions if not question.get("withdrawn_at")]
+    for item in handed:
+        key, target = item.decision, item.ask_id
+        ref = handoff_refs[key]
+        if key in listed:
+            continue
+        if target and not any(key in (question.get("decision"), *(question.get("covers") or []))
+                              for question in registered):
+            continue
+        if not target and not any(ask_state.registered_ask_id(question, key) for question in registered):
+            continue
+        ask = ask_entries.get(ref[0] if ref else (target or "").partition(":")[0])
+        remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask or {}), 1)
+                     if ref and (not ref[1] or number in ref[1])
+                     and not ask_state.covered((ref[0], frozenset((number,))), closed_ids, known_asks)]
+        since = scan_sessions.parse_time(item.handed_off_at) or now
+        found.append((since, {"row": None, "name": (ask or {}).get("worktree") or target or key,
+                              "state": "unanswered", "since": item.handed_off_at, "decisions": [key],
+                              "question": excerpt("\n".join(question for _, question in remaining) or (ask or {}).get("text") or key),
+                              "ask": {**report_view(ask), "question_numbers": [number for number, _ in remaining]} if ask else None,
+                              "asking": ask_state.for_key(state, key, known_asks, bound_asks),
+                              "answer": None}))
     for item in rejected or []:
         asked = "\n".join(str(question.get("question") or "") for question in item["questions"]
                           if isinstance(question, dict))
@@ -1059,7 +1184,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "ask_id": asking.ask,
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
-    return {"id": key, **data["questions"][key], "asking": ask_state.for_row(data, data["questions"][key]["row"]),
+    return {"id": key, **data["questions"][key], "asking": ask_state.asking(data, None, {}, row=data["questions"][key]["row"]),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1340,7 +1465,9 @@ def unrecorded_questions(data: dict, projects: Path, workspaces: list[Path]) -> 
 
 def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             answers: list[answer_evidence.Answer], now: datetime, entries: list[dict] | None = None,
-            unrecorded: list[dict] | None = None) -> dict[str, list[dict]]:
+            unrecorded: list[dict] | None = None, *,
+            bindings: Mapping[str, ask_state.HandoffBinding] | None = None,
+            resolved: Mapping[str, list[lead_decisions.Decision]] | None = None) -> dict[str, list[dict]]:
     """Open items as lists, settled questions with evidence, transcript answers still missing from state, and the
     asked questions never recorded (`unrecorded`, from unrecorded_questions). An unanswered question carries
     `reissued` (withdrawn_by) from the inbox `entries`."""
@@ -1352,11 +1479,13 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             continue
         view = {"id": key, **item}
         asked_at = scan_sessions.parse_time(item["asked_at"])
-        covered = covering_answers(item, decisions)
+        covered = covering_answers(item, decisions, bindings)
+        direct = (resolved or {}).get(key)
         if item.get("withdrawn_at"):
             settled.append({**view, "state": "withdrawn", "since": item["withdrawn_at"],
                             "reason": item["withdrawal_reason"]})
-        elif covered and len(covered) == len(item["covers"]):
+        elif direct or resolved is None and covered and len(covered) == len(item["covers"]):
+            covered = direct or covered
             settled.append({**view, "state": "settled", "since": max(
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
                             "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
@@ -1609,6 +1738,7 @@ def main(argv: list[str] | None = None) -> int:
     asking = commands.add_parser("asking", help="list the rows and decision keys being asked, with workspace and time")
     asking.add_argument("--summary", action="store_true", help="one 伺い中 line per question")
     asking.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG)
+    asking.add_argument("--handed-off-file", type=Path, default=lead_decisions.HANDED_OFF_LOG)
     pending_command = commands.add_parser(
         "pending", help="list open items with their ids (an unanswered question with the prs its #numbers name and the "
                         "later asks that withdrew its ask as reissued), settled questions with evidence, unrecorded "
@@ -1828,22 +1958,42 @@ def main(argv: list[str] | None = None) -> int:
             claims = {key: claim for key, claim in claims.items() if key in open_keys}
             claims = inbox_read.checked_claims(claims, datetime.now(timezone.utc), args.orca, args.claude_projects)
             decided = lead_decisions.history(lead_decisions.records(args.decisions_file.expanduser()))
-            handed = list({item.decision: item for item in lead_decisions.handed_off(args.handed_off_file.expanduser())
-                           if item.decision not in decided}.values())
+            latest_handoffs: dict[str, lead_decisions.HandOff] = {}
+            history = list(lead_decisions.handed_off(args.handed_off_file.expanduser()))
+            for item in history:
+                earlier = latest_handoffs.get(item.decision)
+                if not item.ask_id and earlier and earlier.ask_id:
+                    item = lead_decisions.HandOff(item.decision, item.handed_off_at, earlier.ask_id)
+                latest_handoffs[item.decision] = item
+            for key in decided.keys() & latest_handoffs.keys():
+                if lead_decisions.decision_for_handoff(decided[key][-1].view(), True) is None:
+                    del decided[key]
+            known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
+            evidence = lead_decisions.ask_answers(answers_log) if data["presented"] else {}
+            presented_answers = {}
+            for key in data["presented"]:
+                ask_id = latest_handoffs[key].ask_id if key in latest_handoffs else None
+                ref = ask_state.handoff_ref(ask_id, key, list(known.values()), data["questions"].values())
+                if ref and (proof := lead_decisions.ask_answer_for_handoff(ref, evidence, known)):
+                    stamps = [at for part in proof.get("answers", [proof]) if (at := scan_sessions.parse_time(part.get("ts")))]
+                    if stamps:
+                        presented_answers[key] = max(stamps)
+            handed = [item for key, item in latest_handoffs.items() if key not in decided]
             since = handoff.last_sent_at(args.handoffs_dir.expanduser())
             rejected = [{**item, "worktree": worktree.name} for worktree in answer_evidence.asking_worktrees(args)
                         for item in answer_evidence.rejected_questions(answer_evidence.transcripts_of(
                             args.claude_projects.expanduser(), [worktree]), since)]
             result = stale_asks(rows, entries, open_ids, answer_evidence.from_arguments(args, answers_log),
                                 datetime.now(timezone.utc), state=data, handed=handed,
+                                bindings=ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id),
                                 claimed={ask.report["id"]: claim for ask in asks
                                          if (claim := inbox_read.ask_claim(ask, claims))},
                                 decided=decided, rejected=rejected,
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
             result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
-                data, {key: items[-1] for key, items in decided.items() if items}, datetime.now(timezone.utc),
-                entries)], key=lambda item: -item["age_minutes"])
+                data, {key: items[-1] for key, items in decided.items()}, datetime.now(timezone.utc),
+                entries, presented_answers)], key=lambda item: -item["age_minutes"])
             unseen: set[str] = set()
             if lead := appointed_lead(data):
                 try:
@@ -1915,8 +2065,8 @@ def main(argv: list[str] | None = None) -> int:
                 left_matches = data["left"].get(args.row, {}).get("final_message") == file_text(args.final_message_file)
                 result = {"left": left_matches}
             elif args.action == "asking":
-                result = [ask_state.view(item) for item in ask_state.active(
-                    data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())))]
+                decided, bindings, resolved = current_decisions(data, args.decisions_file, args.handed_off_file)
+                result = [item for item in ask_state.asking(data, None, bindings) if item["id"] not in resolved]
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":
@@ -1925,9 +2075,11 @@ def main(argv: list[str] | None = None) -> int:
                                      if item.get("asked_in"))
                 if lead := appointed_lead(data):
                     args.asked_in.append(lead)
-                result = pending(data, lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser())),
+                decided, bindings, resolved = current_decisions(data, args.decisions_file, lead_decisions.HANDED_OFF_LOG)
+                result = pending(data, decided,
                                  answer_evidence.from_arguments(args, inbox_read.answers_path()), datetime.now(timezone.utc),
-                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces))
+                                 inbox_entries(), unrecorded_questions(data, args.claude_projects.expanduser(), workspaces),
+                                 bindings=bindings, resolved=resolved)
             elif args.action == "get":
                 key = args.id or args.item_id
                 result = next(({"id": key, **data[kind][key]} for kind in
@@ -1992,7 +2144,7 @@ def main(argv: list[str] | None = None) -> int:
                                      f"{label}質問 ID {answer.question} を指定し、hourly_state.py {retry} で再実行してください。"
                                      f"{error}") from error
             if sync_answers:
-                answer_sync.update_corrected_keys(items)
+                answer_sync.update_corrected_keys(items, data["questions"].values())
             for workspace in dict.fromkeys(commented):
                 if why := write_comment(args.orca, workspace, workspace_comment(data, workspace)):
                     if args.action == "comment":

@@ -27,11 +27,14 @@ names each answered question whose inbox ask a later ask of the same lane withdr
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from functools import cache
 import json
 import os
 from pathlib import Path
 import re
 import runpy
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -44,6 +47,8 @@ import handoff
 import hourly_state
 import inbox_read
 import hourly_runtime
+import lane_input
+import lead_decisions
 import retro
 
 STATE_DIR = os.environ.get("TRIAGE_STATE_DIR", "~/.cache/orca-session-triage")
@@ -70,6 +75,9 @@ VERDICT_CLASSES = ("waiting", "blocked", "in_progress", "done_unmerged", "finish
 
 JAPANESE = ("HIRAGANA LETTER", "KATAKANA LETTER", "HALFWIDTH KATAKANA LETTER",
             "CJK UNIFIED IDEOGRAPH", "CJK COMPATIBILITY IDEOGRAPH")
+QUESTION_URL = re.compile(r"https?://[^\s<>()（）「」、。]+")
+KANJI = re.compile(r"[\u3400-\u9fff]")
+ALPHANUMERIC = re.compile(r"[a-z0-9]+")
 
 
 def in_japanese(question: dict[str, Any]) -> bool:
@@ -89,7 +97,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     state = read_json(state_dir / "hourly-state.json")
     lead = (state.get("lead") or {}).get("worktree") if isinstance(state, dict) else None
     if isinstance(state, dict) and lead and ask_state.same_workspace(lead, workspace):
-        return duplicate_question(hook_input, state)
+        return duplicate_question(hook_input, state, state_dir, orca)
     try:
         if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
                    for automation in triage_automations(orca, workspace)):
@@ -102,7 +110,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     reasons = []
-    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}):
+    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca):
         reasons.append(duplicated["hookSpecificOutput"]["permissionDecisionReason"])
     if not all(in_japanese(question) for question in questions):
         reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
@@ -128,14 +136,206 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     return deny(reasons)
 
 
-def duplicate_question(hook_input: dict, state: dict) -> dict | None:
-    """Name an answered ask or a question another tab has claimed or is already asking."""
+def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], numbers: dict[str, set[int]],
+                         unmatched: set[str], state_dir: Path, orca: str) -> list[str]:
+    prompts = lane_input.direct_prompts(asks, orca)
+    if not prompts:
+        return []
+    path = state_dir / "ask-lane-input-shown.json"
+    reasons = []
+    try:
+        with retro.locked(path.with_suffix(".lock")):
+            try:
+                shown = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                shown = {}
+            for ask_id, inputs in prompts.items():
+                has_parts = bool(inbox_read.questions_of(asks[ask_id]))
+                refs = [f"{ask_id}:{number}" for number in sorted(numbers[ask_id])]
+                keys = refs + ([f"{ask_id}:?"] if ask_id in unmatched else []) or [ask_id]
+                seen = [shown.setdefault(key, []) for key in keys]
+                new_inputs = [(prompt, at) for prompt, at in inputs if any(at.isoformat() not in times for times in seen)]
+                if not new_inputs:
+                    continue
+                for times in seen:
+                    times.extend(at.isoformat() for _, at in new_inputs if at.isoformat() not in times)
+                questions = "・".join(f"「{label}」" for label in dict.fromkeys(labels[ask_id]))
+                lane = asks[ask_id].get("worktree") or asks[ask_id]["handle"]
+                ref = f"{ask_id}:<質問番号>" if has_parts else ask_id
+                excerpts = "、".join(f"{at.astimezone():%m/%d %H:%M}「{prompt[:80]}」" for prompt, at in new_inputs)
+                reasons.append(f"{questions}（ask {ask_id}）の後、{lane} のタブに入力がありました（{excerpts}）。"
+                               "三浦さんの回答なら、伺わずに担当へ "
+                               f"`triage-notify --answered {ref} <答えの要約>` での記録を頼んでください。"
+                               "元の ask で入力が答えている問いを確認し、対応する番号だけを指定してください。"
+                               "回答でなければ、同じ AskUserQuestion をもう一度呼ぶと通ります。")
+            if reasons:
+                retro.atomic_text(path, json.dumps(shown, separators=(",", ":")))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    return reasons
+
+
+QUESTION_CONDITIONS = re.compile(r"今週|来週|先週|今月|来月|先月|今日|本日|明日|昨日|[月火水木金土日]曜"
+                                 r"|午前|午後|承認前|承認後|\d+(?:年|月|日|時|分|週)"
+                                 r"|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2}|\d{1,2}/\d{1,2}"
+                                 r"|承認を得(?:てから|た後|る前|た場合|なかった場合)|承認取得[前後]"
+                                 r"|以降|以前|(?<=[0-9日時分曜])\s*まで(?:に)?|jst|utc|再起動|リスタート|稼働を続け"
+                                 r"|本番|検証環境|ステージング|(?<![a-z])(?:production|prod|staging|stg)(?![a-z])"
+                                 r"|(?:ある|ない|する|しない|できる|できない)(?=場合|とき)")
+ASK_REFERENCE = r"[0-9a-f-]{8,36}(?::[1-9]\d*)?"
+ASK_CITATION = re.compile(rf"\bask(?:\s+id)?[\s:=]+({ASK_REFERENCE})(?![a-z0-9_-])", re.I)
+BARE_ASK_CITATION = re.compile(r"(?<![a-z0-9_-])[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"
+                               r"(?::[1-9]\d*)?(?![a-z0-9_-])", re.I)
+SAME_CONDITION = {"本日": "今日", "リスタート": "再起動", "production": "本番", "prod": "本番",
+                  "staging": "ステージング", "stg": "ステージング"}
+DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
+ISSUE_NUMBER = re.compile(r"(?:#|＃)\s*(\d+)")
+PULL_LINK = re.compile(r"^https?://[^/]+/(?:[^/?#]+/)*(?:pull|pulls|pr)/\d+(?=[/?#]|$)", re.I)
+ISSUE_LINK = re.compile(r"^https?://(?:github\.com/[^/]+/[^/]+/issues/\d+"
+                        r"|[^/]+\.backlog\.com/view/[A-Z0-9_]+-\d+)(?=[/?#]|$)", re.I)
+
+
+def question_conditions(value: str) -> list[str]:
+    return [SAME_CONDITION.get(term, term)
+            for raw in QUESTION_CONDITIONS.findall(lane_input.normalized(QUESTION_URL.sub("", value)))
+            if (term := raw.strip())]
+
+
+def question_scope_agrees(original: dict, current: dict, *, explicit: bool = False) -> bool:
+    text = current.get("question") or ""
+    original_text = original.get("question") or ""
+    known_links = set(QUESTION_URL.findall(answer_evidence.shown_question(original)))
+    shown_links = set(QUESTION_URL.findall(answer_evidence.shown_question(current)))
+    known_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(original_text)))
+    shown_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(text)))
+    for kind in (PULL_LINK, ISSUE_LINK):
+        known_targets = {match[0].lower() for link in known_links if (match := kind.match(link))}
+        shown_targets = {match[0].lower() for link in shown_links if (match := kind.match(link))}
+        if known_targets and shown_targets:
+            if known_targets.isdisjoint(shown_targets):
+                return False
+            break
+    else:
+        if not explicit and known_links and shown_links and known_links.isdisjoint(shown_links):
+            return False
+    if known_numbers and shown_numbers and known_numbers != shown_numbers:
+        return False
+    annotations = "".join(f"{original[key]} " for key in ("context", "impact") if original.get(key))
+    if annotations:
+        text = text.removeprefix(annotations)
+    text = BARE_ASK_CITATION.sub("", ASK_CITATION.sub("", text))
+    old_conditions, new_conditions = question_conditions(original_text), question_conditions(text)
+    described_targets = {term for option in current.get("options") or [] for term in question_conditions(
+        f"{option.get('label', '')} {option.get('description', '')}") if term in DEPLOYMENT_TARGETS}
+    old_targets = DEPLOYMENT_TARGETS.intersection(old_conditions)
+    if "この環境" in text and len(old_targets) == 1 and described_targets == old_targets:
+        old_conditions = [term for term in old_conditions if term not in old_targets]
+    return old_conditions == new_conditions and all(
+        not current.get(key) or question_conditions(original.get(key) or "") == question_conditions(current[key])
+        for key in ("context", "impact"))
+
+
+def question_options_agree(left: dict, right: dict) -> bool:
+    def choices(question: dict) -> dict[str, tuple[str, str]]:
+        return {lane_input.option_key(option["label"]): (
+                    lane_input.normalized(option["label"]).removesuffix("(推奨)").removesuffix("(recommended)").strip(),
+                    lane_input.normalized(str(option.get("description") or "")))
+                for option in question.get("options") or [] if isinstance(option, dict) and option.get("label")}
+
+    first, second = choices(left), choices(right)
+    if not first or not second:
+        return True
+    if first.keys() != second.keys() or bool(left.get("multiSelect")) != bool(right.get("multiSelect")):
+        return False
+    for key, (label, description) in first.items():
+        other_label, other_description = second[key]
+        if label == other_label:
+            if not description or not other_description or description == other_description:
+                continue
+        elif key not in (label, other_label) or not description or not other_description:
+            return False
+        elif description == other_description:
+            continue
+        if question_conditions(description) != question_conditions(other_description):
+            return False
+        wording = SequenceMatcher(None, description, other_description, autojunk=False)
+        if ALPHANUMERIC.findall(description) != ALPHANUMERIC.findall(other_description):
+            return False
+        if (wording.ratio() < 0.6 if label == other_label else wording.find_longest_match().size < 24):
+            return False
+        if any(
+                action == "replace" and end - start <= 8 and other_end - other_start <= 8
+                and KANJI.search(description[start:end]) and KANJI.search(other_description[other_start:other_end])
+                for action, start, end, other_start, other_end in wording.get_opcodes()):
+            return False
+    return True
+
+
+@cache
+def workspace_repo_matches(location: Path, environment: str, repo: str, orca: str) -> bool:
+    if location.parent.name == repo:
+        return True
+    try:
+        if not environment:
+            origin = subprocess.check_output(["git", "-C", str(location), "remote", "get-url", "origin"],
+                                             text=True, stderr=subprocess.DEVNULL, timeout=2).strip()
+            return origin.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git") == repo
+        worktrees = orca_result(orca, "worktree", "list", "--environment", environment, "--repo", f"name:{repo}")["worktrees"]
+        return any(item.get("path") == str(location) for item in worktrees)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return False
+
+
+def worker_scope(entry: dict, rows: set[str], remote_hosts: dict, orca: str) -> bool:
+    if not rows:
+        return True
+    local = os.environ.get("TRIAGE_HOST") or socket.gethostname()
+    for row in rows:
+        environment, _, workspace = row.rpartition("::")
+        location = Path(workspace)
+        if location.name != entry.get("worktree"):
+            continue
+        host = (remote_hosts.get(environment) or {}).get("report_host") if environment else local
+        repo = entry.get("repo")
+        if host and entry.get("host") in (None, host) and (not repo or workspace_repo_matches(location, environment, repo, orca)):
+            return True
+    return False
+
+
+def registered_scope(question: dict, entries: list[dict],
+                     handoff_ids: dict[str, ask_state.HandoffBinding]) -> list[tuple[str, frozenset[int]]]:
+    scoped = []
+    for ask_id, numbers in ask_state.references(question, entries, bindings=handoff_ids):
+        if not numbers:
+            original = next(entry for entry in entries if entry.get("id") == ask_id)
+            matched = [number for number, part in enumerate(inbox_read.questions_of(original), 1)
+                       if isinstance(part, dict) and question.get("question")
+                       in (part.get("question"), answer_evidence.shown_question(part))]
+            if len(matched) == 1:
+                numbers = frozenset(matched)
+        scoped.append((ask_id, numbers))
+    return scoped
+
+
+def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str) -> dict | None:
     entries = hourly_state.inbox_entries()
-    answers = inbox_read.answer_records(inbox_read.answers_path())
+    path = inbox_read.answers_path()
+    answers = inbox_read.answer_records(path)
+    answers.update(lane_input.inferred_answers(inbox_read.paths()[0], path, orca))
     claims = inbox_read.read_claims(inbox_read.claims_path())
+    withdrawn = inbox_read.withdrawal_times(entries)
+    handoff_ids = ask_state.handoff_bindings((item.decision, item.ask_id) for item in
+                                             lead_decisions.handed_off(lead_decisions.HANDED_OFF_LOG.expanduser()) if item.ask_id)
+    remote_config = Path(os.environ.get("TRIAGE_PULL_CONFIG") or "~/.cache/orca-briefs/remote-inboxes.json").expanduser()
+    remote_data = read_json(remote_config)
+    remote_hosts = remote_data.get("hosts", {}) if isinstance(remote_data, dict) else {}
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     cwd, session = hook_input["cwd"], hook_input.get("session_id")
     reasons = []
+    uncovered: dict[str, dict] = {}
+    labels: dict[str, list[str]] = {}
+    asked_numbers: dict[str, set[int]] = {}
+    unmatched: set[str] = set()
     for question in questions:
         text, header = question.get("question") or "", question.get("header") or ""
         recorded = list(state.get("questions", {}).values())
@@ -144,31 +344,93 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
                and item.get("answer") is None and not item.get("withdrawn_at")]
         own = [item for item in mine if item.get("question") == text]
         if not own and header:
-            own = [item for item in mine if item.get("header") == header]
+            own = [item for item in mine if item.get("header") == header
+                   and question_scope_agrees(item, question)]
         if own:
             matched = [max(own, key=lambda item: item.get("asked_at") or "")]
         else:
             matched = [item for item in recorded if item.get("question") == text]
-            bindings = {(item.get("row"), item.get("decision"), tuple(item.get("covers") or [])) for item in matched}
-            if len(bindings) > 1:
+            placements = {(item.get("row"), item.get("decision"), tuple(item.get("covers") or [])) for item in matched}
+            if len(placements) > 1:
                 matched = []
-        refs = [ref for item in matched for ref in ask_state.references(item, entries)]
-        if not matched:
-            shown = [(str(entry["id"]), frozenset((number,)))
-                     for entry in entries if entry.get("kind") == "ask" and entry.get("id")
-                     for number, original in enumerate(inbox_read.questions_of(entry), start=1)
-                     if text in (original.get("question"), answer_evidence.shown_question(original))
-                     and (not header or original.get("header") == header)]
-            if len({ref[0] for ref in shown}) == 1:
+        refs = [ref for item in matched for ref in ask_state.references(item, entries, bindings=handoff_ids)]
+        for ask_id, numbers in list(refs):
+            original = inbox_read.questions_of(next(item for item in entries if item.get("id") == ask_id))
+            parts = [original[n - 1] for n in numbers if 0 < n <= len(original)] if numbers else original
+            if parts and all(isinstance(part, dict) and (not question_options_agree(part, question)
+                                                         or not question_scope_agrees(part, question)) for part in parts):
+                refs.remove((ask_id, numbers))
+                matched = [item for item in matched
+                           if (ask_id, numbers) not in ask_state.references(item, entries, bindings=handoff_ids)]
+        presented = answer_evidence.shown_question(question)
+        without_links = QUESTION_URL.sub("", presented)
+        cited = [token.lower() for token in dict.fromkeys([
+            *ASK_CITATION.findall(without_links), *BARE_ASK_CITATION.findall(without_links)])]
+        tokens = cited or re.findall(rf"(?<![\w-]){ASK_REFERENCE}(?![\w-])", presented)
+        named = [ref for token in tokens if (ref := ask_state.reference(token, entries))]
+        if cited and len(cited) != len(named):
+            continue
+        numbered = [ref for ref in named if ref[1] and (entry := next(e for e in entries if e.get("id") == ref[0]))
+                    and max(ref[1]) <= len(inbox_read.questions_of(entry))]
+        if len(set(numbered)) == 1:
+            ask_id, numbers = numbered[0]
+            original_parts = inbox_read.questions_of(next(e for e in entries if e.get("id") == ask_id))
+            if any(isinstance(part := original_parts[number - 1], dict)
+                   and (not question_options_agree(part, question)
+                        or not question_scope_agrees(part, question, explicit=True)) for number in numbers):
+                continue
+            refs = numbered[:1]
+        elif named or not refs or any(not numbers for _, numbers in refs):
+            workers = {row for item in matched if (row := item.get("row"))}
+            named_ids = {ref[0] for ref in named}
+            originals = [(str(entry["id"]), number, original)
+                         for entry in entries if entry.get("kind") == "ask" and entry.get("id")
+                         and (entry["id"] in named_ids if named_ids else worker_scope(entry, workers, remote_hosts, orca))
+                         for number, original in enumerate(inbox_read.questions_of(entry), start=1)
+                         if isinstance(original, dict) and (named_ids or not header or original.get("header") == header)
+                         and question_options_agree(original, question)
+                         and question_scope_agrees(original, question, explicit=bool(named_ids))
+                         and (named_ids or entry["id"] not in withdrawn and f"{entry['id']}:{number}" not in withdrawn)]
+            shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
+                     if text in (original.get("question"), answer_evidence.shown_question(original))]
+            if not shown and header:
+                links = set(QUESTION_URL.findall(presented))
+                shown = [(ask_id, frozenset((number,))) for ask_id, number, original in originals
+                         if named_ids or links.intersection(QUESTION_URL.findall(answer_evidence.shown_question(original)))]
+            if named_ids and len(shown) == 1:
+                refs = shown
+            elif len(named_ids) == 1:
+                if not originals and any(inbox_read.questions_of(entry) for entry in entries if entry.get("id") in named_ids):
+                    continue
+                refs = [(next(iter(named_ids)), frozenset())]
+            elif refs:
+                for index, (ask_id, numbers) in enumerate(refs):
+                    candidates = [parts for original, parts in shown if original == ask_id]
+                    if not numbers and len(candidates) == 1:
+                        refs[index] = ask_id, candidates[0]
+            elif len(shown) == 1:
                 refs.extend(shown)
+        if named:
+            matched = [item for item in matched if any(ask_state.overlaps(ref, other) for ref in refs
+                       for other in registered_scope(item, entries, handoff_ids))]
         for ref in dict.fromkeys(refs):
             ask_id, numbers = ref
-            if ask_state.covered(ref, list(answers), entries):
-                times = [record.get("ts") or "時刻不明" for key, record in answers.items()
-                         if key == ask_id or key.startswith(ask_id + ":")
-                         and (not numbers or int(key.rsplit(":", 1)[1]) in numbers)]
-                reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{', '.join(times)}）。答えを読んでください。")
             ask = next(entry for entry in entries if entry.get("id") == ask_id)
+            if ask_state.covered(ref, list(answers), entries):
+                parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
+                covered = inbox_read.answer_parts(ask_id, parts, answers)
+                facts = [f"{ask.get('worktree') or ask_id} の回答「{record['note']}」"
+                         if record.get("how") in inbox_read.LANE_ANSWERS | {inbox_read.HOURLY_CORRECTION} and record.get("note")
+                         else record.get("ts") or "時刻不明" for record in covered]
+                facts = list(dict.fromkeys(facts))
+                reasons.append(f"「{header or text}」は ask {ask_id} の回答済みの問いです（{'、'.join(facts)}）。"
+                               "記録された回答を確認してください。")
+            else:
+                uncovered[ask_id] = ask
+                labels.setdefault(ask_id, []).append(text or header)
+                asked_numbers.setdefault(ask_id, set()).update(numbers)
+                if not numbers and inbox_read.questions_of(ask):
+                    unmatched.add(ask_id)
             parts = numbers or range(1, len(inbox_read.questions_of(ask)) + 1)
             candidates = ([inbox_read.question_claim(claims, ask_id, number) for number in parts]
                           if parts else [claims.get(ask_id)])
@@ -178,15 +440,19 @@ def duplicate_question(hook_input: dict, state: dict) -> dict | None:
         for item in matched:
             if item.get("answer") is not None:
                 reasons.append(f"「{header or text}」は hourly_state の回答済みの問いです（{item.get('answered_at')}）。答えを読んでください。")
-        related = {value for item in matched for value in [item.get("decision"), *(item.get("covers") or [])]}
+        related = {value for item in matched for value in [item.get("decision"), *(item.get("covers") or [])]
+                   if value and ask_state.same_bound_ask(item, handoff_ids.get(value), value)}
         for item in ask_state.active(state):
             same = ask_state.same_workspace(item["by"], cwd)
             if same and (not item["session"] or item["session"] == session):
                 continue
-            bindings = ask_state.references(item["record"], entries)
-            overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in bindings)
-            if item["record"] in matched or related.intersection(item["keys"]) or overlap:
-                reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(item['keys'])}、問い {item['id']}）。重ねて伺わないでください。")
+            held = (registered_scope(item["record"], entries, handoff_ids) if named else
+                    ask_state.references(item["record"], entries, bindings=handoff_ids))
+            overlap = any(ask_state.overlaps(ref, other) for ref in refs for other in held)
+            keys = ask_state.active_keys(item, handoff_ids)
+            if item["record"] in matched or related.intersection(keys) or overlap:
+                reasons.append(f"「{header or text}」は {item['by']} が伺い中です（{item['at']}、行 {item['row']}、鍵 {', '.join(keys)}、問い {item['id']}）。重ねて伺わないでください。")
+    reasons.extend(direct_input_reasons(uncovered, labels, asked_numbers, unmatched, state_dir, orca))
     return deny(list(dict.fromkeys(reasons)))
 
 

@@ -604,15 +604,27 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     answered = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
     keys = list(dict.fromkeys(args.decision))
     bound = decision_asks(args.decision_ask, keys)
-    settled = [answered[key] for key in keys if key in answered]
+    history = [item for item in lead_decisions.handed_off(args.handed_off_file.expanduser()) if item.decision in keys]
+    selected = {**{item.decision: item.ask_id for item in history if item.ask_id}, **bound}
+    checked = {item.decision for item in history} | selected.keys()
+    inbox = args.inbox.expanduser()
+    asks = {row["id"]: row for row in inbox_read.inbox_entries(inbox)
+            if row.get("kind") == "ask" and row.get("id")} if checked else {}
+    choices = lead_decisions.ask_answers(inbox_read.answers_path()) if asks else {}
+    questions = hourly_state.read(args.state_file.expanduser())["questions"].values() if asks else ()
+    settled = []
+    for key in keys:
+        if key in answered and lead_decisions.decision_for_handoff(answered[key].view(), key in checked):
+            settled.append(f"{key}: {answered[key].answer}")
+        elif key in checked and (proof := lead_decisions.bound_handoff_answer(key, selected.get(key), choices, asks, questions)):
+            settled.append(f"{key}: ask {proof.get('id') or selected.get(key) or key} の回答を記録済みです")
     if settled:
         print("handoff: the lead already answered; follow each answer and drop it from the handoff:",
-              *(f"{item.decision}: {item.answer}" for item in settled), sep="\n", file=sys.stderr)
+              *settled, sep="\n", file=sys.stderr)
         return 1
     body = args.body_file.read_text(encoding="utf-8").strip()
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
-    inbox = args.inbox.expanduser()
     before, after, end = inbox_around(inbox, args.since)
     if not args.force and (later := inbox_read.later_run_notes(args.orca, "handoff")):
         print("handoff: not sent: a later scheduled run of this workspace began, or was skipped because this run was "

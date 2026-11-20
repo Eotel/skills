@@ -24,6 +24,8 @@ Find Orca worktrees whose agents finished, stalled, wait on a human, or never
 got a task; relay the user's answers and next steps in one batch; clear the
 board's done cards; close what the user approves.
 
+For lane-tab answers and duplicate-question checks, see [references/hourly.md](references/hourly.md).
+
 ## Where
 
 - `scripts/scan_sessions.py`: classifies every worktree from Orca state plus

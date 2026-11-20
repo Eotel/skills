@@ -462,7 +462,10 @@ def inbox_entries(inbox: Path) -> list[dict]:
 DELIVERY_ANSWERS = frozenset(("send", "send --decision"))
 HOURLY_ANSWER = "hourly_state.py answered"
 HOURLY_CORRECTION = "hourly_state.py corrected"
-HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION))
+LANE_ANSWER = "triage-notify --answered"
+TRANSCRIPT_ANSWER = "lane transcript"
+LANE_ANSWERS = frozenset((LANE_ANSWER, TRANSCRIPT_ANSWER))
+HOURLY_ANSWERS = frozenset((HOURLY_ANSWER, HOURLY_CORRECTION)) | LANE_ANSWERS
 SUBSTANTIVE_ANSWERS = DELIVERY_ANSWERS | HOURLY_ANSWERS
 
 
@@ -482,8 +485,12 @@ def delivered_records(path: Path) -> dict[str, dict]:
 
 def answer_records(path: Path) -> dict[str, dict]:
     """Current answers in append order, independently of their delivery history."""
+    return current_answers(answer_entries(path))
+
+
+def current_answers(records: Iterable[dict]) -> dict[str, dict]:
     found: dict[str, dict] = {}
-    for record in answer_entries(path):
+    for record in records:
         previous = found.get(record["id"])
         how = record.get("how")
         if (previous is None or how == HOURLY_CORRECTION
@@ -562,6 +569,21 @@ def open_asks(entries: list[dict], answered: frozenset[str]) -> list[OpenAsk]:
             found.append(OpenAsk(item, left, asked_at(item)))
     # Python's sort is stable: asks without a readable time keep their append order, after the rest.
     return sorted(found, key=lambda ask: (ask.at is None, ask.at or datetime.min.replace(tzinfo=timezone.utc)))
+
+
+def withdrawal_times(entries: list[dict]) -> dict[str, datetime]:
+    asks = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    withdrawn: dict[str, datetime] = {}
+    for report in entries:
+        if not report.get("withdraws") or not (at := asked_at(report)):
+            continue
+        for ref in report["withdraws"]:
+            if (not isinstance(ref, str) or not (ask := asks.get(ref.partition(":")[0]))
+                    or not (opened := asked_at(ask)) or opened > at
+                    or any(ask.get(key) != report.get(key) for key in ("host", "repo", "worktree"))):
+                continue
+            withdrawn[ref] = min(at, withdrawn.get(ref, at))
+    return withdrawn
 
 
 def ledger_owners(proposal_ids: list[str]) -> dict[str, str]:
@@ -676,7 +698,7 @@ def answer_sender() -> dict[str, str | None]:
 
 def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
                    sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
-                   answer_at: str | None = None) -> None:
+                   answer_at: str | None = None, transcript_input: str | None = None) -> None:
     """Append one line per answered id with its source worktree/session; lock concurrent writers' lines whole.
 
     Both send and `answered` use this writer, so handoff can identify this run's own delivered answers.
@@ -687,6 +709,7 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
     lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": source,
                                **({"note": note} if note else {}),
                                **({"sent_text": sent_text} if sent_text is not None else {}),
+                               **({"input": transcript_input} if transcript_input is not None else {}),
                                **({"answer_at": answer_at} if answer_at is not None else {})},
                                ensure_ascii=False) + "\n" for answer in ids]
     with writing(path, lines=lines) as write_file:
@@ -1121,6 +1144,9 @@ def main(argv: list[str] | None = None) -> int:
                               help="atomically write JSON to FILE instead of stdout (implies --json)")
     open_command.add_argument("--claude-projects", type=Path, default=Path("~/.claude/projects"),
                               help="transcripts used to check whether a claimed question is still being asked")
+    lane_answers = actions.add_parser("lane-answers", help="report transcript evidence for the specified local asks")
+    lane_answers.add_argument("ids", nargs="+", metavar="ASK_ID")
+    lane_answers.add_argument("--candidates", action="store_true", help="return all inputs for controller delivery matching")
     answered = actions.add_parser("answered", help="record asks as answered without sending (answered elsewhere, "
                                                    "or no longer asked); send --decision --ask records its own")
     answered.add_argument("ids", nargs="?", help="comma-separated ask ids, or <ask id>:<question number>")
@@ -1183,9 +1209,20 @@ def main(argv: list[str] | None = None) -> int:
                 hold_seconds=args.hold_seconds if args.hold_seconds is not None
                 else WAKING_HOLD_SECONDS if args.exit_on_event else 0))
             return 0
+        if args.action == "lane-answers":
+            import lane_input
+            candidates = lane_input.export_candidates(inbox, answers_path(),
+                                                       os.environ.get("ORCA_CLI_COMMAND", "orca"), set(args.ids))
+            records = candidates if args.candidates else lane_input.unambiguous_answers(candidates)
+            print(json.dumps(records, ensure_ascii=False))
+            return 0
         if args.action in ("open-asks", "questions", "answered", "claim"):
+            if args.action in ("open-asks", "questions"):
+                import lane_input
+                lane_input.reconcile_answers(inbox, answers_path(), getattr(args, "orca", None)
+                                             or os.environ.get("ORCA_CLI_COMMAND", "orca"))
             entries = inbox_entries(inbox)
-            asks = open_asks(entries, answered_ids(answers_path()))
+            asks = open_asks(entries, answered_ids(answers_path()) | set(withdrawal_times(entries)))
             open_keys = frozenset(key for ask in asks for key in (
                 ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
             claims = {key: claim for key, claim in read_claims(claims_path()).items() if key in open_keys}
