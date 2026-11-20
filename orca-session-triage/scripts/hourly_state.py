@@ -620,15 +620,12 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
     for identifier, item in state["questions"].items():
         if item.get("answer") is not None or item.get("withdrawn_at"):
             continue
+        manual = covering_answers(item, decisions, bindings)
         refs = ask_state.references(item, entries, bindings=bindings)
         if not refs:
+            if manual and len(manual) == len(item.get("covers") or []):
+                resolved[identifier] = manual
             continue
-        if not ask_state.references(item, entries):
-            lane = Path(item["row"].rsplit("::", 1)[-1]).name
-            if not all(asks[ask_id].get("worktree") == lane and asks[ask_id].get("text") == item.get("final_message")
-                       for ask_id, _ in refs):
-                continue
-        manual = covering_answers(item, decisions, bindings)
         covered_keys = {answer.decision for answer in manual}
         targets = {key: ask_state.handoff_target(key, bindings[key].ask_id if key in bindings else None,
                                                 entries, (item,))
@@ -636,7 +633,9 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
                    if ask_state.same_bound_ask(item, bindings.get(key), key)}
         if any(key not in covered_keys and not targets.get(key) for key in item.get("covers") or []):
             continue
-        handed_refs = [target for key, target in targets.items() if key in handoff_keys and target]
+        handed_parts = [f"{ask_id}:{number}" if number else ask_id
+                        for key, target in targets.items() if key in handoff_keys and target
+                        for ask_id, numbers in (target,) for number in numbers or (0,)]
         manual_refs = [target for key in covered_keys if (target := targets.get(key))]
         evidence = []
         for ref in refs:
@@ -648,8 +647,8 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
             parts = [part for part in parts
                      if (at := scan_sessions.parse_time(part.get("ts"))) and (not issued or at >= issued)
                      and (part.get("how") != "triage-notify --withdraws"
-                          or any(ask_state.includes(handed, ask_state.reference(part["id"], entries) or ref)
-                                 or ask_state.includes(handed, ref) for handed in handed_refs))]
+                          or ask_state.covered(ref, handed_parts, entries)
+                          or ":" in part["id"] and part["id"] in handed_parts)]
             if not proof or len(parts) != len(proof.get("answers", [proof])):
                 break
             evidence.extend(lead_decisions.Decision(part["id"], item["decision"], part.get("note") or "回答済み",
@@ -1485,7 +1484,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
         if item.get("withdrawn_at"):
             settled.append({**view, "state": "withdrawn", "since": item["withdrawn_at"],
                             "reason": item["withdrawal_reason"]})
-        elif direct or covered and len(covered) == len(item["covers"]):
+        elif direct or resolved is None and covered and len(covered) == len(item["covers"]):
             covered = direct or covered
             settled.append({**view, "state": "settled", "since": max(
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
@@ -2067,7 +2066,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"left": left_matches}
             elif args.action == "asking":
                 decided, bindings, resolved = current_decisions(data, args.decisions_file, args.handed_off_file)
-                result = [item for item in ask_state.asking(data, decided, bindings) if item["id"] not in resolved]
+                result = [item for item in ask_state.asking(data, None, bindings) if item["id"] not in resolved]
             elif args.action == "requests-needing-owner":
                 result = owner_report(data, live, intake)
             elif args.action == "pending":

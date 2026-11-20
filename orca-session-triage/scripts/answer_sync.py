@@ -274,7 +274,10 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 matched = any(ask_state.overlaps(ref, given) for ref in refs for given in touched)
                 covered = matched and all(ask_state.covered(ref, list(records), entries) for ref in refs)
                 bindings = item.get("covers") or ([item["decision"]] if item.get("decision") in keys else [])
-                bindings = [value for value in bindings if ask_state.same_bound_ask(item, bound.get(value), value)]
+                if any(not ask_state.same_bound_ask(item, bound.get(value), value)
+                       or (target := refs_by_key.get(value)) and not any(ask_state.overlaps(target, ref) for ref in refs)
+                       for value in bindings):
+                    continue
                 source = ask_state.reference(item.get("ask_id") or "", entries)
                 if source and source[1]:
                     # Completing a whole-ask key must not replace a selected part with combined answers.
@@ -284,9 +287,9 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                         and how in inbox_read.DELIVERY_ANSWERS):
                     continue
                 if bindings:
-                    if (source and not any(ask_state.overlaps(source, ref) for value in bindings
-                                           if (ref := refs_by_key.get(value)))
-                            and not ask_state.covered(source, list(records), entries)):
+                    extra_refs = [ref for ref in refs if not any(ask_state.includes(target, ref) for value in bindings
+                                                                 if (target := refs_by_key.get(value)))]
+                    if not all(ask_state.covered(ref, list(records), entries) for ref in extra_refs):
                         continue
                     available = {value: latest[value].answer for value in bindings if value in latest
                                  and not (value in handed_keys and latest[value].from_ask)
@@ -295,9 +298,11 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                     available.update({value: answers_by_key[value] for value in bindings if value in answers_by_key
                                       and value not in available and value in handed_keys})
                     available.update(keys)
-                    if not all(value in available for value in bindings) or not any(value in keys for value in bindings):
+                    if not all(value in available for value in bindings) or not (
+                            matched or any(value in keys for value in bindings)):
                         continue
-                    parts = list(dict.fromkeys(available[value] for value in bindings))
+                    parts = list(dict.fromkeys([*(available[value] for value in bindings),
+                                               *(answer_text(answer_parts(ref, records, entries)) for ref in extra_refs)]))
                 elif covered:
                     parts = list(dict.fromkeys(answer_text(answer_parts(ref, records, entries)) for ref in refs))
                 else:

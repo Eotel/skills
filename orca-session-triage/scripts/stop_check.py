@@ -190,7 +190,9 @@ SAME_CONDITION = {"本日": "今日", "リスタート": "再起動", "productio
                   "staging": "ステージング", "stg": "ステージング"}
 DEPLOYMENT_TARGETS = frozenset(("本番", "検証環境", "ステージング"))
 ISSUE_NUMBER = re.compile(r"(?:#|＃)\s*(\d+)")
-ISSUE_LINK = re.compile(r"/(?:pull|pulls|pr|issues|view)/[^/?#\s]+(?:[/?#]|$)", re.I)
+PULL_LINK = re.compile(r"^https?://[^/]+/(?:[^/?#]+/)*(?:pull|pulls|pr)/\d+(?=[/?#]|$)", re.I)
+ISSUE_LINK = re.compile(r"^https?://(?:github\.com/[^/]+/[^/]+/issues/\d+"
+                        r"|[^/]+\.backlog\.com/view/[A-Z0-9_]+-\d+)(?=[/?#]|$)", re.I)
 
 
 def question_conditions(value: str) -> list[str]:
@@ -204,13 +206,19 @@ def question_scope_agrees(original: dict, current: dict, *, explicit: bool = Fal
     original_text = original.get("question") or ""
     known_links = set(QUESTION_URL.findall(answer_evidence.shown_question(original)))
     shown_links = set(QUESTION_URL.findall(answer_evidence.shown_question(current)))
-    known_issues = {re.split(r"[?#]", link, maxsplit=1)[0].rstrip("/") for link in known_links if ISSUE_LINK.search(link)}
-    shown_issues = {re.split(r"[?#]", link, maxsplit=1)[0].rstrip("/") for link in shown_links if ISSUE_LINK.search(link)}
     known_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(original_text)))
     shown_numbers = set(ISSUE_NUMBER.findall(lane_input.normalized(text)))
-    if (known_issues and shown_issues and not known_issues.intersection(shown_issues)
-            or not explicit and known_links and shown_links and not known_links.intersection(shown_links)
-            or known_numbers and shown_numbers and known_numbers != shown_numbers):
+    for kind in (PULL_LINK, ISSUE_LINK):
+        known_targets = {match[0].lower() for link in known_links if (match := kind.match(link))}
+        shown_targets = {match[0].lower() for link in shown_links if (match := kind.match(link))}
+        if known_targets and shown_targets:
+            if known_targets.isdisjoint(shown_targets):
+                return False
+            break
+    else:
+        if not explicit and known_links and shown_links and known_links.isdisjoint(shown_links):
+            return False
+    if known_numbers and shown_numbers and known_numbers != shown_numbers:
         return False
     annotations = "".join(f"{original[key]} " for key in ("context", "impact") if original.get(key))
     if annotations:

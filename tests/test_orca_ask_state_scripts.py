@@ -894,8 +894,8 @@ assert writer is not None and writer.wait(timeout=10) == 0
     def test_guard_allows_another_pr_with_the_same_registered_question_header(self) -> None:
         self.env.update(CLAUDE_CODE_SESSION_ID="lead-session", ORCA_WORKTREE_ID="repo::/w/lead",
                         ORCA_WORKTREE_PATH="/w/lead")
-        original = {**self.question, "question": "skills #237 を公開しますか？ https://example.test/pr/237",
-                    "context": "手順 https://example.test/release"}
+        original = {**self.question, "question": "公開しますか？ https://github.com/Eotel/skills/pull/237",
+                    "context": "関連課題 https://github.com/Eotel/skills/issues/238 手順 https://sites.google.com/view/release"}
         self.write_lines(self.inbox, [
             {"id": self.ASK, "ts": self.AT, "kind": "ask", "worktree": "worker",
              "text": original["question"], "questions": [original]},
@@ -912,10 +912,11 @@ assert writer is not None and writer.wait(timeout=10) == 0
                                                            "covers": [self.KEY + part], "header": original["header"],
                                                            "question": original["question"], "asked_at": self.AT}))
                 self.assertEqual(register.returncode, 0, register.stderr)
-                self.question = {**original, "question": "skills #241 を公開しますか？ https://example.test/pr/241"}
+                self.question = {**original, "question": "公開しますか？ https://github.com/Eotel/skills/pull/241"}
                 self.assertEqual(self.hook().stdout, "")
-        self.question = {**original, "question": f"ask {self.ASK}:1 skills #237 を公開しますか？",
-                         "context": "比較表 https://example.test/other-reference"}
+        self.question = {**original,
+                         "question": f"ask {self.ASK}:1 公開しますか？ https://github.com/Eotel/skills/pull/237/files",
+                         "context": "比較表 https://sites.google.com/view/project-reference"}
         reason = json.loads(self.hook().stdout)["hookSpecificOutput"]
         self.assertEqual(reason["permissionDecision"], "deny")
         self.assertIn("worker の回答「公開する」", reason["permissionDecisionReason"])

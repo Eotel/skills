@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
 import re
+import socket
 
 import inbox_read
 
@@ -53,6 +56,10 @@ def references(question: dict, entries: list[dict], *,
             continue
         declared = reference(value, entries)
         ref = handoff_ref(binding.ask_id, value, entries, (question,)) if binding else declared
+        if ref and binding and not (declared or question.get("ask_id")):
+            report = next(item for item in entries if item.get("id") == ref[0])
+            if not registered_sender(question, report):
+                continue
         if declared and ref and declared[0] == ref[0] and ref[1] and ref[1] < declared[1]:
             ref = declared
         if ref:
@@ -64,6 +71,23 @@ def references(question: dict, entries: list[dict], *,
     elif source and not any(ref[0] == source[0] for ref in found):
         found.append(source)
     return list(dict.fromkeys(found))
+
+
+def registered_sender(question: dict, report: dict) -> bool:
+    environment, _, row = (question.get("row") or "").rpartition("::")
+    if Path(row).name != report.get("worktree") or question.get("final_message") != report.get("text"):
+        return False
+    host = report.get("host")
+    if not environment or environment == "local":
+        return not host or host == (os.environ.get("TRIAGE_HOST") or socket.gethostname())
+    if not host:
+        return False
+    config = Path(os.environ.get("TRIAGE_PULL_CONFIG") or "~/.cache/orca-briefs/remote-inboxes.json").expanduser()
+    try:
+        hosts = json.loads(config.read_text()).get("hosts", {})
+    except (OSError, ValueError, AttributeError):
+        hosts = {}
+    return host == ((hosts.get(environment) or {}).get("report_host") or environment)
 
 
 def handoff_ref(ask_id: str | None, key: str, entries: list[dict],
@@ -103,22 +127,18 @@ def same_bound_ask(question: dict, target: HandoffBinding | str | None, key: str
     ask_id = target.ask_id if isinstance(target, HandoffBinding) else target
     registered = question.get("ask_id")
     named = ASK_KEY.fullmatch(key)
+    additional = question.get("decision") != key and key in (question.get("covers") or [])
+    if registered and isinstance(target, HandoffBinding) and not matching_ref(ask_id, registered):
+        additional = additional and not any(matching_ref(old, registered) for old in target.earlier)
     if not named:
-        if not registered or matching_ref(ask_id, registered):
-            return True
-        covers = question.get("covers") or []
-        return (question.get("decision") != key and key in covers and len(covers) > 1
-                and not (isinstance(target, HandoffBinding)
-                         and any(matching_ref(old, registered) for old in target.earlier)))
+        return not registered or matching_ref(ask_id, registered) or additional
     named_id, part = named.groups()
     named_ref = f"{named_id}:{part}" if part else named_id
     if not registered or part and ":" not in registered and matching_ref(registered, named_id):
         return matching_ref(ask_id, named_ref)
     if matching_ref(ask_id, registered):
         return True
-    if isinstance(target, HandoffBinding) and any(matching_ref(old, registered) for old in target.earlier):
-        return False
-    return ":" not in registered and question.get("decision") != key and matching_ref(ask_id, named_ref)
+    return additional and matching_ref(ask_id, named_ref)
 
 
 def handoff_target(key: str, ask_id: str | None, entries: list[dict],
