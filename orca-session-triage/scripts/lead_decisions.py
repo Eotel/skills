@@ -38,6 +38,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import sys
 from typing import Protocol
 import uuid
@@ -51,6 +52,8 @@ HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
 REMOVAL_KEYS = ("after", "discard", "compose_down", "archive_path", "approve")
+DISCARD_IN_ANSWER = re.compile(
+    r"(?<![\w/])(?:`([^`\n]+)`|([\w./-]*[./][\w./-]+))\s*(?:は|を)\s*捨て(?:て|る|、)")
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value", *REMOVAL_KEYS))
 # The one removal condition: the worktree goes once that PR merged.
 PR_MERGED = re.compile(r"pr-merged:https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/pull/(?P<number>\d+)")
@@ -186,6 +189,7 @@ class PrState:
     head: str | None = None
     type: str | None = None  # "issue" or "pr" when read with include_issues
     closing_prs: frozenset[int] = frozenset()  # an issue's PRs that close it
+    closed_at: str | None = None
 
 
 ITEM_TYPES = {"Issue": "issue", "PullRequest": "pr"}
@@ -402,7 +406,8 @@ def github_pr_states(repo: str, numbers: list[int], *, include_issues: bool = Fa
              PrState(node.get("state"), node.get("updatedAt"), node.get("headRefOid"),
                      ITEM_TYPES.get(node.get("__typename") or ""), frozenset(
                          closing["number"] for closing in (node.get("closedByPullRequestsReferences") or {}).get(
-                             "nodes") or [] if isinstance(closing, dict) and isinstance(closing.get("number"), int)))
+                         "nodes") or [] if isinstance(closing, dict) and isinstance(closing.get("number"), int)),
+                     node.get("mergedAt") or node.get("closedAt"))
              for repository, aliases in read for alias, ref in aliases.items()
              if isinstance(ref, (int, scan_sessions.Item)) and isinstance(node := (repository or {}).get(alias), dict)}
     missing = [f"#{number}" for number in numbers if number not in found]
@@ -746,7 +751,14 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
             if not decision:
                 raise ValueError("--decision is empty")
             at = decided_at(args.decided_at)
-            entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=stamped(non_empty(args.answer_file), at),
+            answer = stamped(non_empty(args.answer_file), at)
+            if decision.startswith("remove:") and not args.discard:
+                paths = list(dict.fromkeys(path for quoted, plain in DISCARD_IN_ANSWER.findall(answer)
+                                          if inside(path := quoted or plain)))
+                if paths:
+                    options = " ".join(f"--discard {shlex.quote(path)}" for path in paths)
+                    raise ValueError(f"破棄するファイルを確認し、同じ record コマンドに {options} を指定してください")
+            entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=answer,
                              decided_at=at, value=answer_value(decision, args.value),
                              removal=RemovalTerms.checked(decision, args.after, args.discard, args.compose_down,
                                                           archive_path=args.archive_path, approve=args.approve))

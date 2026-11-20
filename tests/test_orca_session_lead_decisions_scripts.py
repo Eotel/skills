@@ -201,6 +201,18 @@ class LeadDecisionsTests(unittest.TestCase):
                 self.assertIn(reason, result.stderr)
                 self.assertEqual(self.log.read_text(encoding="utf-8"), written)
 
+    def test_discard_in_prose_requires_an_explicit_path(self) -> None:
+        answer = self.root / "discard.txt"
+        answer.write_text("nvim.log を捨てて消す", encoding="utf-8")
+        command = ("record", "--decision", "remove:/w/lane", "--answer-file", str(answer))
+        declined = self.run_tool(*command)
+        self.assertEqual(declined.returncode, 1, declined.stderr)
+        self.assertIn("--discard nvim.log", declined.stderr)
+        self.assertFalse(self.log.exists())
+        accepted = self.run_tool(*command, "--discard", "nvim.log")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(json.loads(accepted.stdout)["removal"]["discard"], ["nvim.log"])
+
     def test_an_empty_answer_is_refused_and_nothing_is_written(self) -> None:
         answer_file = self.root / "empty.txt"
         answer_file.write_text("  \n", encoding="utf-8")

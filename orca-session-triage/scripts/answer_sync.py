@@ -161,7 +161,8 @@ def update_corrected_keys(items: list[dict], questions: Iterable[dict]) -> None:
 
 def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
            decisions: Mapping[str, str] | None = None, state_file: Path | None = None,
-           decisions_file: Path | None = None, handed_off_file: Path | None = None) -> dict:
+           decisions_file: Path | None = None, handed_off_file: Path | None = None,
+           hold_id: str | None = None, hold_due_at: str | None = None) -> dict:
     """Validate related hourly answers first, then persist their shared text and timestamp.
 
     Repeating a completed delivery is safe. Each store keeps its existing lock; a failed write
@@ -320,5 +321,6 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 hourly_state.save(state_file, data)
             for key, (text, source_at) in new_delivery.items():
                 inbox_read.record_answers(log, [key], how, text, at=when, sender=sender, answer_at=source_at,
-                                          sent_text=answer if answer != text else None)
+                                          sent_text=answer if answer != text else None,
+                                          hold_id=hold_id, hold_due_at=hold_due_at)
     return {"questions": [item["id"] for item in changed], "decisions": list(keys), "at": when}

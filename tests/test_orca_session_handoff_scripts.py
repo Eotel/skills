@@ -128,6 +128,7 @@ class HandoffTests(unittest.TestCase):
                 self.assertEqual(refused.returncode, 1, refused.stderr)
                 self.assertIn("aaaaaaaa-1111", refused.stderr)
                 self.assertIn("bbbbbbbb-2222", refused.stderr)
+                self.assertIn("--seen aaaaaaaa-1111 --seen bbbbbbbb-2222", refused.stderr)
                 self.assertNotIn("id=other", refused.stderr)
                 self.assertFalse(self.sent.exists())
                 self.assertFalse(self.handed_off.exists())
@@ -356,18 +357,20 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(both.returncode, 0, both.stderr)
         self.assertTrue(self.sent.exists())
 
-    def test_refuses_while_a_later_scheduled_run_began_or_was_skipped_for_this_one(self) -> None:
-        # 11/12: the 10:00 run worked past noon; the 11:00 run was skipped for it and the 12:00 run began unseen.
+    def test_a_skipped_later_run_warns_but_a_started_run_owns_the_handoff(self) -> None:
         self.inbox.write_text("")
         orca = self.root / "orca"
         hour, ten = 3_600_000, int(datetime(2026, 11, 12, 10, 0).timestamp() * 1000)
-        runs = [{"status": "dispatched", "scheduledFor": ten + hour, "startedAt": ten + hour + 480_000,
+        runs: list[dict] = [{"status": "dispatched", "scheduledFor": ten + hour, "startedAt": ten + hour + 480_000,
                  "terminalPaneKey": "pane-11"},
                 {"status": "dispatched", "scheduledFor": ten, "startedAt": ten + 422_000, "terminalPaneKey": "pane-10"}]
+        runs = [{**run, "trigger": "scheduled", "workspaceId": "repo1::/w/triage"} for run in runs]
+        history = self.root / "runs.json"
+        history.write_text(json.dumps(runs))
         orca.write_text(
-            f"#!{sys.executable}\nimport json, sys\n"
+            f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
             "automations = [{'id': 'a1', 'prompt': '/orca-session-triage hourly', 'workspaceId': 'repo1::/w/triage'}]\n"
-            f"runs = {[{**run, 'trigger': 'scheduled', 'workspaceId': 'repo1::/w/triage'} for run in runs]!r}\n"
+            f"runs = json.loads(Path({str(history)!r}).read_text())\n"
             "result = {'automations': automations} if sys.argv[1:3] == ['automations', 'list'] else {'runs': runs}\n"
             "print(json.dumps({'result': result}))\n")
         orca.chmod(0o755)
@@ -380,6 +383,16 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(refused.returncode, 1)
         self.assertIn("11/12 11:00 の定時の回が始まった（dispatched、11/12 11:08 開始、pane pane-11）", refused.stderr)
         self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertTrue(self.sent.exists())
+
+        self.sent.unlink()
+        runs[0] = {**runs[0], "status": "skipped_precheck", "terminalPaneKey": None,
+                   "precheckResult": {"stdout": "skip: a scheduled turn in /w/triage is working"}}
+        history.write_text(json.dumps(runs))
+        warned = self.run_tool("--since", "0", env=env)
+        self.assertEqual(warned.returncode, 0, warned.stderr)
+        self.assertIn("注意:", warned.stderr)
+        self.assertIn("skipped_precheck", warned.stderr)
         self.assertTrue(self.sent.exists())
 
     def test_search_prints_the_matching_lines_and_keys_of_each_saved_handoff_since_a_time(self) -> None:

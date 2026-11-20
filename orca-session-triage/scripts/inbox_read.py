@@ -56,6 +56,7 @@ from operator import itemgetter
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -379,8 +380,15 @@ def read(inbox: Path, cursor: Path, options: ReadOptions) -> None:
                    if (item := entry(raw)) is not None and shown_by_filters(item, options)]
         latest = max(reversed(earlier), key=lambda item: asked_at(item) or datetime.min.replace(tzinfo=timezone.utc),
                      default={})
+        oldest = min(((at, item["ts"]) for item in earlier if (at := asked_at(item)) is not None), default=None)
+        lanes = sorted({item["worktree"] for item in earlier if item.get("worktree")})
+        kinds = sorted({item["kind"] for item in earlier if item.get("kind") in REPORT_KINDS})
+        commands = [shlex.join(["inbox", "--since", oldest[1], *(["--wt", lane] if lane else []),
+                               *(["--kind", ",".join(kinds)] if kinds else []), "--full"])
+                    for lane in (lanes or [None])] if oldest else []
         print(f"inbox-read: no matching entries after the cursor; before the cursor: {len(earlier)} matching entries; "
-              f"latest id={latest.get('id') or '-'} ts={latest.get('ts') or '-'}", file=sys.stderr)
+              f"latest id={latest.get('id') or '-'} ts={latest.get('ts') or '-'}"
+              + ("; " + "\n".join(commands) if commands else ""), file=sys.stderr)
         entries = inbox_entries(inbox) if options.source is not None else []
         if options.source is not None and not any(source_of(item) in options.source.names for item in entries):
             print(f"inbox-read: no entry has source {options.source.given}; near sources: "
@@ -442,7 +450,33 @@ def read_ids(inbox: Path, cursor: Path, options: ReadOptions) -> None:
     if missing:
         raise ValueError("no entry has id " + ",".join(missing))
     for _, acknowledged, item in sorted({placed.end: placed for found in hits.values() for placed in found}.values()):
-        print(f"{entry_header(item, options.answers)}{' 既読' if acknowledged else ''}\n{full_text(item, options.answers)}\n")
+        suffix = " 既読" if acknowledged else ""
+        if options.summary:
+            print(summary_line(item, options.answers) + suffix)
+        else:
+            print(f"{entry_header(item, options.answers)}{suffix}\n{full_text(item, options.answers)}")
+        if item.get("kind") == "ask":
+            print_answer_details(item, options.answers)
+        if not options.summary:
+            print()
+
+
+def print_answer_details(item: dict, answers: Mapping[str, dict]) -> None:
+    ask_id = item["id"]
+    ids = [ask_id, *(f"{ask_id}:{n}" for n in range(1, len(questions_of(item)) + 1))]
+    for key in ids:
+        if not (record := answers.get(key)):
+            continue
+        sender = record.get("sender")
+        sender = sender if isinstance(sender, dict) else {}
+        print(f"{key} 回答記録 {record.get('ts') or '-'} {record.get('how') or '-'}")
+        if sender.get("worktree"):
+            print("  送信元 " + " / ".join(str(sender[k]) for k in ("worktree", "session") if sender.get(k)))
+        for field, label in (("note", "回答"), ("sent_text", "送信内容"), ("hold_id", "待機 ID"), ("hold_due_at", "期限")):
+            if value := record.get(field):
+                print(f"  {label}: {value}")
+        if not (record.get("note") or record.get("sent_text")) and record.get("ts") and item.get("worktree"):
+            print("  " + shlex.join(["timeline.py", "--lane", source_of(item), "--since", record["ts"]]))
 
 
 def inbox_entries(inbox: Path) -> list[dict]:
@@ -698,7 +732,8 @@ def answer_sender() -> dict[str, str | None]:
 
 def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
                    sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
-                   answer_at: str | None = None, transcript_input: str | None = None) -> None:
+                   answer_at: str | None = None, transcript_input: str | None = None,
+                   hold_id: str | None = None, hold_due_at: str | None = None) -> None:
     """Append one line per answered id with its source worktree/session; lock concurrent writers' lines whole.
 
     Both send and `answered` use this writer, so handoff can identify this run's own delivered answers.
@@ -710,6 +745,8 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
                                **({"note": note} if note else {}),
                                **({"sent_text": sent_text} if sent_text is not None else {}),
                                **({"input": transcript_input} if transcript_input is not None else {}),
+                               **({"hold_id": hold_id} if hold_id else {}),
+                               **({"hold_due_at": hold_due_at} if hold_due_at else {}),
                                **({"answer_at": answer_at} if answer_at is not None else {})},
                                ensure_ascii=False) + "\n" for answer in ids]
     with writing(path, lines=lines) as write_file:
@@ -735,6 +772,8 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
                   take_over: bool = False) -> list[Claim]:
     """Append one claim line per id under a lock, unless another worktree already claims an open ask or
     question they cover: then return those claims and write nothing, so two tabs never both go on to ask."""
+    import ask_state
+
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
     with ExitStack() as locks:
@@ -745,7 +784,7 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
             fcntl.flock(stream, fcntl.LOCK_EX)
         held = read_claims(path)
         taken = list({claim.id: claim for claimed in ids for claim in overlapping_claims(held, claimed, open_keys)
-                      if claim.by != by}.values())
+                      if not ask_state.same_workspace(claim.by, by)}.values())
         if taken and not take_over:
             return taken
         # Taking over an ask also takes its questions another worktree claimed one by one.
@@ -1076,11 +1115,9 @@ def owner_line(run: dict) -> str:
         return f"pane {run.get('terminalPaneKey') or '-'}, {run.get('status') or '-'}; transcript unread: {error}"
 
 
-def later_run_notes(orca: str, tool: str) -> list[str]:
-    """A line for each scheduled run due after this tab's run that began, or that the precheck skipped for it
-    (hourly_runtime.later_runs); when Orca cannot be read, none, and why on stderr under the tool's name."""
+def later_runs(orca: str, tool: str) -> list[dict]:
     try:
-        return [hourly_runtime.later_run_note(run) for run in hourly_runtime.later_runs(orca)]
+        return hourly_runtime.later_runs(orca)
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
         print(f"{tool}: 後の定時の回を Orca から読めなかった: {error}", file=sys.stderr)
         return []
@@ -1165,6 +1202,8 @@ def main(argv: list[str] | None = None) -> int:
     claim.add_argument("--by", required=True, help="the worktree asking them")
     claim.add_argument("--take-over", action="store_true",
                        help="claim them even though another worktree claims one; only when it is not asking")
+    claim.add_argument("--since", metavar="HH:MM|ISO",
+                       help="refuse if the lead sent to any of these worktrees at or after this time")
     questions = actions.add_parser(
         "questions", help="print, as JSON, the next 4 unanswered structured questions: `questions` to pass to "
                           "AskUserQuestion, `items` naming each one's id and source, `remaining`, and "
@@ -1198,8 +1237,8 @@ def main(argv: list[str] | None = None) -> int:
             options = ReadOptions(brief=args.brief, kinds=args.kind, source=source, summary=args.summary,
                                   ids=args.ids, since=args.since, text=args.text,
                                   answers=answer_records(answers_path()))
-            for note in later_run_notes(os.environ.get("ORCA_CLI_COMMAND", "orca"), "inbox-read"):
-                print(note)
+            for run in later_runs(os.environ.get("ORCA_CLI_COMMAND", "orca"), "inbox-read"):
+                print(hourly_runtime.later_run_note(run))
             (read_ids if args.ids else read_text if args.text is not None else read)(inbox, cursor, options)
             return 0
         if args.action == "watch":
@@ -1231,6 +1270,13 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.by.strip():
                     raise ValueError("--by names the worktree asking")
                 ids = checked_answer_ids(args.ids, entries)
+                import handoff
+
+                reports = {item["id"]: item for item in entries if item.get("id")}
+                sources = {str(reports[key.partition(":")[0]].get(field) or "")
+                           for key in ids for field in ("handle", "worktree")} - {""}
+                if why := handoff.require_lead_stopped(sources, args.since, allow_lead=args.by.strip()):
+                    raise ValueError(why)
                 taken = record_claims(claims_path(), ids, args.by.strip(), open_keys, args.take_over)
                 for claim in taken:
                     print(f"inbox-read: {claim.id} は {claim_label(claim)}。重ねて伺わない"

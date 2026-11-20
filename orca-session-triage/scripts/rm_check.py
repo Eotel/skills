@@ -1416,20 +1416,36 @@ def pr_base(worktree: str | Path, pr: dict | None) -> str | None:
     return ref if ref and ref_exists(worktree, ref) else None
 
 
-def pull_request(worktree: str | Path, number: int) -> tuple[dict | None, str | None]:
+def pull_request(worktree: str | Path, number: int, *, repo: str | None = None) -> tuple[dict | None, str | None]:
     """Return (pr, error): the PR's number/state/head, or why `gh` could not tell."""
     try:
-        out = subprocess.run(["gh", "pr", "view", str(number), "--json", "number,state,headRefOid,baseRefName"],
-                             cwd=worktree, capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(["gh", "pr", "view", str(number), "--json", "number,state,headRefOid,baseRefName",
+                              *(["--repo", repo] if repo else [])],
+                             cwd=worktree, capture_output=True, text=True, check=True, timeout=30).stdout
         return json.loads(out), None
     except subprocess.CalledProcessError as error:
         return None, (error.stderr or "").strip() or str(error)
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         return None, str(error)
 
 
 def head_in(worktree: str | Path, base: str | None) -> bool:
     return base is not None and git(worktree, "merge-base", "--is-ancestor", "HEAD", base).returncode == 0
+
+
+def upstream_pr_at_head(worktree: str | Path, upstream: str, number: int | None = None) -> dict | None:
+    branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if not branch or not head:
+        return None
+    try:
+        result = subprocess.run(["gh", "pr", "list", "--repo", upstream, "--head", branch, "--state", "open",
+                                 "--json", "number,state,headRefOid,baseRefName"], cwd=worktree,
+                                capture_output=True, text=True, check=True, timeout=30)
+        return next((pr for pr in json.loads(result.stdout) if pr.get("state") == "OPEN"
+                     and pr.get("headRefOid") == head and (number is None or pr.get("number") == number)), None)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def merged_pr_at_head(worktree: str | Path) -> tuple[dict | None, str | None]:
@@ -1709,7 +1725,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--worktree", help="worktree path to check")
     parser.add_argument("--main", help="main checkout to compare ignored files with (default: first `git worktree list` entry)")
     parser.add_argument("--base", help="ref that merged work must be in (default: the --pr base branch, else the remote branch the worktree started from, else origin/HEAD; without a PR, use the branch's upstream if only it holds HEAD)")
-    parser.add_argument("--pr", type=int, help="PR number; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit "
+    parser.add_argument("--pr", help="PR number or upstream OWNER/REPO#NUMBER; a MERGED or OPEN PR whose head is HEAD clears the unmerged-commit "
                                                "check. Without it, a MERGED PR of the checked-out branch whose head is "
                                                "HEAD (asked of gh when HEAD is not in the base) counts the same")
     parser.add_argument("--pr-head", help="full SHA of a PR head confirmed MERGED on a host with gh; HEAD may be its ancestor")
@@ -1757,8 +1773,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"),
                         help="Orca CLI executable for --confirm-gone (default: $ORCA_CLI_COMMAND or orca)")
     args = parser.parse_args(argv)
+    if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
+        parser.error("PATH and --worktree name different worktrees")
+    if not (args.path or args.worktree):
+        parser.error("give the worktree as PATH or --worktree")
     if args.confirm_gone is not None:
-        gone = confirm_gone(Path(args.worktree).resolve(), args.orca, args.confirm_gone)
+        gone = confirm_gone(Path(args.worktree or args.path).resolve(), args.orca, args.confirm_gone)
         json.dump(gone, sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0 if gone["gone"] else 1
@@ -1770,14 +1790,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if any(path.is_absolute() or not path.parts or ".." in path.parts
            or any(part.casefold() == ".git" for part in path.parts) for path in named):
         parser.error("--archive-path takes a path inside the worktree, relative to it")
-    if args.path and args.worktree and Path(args.path).resolve() != Path(args.worktree).resolve():
-        parser.error("PATH and --worktree name different worktrees")
-    if not (args.path or args.worktree):
-        parser.error("give the worktree as PATH or --worktree")
-    if args.pr_number not in (None, "-"):
-        if not args.pr_number.isdigit() or (args.pr and args.pr != int(args.pr_number)):
-            parser.error("PR must be a number or -, and agree with --pr")
-        args.pr = int(args.pr_number)
+    references = [ref for ref in (args.pr_number, args.pr) if ref not in (None, "-")]
+    if len(set(references)) > 1:
+        parser.error("positional PR and --pr must agree")
+    reference = re.fullmatch(r"(?:([A-Za-z0-9-]+/[A-Za-z0-9._-]+)#)?([1-9]\d*)", references[0]) if references else None
+    if references and not reference:
+        parser.error("PR must be a number, upstream OWNER/REPO#NUMBER, or -")
+    pr_repo, args.pr = (reference[1], int(reference[2])) if reference else (None, None)
+    if pr_repo and args.pr_head:
+        parser.error("--pr-head is only for a merged PR on origin")
 
     worktree = str(Path(args.worktree or args.path).resolve())
     inside = git(worktree, "rev-parse", "--is-inside-work-tree")
@@ -1802,8 +1823,21 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if checkout is None:
         parser.error("could not locate the main checkout; pass --main")
     main = str(Path(checkout).resolve())
-    pr, pr_error = pull_request(worktree, args.pr) if args.pr else (None, None)
     notes = []
+    remote = git(worktree, "remote", "get-url", "upstream")
+    upstream_host, upstream_repo = remote_identity(remote.stdout.strip()) if remote.returncode == 0 else ("", "")
+    pr = pr_error = None
+    if pr_repo and (upstream_host != "github.com" or upstream_repo.casefold() != pr_repo.casefold()):
+        parser.error("qualified PR must point at the configured GitHub upstream")
+    if upstream_host == "github.com" and not args.pr_head:
+        pr = upstream_pr_at_head(worktree, upstream_repo, args.pr if pr_repo else None)
+        if pr:
+            notes.append(f"PR {upstream_repo}#{pr['number']} is OPEN at HEAD")
+    if not pr and args.pr:
+        if pr_repo:
+            pr_error = f"{pr_repo}#{args.pr} is not an open PR for this branch at HEAD"
+        else:
+            pr, pr_error = pull_request(worktree, args.pr)
     keep_blocker = None
     try:
         comment = keep_note(worktree_notes.comment(Path(worktree)))
@@ -1845,7 +1879,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
     if fetch_note:
         notes.append(fetch_note)
-    if not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree) or fallback):
+    if not pr and not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree) or fallback):
         pr, lookup_error = merged_pr_at_head(worktree)
         branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
         if pr:

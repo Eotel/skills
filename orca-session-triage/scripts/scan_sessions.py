@@ -2093,7 +2093,7 @@ def remote_git_hint(row: dict) -> dict:
             "pr_number": int(found.group(2)) if found else linked.get("number")}
 
 
-def git_state(path: str) -> dict | None:
+def git_state(path: str, *, refresh_stale: bool = False) -> dict | None:
     """Branch, uncommitted paths, commits missing from all remote refs, and the GitHub repo."""
     def run(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=30)
@@ -2106,6 +2106,12 @@ def git_state(path: str) -> dict | None:
         branch = run("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() or None
         head, _, head_at = run("log", "-1", "--format=%H %cI").stdout.strip().partition(" ")
         origin = run("remote", "get-url", "origin").stdout.strip()
+        upstream = github_slug(run("remote", "get-url", "upstream").stdout.strip())
+        fetch_error = None
+        if refresh_stale and origin and ahead.returncode == 0 and ahead.stdout.strip().isdigit() and int(ahead.stdout) > 0:
+            fetch_error = rm_check.fetch_when_stale(path, rm_check.default_base(path))
+            if fetch_error is None:
+                ahead = run("rev-list", "--count", "HEAD", "--not", "--remotes")
         main_tree = run("rev-parse", "--verify", "origin/main^{tree}")
         same_tree = main_tree.returncode == 0 and main_tree.stdout == run("rev-parse", "HEAD^{tree}").stdout
     except (OSError, subprocess.TimeoutExpired):
@@ -2116,6 +2122,8 @@ def git_state(path: str) -> dict | None:
         "unpushed": int(ahead.stdout) if ahead.returncode == 0 else None,
         **({"unpushed_content": 0} if same_tree else {}),
         "github": github_slug(origin),
+        **({"upstream": upstream} if upstream else {}),
+        **({"fetch_error": fetch_error} if fetch_error else {}),
     }
 
 
@@ -2168,6 +2176,7 @@ def summarize_pr(data: dict, reviews: Sequence[dict] = (), comments: Sequence[di
         "latest_human_activity": activity, "last_commit_at": last_commit_at,
         "reply_after_last_commit": reply_after_commit,
         "merge_state": data.get("mergeStateStatus"), "merged_at": data.get("mergedAt"), "checks": checks,
+        **({"merge_oid": data["mergeCommit"]["oid"]} if (data.get("mergeCommit") or {}).get("oid") else {}),
     }
 
 
@@ -2176,7 +2185,16 @@ class Item(NamedTuple):
     number: int
 
 
-PrRef = int | str | Item  # a PR number, the head branch to find the PR by, or an issue or PR to read the state of
+class ExactHead(NamedTuple):
+    oid: str
+
+
+class UpstreamBranch(NamedTuple):
+    branch: str
+    oid: str
+
+
+PrRef = int | str | Item | ExactHead | UpstreamBranch
 PrLookup = Callable[[str, list[PrRef]], dict[PrRef, dict | None]]
 
 GH_TIMEOUT = 15
@@ -2189,6 +2207,7 @@ GRAPHQL_CHUNK = 25  # 25 PRs by number in one query cost 1 point, as one `gh pr 
 BRANCH_CANDIDATES = 5
 PR_ACTIVITY_DIR = "~/.cache/orca-session-triage/pr-activity"
 SLUG = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+COMMIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 NOT_IN_BRANCH = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")  # git refuses these in a branch name
 # The `gh pr view --json` fields summarize_pr reads, with only the last commit
 # (gh pages through every commit) and the check states. gh also pages past 100
@@ -2196,7 +2215,7 @@ NOT_IN_BRANCH = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")  # git refuses these in 
 PR_FACTS = """
 fragment PrFacts on PullRequest {
   number url state updatedAt isCrossRepository headRefName headRefOid
-  reviewDecision mergeStateStatus mergedAt
+  reviewDecision mergeStateStatus mergedAt closedAt mergeCommit { oid }
   author { __typename login }
   reviewRequests(first: 100) { nodes { requestedReviewer {
     __typename ... on User { login } ... on Bot { login } ... on Team { name } } } }
@@ -2214,6 +2233,10 @@ def is_pr_ref(ref: object) -> bool:
         return False
     if isinstance(ref, Item):
         return ref.number > 0
+    if isinstance(ref, ExactHead):
+        return COMMIT_OID.fullmatch(ref.oid) is not None
+    if isinstance(ref, UpstreamBranch):
+        return is_pr_ref(ref.branch) and is_pr_ref(ExactHead(ref.oid))
     if isinstance(ref, int):
         return ref > 0
     return isinstance(ref, str) and bool(ref) and not NOT_IN_BRANCH.search(ref)
@@ -2232,9 +2255,14 @@ def pr_query(owner: str, name: str, refs: list[PrRef]) -> tuple[str, dict[str, P
         elif isinstance(ref, int):
             alias = f"pr_{ref}"
             fields.append(f"{alias}: pullRequest(number: {ref}) {{ ...PrFacts }}")
+        elif isinstance(ref, ExactHead):
+            alias = f"commit_{index}"
+            fields.append(f"{alias}: object(expression: {json.dumps(ref.oid)}) {{ ... on Commit "
+                          "{ associatedPullRequests(first: 20) { nodes { ...PrFacts } } } }")
         else:
             alias = f"branch_{index}"
-            fields.append(f"{alias}: pullRequests(headRefName: {json.dumps(ref, ensure_ascii=False)}, "
+            branch = ref.branch if isinstance(ref, UpstreamBranch) else ref
+            fields.append(f"{alias}: pullRequests(headRefName: {json.dumps(branch, ensure_ascii=False)}, "
                           f"first: {BRANCH_CANDIDATES}, orderBy: {{field: CREATED_AT, direction: DESC}}) "
                           "{ nodes { ...PrFacts } }")
         aliases[alias] = ref
@@ -2299,7 +2327,7 @@ def view_fields(node: dict) -> dict:
     requested = [(entry or {}).get("requestedReviewer") for entry in (node.get("reviewRequests") or {}).get("nodes") or []]
     return {
         **{key: node.get(key) for key in ("number", "url", "state", "headRefName", "headRefOid",
-                                          "reviewDecision", "mergeStateStatus", "mergedAt")},
+                                          "reviewDecision", "mergeStateStatus", "mergedAt", "mergeCommit")},
         # gh prints an author that is not a User (a bot) as app/<login>.
         "author": None if not author else {
             "login": author.get("login") if author.get("__typename") == "User" else f"app/{author.get('login')}"},
@@ -2374,8 +2402,16 @@ def gh_prs(slug: str, refs: list[PrRef], cache_dir: Path = Path(PR_ACTIVITY_DIR)
             if isinstance(ref, Item):
                 found[ref] = {"state": answer["state"]} if isinstance(answer.get("state"), str) else None
                 continue
-            node = (pr_for_branch(answer.get("nodes") or [], ref, default_branch)
-                    if isinstance(ref, str) else answer)
+            if isinstance(ref, ExactHead):
+                candidates = (answer.get("associatedPullRequests") or {}).get("nodes") or []
+                node = next((pr for pr in candidates if isinstance(pr, dict) and pr.get("headRefOid") == ref.oid
+                             and str(pr.get("url") or "").casefold().startswith(f"https://github.com/{slug}/pull/".casefold())
+                             and pr.get("state") in ("OPEN", "MERGED")), None)
+            elif isinstance(ref, UpstreamBranch):
+                node = next((pr for pr in answer.get("nodes") or [] if isinstance(pr, dict)
+                             and pr.get("state") == "OPEN" and pr.get("headRefOid") == ref.oid), None)
+            else:
+                node = pr_for_branch(answer.get("nodes") or [], ref, default_branch) if isinstance(ref, str) else answer
             found[ref] = node if isinstance(node, dict) and isinstance(node.get("number"), int) else None
     nodes = {node["number"]: node for ref, node in found.items() if node and not isinstance(ref, Item)}
     with ThreadPoolExecutor(max_workers=max(1, min(4, len(nodes)))) as pool:
@@ -2618,15 +2654,27 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
     ledger = (proposals() if proposals and any(PROPOSAL_REF.search(text) for text in wait_texts.values())
               else None) or {}
     refs_by_repo: dict[str, list[PrRef]] = {}
+    checkout_refs: dict[int, tuple[PrRef | None, ExactHead | None, UpstreamBranch | None]] = {}
     for row in rows:
         if id(row) not in fact_row_ids:
             continue
         git = git_by_row.get(id(row))
         ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
-        if git and git.get("github") and ref:
+        exact = fork = None
+        if git and git.get("github"):
             refs = refs_by_repo.setdefault(git["github"], [])
-            if ref not in refs:
+            if ref and ref not in refs:
                 refs.append(ref)
+            if (head := git.get("head")) and COMMIT_OID.fullmatch(head):
+                exact = ExactHead(head)
+                if exact not in refs:
+                    refs.append(exact)
+                if (upstream := git.get("upstream")) and upstream.casefold() != git["github"].casefold() and git.get("branch"):
+                    fork = UpstreamBranch(git["branch"], head)
+                    upstream_refs = refs_by_repo.setdefault(upstream, [])
+                    if fork not in upstream_refs:
+                        upstream_refs.append(fork)
+        checkout_refs[id(row)] = ref, exact, fork
         for slug, number in waits_by_row.get(id(row), []):
             if slug is None:
                 continue
@@ -2652,10 +2700,27 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             result.append(row)
             continue
         git, waits, wait_text = git_by_row[id(row)], waits_by_row.get(id(row), []), wait_texts.get(id(row), "")
-        ref = (row["linked_pr"] or {}).get("number") or (git or {}).get("pr_number") or (git or {}).get("branch")
+        ref, exact, fork = checkout_refs[id(row)]
         pr = prs.get((git["github"], ref)) if git and git.get("github") and ref else None
+        if git and git.get("github"):
+            if fork and (upstream_pr := prs.get((git["upstream"], fork))):
+                pr = {**upstream_pr, "repository": git["upstream"]}
+            elif not pr and exact and (matching := prs.get((git["github"], exact))):
+                pr = matching
+        checks = []
         if pr is not None and git is not None:
             pr = {**pr, "head_matches": pr.get("head_oid") == git.get("head") if git.get("head") else None}
+            if (git.get("unpushed") or 0) > 0:
+                merged = pr.get("merge_oid") if pr.get("state") == "MERGED" else None
+                if pr["head_matches"]:
+                    git = {**git, "unpushed": 0}
+                    checks.append("PR head と同じ")
+                elif (isinstance(merged, str) and git.get("head") and COMMIT_OID.fullmatch(merged)
+                        and rm_check.git(row["path"], "merge-base", "--is-ancestor", git["head"], merged).returncode == 0):
+                    git = {**git, "unpushed": 0}
+                    checks.append("HEAD は PR のマージコミットに含まれています")
+        if git and git.get("fetch_error"):
+            checks.append(git["fetch_error"])
         row: dict[str, Any] = {**row, "git": git, "pr": pr}
         open_pr_cleanup = pr is not None and git is not None and open_pr_with_no_local_work(row, pr, git)
         if open_pr_cleanup and git is not None and pr is not None and (used_at := checkout_in_use(git, pr)):
@@ -2689,6 +2754,8 @@ def add_next_step_facts(rows: list[dict], git_lookup: Callable[[str], dict | Non
             decided = [proposal[:8] for proposal in named]
             row = {**row, "waits_decided": decided,
                    "reasons": [*row.get("reasons", []), "待っていた案が台帳で決まった: " + ", ".join(decided)]}
+        if checks:
+            row = {**row, "reasons": [*row.get("reasons", []), *checks]}
         result.append(row)
     return result
 
@@ -3259,6 +3326,7 @@ def review_queue(rows: list[dict], verdicts: dict | None = None, *, force: bool 
         return current_verdict(row, verdicts) is None
 
     return [{**{key: row.get(key) for key in QUEUE_FIELDS},
+             **({"review": review} if (review := review_result(row, github_of(row))) else {}),
              **{key: row[key] for key in ("claude_sessions", "automation_workspaces", "automation_blocker",
                                            "codex_approvals") if row.get(key)},
              **({"inbox": row["inbox"], "newest_report": newest_report(row)} if row.get("inbox") else {}),
@@ -3335,6 +3403,14 @@ def load_verdicts(store_path: str | Path) -> dict[str, dict]:
     return {}
 
 
+def blocked_on_review(row: dict, verdict: dict) -> bool:
+    review = row.get("review") or {}
+    return ((row.get("pr") or {}).get("state") == "OPEN"
+            and review.get("head_matches") is True and review.get("changes_requested") is True
+            and verdict.get("class") == "blocked"
+            and bool(re.search(r"レビュー|review", str(verdict.get("waits_on") or ""), re.IGNORECASE)))
+
+
 def classed_queue(session: Path) -> dict[str, dict]:
     """{path: verdict} from a session directory whose result answers its own queue, else {}.
 
@@ -3344,15 +3420,16 @@ def classed_queue(session: Path) -> dict[str, dict]:
     if not (isinstance(queue, dict) and isinstance(result, dict)
             and result.get("queue_generated_at") == queue.get("generated_at")):
         return {}
-    read = {e.get("identity") or e["path"]: e.get("read") for e in queue.get("rows") or []
-            if isinstance(e, dict) and "path" in e}
+    queued = {e.get("identity") or e["path"]: e for e in queue.get("rows") or []
+              if isinstance(e, dict) and "path" in e}
     queued_at = str(queue.get("generated_at") or "")
     return {v.get("identity") or v["path"]: {**{k: x for k, x in v.items()
                                                 if k not in ("path", "identity", "read", "queued_at")},
-                        "read": read[v.get("identity") or v["path"]], "queued_at": queued_at}
+                        "read": row["read"], "queued_at": queued_at}
             for v in result.get("rows") or []
-            if isinstance(v, dict) and (v.get("identity") or v.get("path")) in read
-            and v.get("class") in VERDICT_CLASSES and read[v.get("identity") or v["path"]] is not None}
+            if isinstance(v, dict) and (row := queued.get(v.get("identity") or v.get("path")))
+            and v.get("class") in VERDICT_CLASSES and row.get("read") is not None
+            and not blocked_on_review(row, v)}
 
 
 def newer_verdicts(verdicts: dict[str, dict], incoming: dict[str, dict]) -> dict[str, dict]:
@@ -4100,7 +4177,13 @@ def pr_number(row: dict) -> int | None:
 def rm_spec(row: dict) -> str:
     path = row["path"]
     name = shlex.quote(path) if any(char.isspace() for char in path) else path
-    return f"{name} {pr_number(row) or '-'}"
+    return f"{name} {pr_spec(row)}"
+
+
+def pr_spec(row: dict) -> str:
+    pr = row.get("pr") or {}
+    number = pr_number(row)
+    return f"{pr['repository']}#{number}" if number and pr.get("repository") else str(number or "-")
 
 
 @cache
@@ -4150,7 +4233,7 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
     if not remove_ok and not plan_cleanup and not environment:
         return shlex.join([str(RM_CHECK), *options, *decision_options(decisions_file),
-                           row["path"], str(pr_number(row) or "-")])
+                           row["path"], pr_spec(row)])
     if requirement := batch_requirement(row):
         return requirement
     if not batch_has_preview():
@@ -4324,6 +4407,7 @@ def main(argv: list[str] | None = None) -> int:
                                                interruption_times=interruption_times,
                                                interruption_observations=interruption_observations),
                                pr_lookup=partial(gh_prs, cache_dir=Path(args.pr_cache).expanduser(), reach=reach),
+                               git_lookup=partial(git_state, refresh_stale=not args.ps_json),
                                verdicts=verdicts, proposals=ledger_proposals)
     if interruption_observations:
         save_interruption_times(interruption_path, interruption_observations, interruption_times)

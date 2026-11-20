@@ -73,6 +73,27 @@ class AskStateTests(unittest.TestCase):
     def relay(self, text: str, at: str, *, ask: str | None = None) -> None:
         self.python(f"import answer_sync; answer_sync.record([{ask or self.ASK!r}], {text!r}, 'send', at={at!r})")
 
+    def test_question_hook_claims_and_answers_only_the_bound_part(self) -> None:
+        second = {**self.question, "header": "日付", "question": "日付を変更しますか？"}
+        self.write_lines(self.inbox, [{"id": self.ASK, "ts": self.AT, "kind": "ask",
+                                      "worktree": "worker", "questions": [self.question, second]}])
+        self.state.write_text(json.dumps({"lead": {"worktree": "/w/hourly"}}))
+        displayed = {**self.question, "question": f"ask {self.ASK}:1 公開しますか？"}
+        hook = {"cwd": "/w/hourly", "session_id": "hourly-session", "tool_use_id": "toolu_010",
+                "tool_name": "AskUserQuestion", "tool_input": {"questions": [displayed]}}
+        pre = self.run_tool("stop_check.py", stdin=json.dumps({**hook, "hook_event_name": "PreToolUse"}))
+        self.assertEqual((pre.returncode, pre.stdout), (0, ""), pre.stderr)
+        [claim] = [json.loads(line) for line in self.claims.read_text().splitlines()]
+        self.assertEqual((claim["id"], claim["by"]), (f"{self.ASK}:1", "/w/hourly"))
+        updated_display = "表示された文言が異なる場合"
+        response = {"questions": [{**displayed, "question": updated_display}],
+                    "answers": {updated_display: "待つ"}}
+        post = self.run_tool("stop_check.py", stdin=json.dumps({**hook, "hook_event_name": "PostToolUse",
+            "tool_input": {"questions": response["questions"]}, "tool_response": response}))
+        self.assertEqual((post.returncode, post.stdout), (0, ""), post.stderr)
+        [answer] = [json.loads(line) for line in self.answers.read_text().splitlines()]
+        self.assertEqual((answer["id"], answer["note"]), (f"{self.ASK}:1", "待つ"))
+
     def test_unicode_line_separator_survives_batch_relay_and_decision_readers(self) -> None:
         asked = self.ask()
         answer = "前\u2028後"
