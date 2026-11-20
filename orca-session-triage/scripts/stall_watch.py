@@ -767,6 +767,9 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     inbox, answers, holds, board, hourly_state, remotes = INBOX, ANSWERS, HOLDS, BOARD, HOURLY_STATE, REMOTES
     reports: dict[str, list[Report]] = {}
     for item in read_jsonl(inbox):
+        if (item.get("kind") == "info" and not item.get("handle")
+                and (item.get("repo"), item.get("worktree")) == (BRIEFS.parent.name, BRIEFS.name)):
+            continue
         at = parse(item.get("ts"))
         if at and at <= now and item.get("worktree") and item.get("kind") in ("ask", "done", "info"):
             reports.setdefault(item["worktree"], []).append(
