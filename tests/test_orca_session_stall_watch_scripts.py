@@ -216,6 +216,20 @@ class MorningLanesTests(unittest.TestCase):
         self.assertEqual([item.signal for item in stall.judge(lane, None, records, NOW, FakeProbe(), live=False)],
                          ["idle_after_report"])
 
+    def test_an_hourly_handoff_the_lead_answered_is_read_by_the_next_run_not_sent(self) -> None:
+        _, records = morning()
+        hourly = row("triage-hourly", repo="orca", terminals=[{"handle": "term_hourly"}],
+                     automation_workspaces=["session triage"], claude=claude("2026-11-16T09:50:00+09:00"))
+        handoff = report("handoff-0001", "ask", "2026-11-16T09:42:41+09:00",
+                         "09:00 の定時のタブからです。\n\n## 指揮の番\n\n1. 再レビューを回してください。\n\n"
+                         "—— 送る直前に道具が足した事実 ——\n走査の開始後に届いた報告: 0 件（なし）", "term_hourly")
+        answered = replace(
+            records, reports_by_worktree={**records.reports_by_worktree, "triage-hourly": (handoff,)},
+            answers_by_ask={**records.answers_by_ask,
+                            "handoff-0001": (stall.Answer(at("2026-11-16T10:13:00+09:00"), "inbox_read.py answered"),)})
+
+        self.assertEqual(stall.judge(hourly, None, answered, NOW, FakeProbe(), live=False), [])
+
     def test_an_ask_with_a_question_still_unanswered_is_still_waiting(self) -> None:
         lanes, records = morning()
         lane, _ = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-left"))

@@ -20,7 +20,8 @@ Signals:
   watcher_outlived     a wait loop whose command runs `sleep` has run an hour or more, and the PR it names is merged
                        or closed
   answer_undelivered   the lane's ask has an answer recorded, nothing was sent to the lane since the ask, and the
-                       lane has not moved since the answer
+                       lane has not moved since the answer; an hourly run's handoff (handoff.py) is left out, since
+                       the next run reads its answer and the lead sends nothing to the hourly tab
   promise_unscheduled  the lane's last report or final message promises work at a time that has passed (明朝,
                        明日午前, 11/16 の朝, 今夜, 18:00 に), no hold, open handoff, work_due, Orca automation, or
                        one-shot schedule keeps it, and the lane has not moved since that time
@@ -355,7 +356,8 @@ def covering_answers(ask: Report, records: Records) -> list[Answer]:
 
 def answer_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
     found = []
-    for ask in (report for report in lane_reports(row, records) if report.kind == "ask"):
+    for ask in (report for report in lane_reports(row, records)
+                if report.kind == "ask" and not inbox_read.is_handoff({"text": report.text})):
         answers = [answer for key, given in records.answers_by_ask.items()
                    if key == ask.id or key.startswith(ask.id + ":") for answer in given]
         covering = covering_answers(ask, records)
