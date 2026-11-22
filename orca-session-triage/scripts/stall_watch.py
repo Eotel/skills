@@ -20,9 +20,10 @@ Signals:
   watcher_outlived     a wait loop whose command runs `sleep` has run an hour or more, and the PR it names is merged
                        or closed
   answer_undelivered   the lane's ask has an answer recorded, nothing was sent to the lane since the ask, and the
-                       lane has not moved since the answer; an hourly run's handoff (handoff.py) is left out, and so
-                       is every other ask of the workspace of an automation that sends those handoffs, since the
-                       next run reads the answer and the lead sends nothing to the hourly tab
+                       lane has not moved since the answer; an hourly run's handoff (handoff.py) is left out, since
+                       the next run reads its answer and the lead sends nothing to the hourly tab; so is every ask
+                       of a workspace that has an automation and has sent a handoff, whichever of its automations
+                       asked (until its first handoff its other asks are reported)
   promise_unscheduled  the lane's last report or final message promises work at a time that has passed (明朝,
                        明日午前, 11/16 の朝, 今夜, 18:00 に), no hold, open handoff, work_due, Orca automation, or
                        one-shot schedule keeps it, and the lane has not moved since that time
