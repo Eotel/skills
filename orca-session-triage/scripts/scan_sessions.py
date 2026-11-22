@@ -3094,6 +3094,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         blockers = []
         if lead == row_identity(row):
             blockers.append("指揮の作業場")
+        if not environment and (checkout := Path(row["path"])).is_dir() and not (checkout / ".git").exists():
+            blockers.append("git の worktree ではないディレクトリ")
         if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
             blockers.append("structured-agent-session の agent がいる作業場")
         if row.get("scanned_at") and not row.get("agent_ownership_observed"):
