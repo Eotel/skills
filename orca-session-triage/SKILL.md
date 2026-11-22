@@ -146,8 +146,9 @@ For lane-tab answers and duplicate-question checks, see [references/hourly.md](r
   meaningful tabs (`--summary` gives another Mac's rows as `rm-check-batch --host`
   commands). A saved `finished` verdict without `needs_user` makes its agent
   tabs closable. Saved `blocked` and `waiting` verdicts keep their agent tabs.
-  Removal views report the appointed lead, structured sessions, a current
-  owner decision, open asks and requests, and active holds on stderr.
+  Removal views report the appointed lead, structured sessions, local
+  directories whose `.git` is missing (not a worktree) or cannot be checked, a
+  current owner decision, open asks and requests, and active holds on stderr.
   Active holds make the row `blocked` and name the release condition and
   follow-up. `--rm-specs --row NAME` (repeatable) prints only the named rows,
   a finished one also while its tabs remain. An explicit removal approval in
