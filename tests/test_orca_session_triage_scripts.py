@@ -3149,6 +3149,20 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertEqual(out.getvalue(), f"{linked} -\n")
                 self.assertIn("git の worktree ではない", err.getvalue())
 
+    def test_removal_specs_continue_past_a_directory_they_cannot_read(self) -> None:
+        saved, locked = self.dir / "scan.json", self.dir / "locked"
+        (locked / ".git").mkdir(parents=True)
+        saved.write_text(json.dumps([{"path": path, "repo": "app", "class": "finished", "meaningful_tabs": []}
+                                     for path in (str(locked), "/w/app/readable")]))
+        locked.chmod(0)
+        try:
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(scan.main(["--from", str(saved), "--rm-specs"]), 0)
+        finally:
+            locked.chmod(0o700)
+        self.assertEqual(out.getvalue(), "/w/app/readable -\n")
+        self.assertIn("git の worktree か確認できない", err.getvalue())
+
     def test_archive_approval_requires_a_saved_scan_and_reuses_its_decisions_log(self) -> None:
         saved, decisions = self.dir / "scan.json", self.dir / "custom decisions"
         row = {"path": "/w/app/archive", "repo": "app", "class": "stalled", "terminals": [],

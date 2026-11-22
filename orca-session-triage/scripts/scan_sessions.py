@@ -3046,6 +3046,17 @@ def active_holds(now: datetime) -> dict[tuple[str | None, str], dict]:
                  if hold["released_at"] is None else hold["released_at"] > stamp)}
 
 
+def non_worktree_blocker(directory: Path) -> str | None:
+    try:
+        if directory.is_dir():
+            (directory / ".git").lstat()
+    except FileNotFoundError:
+        return "git の worktree ではないディレクトリ"
+    except OSError as error:
+        return f"git の worktree か確認できない: {error.strerror}"
+    return None
+
+
 def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file: Path,
                              now: datetime | None = None, *,
                              open_asks: Sequence[inbox_read.OpenAsk] = (),
@@ -3094,8 +3105,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         blockers = []
         if lead == row_identity(row):
             blockers.append("指揮の作業場")
-        if not environment and (checkout := Path(row["path"])).is_dir() and not (checkout / ".git").exists():
-            blockers.append("git の worktree ではないディレクトリ")
+        if not environment and (unremovable := non_worktree_blocker(Path(row["path"]))):
+            blockers.append(unremovable)
         if any(agent.get("structured_host_owned") for agent in row.get("agents") or []):
             blockers.append("structured-agent-session の agent がいる作業場")
         if row.get("scanned_at") and not row.get("agent_ownership_observed"):
