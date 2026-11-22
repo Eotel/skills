@@ -9804,6 +9804,18 @@ class InboxWatchServiceTests(unittest.TestCase):
                     patch.object(inbox_service, "offset_readers", return_value=[42]):
                 self.assertTrue(inbox_service.status(root)[0])
 
+    def test_status_counts_uv_and_its_python_child_as_one_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _, watch, offset, _ = inbox_service.paths(root)
+            service = (f"42 1 uv run --python 3.12 --script {watch} {offset}\n"
+                       f"43 42 /uv/python3.12 {watch} {offset}\n")
+            second = f"77 1 python3 {watch} {offset}\n"
+            for listing, running in ((service, True), (service + second, False)):
+                with self.subTest(running=running), patch.object(inbox_service, "launchd_pid", return_value=42), \
+                        patch.object(inbox_service.subprocess, "run",
+                                     return_value=subprocess.CompletedProcess([], 0, listing, "")):
+                    self.assertEqual(inbox_service.status(root)[0], running)
+
     def test_alert_service_uses_a_separate_cursor_and_notifier(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             payload = inbox_service.plistlib.loads(inbox_service.alert_plist_bytes(

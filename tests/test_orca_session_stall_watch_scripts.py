@@ -230,6 +230,26 @@ class MorningLanesTests(unittest.TestCase):
 
         self.assertEqual(stall.judge(hourly, None, answered, NOW, FakeProbe(), live=False), [])
 
+    def test_an_ask_the_hourly_workspace_relayed_has_no_answer_to_deliver(self) -> None:
+        _, records = morning()
+        hourly = row("triage-hourly", repo="orca", terminals=[{"handle": "term_hourly"}],
+                     automation_workspaces=["session triage"], claude=claude("2026-11-16T09:50:00+09:00"))
+        handoff = report("handoff-0001", "ask", "2026-11-16T08:42:41+09:00",
+                         "08:00 の定時のタブからです。\n\n—— 送る直前に道具が足した事実 ——", "term_hourly")
+        relay = report("relay-0001", "ask", "2026-11-16T09:42:41+09:00",
+                       "09:00 の定時のタブから、担当への伝達の依頼です。", "term_hourly")
+        answered = replace(
+            records, reports_by_worktree={**records.reports_by_worktree, "triage-hourly": (handoff, relay)},
+            answers_by_ask={**records.answers_by_ask,
+                            "relay-0001": (stall.Answer(at("2026-11-16T10:13:00+09:00"), "inbox_read.py answered"),)})
+
+        self.assertEqual(stall.judge(hourly, None, answered, NOW, FakeProbe(), live=False), [])
+        for lane, reports in (({**hourly, "automation_workspaces": []}, (handoff, relay)), (hourly, (relay,))):
+            with self.subTest(automations=lane["automation_workspaces"]):
+                other = replace(answered, reports_by_worktree={"triage-hourly": reports})
+                self.assertEqual(["answer_undelivered"],
+                                 [item.signal for item in stall.judge(lane, None, other, NOW, FakeProbe(), live=False)])
+
     def test_an_ask_with_a_question_still_unanswered_is_still_waiting(self) -> None:
         lanes, records = morning()
         lane, _ = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-left"))
