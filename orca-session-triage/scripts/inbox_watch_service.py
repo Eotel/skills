@@ -109,14 +109,14 @@ def uses_offset(command: str, offset: str | Path) -> bool:
 
 
 def offset_readers(offset: str | Path) -> list[int]:
-    result = subprocess.run(["ps", "-ww", "-axo", "pid=,command="], capture_output=True,
+    result = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,command="], capture_output=True,
                             text=True, check=True, timeout=10)
-    readers = []
+    parent_by_reader: dict[int, int] = {}
     for line in result.stdout.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0].isdigit() and uses_offset(parts[1], offset):
-            readers.append(int(parts[0]))
-    return readers
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and uses_offset(parts[2], offset):
+            parent_by_reader[int(parts[0])] = int(parts[1])
+    return [pid for pid, parent in parent_by_reader.items() if parent not in parent_by_reader]
 
 
 def status(home: str | Path | None = None) -> tuple[bool, str]:
