@@ -802,6 +802,11 @@ def current_decisions(
                         for ask_id, numbers in (target,) for number in numbers or (0,)]
         manual_refs = [target for key in covered_keys if (target := targets.get(key))]
         evidence = []
+        if manual_refs:
+            refs = list(dict.fromkeys(
+                (ask_id, frozenset({number}) if number else frozenset())
+                for ask_id, numbers in refs
+                for number in sorted(numbers) or range(1, len(inbox_read.questions_of(asks[ask_id])) + 1) or (0,)))
         for ref in refs:
             if any(ask_state.includes(manual_ref, ref) for manual_ref in manual_refs):
                 continue

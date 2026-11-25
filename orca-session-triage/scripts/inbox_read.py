@@ -746,7 +746,7 @@ def answer_sender() -> dict[str, str | None]:
 
 
 def same_answer_session(sender: Mapping[str, str | None] | None, source: Mapping[str, str | None]) -> bool:
-    return bool(sender and source.get("session") and sender.get("session") == source["session"]
+    return bool(isinstance(sender, Mapping) and source.get("session") and sender.get("session") == source["session"]
                 and sender.get("worktree") == source.get("worktree"))
 
 
