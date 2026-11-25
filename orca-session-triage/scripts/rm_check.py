@@ -1834,9 +1834,8 @@ def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Pat
             commands = []
         elif pr:
             detail = line.strip()
-            if detail.startswith("違い: "):
-                has_drift = True
-            elif detail.startswith("直し方: "):
+            has_drift |= detail.startswith(("違い:", "Asana:"))
+            if detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場:"):
                 display = detail.removeprefix("直す作業場:").strip()

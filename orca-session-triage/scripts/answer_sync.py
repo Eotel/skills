@@ -108,7 +108,7 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
             previous = recorded.get(key)
             if replacement and part:
                 previous = next(iter(inbox_read.answer_parts(whole, (int(part),), recorded)), None)
-            elif replacement and previous is None:
+            elif replacement and (previous is None or previous.get("how") not in inbox_read.SUBSTANTIVE_ANSWERS):
                 entry = next((ask for ask in entries if ask.get("id") == whole), {})
                 numbers = range(1, len(inbox_read.questions_of(entry)) + 1)
                 parts = inbox_read.answer_parts(whole, numbers, recorded)

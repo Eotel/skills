@@ -314,8 +314,11 @@ def print_read(result: dict, now: datetime) -> None:
             for line in lines:
                 if line and not line[0].isspace() and not line.startswith(TOPIC_FIXER_JSON):
                     record_key = line
-                if line.lstrip().startswith("直す作業場: "):
-                    detail = line.lstrip().removeprefix("直す作業場: ")
+                if line.lstrip().startswith("直す作業場:"):
+                    detail = line.lstrip().removeprefix("直す作業場:").strip()
+                    if not detail:
+                        display.setdefault(f"unreadable:{record_key}", "  直す作業場: 要確認（担当行が途中で切れています）")
+                        continue
                     try:
                         worktree = legacy_topic_worktree(detail, structured_prs.get(record_key, ()))
                     except ValueError:

@@ -6000,7 +6000,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(self.run_main("--from", str(saved))[0], 1)
 
         for fragment in (f"  Asana: 完了 False → True（asana_sync.py {url} で直る）",
-                         "  直す作業場:"):
+                         "  Asana: Asana のタスクが 2 件", "  直す作業場:"):
             topic.write_text(f"{url}\n{fragment}\n")
             self.assertEqual(self.run_main("--from", str(saved))[0], 1)
             self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
