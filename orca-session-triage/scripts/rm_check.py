@@ -650,6 +650,7 @@ class IgnoredPaths(NamedTuple):
     # The paths of `review` split by what they hold: work records --archive-scratch moves aside, and the rest.
     records: list[Record]
     held: list[Held]
+    error: str | None = None
 
 
 def dependency_clones(worktree: Path, rel: str, linked: Sequence[Path] = ()) -> list[Path]:
@@ -765,29 +766,48 @@ class NestedRestore:
         return {str(copy.relative_to(self.root)): list(plan.files) for copy, plan in self.plans.items()}
 
 
-def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None) -> CloneResult:
+def has_unrestored_clone_changes(copy: Path, status: str, index: str, restored: dict[Path, list[int]] | None) -> bool:
+    changes = [entry for entry in status.split("\0") if entry]
+    if not changes or not restored or any(not entry.startswith("?? ") for entry in changes):
+        return bool(changes)
+    tracked: dict[str, list[Path]] = {}
+    for entry in index.split("\0"):
+        mode, _, name = entry.partition("\t")
+        if mode.startswith(("100644 ", "100755 ", "120000 ")):
+            tracked.setdefault(filename_key(name), []).append(Path(name))
+    listings: dict[Path, dict[str, Path]] = {}
+    for entry in changes:
+        name = entry[3:]
+        try:
+            actual = disk_path(copy, Path(name), listings)
+            if (restored.get(actual) != file_stamp(actual)
+                    or not any(disk_path(copy, expected, listings) == actual
+                               for expected in tracked.get(filename_key(name), ()))):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None,
+                restored: dict[Path, list[int]] | None = None) -> CloneResult:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
     copy = copy.resolve()
     if copy in checked:
         return checked[copy]
+    refs = origin_refs(copy, branches_and_tags=True)
     blockers = []
     branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
     details = [f"branch {branch or '(detached HEAD)'}"]
-    status = git(copy, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all")
-    approved = restore is not None and restore.allows_changes(copy)
-    if status.returncode or (status.stdout.strip() and not approved):
-        blockers.append("uncommitted changes or git status failed")
-    elif restore and copy in restore.plans:
-        details.append("uncommitted changes: approved for restoration")
-    else:
-        details.append("uncommitted changes: none")
     stash = git(copy, "stash", "list")
     if stash.returncode or stash.stdout.strip():
         blockers.append("stash remains or could not be checked")
     else:
         details.append("stash: none")
-    discard = restore.discard if restore and copy in restore.found else frozenset()
-    ignored = ignored_paths(copy, None, clone_checks=checked, discard=discard)
+    discard = restore.discard if restore and copy in restore.requested else frozenset()
+    ignored = ignored_paths(copy, None, clone_checks=checked, discard=discard, restored=restored)
+    if ignored.error:
+        blockers.append(ignored.error)
     if ignored.review or ignored.nested or ignored.lock_holders:
         blockers.append("ignored paths or live locks to preserve: " + ", ".join(
             [*ignored.review, *(str(path) for path in ignored.nested), *map(str, ignored.lock_holders)]))
@@ -802,7 +822,6 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
     modules = copy / ".git/modules"
     if entries.returncode or initialized or (modules.is_dir() and any(modules.iterdir())):
         blockers.append("submodule repositories need preservation: " + ", ".join(initialized or [str(modules)]))
-    refs = origin_refs(copy, branches_and_tags=True)
     local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
     if local.returncode:
         blockers.append("local branches and tags could not be checked")
@@ -814,6 +833,14 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("local tips: " + ", ".join(f"{name} {oid[:12] or '?'}" for name, oid in unsaved))
     else:
         details.append("commits absent from origin: none")
+    status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
+    approved = restore is not None and restore.allows_changes(copy)
+    if status.returncode or (not approved and has_unrestored_clone_changes(copy, status.stdout, entries.stdout, restored)):
+        blockers.append("uncommitted changes or git status failed")
+    elif restore and copy in restore.plans:
+        details.append("uncommitted changes: approved for restoration")
+    else:
+        details.append("uncommitted changes: none")
     result = CloneResult(blockers, [*details, *blockers])
     checked[copy] = result
     return result
@@ -821,7 +848,8 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
 
 def ignored_paths(worktree: str | Path, main: str | Path | None, *,
                   clone_checks: dict[Path, CloneResult] | None = None,
-                  restore: NestedRestore | None = None, discard: frozenset[Path] = frozenset()) -> IgnoredPaths:
+                  restore: NestedRestore | None = None, discard: frozenset[Path] = frozenset(),
+                  restored: dict[Path, list[int]] | None = None) -> IgnoredPaths:
     """(review, regenerable, nested, notes, lock_holders, records, held): ignored paths that hold something and are
     neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
     test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
@@ -838,15 +866,25 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
     held: list[Held] = []
     root = Path(worktree).resolve()
     cache_tags: dict[Path, bool] = {}
+    listings: dict[Path, dict[str, Path]] = {}
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
-    for entry in git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
+    status = git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", "--ignored=matching", "--untracked-files=normal")
+    if status.returncode:
+        return IgnoredPaths(review, regenerable, nested, notes, holders, records, held,
+                            f"ignored paths could not be checked (Git exit {status.returncode})")
+    for entry in status.stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
             continue
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel if main is not None else None
-        if any(path.is_relative_to(source) for path in discard) and all(
-                path in discard or holds_nothing(path) for path in files_in(source)):
-            continue
+        if discard:
+            try:
+                actual = disk_path(root, Path(rel), listings)
+            except OSError:
+                actual = source
+            if any(path.is_relative_to(actual) for path in discard) and all(
+                    path in discard or holds_nothing(path) for path in files_in(actual)):
+                continue
         if holds_nothing(source) or (copy is not None and same_tree(source, copy)):
             continue
         if rel == SCHEDULED_LOCK and not source.is_symlink() and (holder := lock_holder(source)) is not None:
@@ -862,7 +900,7 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
                 continue
         if clones:
             for clone in clones:
-                examined = clone_check(clone, clone_checks, restore)
+                examined = clone_check(clone, clone_checks, restore, restored)
                 if examined.blockers:
                     review.append("%s (%s)" % (clone, "; ".join(examined.blockers)))
                     content = held_details(clone)
@@ -965,6 +1003,8 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
         blockers.append("--restore-nested の復元条件を満たしません")
     discard = restore.discard if approved and restore else frozenset()
     ignored = ignored_paths(copy, repository, discard=discard)
+    if ignored.error:
+        blockers.append(ignored.error)
     review, deeper = ignored.review, ignored.nested
     if review or deeper:
         blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
@@ -1292,6 +1332,10 @@ def file_stamp(path: Path) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
+def filename_key(name: str) -> str:
+    return normalize("NFD", normalize("NFD", name).casefold())
+
+
 def disk_entry(directory: Path, name: str, listings: dict[Path, dict[str, Path]]) -> Path:
     if directory not in listings:
         listings[directory] = {entry.name: entry for entry in directory.iterdir()}
@@ -1300,10 +1344,9 @@ def disk_entry(directory: Path, name: str, listings: dict[Path, dict[str, Path]]
         return entries[name]
     path = directory / name
     identity = path.lstat()
-    spelling = normalize("NFD", normalize("NFD", name).casefold())
+    spelling = filename_key(name)
     for entry in entries.values():
-        normalized = normalize("NFD", normalize("NFD", entry.name).casefold())
-        if normalized == spelling and os.path.samestat(entry.lstat(), identity):
+        if filename_key(entry.name) == spelling and os.path.samestat(entry.lstat(), identity):
             return entry
     raise FileNotFoundError(path)
 
@@ -1321,7 +1364,7 @@ def optional_stamp(path: Path) -> list[int] | None:
         return None
 
 
-def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]], *, include_ctime: bool = False) -> list[str]:
+def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]]) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
     moved = []
@@ -1331,7 +1374,7 @@ def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]],
             try:
                 path = Path(top) / name
                 stamp = file_stamp(path)
-                latest_ns = max(stamp[3], stamp[4]) if include_ctime else stamp[3]
+                latest_ns = max(stamp[3], stamp[4])
                 if latest_ns > after * 1e9 and restored.get(str(path.relative_to(worktree))) != stamp:
                     moved.append((latest_ns, path))
             except OSError:
@@ -1422,8 +1465,11 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested, notes, lock_holders, records, held_files = ignored_paths(
-        worktree, main, clone_checks=clone_checks, restore=restore)
+    restored_paths = {Path(worktree).resolve() / relative: stamp for relative, stamp in (restored or {}).items()}
+    review, regenerable, nested, notes, lock_holders, records, held_files, ignore_error = ignored_paths(
+        worktree, main, clone_checks=clone_checks, restore=restore, restored=restored_paths)
+    if ignore_error:
+        blockers.append(ignore_error)
     notes.extend(clone_notes)
     notes.extend(merge_notes)
     nested = [nested_check(copy, restore) for copy in dict.fromkeys([*untracked_nested, *nested])]
@@ -2411,7 +2457,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 current = nested_check(copy)
                 prefix = f"{copy.relative_to(root)}/"
                 written = {name.removeprefix(prefix): stamp for name, stamp in restored.items() if name.startswith(prefix)}
-                movement = moved_since(copy, since, written, include_ctime=True) if since and restore else []
+                movement = moved_since(copy, since, written) if since and restore else []
                 if current != item or movement:
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     if movement:

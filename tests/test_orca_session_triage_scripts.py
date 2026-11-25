@@ -6562,6 +6562,80 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result.get("restore_nested")), (1, {rel: ["app.txt"]}), result)
         self.assertEqual(disposable.read_text(), "explicitly approved\n")
 
+        directory = copy / "cafe\u0301"
+        directory.mkdir()
+        ignored = directory / "report.tmp"
+        ignored.write_text("approved ignored file\n")
+        (copy / ".git/info/exclude").write_text("/ca*/\n")
+        self.assertIn("!! caf\u00e9/", git(copy, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored=matching"))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--discard-before-restore", f"{rel}/{filename}",
+                                         "--discard-before-restore", f"{rel}/{directory.name}/report.tmp")
+
+        self.assertEqual((code, result.get("restore_nested")), (1, {rel: ["app.txt"]}), result)
+        self.assertEqual(ignored.read_text(), "approved ignored file\n")
+        self.assertFalse(result["review"], result)
+
+    def test_nested_clone_accepts_the_restored_tracked_file_under_its_disk_alias(self) -> None:
+        original, alias = "Μαΐου", "ΜΑΪ́ΟΥ"
+        versioned = self.main / original / "inside/app.txt"
+        versioned.parent.mkdir(parents=True)
+        versioned.write_text("tracked\n")
+        git(self.main, "add", str(versioned.relative_to(self.main)))
+        git(self.main, "commit", "-qm", "track Unicode file")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = self.wt / rel
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (copy / original).rename(copy / alias)
+        if not (copy / original).is_dir():
+            self.skipTest("requires a case-insensitive filesystem with normalized lookup")
+        file = copy / alias / "inside/app.txt"
+        file.unlink()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+
+        self.assertEqual((code, result["ok"]), (0, True), result)
+        self.assertEqual(file.read_text(), "tracked\n")
+        unknown = file.with_name("unapproved.txt")
+        unknown.write_text("keep this file\n")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, blocked = self.run_main("--restored-file-stamps", json.dumps(result["restored_file_stamps"]))
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(unknown.read_text(), "keep this file\n")
+
+    def test_clone_cleanup_rechecks_files_after_the_remote_lookup(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = (self.wt / rel).resolve()
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        saved = (copy / "app.txt").stat()
+        since = datetime.now(timezone.utc).isoformat()
+        created = copy / "private.sqlite3"
+        lookup = rmcheck.origin_refs
+
+        def copy_during_lookup(path: Path, *, branches_and_tags: bool = False) -> list[tuple[str, str]] | None:
+            refs = lookup(path, branches_and_tags=branches_and_tags)
+            if path == copy:
+                created.write_bytes(b"data copied while checking the remote")
+                os.utime(created, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+            return refs
+
+        with (patch.object(rmcheck, "origin_refs", side_effect=copy_during_lookup),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 1, result)
+        self.assertNotIn(rel, result["regenerable"])
+        self.assertEqual(created.read_bytes(), b"data copied while checking the remote")
+
     def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6861,6 +6935,16 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(created.read_text(), "keep this file\n")
 
+        ignored = copy / "private.sqlite3"
+        created.rename(ignored)
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("private.sqlite3\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(ignored.read_text(), "keep this file\n")
+
     def test_native_nested_removal_refuses_untracked_files_created_after_the_last_check(self) -> None:
         copy = self.nested_catalog().resolve()
         git(copy, "config", "status.showUntrackedFiles", "no")
@@ -6878,6 +6962,24 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_ignored_inventory_failure_stops_approved_detach(self) -> None:
+        copy = self.nested_catalog().resolve()
+        actual_git = rmcheck.git
+
+        def fail_inventory(cwd: str | Path, *args: str,
+                           env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == copy and "--ignored=matching" in args:
+                return subprocess.CompletedProcess(args, 128, "", "cannot read ignored files")
+            return actual_git(cwd, *args, env=env)
+
+        with (patch.object(rmcheck, "git", side_effect=fail_inventory),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("ignored paths could not be checked", " ".join(result["reasons"]))
+        self.assertTrue(copy.exists())
 
     def test_nested_catalog_written_after_the_scan_stops_approved_detach(self) -> None:
         copy = self.nested_catalog()
