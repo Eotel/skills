@@ -6874,6 +6874,45 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(rel, result["restored_nested"]["local-deps/pushed"])
         self.assertFalse(copy.exists())
 
+    def test_nested_restore_respects_decomposed_paths_recorded_in_git(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("requires Git's macOS Unicode path normalization")
+        copy = self.nested_catalog()
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(copy, "config", "core.precomposeunicode", "false")
+        rel = "cafe\u0301/inside/gone.txt"
+        path = copy / rel
+        path.parent.mkdir(parents=True)
+        path.write_text("tracked\n")
+        git(copy, "add", rel)
+        git(copy, "commit", "-qm", "store a decomposed path")
+        git(copy, "push", "-q", "origin", "HEAD:main")
+        if not (copy / "caf\u00e9").is_dir():
+            self.skipTest("requires normalization-insensitive file lookup")
+        git(copy, "config", "core.precomposeunicode", "true")
+        path.unlink()
+        path.parent.rmdir()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("Git とディスクのパス表記が異なります", " ".join(result["reasons"]))
+        self.assertFalse(path.exists())
+
+        deps = Path(self.tmp.name) / "deps"
+        git(deps, "worktree", "remove", "--force", str(copy))
+        git(deps, "clone", "-q", "-b", "main", str(Path(self.tmp.name) / "deps.git"), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        path.unlink()
+        path.parent.rmdir()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, clone = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, clone["ok"]), (0, True), clone)
+        self.assertEqual(path.read_text(), "tracked\n")
+
     def test_restore_approval_preserves_other_nested_worktrees_even_with_the_batch_flag(self) -> None:
         copy = self.nested_catalog()
         other = self.wt / "local-deps/other"

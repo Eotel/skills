@@ -989,9 +989,11 @@ def on_remote(worktree: Path, head: str) -> bool:
 
 def linked_restore_alias(copy: Path, paths: Collection[str]) -> str | None:
     config = git(copy, "config", "--bool", "core.precomposeunicode")
-    precompose = config.returncode == 0 and config.stdout.strip() == "true"
+    precompose = sys.platform == "darwin" and config.returncode == 0 and config.stdout.strip() == "true"
     listings: dict[Path, dict[str, Path]] = {}
     for relative in paths:
+        if precompose and normalize("NFC", relative) != relative:
+            return relative
         actual = copy
         for part in Path(relative).parts:
             try:
@@ -1000,7 +1002,8 @@ def linked_restore_alias(copy: Path, paths: Collection[str]) -> str | None:
                 break
             except OSError:
                 return relative
-            if (normalize("NFC", actual.name) != normalize("NFC", part) if precompose else actual.name != part):
+            observed = normalize("NFC", actual.name) if precompose else actual.name
+            if observed != part:
                 return relative
     return None
 
@@ -2426,7 +2429,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
-                    done = git(copy, "--literal-pathspecs", "restore", f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
+                    done = git(copy, "-c", "core.precomposeunicode=false", "--literal-pathspecs", "restore",
+                               f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
                     if done.returncode:
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
                         break
