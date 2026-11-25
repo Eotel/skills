@@ -11,3 +11,9 @@
 - 帳票・画面の見た目を選ぶ問いは、文だけで伺わない。担当に、全体の中の位置を枠で示し案を同じ文字列で描いたページを作らせ、open を確かめてから AskUserQuestion で伺う。 <!-- triage-retro:278f9552-ece6-581b-9afe-e47aaf716582 -->
 - AskUserQuestion の答えで、選んだ選択肢（投稿・merge など外へ出す操作）とメモが食い違うときは、許可として担当へ渡す前に読みを 1 問で確かめる。先にメモ付きのまま渡したら、確かめた答えで上書きを送る <!-- triage-retro:a39ef175-0051-5f45-a8c5-12ae7f2a7eb5 -->
 - 組織の secret が repo に渡っているかは、gh secret list --org（組織の管理者以外は 403）ではなく、gh api repos/<o>/<r>/actions/organization-secrets で読む。repo の secret は gh secret list -R で読む。 <!-- triage-retro:4974278a-ada9-57d1-8614-a51d99d22fa1 -->
+- 定時のタブが作業場のコメント（要判断・回の結果）を書くときは orca worktree set --worktree path:<作業場のパス> --comment "<文>" を使う。orca worktree --help には comment が出ないので、命令は orca --help で引く <!-- triage-retro:ea956139-2a62-5106-9cd3-71aca0de687d -->
+- 担当の投稿文の下書きに「分かりやすく」と返されたら、担当へ戻さず定時のタブが書き直し、伝える点を番号で問いに書き、全文を preview に入れて聞き直す。項目名だけでなく何に使うかを書く。 <!-- triage-retro:e82f8cc6-aa1e-545e-b840-2d2b77e33520 -->
+- review-pr の結果を担当へ渡す文面に「独立レビューは bot の review と同じく数えない。Asana のレビュー状態は人の review が来るまでレビュー待ちのまま変えない」を入れる。 <!-- triage-retro:dcb16535-cf96-5c79-9e02-2a8278fca50a -->
+- gh search prs --reviewed-by X --updated ">=日付" は X が過去にレビューし日付以降に更新された PR で、--limit で切れる。今日のレビューは gh pr view --json latestReviews の submittedAt で PR ごとに確かめる。 <!-- triage-retro:26a1db41-087b-5450-a933-6ed595c5df3f -->
+- taihei-cvm-server の dry-run・照合の JSON は contract_id（または会社事業所コードと工番の組）で抽出・集計する。工番（contract_number）は会社事業所の間で重複する（例: 1060 と 1080 の M230167）。 <!-- triage-retro:0b14a9c1-f81c-5378-9275-e4bb16b7f2d6 -->
+- macOS の cut -c は途中で切れた日本語を含む出力で「Illegal byte sequence」で停止する。定時の走査の長い行は python3 -I で errors='replace' を指定して読み込み、文字単位で切る。 <!-- triage-retro:b2f1732c-d719-58ff-85ee-3293a001773c -->
