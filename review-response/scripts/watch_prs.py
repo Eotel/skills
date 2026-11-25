@@ -11,6 +11,8 @@ retried on the next poll, not for the other PRs of that repository in the same p
 FAILURE line ends with 未起動 ["job", ...]: <reason> for the failed GitHub Actions
 jobs whose first annotation says GitHub never started them (an Actions budget or the
 spending limit), read once per failed result with one REST call per failed job.
+When available, the same line shows the organization's Actions budget, spending
+stop setting, and monthly net amount from the billing budgets and usage APIs.
 
 Cost per cycle: one `gh api rate_limit`, which does not count against the primary
 rate limits (it can count against secondary limits), then one GraphQL `gh pr view`
@@ -29,7 +31,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from datetime import datetime, timezone
-from functools import partial
+from functools import cache, partial
 import json
 from pathlib import Path
 import re
@@ -71,12 +73,50 @@ def finished_checks(checks: list[dict]) -> tuple[bool, list[str]]:
     return bool(checks), failed
 
 
-def not_started_note(reasons: dict[str, str]) -> str:
+def not_started_note(reasons: dict[str, str], billing: Callable[[], str] = str) -> str:
     """' 未起動 ["job", ...]: <reason>' per reason the named jobs share; empty without one."""
     jobs: dict[str, list[str]] = {}
     for name, reason in reasons.items():
         jobs.setdefault(reason, []).append(name)
-    return "".join(f" 未起動 {json.dumps(names, ensure_ascii=False)}: {reason}" for reason, names in jobs.items())
+    return ("".join(f" 未起動 {json.dumps(names, ensure_ascii=False)}: {reason}" for reason, names in jobs.items())
+            + billing()) if jobs else ""
+
+
+def actions_billing_note(owner: str) -> str:
+    def get(suffix: str, field: str) -> list[dict] | None:
+        try:
+            data = gh_json(["api", f"organizations/{owner}/settings/billing/{suffix}"])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+        values = data.get(field) if isinstance(data, dict) else None
+        return values if isinstance(values, list) and all(isinstance(item, dict) for item in values) else None
+
+    now = datetime.now(timezone.utc)
+    budgets = get("budgets?scope=organization&per_page=100", "budgets") or []
+    amounts = []
+    for budget in budgets:
+        products = budget.get("budget_product_skus")
+        if not isinstance(products, list):
+            products = [budget.get("budget_product_sku")]
+        if budget.get("budget_scope") != "organization" or "actions" not in products:
+            continue
+        amount, stopped = budget.get("budget_amount"), budget.get("prevent_further_usage")
+        if type(amount) in (int, float):
+            setting = {True: "（上限で停止）", False: "（上限で停止しない）"}[stopped] if isinstance(stopped, bool) else ""
+            amounts.append(f"予算 ${amount:,.2f}{setting}")
+    usage = get(f"usage?year={now.year}&month={now.month}", "usageItems")
+    if usage is not None:
+        total = 0.0
+        for item in usage:
+            if str(item.get("product") or "").casefold() != "actions":
+                continue
+            net = item.get("netAmount")
+            if not isinstance(net, (int, float)) or isinstance(net, bool):
+                break
+            total += net
+        else:
+            amounts.append(f"当月の純利用額 ${total:,.2f}")
+    return " | Actions " + "・".join(dict.fromkeys(amounts)) if amounts else ""
 
 
 def unstarted_jobs(repo: str, checks: list[dict]) -> dict[str, str]:
@@ -127,7 +167,8 @@ def codex_reviews(comments: list[dict]) -> dict[str, tuple[str, str, bool | None
 def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
                 unstarted: Callable[[list[dict]], dict[str, str]] = lambda checks: {},
                 now: float | None = None, codex_wait: float = CODEX_WAIT_MINUTES * 60,
-                codex_used: Callable[[], bool] = lambda: True) -> tuple[list[str], dict]:
+                codex_used: Callable[[], bool] = lambda: True,
+                billing: Callable[[], str] = str) -> tuple[list[str], dict]:
     """Diff: return (event lines, new state) without mutating either input.
 
     `unstarted(checks)` names the failed jobs GitHub never started, with the reason (see unstarted_jobs); it is
@@ -166,7 +207,7 @@ def diff_events(spec: str, previous: dict, snapshot: dict, me: str,
         )
         signature = json.dumps([head, result, terminal_results], ensure_ascii=False, separators=(",", ":"))
         if state.get("ci") != signature:
-            detail = (" failed=" + json.dumps(failed, ensure_ascii=False) + not_started_note(unstarted(checks))
+            detail = (" failed=" + json.dumps(failed, ensure_ascii=False) + not_started_note(unstarted(checks), billing)
                       if failed else "")
             events.append(f"{spec} CI {result} ({len(checks)} checks, {len(failed)} failed, head {head[:9]}){detail}")
         state["ci"] = signature
@@ -339,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             had_errors = False
             codex_search_failed: set[str] = set()
+            billing_for_owner = cache(actions_billing_note)
             try:
                 remaining, reset = graphql_budget()
             except FileNotFoundError:
@@ -365,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
                     events, updated = diff_events(spec, previous, snapshot, args.me, partial(unstarted_jobs, repo),
                                                   codex_wait=args.codex_wait * 60,
                                                   codex_used=partial(codex_commented, repo, codex_repos,
-                                                                     codex_search_failed))
+                                                                     codex_search_failed),
+                                                  billing=partial(billing_for_owner, repo.partition("/")[0]))
                 except FileNotFoundError:
                     raise ValueError("gh CLI is required") from None
                 except (ValueError, KeyError, subprocess.TimeoutExpired) as exc:

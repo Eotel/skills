@@ -3,17 +3,20 @@
 
 A FAILED line ends with 未起動 ["job", ...]: <reason> for the failed check runs whose first annotation says GitHub
 never started them (an Actions budget or the spending limit); only a failed run with annotations is read, one REST
-call each.
+call each. When available, the line also shows the organization's Actions budget and monthly net usage.
 """
 
 from __future__ import annotations
 
 import argparse
+from functools import cache, partial
 import json
 import re
 import subprocess
 import sys
 import time
+
+from watch_prs import actions_billing_note, not_started_note
 
 
 def classify_checks(runs: list[dict]) -> tuple[bool, list[str]]:
@@ -27,14 +30,6 @@ def classify_checks(runs: list[dict]) -> tuple[bool, list[str]]:
 
 # GitHub's annotation on a job it never ran, e.g. "... because an Actions budget is preventing further use."
 NOT_STARTED = "The job was not started because"
-
-
-def not_started_note(reasons: dict[str, str]) -> str:
-    """' 未起動 ["job", ...]: <reason>' per reason the named jobs share; empty without one."""
-    jobs: dict[str, list[str]] = {}
-    for name, reason in reasons.items():
-        jobs.setdefault(reason, []).append(name)
-    return "".join(f" 未起動 {json.dumps(names, ensure_ascii=False)}: {reason}" for reason, names in jobs.items())
 
 
 def unstarted_runs(repo: str, runs: list[dict]) -> dict[str, str]:
@@ -145,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     pending = list(dict.fromkeys(args.commits))
     try:
         while pending:
+            billing_for_owner = cache(actions_billing_note)
             for spec in list(pending):
                 repo, sha = spec.split("@", 1)
                 try:
@@ -160,7 +156,8 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if done:
                     count = len(runs) + len(combined["statuses"])
-                    detail = ("FAILED " + json.dumps(failed) + not_started_note(unstarted_runs(repo, runs)) if failed
+                    detail = ("FAILED " + json.dumps(failed)
+                              + not_started_note(unstarted_runs(repo, runs), partial(billing_for_owner, repo.partition("/")[0])) if failed
                               else f"ok ({count} checks)")
                     print(f"DONE {repo}@{sha[:9]} {detail}", flush=True)
                     pending.remove(spec)

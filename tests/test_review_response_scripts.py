@@ -24,7 +24,19 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "review-response" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 WORKTREE_SETUP = ROOT / "codex-tdd-orchestration" / "scripts" / "worktree-setup.sh"
+BILLING = {
+    "budgets": {"budgets": [{"budget_product_skus": ["actions"], "budget_scope": "organization",
+                             "budget_amount": 50, "prevent_further_usage": True},
+                            {"budget_product_skus": ["actions_linux"], "budget_scope": "repository",
+                             "budget_amount": 9, "prevent_further_usage": False}]},
+    "usage": {"usageItems": [
+        {"product": "Actions", "netAmount": 14.75, "grossAmount": 42.25},
+        {"product": "actions", "netAmount": 35.25, "grossAmount": 47.09},
+        {"product": "Packages", "netAmount": 15.99},
+    ]},
+}
 
 
 def load_script(name: str) -> ModuleType:
@@ -449,7 +461,7 @@ class WatchPrsTests(unittest.TestCase):
 
     def fake_gh(
         self, views: dict[str, dict], feeds: dict[str, list[dict]], remaining: int = 5000, reset: int = 1793160542,
-        codex_comments: int | None = 1,
+        codex_comments: int | None = 1, billing: dict | None = None,
     ) -> tuple[list[list[str]], Callable[..., subprocess.CompletedProcess[str]]]:
         """Answer gh at the subprocess boundary and record each command's arguments.
 
@@ -470,6 +482,11 @@ class WatchPrsTests(unittest.TestCase):
                 body = {"total_count": codex_comments, "items": []}
             elif args[-1].split("?")[0].endswith("/annotations"):
                 body = feeds.get(args[-1].split("?")[0], [])
+            elif args[-1].startswith("organizations/acme/settings/billing/"):
+                kind = args[-1].split("?")[0].rsplit("/", 1)[-1]
+                if kind not in (billing or {}):
+                    return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
+                body = (billing or {})[kind]
             else:
                 body = [feeds.get(args[-1].split("?")[0], [])]
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
@@ -788,22 +805,24 @@ class WatchPrsTests(unittest.TestCase):
                     {"name": "unit", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": job.format(11)},
                     {"name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": job.format(12)},
                     {"name": "docs", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": job.format(13)}]}
-        calls, run = self.fake_gh({"12": view}, {
-            "repos/acme/api/check-runs/11/annotations": [{"message": reason}],
-            "repos/acme/api/check-runs/12/annotations": [{"message": "Process completed with exit code 1."}]})
-        with tempfile.TemporaryDirectory() as temporary:
-            listing = Path(temporary) / "prs.txt"
-            listing.write_text(self.spec + "\n", encoding="utf-8")
-            output = io.StringIO()
-            with patch.object(prs.subprocess, "run", side_effect=run), redirect_stdout(output):
-                code = prs.main([str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me,
-                                 "--once"])
-        self.assertEqual(code, 0)
-        self.assertEqual(output.getvalue().splitlines(), [
-            f'acme/api#12 CI FAILURE (3 checks, 2 failed, head aaaaaaaaa) failed=["unit", "lint"] 未起動 ["unit"]: {reason}'])
-        self.assertEqual([args[-1] for args in calls if "annotations" in args[-1]],
-                         ["repos/acme/api/check-runs/11/annotations?per_page=1",
-                          "repos/acme/api/check-runs/12/annotations?per_page=1"])
+        for available, suffix in ((None, ""), (BILLING, " | Actions 予算 $50.00（上限で停止）・当月の純利用額 $50.00")):
+            with self.subTest(available=bool(available)), tempfile.TemporaryDirectory() as temporary:
+                calls, run = self.fake_gh({"12": view}, {
+                    "repos/acme/api/check-runs/11/annotations": [{"message": reason}],
+                    "repos/acme/api/check-runs/12/annotations": [{"message": "Process completed with exit code 1."}]},
+                    billing=available)
+                listing = Path(temporary) / "prs.txt"
+                listing.write_text(self.spec + "\n", encoding="utf-8")
+                output = io.StringIO()
+                with patch.object(prs.subprocess, "run", side_effect=run), redirect_stdout(output):
+                    code = prs.main([str(listing), "--state-file", str(Path(temporary) / "state.json"), "--me", self.me,
+                                     "--once"])
+                self.assertEqual(code, 0)
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f'acme/api#12 CI FAILURE (3 checks, 2 failed, head aaaaaaaaa) failed=["unit", "lint"] 未起動 ["unit"]: {reason}{suffix}'])
+                self.assertEqual([args[-1] for args in calls if "annotations" in args[-1]],
+                                 ["repos/acme/api/check-runs/11/annotations?per_page=1",
+                                  "repos/acme/api/check-runs/12/annotations?per_page=1"])
 
     def test_low_graphql_budget_waits_for_reset_without_reading_prs(self) -> None:
         reset = 1793160542
@@ -909,7 +928,8 @@ class WatchChecksTests(unittest.TestCase):
                     self.assertEqual(checks.classify_commit(runs, {"state": "pending", "statuses": []}, suites), (False, []))
 
     def poll_commit(self, runs: list[dict], status_pages: list[dict], suite_pages: list[dict] | None = None,
-                    annotations: dict[int, list[dict]] | None = None) -> tuple[int, str, list, Mock]:
+                    annotations: dict[int, list[dict]] | None = None,
+                    billing: dict | None = None) -> tuple[int, str, list, Mock]:
         output = io.StringIO()
         errors = io.StringIO()
         if suite_pages is None:
@@ -924,6 +944,11 @@ class WatchChecksTests(unittest.TestCase):
                 payload = suite_pages
             elif (found := re.fullmatch(r"repos/example/api/check-runs/(\d+)/annotations\?per_page=1", command[-1])):
                 payload = (annotations or {})[int(found[1])]
+            elif command[-1].startswith("organizations/example/settings/billing/"):
+                kind = command[-1].split("?")[0].rsplit("/", 1)[-1]
+                if kind not in (billing or {}):
+                    return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
+                payload = (billing or {})[kind]
             else:
                 self.fail(f"unexpected API command: {command}")
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
@@ -966,10 +991,12 @@ class WatchChecksTests(unittest.TestCase):
                 {"id": 12, "name": "lint", "status": "completed", "conclusion": "failure", "output": {"annotations_count": 0}},
                 {"id": 13, "name": "docs", "status": "completed", "conclusion": "success", "output": {"annotations_count": 2}}]
         code, output, calls, _ = self.poll_commit(runs, [{"state": "pending", "statuses": []}],
-                                                  annotations={11: [{"message": reason}]})
+                                                  annotations={11: [{"message": reason}]},
+                                                  billing={"usage": BILLING["usage"]})
         self.assertEqual(code, 0)
-        self.assertEqual(output, f'DONE example/api@abcdef123 FAILED ["unit", "lint"] 未起動 ["unit"]: {reason}\n')
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(output, f'DONE example/api@abcdef123 FAILED ["unit", "lint"] 未起動 ["unit"]: {reason}'
+                                 " | Actions 当月の純利用額 $50.00\n")
+        self.assertEqual(len(calls), 6)
 
     def test_statuses_only_commit_finishes(self) -> None:
         for state, expected in (("success", "ok (1 checks)"), ("failure", 'FAILED ["legacy"]'), ("error", 'FAILED ["legacy"]')):
