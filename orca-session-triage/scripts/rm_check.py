@@ -2257,8 +2257,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         return (*movable, *found, *plans)
 
     def may_detach(nested: list[dict]) -> bool:
-        return args.detach_nested or bool(args.apply_restore_nested and restore and nested
-                                          and all(Path(item["path"]) in restore.requested for item in nested))
+        if restore is None:
+            return args.detach_nested
+        return bool(args.apply_restore_nested and nested
+                    and all(Path(item["path"]) in restore.requested for item in nested))
 
     def restore_approval_error() -> str | None:
         if not args.restore_approval:
@@ -2346,6 +2348,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 result["blockers"].append(approval_error)
                 result["ok"] = False
                 removable = False
+            if removable and restore:
+                fresh_nested = [nested_check(Path(item["path"])) for item in nested]
+                movement = moved_since(root, since, restored) if since else []
+                if fresh_nested != nested or movement:
+                    result["blockers"].extend(["子 worktree が削除直前に変わりました", *movement])
+                    result["ok"] = False
+                    removable = False
             detached = [item["path"] for item in nested if removable
                         and (not item["restore"]
                              or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)

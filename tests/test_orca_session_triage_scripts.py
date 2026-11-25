@@ -6689,18 +6689,37 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(rel, result["restored_nested"]["local-deps/pushed"])
         self.assertFalse(copy.exists())
 
-    def test_implicit_detach_preserves_other_nested_worktrees(self) -> None:
+    def test_restore_approval_preserves_other_nested_worktrees_even_with_the_batch_flag(self) -> None:
         copy = self.nested_catalog()
         other = self.wt / "local-deps/other"
         git(copy, "worktree", "add", "-q", "--detach", str(other), "HEAD")
         filename = copy / "locale/de/LC_MESSAGES/django.po"
         filename.write_text("modified catalog\n")
 
-        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested", "--detach-nested")
 
         self.assertEqual(code, 1, result)
         self.assertTrue(other.exists())
         self.assertEqual(filename.read_text(), "modified catalog\n")
+
+    def test_nested_worktree_is_rechecked_after_the_approved_restore(self) -> None:
+        copy = self.nested_catalog()
+        filename = copy / "locale/de/LC_MESSAGES/django.po"
+        filename.write_text("approved change\n")
+        examine = rmcheck.nested_check
+        calls = 0
+
+        def edit_before_detach(path: Path, restore: rmcheck.NestedRestore | None = None) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                filename.write_text("new edit before detach\n")
+            return examine(path, restore)
+
+        with patch.object(rmcheck, "nested_check", side_effect=edit_before_detach):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(filename.read_text(), "new edit before detach\n")
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
