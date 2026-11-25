@@ -6348,6 +6348,12 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(unpublished.read_text(), "untracked data\n")
         unpublished.unlink()
 
+        git(copy, "rm", "--cached", "-f", "app.txt")
+        code, blocked = self.run_main(*options, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        git(copy, "add", "app.txt")
+
         before = datetime.now(timezone.utc).isoformat()
         code, result = self.run_main(*options, "--apply-restore-nested", "--since", before)
         self.assertEqual(code, 0, result)

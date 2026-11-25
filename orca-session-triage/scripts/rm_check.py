@@ -685,15 +685,21 @@ class NestedRestore:
             return False
         entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
                    for info, _, rel in (item.partition("\t"),)}
-        changes = [item[3:] for item in status.stdout.split("\0") if item
-                   and not (item.startswith("?? ") and copy / item[3:] in self.discard)]
-        for rel in changes:
+        changes = []
+        for item in filter(None, status.stdout.split("\0")):
+            rel = item[3:]
             path = copy / rel
+            if item.startswith("?? "):
+                if path in self.discard:
+                    continue
+                return False
             if (entries.get(rel) not in {"100644", "100755", "120000"}
+                    or (item.startswith("D ") and (path.exists() or path.is_symlink()))
                     or path.parent.resolve() != path.parent or (path.is_dir() and not path.is_symlink())
                     or any(parent.exists() and not parent.is_dir()
                            for parent in path.parents if parent.is_relative_to(copy))):
                 return False
+            changes.append(rel)
         if changes:
             self.plans[copy] = (head.stdout.strip(), changes)
         return True
