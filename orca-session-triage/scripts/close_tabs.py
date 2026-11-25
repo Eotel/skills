@@ -43,6 +43,7 @@ import subprocess
 import sys
 from typing import Protocol
 
+import rm_check
 import scan_sessions
 
 
@@ -339,8 +340,9 @@ def main(argv: Sequence[str] | None = None, host: TabHost | None = None) -> int:
         print(f"--from: {error}", file=sys.stderr)
         return 2
     try:
+        drift = rm_check.scan_topic_blockers(Path(args.from_file))
         selected = [scan_sessions.select_row(rows, name) for name in args.row]
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1
     targets = [(row_of(rows, handle), handle) for value in args.handles for handle in value.split()]
@@ -348,8 +350,17 @@ def main(argv: Sequence[str] | None = None, host: TabHost | None = None) -> int:
     unique = {(row.get("environment") if row else None, handle): (row, handle) for row, handle in targets}
     host = host or OrcaTabs(args.orca)
     caller = Caller.from_environment()
-    results = [close_one([row] if row else rows, handle, host, args.claude_projects.expanduser(),
-                         args.inbox.expanduser(), caller, args.state_file) for row, handle in unique.values()]
+    results = []
+    for row, handle in unique.values():
+        path = Path(row["path"]) if row else None
+        held = [reason for target, reasons in drift.items() if path and
+                (target == path if row and row.get("environment") else target.resolve() == path.resolve())
+                for reason in reasons]
+        if held:
+            results.append((False, f"{handle}: KEPT -> {'・'.join(held)}"))
+        else:
+            results.append(close_one([row] if row else rows, handle, host, args.claude_projects.expanduser(),
+                                     args.inbox.expanduser(), caller, args.state_file))
     print(*(line for _, line in results), sep="\n")
     return 0 if all(closed for closed, _ in results) else 1
 

@@ -765,17 +765,22 @@ def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decisio
             and asked_at and ask_state.answer_follows_question(decisions[key], asked_at)]
 
 
-def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str, lead_decisions.Decision],
-                                                                       dict[str, ask_state.HandoffBinding],
-                                                                       dict[str, list[lead_decisions.Decision]]]:
-    decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
+def current_decisions(
+    state: dict, log: Path, handoffs: Path, *, reports: list[dict] | None = None,
+    scoped_refs: Mapping[str, list[tuple[str, frozenset[int]]]] | None = None,
+    decisions: dict[str, lead_decisions.Decision] | None = None,
+) -> tuple[dict[str, lead_decisions.Decision], dict[str, ask_state.HandoffBinding],
+           dict[str, list[lead_decisions.Decision]]]:
+    if decisions is None:
+        decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
     history = list(lead_decisions.handed_off(handoffs.expanduser()))
     bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id)
     handoff_keys = {item.decision for item in history}
     decisions = {key: value for key, value in decisions.items() if key not in handoff_keys or not value.from_ask}
     if not state["questions"]:
         return decisions, bindings, {}
-    asks = {item["id"]: item for item in inbox_entries() if item.get("id") and item.get("kind") == "ask"}
+    inbox = reports if reports is not None else inbox_entries()
+    asks = {item["id"]: item for item in inbox if item.get("id") and item.get("kind") == "ask"}
     entries = list(asks.values())
     answers = lead_decisions.ask_answers(inbox_read.answers_path())
     resolved = {}
@@ -783,7 +788,9 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
         if item.get("answer") is not None or item.get("withdrawn_at"):
             continue
         manual = covering_answers(item, decisions, bindings)
-        refs = ask_state.references(item, entries, bindings=bindings)
+        refs = (scoped_refs or {}).get(identifier)
+        if refs is None:
+            refs = ask_state.references(item, entries, bindings=bindings)
         if not refs:
             if manual and len(manual) == len(item.get("covers") or []):
                 resolved[identifier] = manual
@@ -800,6 +807,11 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
                         for ask_id, numbers in (target,) for number in numbers or (0,)]
         manual_refs = [target for key in covered_keys if (target := targets.get(key))]
         evidence = []
+        if manual_refs:
+            refs = list(dict.fromkeys(
+                (ask_id, frozenset({number}) if number else frozenset())
+                for ask_id, numbers in refs
+                for number in sorted(numbers) or range(1, len(inbox_read.questions_of(asks[ask_id])) + 1) or (0,)))
         for ref in refs:
             if any(ask_state.includes(manual_ref, ref) for manual_ref in manual_refs):
                 continue
@@ -814,7 +826,8 @@ def current_decisions(state: dict, log: Path, handoffs: Path) -> tuple[dict[str,
             if not proof or len(parts) != len(proof.get("answers", [proof])):
                 break
             evidence.extend(lead_decisions.Decision(part["id"], item["decision"], part.get("note") or "回答済み",
-                                                    part["ts"], from_ask=True) for part in parts)
+                                                    part["ts"], from_ask=True, sender=part.get("sender"))
+                            for part in parts)
         else:
             resolved[identifier] = [*manual, *evidence]
     return decisions, bindings, resolved
@@ -1724,8 +1737,8 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             covered = direct or covered
             settled.append({**view, "state": "settled", "since": max(
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
-                            "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
-                                          "answer": answer.answer} for answer in covered]})
+                            "evidence": [{"id": answer.id, "decision": answer.decision, "decided_at": answer.decided_at,
+                                          "answer": answer.answer, "sender": answer.sender} for answer in covered]})
         elif ((refs := references.get(key, [])) and all(ref.get("state") == "CLOSED" for ref in refs)
               and item.get("ask_id") not in open_keys):
             settled.append({**view, "state": "settled", "since": max(ref.get("updatedAt") or "" for ref in refs),

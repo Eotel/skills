@@ -136,6 +136,7 @@ class Decision:
     value: str | bool | None = None  # what an answer on an Asana 99 item puts there (answer_value)
     removal: RemovalTerms | None = None  # a remove: answer's condition and cleanup
     from_ask: bool | None = False
+    sender: dict[str, str | None] | None = None
 
     @classmethod
     def parse(cls, raw: str, where: str) -> Decision:
@@ -143,7 +144,9 @@ class Decision:
             item = json.loads(raw)
             return cls(id=str(item["id"]), decision=str(item["decision"]), answer=str(item["answer"]),
                        decided_at=str(item["decided_at"]), value=item.get("value"),
-                       removal=RemovalTerms.stored(item.get("removal")), from_ask=None if item.get("from_ask") is None else item["from_ask"] is True)
+                       removal=RemovalTerms.stored(item.get("removal")),
+                       from_ask=None if item.get("from_ask") is None else item["from_ask"] is True,
+                       sender=item.get("sender"))
         except (ValueError, TypeError, KeyError) as error:
             raise ValueError(f"damaged decision record at {where}: {error}") from error
 
@@ -158,6 +161,8 @@ class Decision:
                     del found["removal"][key]
         if not self.from_ask:
             del found["from_ask"]
+        if self.sender is None:
+            del found["sender"]
         return found
 
 
@@ -363,7 +368,8 @@ def answer_line(raw: str) -> Decision:
                     decided_at=at, value=answer_value(decision, item.get("value")),
                     removal=RemovalTerms.checked(decision, item.get("after"), item.get("discard", []),
                                                  item.get("compose_down", False),
-                                                 archive_path=item.get("archive_path", []), approve=item.get("approve", False)))
+                                                 archive_path=item.get("archive_path", []), approve=item.get("approve", False)),
+                    sender={**inbox_read.answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")})
 
 
 def checked_line(number: int, raw: str) -> Decision | BadLine:
@@ -824,7 +830,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
             entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=answer,
                              decided_at=at, value=answer_value(decision, args.value),
                              removal=RemovalTerms.checked(decision, args.after, args.discard, args.compose_down,
-                                                          archive_path=args.archive_path, approve=args.approve))
+                                                          archive_path=args.archive_path, approve=args.approve),
+                             sender={**inbox_read.answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")})
             warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)
             result: object = entry.view()

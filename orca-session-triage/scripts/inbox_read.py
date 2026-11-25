@@ -745,6 +745,11 @@ def answer_sender() -> dict[str, str | None]:
     return {"worktree": str(path), "session": session if isinstance(session, str) and session else None}
 
 
+def same_answer_session(sender: Mapping[str, str | None] | None, source: Mapping[str, str | None]) -> bool:
+    return bool(isinstance(sender, Mapping) and source.get("session") and sender.get("session") == source["session"]
+                and sender.get("worktree") == source.get("worktree"))
+
+
 def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
                    sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
                    answer_at: str | None = None, transcript_input: str | None = None,
@@ -755,7 +760,7 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = at or datetime.now().astimezone().isoformat(timespec="seconds")
-    source = answer_sender() if sender is None else sender
+    source = {**answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")} if sender is None else sender
     lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": source,
                                **({"note": note} if note else {}),
                                **({"sent_text": sent_text} if sent_text is not None else {}),
