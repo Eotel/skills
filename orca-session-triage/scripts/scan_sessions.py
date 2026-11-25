@@ -4450,7 +4450,7 @@ def main(argv: list[str] | None = None) -> int:
                                         open_asks=asks, known_tabs=known_tabs)
         if args.from_file:
             try:
-                drift = rm_check.scan_topic_blockers(Path(args.from_file), [Path(row["path"]) for row in rows])
+                drift = rm_check.scan_topic_blockers(Path(args.from_file))
             except (OSError, ValueError) as error:
                 for row in rows:
                     row["cleanup_blockers"].append(f"topic check の結果を確認できません（{error}）")

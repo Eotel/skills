@@ -4312,12 +4312,12 @@ class ScanCommandTests(unittest.TestCase):
         held, = json.loads(out.getvalue())
         self.assertIn(command, " ".join(held["cleanup_blockers"]))
 
-        first.write_text(f"{url}\n  Asana: 完了 True → False（{command} で直る）\n"
+        first.write_text(f"{url}\n  Asana: 指摘対応済み（未承認） → 承認済み（{command} で直る）\n"
                          f"  直す作業場: {path}（状態修正（Asana）、agent なし）\n")
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved)]), 0)
         legacy, = json.loads(out.getvalue())
-        self.assertIn(command, " ".join(legacy["cleanup_blockers"]))
+        self.assertIn(f"topic check で修正担当に指定されています（{url}、{command}）", legacy["cleanup_blockers"])
 
         retry.write_text("照合 1 件・食い違い 0 件・読めない 0 件\n")
         with redirect_stdout(io.StringIO()) as out:
@@ -5977,14 +5977,19 @@ class RmCheckTests(unittest.TestCase):
         saved.write_text("[]")
         topic = folder / "topic-check.stdout"
         url = "https://github.com/acme/example/pull/81"
+        alias = folder / "alias（別名）"
+        alias.symlink_to(self.wt, target_is_directory=True)
         topic.write_text(f"{url}\n  Asana: 完了 True → False（asana_sync.py {url} で直る）\n"
-                         f"  直す作業場: {self.wt}（merge-pr merged、2026-11-24T11:13:06+09:00、agent なし）\n"
+                         f"  直す作業場: {alias}（状態修正（Asana）、2026-11-24T11:13:06+09:00、agent なし）\n"
                          "https://github.com/acme/example/pull/82\n  直す作業場: なし（作業場はもう無い）\n")
 
         code, result = self.run_main("--from", str(saved))
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
         self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
+        self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
+        self.assertEqual(self.run_main("--from", str(saved))[0], 0)
 
         topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
@@ -6882,6 +6887,17 @@ class LeadDecisionProposalTests(unittest.TestCase):
         with redirect_stdout(out):
             code = self.lead.main(["--decisions-file", str(self.log), *args])
         return code, out.getvalue()
+
+    def test_record_preserves_the_answering_terminal_and_session(self) -> None:
+        answer = self.root / "answer.md"
+        answer.write_text("担当が修正する\n")
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_lead", "CODEX_THREAD_ID": "lead-session"}):
+            code, out = self.call("record", "--decision", "review:acme/app#1", "--answer-file", str(answer))
+        self.assertEqual(code, 0, out)
+        decision, = list(self.lead.records(self.log))
+        self.assertIsNotNone(decision.sender)
+        assert decision.sender is not None
+        self.assertEqual((decision.sender["handle"], decision.sender["session"]), ("term_lead", "lead-session"))
 
     def test_show_match_searches_keys_and_answers_with_any_word_ignoring_case(self) -> None:
         self.lead.append(self.log,
@@ -9629,13 +9645,16 @@ class HourlyReadTests(unittest.TestCase):
             path = Path(root) / "topic-check.stdout"
             pr = "https://github.com/acme/example/pull/81"
             fixer = {"pr": pr, "worktree": "/worktrees/app（修正）/lane", "commands": [f"asana_sync.py {pr}"]}
-            path.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n")
+            path.write_text(f"  直す作業場: {fixer['worktree']}（再調査）（agent なし）\n"
+                            f"topic-fixer-json: {json.dumps(fixer)}\n")
             retry = path.with_name("topic-check.retry.stdout")
             retry.touch()
             with redirect_stdout(io.StringIO()) as out:
                 hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
                                   datetime.now(timezone.utc))
-            self.assertIn(f"直す作業場: {fixer['worktree']}", out.getvalue())
+            self.assertEqual(out.getvalue().splitlines(),
+                             [f"  直す作業場: {fixer['worktree']}（再調査）（agent なし）",
+                              f"  直す作業場: {fixer['worktree']}"])
 
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")

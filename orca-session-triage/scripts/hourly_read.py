@@ -35,7 +35,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 from bash_timeout import LOAD_LIMIT
-from rm_check import topic_check_outputs, topic_fixer_record
+from rm_check import split_topic_suffix, topic_check_outputs, topic_fixer_record
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
                "read_at", "next_offset")
@@ -298,7 +298,7 @@ def print_read(result: dict, now: datetime) -> None:
         display = dict.fromkeys(line for line, _ in lines if line.lstrip().startswith("直す作業場: "))
         for line in display:
             print(line)
-        shown = set(line.lstrip() for line in display)
+        shown = {split_topic_suffix(line.lstrip().removeprefix("直す作業場: "))[0] for line in display}
         for line, path in lines:
             try:
                 record = topic_fixer_record(line, path)
@@ -307,10 +307,9 @@ def print_read(result: dict, now: datetime) -> None:
                 continue
             if record:
                 _, workspace, _ = record
-                label = f"直す作業場: {workspace}"
-                if not any(line == label or line.startswith(f"{label}（") for line in shown):
-                    print(f"  {label}")
-                    shown.add(label)
+                if str(workspace) not in shown:
+                    print(f"  直す作業場: {workspace}")
+                    shown.add(str(workspace))
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))

@@ -47,7 +47,6 @@ CACHE_PREFIXES = ("playwright-report", "blob-report")
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
-TOPIC_FIX = re.compile(r"（(.+) で直る）\s*$")
 TOPIC_FIXER_JSON = "topic-fixer-json: "
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
@@ -1749,10 +1748,10 @@ def topic_check_outputs(directory: Path) -> list[Path]:
     return [first, retry] if first.is_file() else [retry]
 
 
-def scan_topic_blockers(scan_file: Path, worktrees: list[Path]) -> dict[Path, list[str]]:
+def scan_topic_blockers(scan_file: Path) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     for path in topic_check_outputs(scan_file.expanduser().parent):
-        for target, reasons in topic_drift_blockers(path, worktrees).items():
+        for target, reasons in topic_drift_blockers(path).items():
             blockers[target] = list(dict.fromkeys((*blockers.get(target, []), *reasons)))
     return blockers
 
@@ -1769,7 +1768,21 @@ def topic_fixer_record(line: str, path: Path) -> tuple[str, Path, list[str]] | N
     return item["pr"], Path(item["worktree"]), item["commands"]
 
 
-def topic_drift_blockers(path: Path, worktrees: list[Path] | None = None) -> dict[Path, list[str]]:
+def split_topic_suffix(line: str) -> tuple[str, str]:
+    if not line.endswith("）"):
+        return line, ""
+    depth = 1
+    for index in range(len(line) - 2, -1, -1):
+        if line[index] == "）":
+            depth += 1
+        elif line[index] == "（":
+            depth -= 1
+            if depth == 0:
+                return line[:index], line[index + 1:-1]
+    return line, ""
+
+
+def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     structured: set[str] = set()
     pr = None
@@ -1791,15 +1804,15 @@ def topic_drift_blockers(path: Path, worktrees: list[Path] | None = None) -> dic
             commands = []
         elif pr:
             detail = line.strip()
-            if match := TOPIC_FIX.search(detail):
-                commands.append(match[1])
-            elif detail.startswith("直し方: "):
+            if detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場: "):
-                named = detail.removeprefix("直す作業場: ")
-                target = max((worktree for worktree in worktrees or [] if named.startswith(f"{worktree}（")),
-                             key=lambda worktree: len(str(worktree)), default=None)
-                target = target or Path(named.rsplit("（", 1)[0])
+                named, _ = split_topic_suffix(detail.removeprefix("直す作業場: "))
+                target = Path(named)
+            elif detail.endswith(" で直る）"):
+                _, suffix = split_topic_suffix(detail)
+                if suffix:
+                    commands.append(suffix.removesuffix(" で直る"))
     return blockers
 
 
@@ -1823,7 +1836,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--from", dest="from_file", type=Path, metavar="SCAN_JSON",
                         help="a saved scan_sessions.py JSON whose scanned_at is the default --since")
     parser.add_argument("--topic-check", type=Path, metavar="TOPIC_STDOUT",
-                        help="topic check output for this run (default: next to --from, if present); keep named worktrees")
+                        help="topic check --fixers-json output for this run (default: next to --from, if present); "
+                             "keep named worktrees")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                         help="the lead's answers in an append-only JSONL log (default: %(default)s)")
@@ -1990,9 +2004,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     decided = [keep_blocker] if keep_blocker else []
     if args.topic_check or args.from_file:
         try:
-            worktrees = [Path(worktree)]
-            drift = (topic_drift_blockers(args.topic_check.expanduser(), worktrees) if args.topic_check
-                     else scan_topic_blockers(args.from_file, worktrees))
+            drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check
+                     else scan_topic_blockers(args.from_file))
             decided.extend(reason for target, reasons in drift.items()
                            if target.resolve() == Path(worktree) for reason in reasons)
         except (OSError, ValueError) as error:
