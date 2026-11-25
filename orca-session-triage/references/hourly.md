@@ -304,6 +304,12 @@ to three days away, and deadline changes made by someone else in the last
 24 hours. Use these alerts in the hourly report. Route tracker fixes from
 the `gaps` rows.
 
+When deploying deadline alerts, update the running orca-board collector and
+let it refresh Backlog into the Board database. Install the matching Harness
+release on the target Macs and update this skill through APM. Verify the
+scheduled entry point above prints the issue key and deadline alert, including
+the old and new deadline, editor, and time for a recent change.
+
 Asana status and Backlog Watch compare with the most recent successful read of
 their own command in the same directory history, ordered by command read time.
 Backlog compares issue rows without elapsed wait times. New notifications
