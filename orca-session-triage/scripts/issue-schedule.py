@@ -14,7 +14,7 @@ HEADING = re.compile(r"^ {0,3}(#{1,2})[ \t]+(.*?)[ \t#]*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 START = re.compile(r"^( {0,3}[-*+][ \t]+(?:着手|Start)[ \t]*[:：])[ \t]*(.*)$", re.I)
 EFFORT = re.compile(r"^( {0,3}[-*+][ \t]+(?:予定工数|Estimated effort)[ \t]*[:：])[ \t]*(.*)$", re.I)
-DATES = re.compile(r"From\b[ \t]*(.*?)[ \t]*/[ \t]*To\b[ \t]*([^（(]*?)([ \t]*[（(].*)?", re.I)
+DATES = re.compile(r"(?:From\b[ \t]*(.*?)[ \t]*/[ \t]*)?To\b[ \t]*([^（(]*?)([ \t]*[（(].*)?", re.I)
 DECIMAL = re.compile(r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
 
 
@@ -70,8 +70,8 @@ def schedule_body(body: str, start: str | None, done: str | None, effort: str | 
         index, row = start_rows[0]
         dates = DATES.fullmatch(row[2])
         if dates is None:
-            raise ValueError("着手行の日付は From … / To … の形式で指定してください。")
-        from_value = start if start is not None else dates[1].strip()
+            raise ValueError("着手行の日付は From … / To … または To … の形式で指定してください。")
+        from_value = start if start is not None else (dates[1] or "").strip()
         to_value = done if done is not None else dates[2].strip()
         text = f"{row[1]} {date_fields(from_value, to_value)}{dates[3] or ''}"
         lines[index] = text + lines[index][len(lines[index].rstrip("\r\n")):]

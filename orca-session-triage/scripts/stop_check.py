@@ -100,8 +100,9 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
     lead = (state.get("lead") or {}).get("worktree") if isinstance(state, dict) else None
     bindings: dict[int, list[str]] = {}
     if isinstance(state, dict) and lead and ask_state.same_workspace(lead, workspace):
-        return duplicate_question(hook_input, state, state_dir, orca, bindings) or claim_call(
-            hook_input, state_dir, bindings)
+        entries = hourly_state.inbox_entries()
+        return duplicate_question(hook_input, state, state_dir, orca, bindings, entries=entries) or claim_call(
+            hook_input, state_dir, bindings, entries, orca)
     try:
         if not any((automation.get("prompt") or "").startswith("/orca-session-triage hourly")
                    for automation in triage_automations(orca, workspace)):
@@ -114,12 +115,14 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
         runs = []
     questions = (hook_input.get("tool_input") or {}).get("questions") or []
     reasons = []
-    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca, bindings):
+    entries = hourly_state.inbox_entries()
+    if duplicated := duplicate_question(hook_input, state if isinstance(state, dict) else {}, state_dir, orca,
+                                        bindings, entries=entries):
         reasons.append(duplicated["hookSpecificOutput"]["permissionDecisionReason"])
     if not all(in_japanese(question) for question in questions):
         reasons.append("問いごとに、問い・選択肢・説明は、仮名か漢字を含む日本語で書いてください。")
     if not (isinstance(state, dict) and (state.get("lead") or {}).get("worktree")):
-        return deny(reasons) or claim_call(hook_input, state_dir, bindings)
+        return deny(reasons) or claim_call(hook_input, state_dir, bindings, entries, orca)
     pane = os.environ.get("ORCA_PANE_KEY")
     started = next((run.get("startedAt") for run in runs
                     if pane and run.get("terminalPaneKey") == pane), None)
@@ -137,7 +140,7 @@ def question_decision(hook_input: dict[str, Any], orca: str, state_dir: Path,
             reasons.append("最後の引き継ぎはこの回の開始前です。質問の前に handoff.py send で引き継ぎを送ってください。")
     except (OSError, ValueError, LookupError, TypeError, OverflowError) as error:
         reasons.append(f"この回の引き継ぎを確認できません（{error}）。質問の前に handoff.py send で送ってください。")
-    return deny(reasons) or claim_call(hook_input, state_dir, bindings)
+    return deny(reasons) or claim_call(hook_input, state_dir, bindings, entries, orca)
 
 
 def direct_input_reasons(asks: dict[str, dict], labels: dict[str, list[str]], numbers: dict[str, set[int]],
@@ -322,8 +325,9 @@ def registered_scope(question: dict, entries: list[dict],
 
 
 def duplicate_question(hook_input: dict, state: dict, state_dir: Path, orca: str,
-                       bindings: dict[int, list[str]] | None = None) -> dict | None:
-    entries = hourly_state.inbox_entries()
+                       bindings: dict[int, list[str]] | None = None, *, entries: list[dict] | None = None) -> dict | None:
+    if entries is None:
+        entries = hourly_state.inbox_entries()
     path = inbox_read.answers_path()
     answers = inbox_read.answer_records(path)
     answers.update(lane_input.inferred_answers(inbox_read.paths()[0], path, orca))
@@ -472,18 +476,37 @@ def binding_file(hook_input: dict, state_dir: Path) -> Path | None:
     return state_dir / "ask-tool-bindings" / f"{key}.json"
 
 
-def claim_call(hook_input: dict, state_dir: Path, bindings: dict[int, list[str]]) -> dict | None:
+def claim_call(hook_input: dict, state_dir: Path, bindings: dict[int, list[str]], previous: list[dict],
+               orca: str) -> dict | None:
     if not bindings or (path := binding_file(hook_input, state_dir)) is None:
         return None
     cwd = str(Path(hook_input["cwd"]).resolve())
     entries = hourly_state.inbox_entries()
-    answered = inbox_read.answered_ids(inbox_read.answers_path()) | frozenset(inbox_read.withdrawal_times(entries))
-    open_asks = inbox_read.open_asks(entries, answered)
-    open_keys = frozenset(key for ask in open_asks for key in (
-        ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+    answers = inbox_read.answer_records(inbox_read.answers_path())
+    withdrawn = set(inbox_read.withdrawal_times(entries)) | {key for key, answer in answers.items()
+                                                              if answer.get("how") == "triage-notify --withdraws"}
+    open_asks = inbox_read.open_asks(entries, frozenset(answers) | withdrawn)
+    open_keys = inbox_read.open_claim_keys(open_asks)
     wanted = list(dict.fromkeys(key for keys in bindings.values() for key in keys))
-    if any(key not in open_keys for key in wanted):
-        return deny(["ask の状態が変わりました。受信箱で回答と取り下げを確認してください。"])
+    originals = {item["id"]: item for item in previous if item.get("kind") == "ask" and item.get("id")}
+    changes = []
+    for key in wanted:
+        ask_id, _, number = key.partition(":")
+        lane = inbox_read.source_of(originals.get(ask_id, {})) or "-"
+        if key not in open_keys:
+            state = ("取り下げ" if key in withdrawn or ask_id in withdrawn else
+                     "回答済み" if key in answers or ask_id in answers or not number and any(
+                         ref.startswith(f"{ask_id}:") and ref not in withdrawn for ref in answers) else "受付終了")
+            changes.append(f"ask {key}（{lane}）は {state}")
+        for ask in open_asks:
+            report = ask.report
+            if report["id"] not in originals and inbox_read.source_of(report) == lane:
+                changes.append(f"ask {key}（{lane}）と同じ作業場から新しい ask {report['id']} が届きました")
+    for run in inbox_read.later_runs(orca, "stop_check"):
+        if run.get("status") != "skipped_precheck":
+            changes.append(f"ask {', '.join(wanted)}。{hourly_runtime.later_run_note(run)}")
+    if changes:
+        return deny(list(dict.fromkeys(changes)))
     if taken := inbox_read.record_claims(inbox_read.claims_path(), wanted, cwd, open_keys):
         return deny([f"ask {claim.id} は {inbox_read.claim_label(claim)}。重ねて伺わないでください。" for claim in taken])
     scan_sessions.write_json_atomically(path, {"cwd": cwd, "parts": bindings})
@@ -607,7 +630,9 @@ def decide(hook_input: dict, state_dir: str | Path, orca: str = "orca") -> dict[
     """
     if not hook_input.get("session_id"):
         return None
-    pending_asks = unread_ask_reason(hook_input.get("cwd"), orca)
+    notices: list[str] = []
+    pending_asks = unread_ask_reason(hook_input.get("cwd"), orca, notices)
+    message = {"systemMessage": "\n".join(notices)} if notices else {}
     if hook_input.get("stop_hook_active"):
         try:
             runpy.run_path(str(Path.home() / ".agents/hooks/rule_events.py"))["record_exception"](
@@ -615,7 +640,7 @@ def decide(hook_input: dict, state_dir: str | Path, orca: str = "orca") -> dict[
                 ["Stop", "stop_hook_active=true"])
         except Exception:
             pass
-        return {"decision": "block", "reason": pending_asks} if pending_asks else None
+        return {"decision": "block", "reason": pending_asks, **message} if pending_asks else message or None
     session = Path(state_dir) / hook_input["session_id"]
     # Review and live-watch notices block once; unread asks remain a gate until acked.
     reasons = [pending_asks, watched(session, hook_input.get("transcript_path"))]
@@ -623,14 +648,21 @@ def decide(hook_input: dict, state_dir: str | Path, orca: str = "orca") -> dict[
     if isinstance(queue, dict):
         reasons += [unclassed(session, queue), missing_inbox_watch(hook_input.get("cwd"), orca)]
     reasons = [r for r in reasons if r]
-    return {"decision": "block", "reason": " ".join(reasons)} if reasons else None
+    return {"decision": "block", "reason": " ".join(reasons), **message} if reasons else message or None
 
 
-def unread_ask_reason(workspace: str | None, orca: str) -> str | None:
+def unread_ask_reason(workspace: str | None, orca: str, notices: list[str]) -> str | None:
     if not workspace:
         return None
     try:
-        if not hourly_runtime.current_pane(orca):
+        mine, owner = hourly_runtime.cursor_owner(orca)
+        if not mine:
+            if not owner or os.environ.get("TRIAGE_READ_OFFSET"):
+                return None
+            if owner in hourly_runtime.later_runs(orca):
+                asks = inbox_read.unread_asks(*inbox_read.paths(), mine=inbox_read.Sender.of(Path(workspace)))
+                if asks:
+                    notices.append(hourly_runtime.later_run_note(owner))
             return None
         asks = inbox_read.unread_asks(*inbox_read.paths(), mine=inbox_read.Sender.of(Path(workspace)))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -795,7 +827,7 @@ def main(handoffs_dir: Path | None = None) -> int:
     decision = decide(hook_input, str(Path(STATE_DIR).expanduser()), orca)
     if decision:
         json.dump(decision, sys.stdout)
-    else:
+    if not decision or decision.get("decision") != "block":
         try:
             retro.enqueue(hook_input)
         except OSError:

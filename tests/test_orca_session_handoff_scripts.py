@@ -65,6 +65,24 @@ class HandoffTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), "last", "--handoffs-dir", str(self.handoffs)],
                               capture_output=True, text=True)
 
+    def test_send_without_since_uses_only_the_recorded_offset_for_this_pane_and_inbox(self) -> None:
+        first = json.dumps({"id": "seen", "kind": "info", "text": "before"}) + "\n"
+        later = json.dumps({"id": "new", "kind": "info", "text": "after", "worktree": "lane"}) + "\n"
+        self.inbox.write_text(first + later)
+        reads = self.root / "reads"
+        for directory, pane, inbox, offset in (
+            ("20261125T010000Z-matching", "tab:leaf", self.inbox, len(first.encode())),
+            ("20261125T020000Z-other", "tab:another", self.inbox, 0),
+            ("20261125T030000Z-other-inbox", "tab:leaf", self.root / "other.jsonl", 0),
+        ):
+            path = reads / directory / "inbox.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"pane": pane, "inbox": str(inbox.resolve()), "next_offset": offset}))
+        result = self.run_tool("--reads-dir", str(reads), "--force", env={"ORCA_PANE_KEY": "tab:leaf"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("id=new", self.sent.read_text())
+        self.assertNotIn("id=seen", self.sent.read_text())
+
     def notify_appending(self, *before: dict[str, str]) -> None:
         """A triage-notify that appends `before`, then the report it was given, as triage-notify records it."""
         self.notify.write_text(
