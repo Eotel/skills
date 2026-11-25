@@ -6420,6 +6420,24 @@ class RmCheckTests(unittest.TestCase):
         self.assertFalse(linked.exists())
         self.assertFalse(git(clone, "status", "--porcelain"))
 
+    def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        filename.write_text("before scan\n")
+        stamp = filename.stat()
+        since = datetime.now(timezone.utc).isoformat()
+        filename.write_text("copied after scan\n")
+        os.utime(filename, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(filename.read_text(), "copied after scan\n")
+
     def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))

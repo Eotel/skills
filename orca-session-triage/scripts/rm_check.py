@@ -693,6 +693,7 @@ class NestedRestore:
             return False
         entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
                    for info, _, rel in (item.partition("\t"),)}
+        cutoff = self.since.timestamp() * 1e9 if self.since else None
         changes: dict[str, list[int] | None] = {}
         for item in filter(None, status.stdout.split("\0")):
             rel = item[3:]
@@ -708,11 +709,14 @@ class NestedRestore:
                            for parent in path.parents if parent.is_relative_to(copy))):
                 return False
             try:
-                changes[rel] = file_stamp(path)
+                stamp = file_stamp(path)
             except FileNotFoundError:
-                changes[rel] = None
+                stamp = None
             except OSError:
                 return False
+            if cutoff is not None and stamp is not None and max(stamp[3:]) > cutoff:
+                return False
+            changes[rel] = stamp
         if changes:
             index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
             if index.returncode:
@@ -721,7 +725,7 @@ class NestedRestore:
                 stamp = file_stamp(Path(index.stdout.strip()))
             except OSError:
                 return False
-            if self.since and stamp[3] > self.since.timestamp() * 1e9:
+            if cutoff is not None and max(stamp[3:]) > cutoff:
                 return False
             self.plans[copy] = NestedRestorePlan(head.stdout.strip(), stamp, changes)
         return True
