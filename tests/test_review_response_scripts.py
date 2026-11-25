@@ -824,6 +824,15 @@ class WatchPrsTests(unittest.TestCase):
                                  ["repos/acme/api/check-runs/11/annotations?per_page=1",
                                   "repos/acme/api/check-runs/12/annotations?per_page=1"])
 
+    def test_actions_budget_can_be_on_a_later_page(self) -> None:
+        page_one = {"budgets": [{"budget_scope": "repository", "budget_product_sku": "actions",
+                                 "budget_amount": 9}], "has_next_page": True}
+        page_two = {**BILLING["budgets"], "has_next_page": False}
+        with patch.object(prs, "gh_json", side_effect=[page_one, page_two, BILLING["usage"]]) as gh:
+            note = prs.actions_billing_note("acme")
+        self.assertEqual(note, " | Actions 予算 $50.00（上限で停止）・当月の純利用額 $50.00")
+        self.assertTrue(gh.call_args_list[1].args[0][-1].endswith("&page=2"))
+
     def test_low_graphql_budget_waits_for_reset_without_reading_prs(self) -> None:
         reset = 1793160542
         calls, run = self.fake_gh({}, {}, remaining=999, reset=reset)
