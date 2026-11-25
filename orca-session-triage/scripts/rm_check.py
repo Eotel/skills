@@ -10,10 +10,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import filecmp
 from functools import partial
-from hashlib import sha256
+from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryFile
 import posixpath
 import re
 import shlex
@@ -766,6 +767,17 @@ class NestedRestore:
         return {str(copy.relative_to(self.root)): list(plan.files) for copy, plan in self.plans.items()}
 
 
+def matches_checkout_blob(copy: Path, actual: Path, name: Path, blob: str) -> bool:
+    with TemporaryFile() as expected:
+        result = subprocess.run(["git", "-C", str(copy), "-c", "core.precomposeunicode=false", "cat-file", "--filters",
+                                 f"--path={name}", blob], stdout=expected, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode:
+            return False
+        expected.seek(0)
+        with actual.open("rb") as current:
+            return file_digest(current, "sha256").digest() == file_digest(expected, "sha256").digest()
+
+
 def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
     changes = [entry for entry in status.split("\0") if entry]
     if not changes or any(not entry.startswith("?? ") for entry in changes):
@@ -790,21 +802,23 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
                 mode = "100755" if actual.stat().st_mode & 0o100 else "100644"
             else:
                 return True
-            expected = {blob for path, tracked_mode, blob in aliases
-                        if tracked_mode == mode and disk_path(copy, path, listings) == actual}
+            expected = [(path, blob) for path, tracked_mode, blob in aliases
+                        if tracked_mode == mode and disk_path(copy, path, listings) == actual]
             if not expected:
                 return True
+            blobs = {blob for _, blob in expected}
             if mode == "120000":
                 target = os.readlink(os.fsencode(actual))  # noqa: PTH115 - Git hashes the raw symlink target.
                 hashed_link = subprocess.run(["git", "-C", str(copy), "hash-object", "--stdin"],
                                              input=target, capture_output=True)
-                if hashed_link.returncode or os.fsdecode(hashed_link.stdout).strip() not in expected:
+                if hashed_link.returncode or os.fsdecode(hashed_link.stdout).strip() not in blobs:
                     return True
             else:
                 hashed = git(copy, "hash-object", "--no-filters", "--", str(actual))
-                if hashed.returncode or hashed.stdout.strip() not in expected:
+                if hashed.returncode or (hashed.stdout.strip() not in blobs and not any(
+                        matches_checkout_blob(copy, actual, path, blob) for path, blob in expected)):
                     return True
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return True
     return False
 

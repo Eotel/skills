@@ -6583,7 +6583,8 @@ class RmCheckTests(unittest.TestCase):
         versioned.parent.mkdir(parents=True)
         versioned.write_text("tracked\n")
         versioned.with_name("link").symlink_to("app.txt")
-        git(self.main, "add", str(versioned.parent.relative_to(self.main)))
+        (self.main / ".gitattributes").write_text("**/app.txt text eol=crlf\n")
+        git(self.main, "add", ".gitattributes", str(versioned.parent.relative_to(self.main)))
         git(self.main, "commit", "-qm", "track Unicode file")
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6604,7 +6605,7 @@ class RmCheckTests(unittest.TestCase):
             code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested")
 
         self.assertEqual((code, result["ok"]), (0, True), result)
-        self.assertEqual(file.read_text(), "tracked\n")
+        self.assertEqual(file.read_bytes(), b"tracked\r\n")
         self.assertEqual(link.readlink(), Path("app.txt"))
         (self.main / ".git/info/exclude").write_text("")
         with patch.object(rmcheck, "processes_in", return_value=[]):
