@@ -6476,7 +6476,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(filename.read_text(), "copied after scan\n")
 
-        before_deletion = datetime.now(timezone.utc).isoformat()
+        before_deletion = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         filename.unlink()
         code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
                                      "--since", before_deletion)

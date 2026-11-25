@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Collection, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import filecmp
@@ -202,9 +203,8 @@ def log_note(rel: str, files: list[Path]) -> str:
         rel, sum(stat.st_size for stat in stats), latest.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
-def working_changes(worktree: str | Path) -> tuple[list[str], list[str]]:
-    """(uncommitted, regenerable): paths `git status` reports, split off the untracked bytecode in them."""
-    uncommitted, regenerable = [], []
+def working_changes(worktree: str | Path) -> tuple[list[str], list[str], list[str]]:
+    tracked_changes, untracked, regenerable = [], [], []
     # -z gives each path unquoted; a rename's second entry names its source and is skipped.
     entries = iter(git(worktree, "--no-optional-locks", "status", "--porcelain", "-z").stdout.split("\0"))
     for entry in entries:
@@ -213,11 +213,11 @@ def working_changes(worktree: str | Path) -> tuple[list[str], list[str]]:
         if set(entry[:2]) & set("RC"):
             next(entries, None)
         rel = entry[3:]
-        if entry.startswith("?? ") and holds_only_bytecode(Path(worktree) / rel):
-            regenerable.append(rel)
+        if entry.startswith("?? "):
+            (regenerable if holds_only_bytecode(Path(worktree) / rel) else untracked).append(rel)
         else:
-            uncommitted.append(rel)
-    return uncommitted, regenerable
+            tracked_changes.append(rel)
+    return tracked_changes, untracked, regenerable
 
 
 def is_regenerable(relpath: str) -> bool:
@@ -831,7 +831,8 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
             continue
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel if main is not None else None
-        if any(path.is_relative_to(source) for path in discard) and all(path in discard for path in files_in(source)):
+        if any(path.is_relative_to(source) for path in discard) and all(
+                path in discard or holds_nothing(path) for path in files_in(source)):
             continue
         if holds_nothing(source) or (copy is not None and same_tree(source, copy)):
             continue
@@ -932,7 +933,8 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
-    changes, _ = working_changes(copy)
+    tracked_changes, untracked, _ = working_changes(copy)
+    changes = [*tracked_changes, *untracked]
     modified = set(git(copy, "--no-optional-locks", "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
     regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
                    and (copy / rel).with_suffix(".po").is_file()
@@ -1323,11 +1325,11 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     blockers = list(decided)
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
-    changes, bytecode = working_changes(worktree)
+    tracked_changes, untracked, bytecode = working_changes(worktree)
     clone_notes = []
     clone_checks: dict[Path, CloneResult] = {}
     untracked_nested: list[Path] = []
-    for rel in changes[:]:
+    for rel in untracked[:]:
         if PurePosixPath(rel).parts[:1] != ("local-deps",):
             continue
         clones, linked = nested_dependencies(Path(worktree), rel)
@@ -1341,9 +1343,10 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                 elif not restore or clone not in restore.plans:
                     clone_notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
             if all(not problems for _, problems in checked):
-                changes.remove(rel)
+                untracked.remove(rel)
                 bytecode.append(rel)
                 untracked_nested.extend(linked)
+    changes = [*tracked_changes, *untracked]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -2276,6 +2279,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             return "--restore-nested の削除承認を復元直前に確認できません"
         return "--restore-nested の削除承認が変わりました。再検査してください"
 
+    def restoration_lock() -> AbstractContextManager[None]:
+        if args.restore_approval:
+            return lead_decisions.decision_lock(args.decisions_file.expanduser())
+        return nullcontext()
+
     restored_nested: dict[str, list[str]] = {}
     if restore and restore.plans:
         detach = may_detach(result["nested_worktrees"])
@@ -2286,30 +2294,31 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             latest = NestedRestore(root, set(restore.plans), since=since)
             for copy in restore.plans:
                 latest.allows_changes(copy)
-            approval_error = restore_approval_error()
-            if approval_error:
-                decided.append(approval_error)
-            changed = [copy for copy, plan in restore.plans.items() if latest.plans.get(copy) != plan or not plan.matches(copy)]
-            for copy in changed:
-                decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
-            for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                if not approved.matches(copy):
-                    decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
-                    break
-                paths = list(approved.files)
-                done = git(copy, "--literal-pathspecs", "restore", f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
-                if done.returncode:
-                    decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
-                    break
-                try:
-                    for rel in paths:
-                        path = copy / rel
-                        restored[str(path.relative_to(root))] = file_stamp(path)
-                except OSError as error:
-                    decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")
-                    break
-                restored_nested[str(copy.relative_to(root))] = paths
-                notes.append(f"後始末: {copy.relative_to(root)} の追跡済みファイル {len(paths)} 件を復元")
+            with restoration_lock():
+                approval_error = restore_approval_error()
+                if approval_error:
+                    decided.append(approval_error)
+                changed = [copy for copy, plan in restore.plans.items() if latest.plans.get(copy) != plan or not plan.matches(copy)]
+                for copy in changed:
+                    decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
+                for copy, approved in (() if changed or approval_error else restore.plans.items()):
+                    if not approved.matches(copy):
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
+                        break
+                    paths = list(approved.files)
+                    done = git(copy, "--literal-pathspecs", "restore", f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
+                    if done.returncode:
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
+                        break
+                    try:
+                        for rel in paths:
+                            path = copy / rel
+                            restored[str(path.relative_to(root))] = file_stamp(path)
+                    except OSError as error:
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")
+                        break
+                    restored_nested[str(copy.relative_to(root))] = paths
+                    notes.append(f"後始末: {copy.relative_to(root)} の追跡済みファイル {len(paths)} 件を復元")
             recheck = partial(recheck, decided=tuple(decided))
             result = recheck()
         else:
@@ -2325,9 +2334,6 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             result = recheck()
     if may_detach(result["nested_worktrees"]):
         nested = result["nested_worktrees"]
-        if nested and (approval_error := restore_approval_error()):
-            result["blockers"].append(approval_error)
-            result["ok"] = False
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
         # Records --archive-scratch and --archive-path move next do not keep it.
         others = [blocker for blocker in result["blockers"]
@@ -2335,10 +2341,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         scratch_next = bool(archive_movers(Path(worktree), result, movable_now(result), besides_nested=True))
         removable = (nested and (scratch_next or (not others and not result["review"]))
                      and not any(item["blockers"] for item in nested))
-        detached = [item["path"] for item in nested if removable
-                    and (not item["restore"]
-                         or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
-                    and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
+        with restoration_lock() if removable else nullcontext():
+            if removable and (approval_error := restore_approval_error()):
+                result["blockers"].append(approval_error)
+                result["ok"] = False
+                removable = False
+            detached = [item["path"] for item in nested if removable
+                        and (not item["restore"]
+                             or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
+                        and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
         if detached:
             result = recheck()
         elif nested:

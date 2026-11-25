@@ -307,11 +307,18 @@ def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]
 
 
 @contextmanager
-def appending(log: Path) -> Generator[Callable[..., None], None, None]:
-    """Serialize decision updates so an explicit decision can supersede automatic answers."""
+def decision_lock(log: Path, *, exclusive: bool = False) -> Generator[None, None, None]:
     log.parent.mkdir(parents=True, exist_ok=True)
     canonical = log.resolve()
     lock_path = canonical.with_name(canonical.name + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+
+
+@contextmanager
+def appending(log: Path) -> Generator[Callable[..., None], None, None]:
+    """Serialize decision updates so an explicit decision can supersede automatic answers."""
 
     def write(*entries: Decision | HandOff) -> None:
         lines = [json.dumps({**entry.view(), "from_ask": entry.from_ask} if isinstance(entry, Decision) else asdict(entry),
@@ -323,8 +330,7 @@ def appending(log: Path) -> Generator[Callable[..., None], None, None]:
                     stream.writelines(lines)
                     stream.flush()
 
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with decision_lock(log, exclusive=True):
         yield write
 
 
