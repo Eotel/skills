@@ -6,20 +6,23 @@ the path of its results.json: a JSON array with one record per command, each wit
 the keys name, command, exit_code, stdout and stderr (the paths of the command's
 output files), result (the path of its .json result, or null), error, retry,
 compared_to, and changes.
-The lines `<name>: exit N` before it list the same exit codes. Failed commands keep
+At startup, reads/current points to the new run and NEXT_OFFSET is recorded. The
+lines `<name>: exit N | PATH` report each completed command. Failed commands keep
 their stdout and stderr; only successful, parseable JSON is published as a .json
 result. Cleanup can close previous completed scheduled tabs under its existing
 safety checks.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import argparse
 import json
 import os
 from pathlib import Path
+from queue import SimpleQueue
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,20 +30,24 @@ import time
 
 import hourly_runtime
 import hourly_state
+import inbox_read
 import json_output
 import lead_decisions
 from bash_timeout import LOAD_LIMIT
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
-               "read_at")
+               "read_at", "next_offset")
+DEFAULT_READS = Path("~/.cache/orca-session-triage/reads")
 LOAD_TIMEOUT_FACTOR = 2.5
-COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch")
+COMPARE = ("tracker-gaps", "asana99-status", "backlog-watch", "requests-needing-owner")
 BACKLOG_ITEM = re.compile(r"^(?:返信|返信不要|担当確認|判定済み) [A-Z][A-Z0-9_]+-\d+\b")
 BACKLOG_ELAPSED = re.compile(r" \| (?:\d+時間)?\d+分 \| ")
 BACKLOG_PR_ELAPSED = re.compile(
     r"( \| PR [\w.-]+/[\w.-]+#\d+ (?:レビュー待ち|下書き|承認済み|修正依頼|open)) \d+(?:日|時間)(?= →| \||$)")
 BACKLOG_CURSOR = Path("~/.cache/orca-briefs/backlog-watch/state.json")
 ASANA_PARTIAL = re.compile(r"^Eotel へのレビュー依頼: 未取得", re.MULTILINE)
+BACKLOG_READ_FAILURE = re.compile(r"backlog API.{0,30}(?:fail|失敗|取得でき|読み込め)|"
+                                 r"failed to read.{0,30}backlog", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -99,18 +106,64 @@ def read_with_retry(task: ReadTask, directory: Path, timeout: float, loaded: boo
     if backlog and (before is None or backlog_cursor() != before):
         first["error"] = "通知カーソルが更新済みか確認できないため、終了コード 124 を維持します"
         return first
+    return retry_read(task, directory, timeout, first, "high load timeout")
+
+
+def retry_read(task: ReadTask, directory: Path, timeout: float, first: dict, reason: str) -> dict:
     if task.result_file and task.result_file.is_file():
         task.result_file.rename(task.result_file.with_suffix(".first-attempt.json"))
     result = read_task(task, directory, timeout, retry=True)
-    result["retry"] = {"timeout": timeout, "exit_code": result["exit_code"],
+    result["retry"] = {"timeout": timeout, "reason": reason, "exit_code": result["exit_code"],
                        "first_exit_code": first["exit_code"], "first_stdout": first["stdout"],
                        "first_stderr": first["stderr"], "first_error": first["error"]}
     return result
 
 
+def failed_host(result: dict) -> str | None:
+    if result["exit_code"] in (None, 0, 124, 127) or result["retry"]:
+        return None
+    output = "\n".join(Path(result[field]).read_text(encoding="utf-8", errors="replace")
+                       for field in ("stderr", "stdout"))
+    backlog_host = os.environ.get("BACKLOG_SPACE") or "spindd.backlog.com"
+    if re.search(r"error connecting to api\.github\.com\b", output, re.IGNORECASE):
+        return "api.github.com"
+    if BACKLOG_READ_FAILURE.search(output):
+        return backlog_host
+    if "URLError" in output and "nodename nor servname" in output:
+        if result["name"] == "backlog-watch":
+            return backlog_host
+        return "app.asana.com" if result["name"] == "asana99-status" else "api.github.com"
+    return None
+
+
+def retry_network(tasks: list[ReadTask], finished: dict[str, dict], directory: Path, timeout: float,
+                  backlog_before: bytes | None, reachable: dict[str, bool]) -> None:
+    for task in tasks:
+        first = finished[task.name]
+        host = failed_host(first)
+        if not host:
+            continue
+        if task.name == "backlog-watch" and (backlog_before is None or backlog_cursor() != backlog_before):
+            first["error"] = "通知カーソルが更新済みか確認できないため、通信エラーを再試行しません"
+            continue
+        if host not in reachable:
+            try:
+                with socket.create_connection((host, 443), timeout=5):
+                    reachable[host] = True
+            except OSError as error:
+                print(f"network: {host}: {error}", flush=True)
+                reachable[host] = False
+        if reachable[host]:
+            result = retry_read(task, directory, timeout, first, f"network: {host}")
+            finished[task.name] = result
+            print_completion(result)
+
+
 def earlier_reads(root: Path) -> list[tuple[Path, dict[str, dict]]]:
     history = []
     for path in root.glob("*/results.json"):
+        if path.parent.is_symlink():
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -147,6 +200,8 @@ def comparison_data(path: Path, name: str) -> dict[str, dict | str]:
         return {BACKLOG_PR_ELAPSED.sub(r"\1", BACKLOG_ELAPSED.sub(" | ", line, count=1)): line
                 for line in text.splitlines() if BACKLOG_ITEM.match(line)}
     data = json.loads(text)
+    if name == "requests-needing-owner":
+        return {row["id"]: row for row in data["needs_owner"]}
     rows = data.get("gaps", []) if isinstance(data, dict) else data
     if name == "tracker-gaps":
         return {row["key"]: row for row in rows}
@@ -209,17 +264,24 @@ def compare_reads(results: list[dict], history: list[tuple[Path, dict[str, dict]
             json_output.emit(document, path)
         changed = (sorted(key for key in current.keys() & previous.keys() if current[key] != previous[key])
                    if name == "asana99-status" else [])
-        result["changes"] = {"new": new, "gone": gone, "changed": changed}
+        if name == "requests-needing-owner":
+            closed = json.loads(path.read_text(encoding="utf-8"))["closed_issues"]
+            result["changes"] = {"new": new, "closed_issues": [item["id"] for item in closed]}
+        else:
+            result["changes"] = {"new": new, "gone": gone, "changed": changed}
         if name == "backlog-watch":
             result["changes"].update(new=[current[key] for key in new], gone=[previous[key] for key in gone])
 
 
 def print_read(result: dict, now: datetime) -> None:
     name = result["name"]
-    print(f"{name}: exit {result['exit_code']}" + (f" | {result['error']}" if result.get("error") else ""))
     if retry := result.get("retry"):
-        print(f"{name}: retry exit {retry['first_exit_code']} → {retry['exit_code']} (timeout {retry['timeout']:g}s)")
+        print(f"{name}: retry exit {retry['first_exit_code']} → {retry['exit_code']}"
+              f" ({retry['reason']}, timeout {retry['timeout']:g}s)")
     if changes := result.get("changes"):
+        if name == "requests-needing-owner":
+            requests = json.loads(Path(result["result"]).read_text(encoding="utf-8"))
+            print(f"{name}: needs_owner {len(requests['needs_owner'])} | closed_issues {len(requests['closed_issues'])}")
         print(f"{name}: compared to {result.get('compared_to') or '前回の成功記録なし'}")
         for kind, rows in changes.items():
             if rows:
@@ -235,6 +297,32 @@ def print_read(result: dict, now: datetime) -> None:
             text = " ".join((row.get("text") or "").split())
             print(f"{row.get('ts') or '-'} {row.get('source') or '-'} id={row['id']} {text[:160]}"
                   + ("…" if len(text) > 160 else ""))
+
+
+def print_completion(result: dict) -> None:
+    details = [str(field) for field in (result.get("result") or result.get("stdout"), result.get("error"))
+               if field]
+    outcome = f"exit {result['exit_code']}" if result["exit_code"] is not None else "skip"
+    print(" | ".join([f"{result['name']}: {outcome}", *details]), flush=True)
+
+
+def read_inbox(directory: Path, timeout: float) -> dict:
+    task = ReadTask("inbox", [str(Path(__file__).with_name("inbox_read.py")), "read", "--summary"])
+    result = read_task(task, directory, timeout)
+    if result["exit_code"] == 0:
+        lines = Path(result["stdout"]).read_text(encoding="utf-8").splitlines()
+        match = re.fullmatch(r"NEXT_OFFSET=(\d+)", lines[-1]) if lines else None
+        if match:
+            position = int(match[1])
+            output = directory / "inbox.json"
+            json_output.emit({"pane": os.environ.get("ORCA_PANE_KEY") or "",
+                              "inbox": str(inbox_read.paths()[0].resolve()), "next_offset": position}, output)
+            result.update(next_offset=position, result=str(output))
+            print(f"NEXT_OFFSET={position}", flush=True)
+        else:
+            result.update(exit_code=1, error="NEXT_OFFSET is missing from the inbox read")
+    print_completion(result)
+    return result
 
 
 def tasks_for(args: argparse.Namespace, directory: Path) -> list[ReadTask]:
@@ -269,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace", default=hourly_runtime.workspace_path(
         os.environ.get("ORCA_WORKTREE_ID") or os.environ.get("ORCA_WORKTREE_PATH")),
         help="the hourly workspace whose old scheduled tabs cleanup may close")
-    parser.add_argument("--output-root", type=Path, default=Path("~/.cache/orca-session-triage/reads"),
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_READS,
                         help="parent of the unique run directory (default: %(default)s)")
     parser.add_argument("--state-file", type=Path, default=Path(hourly_state.DEFAULT_STATE))
     parser.add_argument("--orca", default=os.environ.get("ORCA_CLI_COMMAND", "orca"))
@@ -285,30 +373,63 @@ def main(argv: list[str] | None = None) -> int:
         history = earlier_reads(root)
         now = datetime.now(timezone.utc)
         directory = Path(tempfile.mkdtemp(prefix=now.strftime("%Y%m%dT%H%M%SZ-"), dir=root))
+        latest = directory / ".current"
+        latest.symlink_to(directory, target_is_directory=True)
+        latest.replace(root / "current")
         print(f"run: {directory}", flush=True)
         try:
             loaded = os.getloadavg()[0] > LOAD_LIMIT
         except OSError:
             loaded = False
         timeout = args.timeout * LOAD_TIMEOUT_FACTOR if loaded else args.timeout
+        inbox = read_inbox(directory, timeout)
         tasks = tasks_for(args, directory)
+        backlog_before = backlog_cursor()
+        reachable: dict[str, bool] = {}
         reads_answers = {"lead-state", "unanswered", "pending", "scan"}
+        finished: dict[str, dict] = {}
+        completed: SimpleQueue[Future[dict]] = SimpleQueue()
         with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            futures = {task.name: pool.submit(read_with_retry, task, directory, timeout, loaded)
-                       for task in tasks if task.name not in reads_answers}
-            futures["open-asks"].result()
-            futures.update({task.name: pool.submit(read_with_retry, task, directory, timeout, loaded)
-                            for task in tasks if task.name in reads_answers})
-            results = [futures[task.name].result() for task in tasks]
+            def submit(task: ReadTask) -> None:
+                pool.submit(read_with_retry, task, directory, timeout, loaded).add_done_callback(completed.put)
+
+            for task in tasks:
+                if task.name not in reads_answers:
+                    submit(task)
+            for _ in tasks:
+                result = completed.get().result()
+                finished[result["name"]] = result
+                print_completion(result)
+                if result["name"] == "open-asks":
+                    for task in tasks:
+                        if task.name in reads_answers:
+                            submit(task)
+        retry_network(tasks, finished, directory, timeout, backlog_before, reachable)
+        results = [inbox, *(finished[task.name] for task in tasks)]
         scan = next(item for item in results if item["name"] == "scan")
+        dependent = ("stale-asks", "requests-needing-owner")
         if scan["exit_code"] == 0:
             stale_file = directory / "stale-asks.partial.json"
-            stale = ReadTask("stale-asks", [str(Path(__file__).with_name("hourly_state.py")),
-                "--state-file", str(args.state_file.expanduser()), "stale-asks", "--from", scan["result"],
-                "--orca", args.orca, "--out", str(stale_file)], True, stale_file)
-            results.append(read_with_retry(stale, directory, timeout, loaded))
+            command = [str(Path(__file__).with_name("hourly_state.py")), "--state-file", str(args.state_file.expanduser())]
+            common = ["--from", str(scan["result"]), "--orca", args.orca]
+            followups = [
+                ReadTask("stale-asks", [*command, "stale-asks", *common, "--out", str(stale_file)], True, stale_file),
+                ReadTask("requests-needing-owner", [*command, "requests-needing-owner", *common], True),
+            ]
+            with ThreadPoolExecutor(max_workers=len(followups)) as pool:
+                after_scan = {}
+                for future in as_completed(pool.submit(read_with_retry, task, directory, timeout, loaded)
+                                           for task in followups):
+                    result = future.result()
+                    print_completion(result)
+                    after_scan[result["name"]] = result
+            retry_network(followups, after_scan, directory, timeout, backlog_before, reachable)
+            results.extend(after_scan[task.name] for task in followups)
         else:
-            results.append({**dict.fromkeys(RECORD_KEYS), "name": "stale-asks", "error": "skipped: scan failed"})
+            for name in dependent:
+                skipped = {**dict.fromkeys(RECORD_KEYS), "name": name, "error": "skipped: scan failed"}
+                print_completion(skipped)
+                results.append(skipped)
         compare_reads(results, history)
         json_output.emit(results, directory / "results.json")
         for result in results:

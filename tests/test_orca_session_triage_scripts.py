@@ -28,7 +28,7 @@ import tempfile
 from threading import Barrier, Event, Thread
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import urllib.error
 import urllib.request
 
@@ -9228,6 +9228,38 @@ class HourlyCleanupCommandTests(unittest.TestCase):
 
 
 class HourlyReadTests(unittest.TestCase):
+    def test_hourly_read_publishes_the_inbox_offset_and_current_run_before_other_reads(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root)
+            inbox = parent / "inbox.jsonl"
+            runs = parent / "reads"
+            write_jsonl(inbox, [{"id": "existing", "kind": "ask", "text": "既存"}])
+            offset = inbox.stat().st_size
+            with inbox.open("ab") as stream:
+                stream.write(b'{"incomplete":')
+
+            def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
+                    timeout: float) -> subprocess.CompletedProcess[str]:
+                if args[1:2] == ["read"]:
+                    with redirect_stdout(stdout), patch.object(inbox_read, "later_runs", return_value=[]):
+                        return subprocess.CompletedProcess(args, inbox_read.main(args[1:]))
+                self.assertTrue((runs / "current").is_symlink())
+                self.assertIn(f"NEXT_OFFSET={offset}", out.getvalue())
+                return subprocess.CompletedProcess(args, 7)
+
+            with (patch("subprocess.run", side_effect=run),
+                  patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox),
+                                          "TRIAGE_READ_OFFSET": str(parent / "read.offset"),
+                                          "ORCA_PANE_KEY": "tab:leaf"}),
+                  redirect_stdout(io.StringIO()) as out):
+                self.assertEqual(hourly.main(["--workspace", "/w/triage", "--output-root", str(runs)]), 1)
+            directory = (runs / "current").resolve()
+            results = {item["name"]: item for item in json.loads((directory / "results.json").read_text())}
+            self.assertEqual(results["inbox"]["next_offset"], offset)
+            self.assertIn("id=existing", (directory / "inbox.stdout").read_text())
+            self.assertIn(f"inbox: exit 0 | {directory / 'inbox.json'}", out.getvalue())
+
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
@@ -9247,6 +9279,42 @@ class HourlyReadTests(unittest.TestCase):
             self.assertIsNone(result["retry"])
             self.assertIn("通知カーソル", result["error"])
             run.assert_called_once()
+
+    def test_connectivity_failure_is_probed_and_retried_once_after_other_reads(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            other_finished = Event()
+            calls = []
+
+            def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
+                    timeout: float) -> subprocess.CompletedProcess[str]:
+                name = Path(args[0]).name
+                if args[1:2] == ["read"]:
+                    stdout.write("NEXT_OFFSET=0\n")
+                elif name == "topic":
+                    calls.append(name)
+                    stderr.write("error connecting to api.github.com\n")
+                    return subprocess.CompletedProcess(args, 1)
+                elif name == "project-status":
+                    other_finished.set()
+                return subprocess.CompletedProcess(args, 1)
+
+            def connect(address: tuple[str, int], timeout: float) -> MagicMock:
+                self.assertTrue(other_finished.is_set())
+                self.assertEqual(address, ("api.github.com", 443))
+                calls.append("probe")
+                return MagicMock()
+
+            with (patch("subprocess.run", side_effect=run), patch("socket.create_connection", side_effect=connect),
+                  redirect_stdout(io.StringIO()) as out):
+                self.assertEqual(hourly.main(["--workspace", "/w/triage", "--output-root", root]), 1)
+            self.assertEqual(calls, ["topic", "probe", "topic"])
+            results = json.loads((Path(root) / "current/results.json").read_text())
+            topic = next(row for row in results if row["name"] == "topic-check")
+            self.assertEqual(topic["retry"]["reason"], "network: api.github.com")
+            self.assertEqual(topic["retry"]["first_exit_code"], 1)
+            self.assertEqual(topic["exit_code"], 1)
+            self.assertIn("topic-check: retry exit 1 → 1", out.getvalue())
 
     def test_high_load_retries_the_scan_and_compares_each_successful_read(self) -> None:
         hourly = load_script("hourly_read")
@@ -9280,6 +9348,9 @@ class HourlyReadTests(unittest.TestCase):
                     text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
                 command = Path(args[0]).name
                 calls.append((command, timeout))
+                if args[1:2] == ["read"]:
+                    stdout.write("NEXT_OFFSET=0\n")
+                    return subprocess.CompletedProcess(args, 0)
                 if command == "scan_sessions.py" and calls.count((command, timeout)) == 1:
                     return subprocess.CompletedProcess(args, 124)
                 if command == "topic":
@@ -9290,6 +9361,8 @@ class HourlyReadTests(unittest.TestCase):
                     result = [{"ts": "2026-11-18T04:01:00Z", "source": "skills/lane", "id": "a1", "text": "用件\n続き"}]
                 elif "stale-asks" in args:
                     result = [{"name": "old-ask", "state": "unasked", "question": "確認事項"}]
+                elif "requests-needing-owner" in args:
+                    result = {"needs_owner": [{"id": "r1"}], "closed_issues": [{"id": "r2"}]}
                 elif command == "project-status":
                     result = {"gaps": [{"key": "backlog:NEW-1", "missing": ["start date"]}]}
                 elif command == "asana99_status.py":
@@ -9309,7 +9382,7 @@ class HourlyReadTests(unittest.TestCase):
             with (patch("subprocess.run", side_effect=run), patch.object(os, "getloadavg", return_value=(301, 0, 0)),
                   patch.dict(os.environ, {"TRIAGE_LEAD_DECISIONS": str(decisions)}), redirect_stdout(io.StringIO()) as out):
                 hourly.main(["--workspace", "/w/triage", "--output-root", root, "--timeout", "40"])
-            [current] = [path for path in parent.iterdir() if path.is_dir() and path not in (old, failed, earlier)]
+            current = (parent / "current").resolve()
             results = {item["name"]: item for item in json.loads((current / "results.json").read_text())}
             self.assertEqual([timeout for name, timeout in calls if name == "scan_sessions.py"], [100, 100])
             self.assertEqual(sum(name == "topic" for name, _ in calls), 1)
@@ -9323,6 +9396,10 @@ class HourlyReadTests(unittest.TestCase):
             self.assertTrue(gaps["gaps"][0]["ignored"])
             self.assertTrue(gaps["new"][0]["ignored"])
             self.assertEqual(gaps["gone"], former["gaps"])
+            owners = results["requests-needing-owner"]
+            self.assertIn("--from", owners["command"])
+            self.assertEqual(owners["changes"], {"new": ["r1"], "closed_issues": ["r2"]})
+            self.assertIn("needs_owner 1", out.getvalue())
             for shown in ("scan: retry", "skills/lane", "a1", "用件 続き", "old-ask | unasked", str(old.resolve())):
                 self.assertIn(shown, out.getvalue())
 
@@ -9335,11 +9412,14 @@ class HourlyReadTests(unittest.TestCase):
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
                     text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
                 seen.append(args)
-                stale = "stale-asks" in args
+                if args[1:2] == ["read"]:
+                    stdout.write("NEXT_OFFSET=0\n")
+                    return subprocess.CompletedProcess(args, 0)
+                dependent = "stale-asks" in args or "requests-needing-owner" in args
                 reads_answers = any(command in args for command in ("lead-state", "unanswered", "pending", "--review-out"))
                 if reads_answers:
-                    self.assertTrue((next(directory.iterdir()) / "open-asks.json").is_file())
-                elif not stale:
+                    self.assertTrue((directory / "current" / "open-asks.json").is_file())
+                elif not dependent:
                     initial.wait()
                 if Path(args[0]).name == "topic":
                     stderr.write("topic unavailable\n")
@@ -9352,6 +9432,9 @@ class HourlyReadTests(unittest.TestCase):
                     Path(args[1]).write_text("[]")
                 else:
                     stdout.write("[]\n")
+                if "requests-needing-owner" in args:
+                    stdout.seek(0)
+                    stdout.write('{"needs_owner":[],"closed_issues":[]}\n')
                 if "--review-out" in args:
                     Path(args[args.index("--review-out") + 1]).write_text(json.dumps({"rows": [{"path": "/w/a"}]}))
                 return subprocess.CompletedProcess(args, 0)
@@ -9359,13 +9442,14 @@ class HourlyReadTests(unittest.TestCase):
                   redirect_stdout(io.StringIO()) as out):
                 code = hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
             self.assertEqual(code, 1)
-            [run_dir] = directory.iterdir()
+            run_dir = (directory / "current").resolve()
             result = json.loads((run_dir / "results.json").read_text())
-            self.assertEqual(len(seen), 12)
+            self.assertEqual(len(seen), 14)
             self.assertEqual({item["name"]: item["exit_code"] for item in result}, {
-                "cleanup-hourly-tabs": 0, "lead-state": 0, "open-asks": 0, "unanswered": 0,
+                "inbox": 0, "cleanup-hourly-tabs": 0, "lead-state": 0, "open-asks": 0, "unanswered": 0,
                 "pending": 0, "handoff-last": 0, "scan": 0, "backlog-watch": 124,
-                "asana99-status": 0, "topic-check": 7, "tracker-gaps": 0, "stale-asks": 0})
+                "asana99-status": 0, "topic-check": 7, "tracker-gaps": 0, "stale-asks": 0,
+                "requests-needing-owner": 0})
             self.assertEqual(json.loads((run_dir / "scan.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "lead-state.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "asana99-status.json").read_text()), [])
@@ -9377,7 +9461,7 @@ class HourlyReadTests(unittest.TestCase):
                           out.getvalue())
             self.assertEqual(out.getvalue().splitlines()[-1],
                              f"results: {run_dir.resolve() / 'results.json'}（命令ごとの記録の配列。各記録の鍵: "
-                             "name・command・exit_code・stdout・stderr・result・error・retry・compared_to・changes・read_at）")
+                             "name・command・exit_code・stdout・stderr・result・error・retry・compared_to・changes・read_at・next_offset）")
 
     def test_a_skipped_stale_asks_record_has_every_key_of_a_run_record(self) -> None:
         hourly_read = load_script("hourly_read")
@@ -9387,12 +9471,12 @@ class HourlyReadTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 3 if "--review-out" in args else 0)
             with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()):
                 hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
-            [run_dir] = Path(root).iterdir()
+            run_dir = Path(root) / "current"
             result = json.loads((run_dir / "results.json").read_text())
             self.assertEqual({tuple(item) for item in result},
                              {("name", "command", "exit_code", "stdout", "stderr", "result", "error",
-                               "retry", "compared_to", "changes", "read_at")})
-            self.assertEqual(result[-1]["error"], "skipped: scan failed")
+                               "retry", "compared_to", "changes", "read_at", "next_offset")})
+            self.assertEqual({item["error"] for item in result[-2:]}, {"skipped: scan failed"})
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
@@ -9860,6 +9944,20 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def test_since_can_resume_from_a_byte_offset_before_the_acknowledged_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))
+            first = json.dumps({"id": "old", "text": "先", "kind": "info"}, ensure_ascii=False) + "\n"
+            second = json.dumps({"id": "new", "text": "後", "kind": "ask"}, ensure_ascii=False) + "\n"
+            inbox.write_text(first + second)
+            cursor.write_text(str(inbox.stat().st_size))
+            with (patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_READ_OFFSET": str(cursor)}),
+                  redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO())):
+                self.assertEqual(inbox_read.main(["read", "--summary", "--since", str(len(first.encode()))]), 0)
+            self.assertIn("id=new", out.getvalue())
+            self.assertNotIn("id=old", out.getvalue())
+            self.assertNotIn("NEXT_OFFSET", out.getvalue())
+
     def setUp(self) -> None:
         # Not the Orca tab that runs the tests, nor this Mac's answer records.
         answers = tempfile.TemporaryDirectory()
