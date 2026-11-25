@@ -2216,11 +2216,16 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         plans = untracked_exec_plans(Path(worktree), base, pr) if args.archive_scratch else ()
         return (*movable, *found, *plans)
 
+    def may_detach(nested: list[dict]) -> bool:
+        return args.detach_nested or bool(args.apply_restore_nested and restore and nested
+                                          and all(Path(item["path"]) in restore.requested for item in nested))
+
     restored_nested: dict[str, list[str]] = {}
     if restore and restore.plans:
-        bypassed = [blocker for blocker in result["blockers"] if args.detach_nested and blocker.startswith(NESTED_READY)]
+        detach = may_detach(result["nested_worktrees"])
+        bypassed = [blocker for blocker in result["blockers"] if detach and blocker.startswith(NESTED_READY)]
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
-        archivable = archive_movers(root, result, movable_now(result), besides_nested=args.detach_nested, explicit=explicit)
+        archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
             for copy, approved in restore.plans.items():
                 latest = NestedRestore(root, {copy}, since=since)
@@ -2254,7 +2259,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         copied = copy_to_main(Path(worktree), Path(main), result["review"])
         if copied:
             result = recheck()
-    if args.detach_nested:
+    if may_detach(result["nested_worktrees"]):
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
         # Records --archive-scratch and --archive-path move next do not keep it.

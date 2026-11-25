@@ -6409,7 +6409,7 @@ class RmCheckTests(unittest.TestCase):
         linked = self.nested_catalog()
         remote = Path(self.tmp.name) / "deps.git"
         clone = self.wt / "local-deps/library"
-        git(self.main, "clone", "-q", str(remote), str(clone))
+        git(self.main, "clone", "-q", "-b", "main", str(remote), str(clone))
         repo_file = Path("locale/de/LC_MESSAGES/django.po")
         for copy in (linked, clone):
             (copy / repo_file).write_text("changed\n")
@@ -6620,11 +6620,24 @@ class RmCheckTests(unittest.TestCase):
         rel = "locale/de/LC_MESSAGES/django.po"
         (copy / rel).write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
 
-        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested", "--detach-nested")
+        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
 
         self.assertEqual((code, result["detached"]), (0, [str(copy.resolve())]), result)
         self.assertIn(rel, result["restored_nested"]["local-deps/pushed"])
         self.assertFalse(copy.exists())
+
+    def test_implicit_detach_preserves_other_nested_worktrees(self) -> None:
+        copy = self.nested_catalog()
+        other = self.wt / "local-deps/other"
+        git(copy, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+        filename = copy / "locale/de/LC_MESSAGES/django.po"
+        filename.write_text("modified catalog\n")
+
+        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertTrue(other.exists())
+        self.assertEqual(filename.read_text(), "modified catalog\n")
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
