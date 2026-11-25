@@ -7310,6 +7310,55 @@ class HandoffProposalTests(unittest.TestCase):
 
 
 class HourlyStateTests(unittest.TestCase):
+    def test_pending_ages_the_first_info_from_the_forwarded_to_terminal_and_workspace(self) -> None:
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+            "for_user": {"retention": {"owner": "/w/lane", "handle": "term_lane", "sent_at": "2026-11-25T10:00:00+09:00"}}}))
+        reports = [("previous", "lane", "term_lane", "info", "00:59:59"),
+                   ("other_workspace", "other", "term_lane", "info", "01:00:00"),
+                   ("other_terminal", "lane", "term_other", "info", "01:00:00"),
+                   ("done", "lane", "term_lane", "done", "01:00:00"),
+                   ("later", "lane", "term_lane", "info", "01:20:00"),
+                   ("same_second", "lane", "term_lane", "info", "01:00:00")]
+        write_jsonl(self.root / "inbox.jsonl", [
+            {"id": ident, "kind": kind, "worktree": worktree, "handle": handle,
+             "ts": f"2026-11-25T{at}Z", "text": "ログの保持期間は90日です。"}
+            for ident, worktree, handle, kind, at in reports])
+
+        with patch.object(hourly_state, "datetime", wraps=datetime) as clock:
+            boundary = datetime(2026, 11, 25, 1, 30, tzinfo=timezone.utc)
+            clock.now.return_value = boundary - timedelta(seconds=1)
+            self.assertEqual(self.call("pending")[1]["unpresented_answers"], [])
+            clock.now.return_value = boundary
+            code, pending = self.call("pending")
+            with redirect_stdout(io.StringIO()) as out:
+                hourly_state.main(["--state-file", str(self.state), "pending", "--summary"])
+
+        self.assertEqual(code, 0)
+        answer, = pending["unpresented_answers"]
+        self.assertEqual((answer["id"], answer["info"]["id"], answer["age_minutes"]), ("retention", "same_second", 30))
+        self.assertIn("未提示の答え", out.getvalue())
+        self.assertIn("info=same_second", out.getvalue())
+        self.assertIn("age_minutes=30", out.getvalue())
+
+    def test_pending_uses_the_latest_forward_for_a_remote_workspace_until_its_key_is_presented(self) -> None:
+        owner = "mbp16::/w/lane"
+        self.state.write_text(json.dumps({"version": 1, "left": {}, "questions": {}, "handoffs": {},
+            "for_user": {"retention": {"owner": owner, "handle": "term_remote", "sent_at": "2026-11-25T10:05:00+09:00"}}}))
+        inbox = self.root / "inbox.jsonl"
+        earlier = {"id": "earlier", "kind": "info", "worktree": "lane", "handle": "term_remote",
+                   "ts": "2026-11-25T01:00:00Z", "text": "前回の転送への答え"}
+        write_jsonl(inbox, [earlier])
+
+        with patch.object(hourly_state, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 25, 2, tzinfo=timezone.utc)
+            self.assertEqual(self.call("pending")[1]["unpresented_answers"], [])
+            write_jsonl(inbox, [earlier, {**earlier, "id": "remote_info", "ts": "2026-11-25T01:06:00Z"}])
+            answer, = self.call("pending")[1]["unpresented_answers"]
+            self.assertEqual((answer["owner"], answer["info"]["id"]), (owner, "remote_info"))
+            self.call("presented", "--key", "retention", "--text-file", self.source("item.txt", "保持期間を伝達しました"),
+                      "--since", "2026-11-25T01:06:00Z")
+            self.assertEqual(self.call("pending")[1]["unpresented_answers"], [])
+
     def test_stale_asks_recovers_handed_off_keys_and_unanswered_orca_comments(self) -> None:
         sent = "2026-11-25T01:00:00Z"
         saved = self.source("scan.json", json.dumps([{"path": "/w/lane", "class": "stalled",

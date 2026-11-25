@@ -430,6 +430,42 @@ def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], 
     return items
 
 
+def unpresented_answers(data: dict, entries: list[dict], now: datetime) -> list[dict]:
+    forwarded = data.get("for_user")
+    if not isinstance(forwarded, dict):
+        return []
+    pending = forwarded.keys() - data["presented"].keys()
+    if not pending:
+        return []
+    cutoff = now - timedelta(minutes=30)
+    reports: dict[tuple[str, str], list[tuple[datetime, dict]]] = {}
+    for entry in entries:
+        handle, lane = entry.get("handle"), entry.get("worktree")
+        if (entry.get("kind") == "info" and entry.get("id") and isinstance(handle, str) and isinstance(lane, str)
+                and (at := scan_sessions.parse_time(entry.get("ts"))) is not None and at <= cutoff):
+            reports.setdefault((handle, lane), []).append((at, entry))
+
+    items = []
+    for key in pending:
+        record = forwarded[key]
+        if not isinstance(record, dict):
+            continue
+        owner, handle = record.get("owner"), record.get("handle")
+        sent_at = scan_sessions.parse_time(record.get("sent_at"))
+        if not isinstance(owner, str) or not isinstance(handle, str) or not handle or sent_at is None:
+            continue
+        path = Path(owner.rsplit("::", 1)[-1])
+        if not path.is_absolute():
+            continue
+        first = min(((at, entry) for at, entry in reports.get((handle, path.name), ()) if at >= sent_at),
+                    key=itemgetter(0), default=None)
+        if first is not None:
+            at, entry = first
+            items.append({"id": key, "owner": owner, "state": "unpresented_answer", "since": at.isoformat(),
+                          "info": report_view(entry), "age_minutes": int((now - at).total_seconds() // 60)})
+    return sorted(items, key=lambda item: (-item["age_minutes"], item["id"]))
+
+
 def merge_presentations(rows: list[dict], presented: list[dict], entries: list[dict]) -> list[dict]:
     def normalized(value: str) -> str:
         return re.sub(r"[\W_]+", "", (value or "").casefold())
@@ -1711,6 +1747,7 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
         "requests": [{"id": key, **item} for key, item in data["requests"].items() if item["closed_at"] is None],
         "user_waits": [{"id": key, **item} for key, item in data["user_waits"].items() if item["closed_at"] is None],
         "presented": presented_now(data, decisions, now, entries),
+        "unpresented_answers": unpresented_answers(data, entries or [], now),
         "left": [{"row": row, **item} for row, item in data["left"].items()],
         "unrecorded_questions": unrecorded or [],
     }
@@ -1885,11 +1922,16 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
             state = f"未提示（指揮へ {item['handoff_count']} 回持ち越し）"
         elif state == "unanswered_user_comment":
             state = "三浦さんの問いに担当が未回答"
+        elif state == "unpresented_answer":
+            state = "未提示の答え"
         ask_id = (item.get("ask") or {}).get("id")
+        info = item.get("info") or {}
         question = (item.get("question") or item.get("original") or item.get("task") or item.get("text")
-                    or item.get("final_message"))
+                    or item.get("final_message") or info.get("text"))
         line = (f"{name} | {state} | since={scan_sessions.jst_timestamp(since) or '-'} | age_minutes={age} "
                 f"| {f'ask={ask_id}' if ask_id else f'id={item.get('id') or '-'}'} | {excerpt(question)}")
+        if info.get("id"):
+            line += f" | info={info['id']}"
         if item.get("link"):
             line += f" | {item['link']}"
         if item.get("evidence"):
@@ -1967,7 +2009,9 @@ def main(argv: list[str] | None = None) -> int:
         "pending", help="list open items with their ids (an unanswered question with the prs its #numbers name and the "
                         "later asks that withdrew its ask as reissued), settled questions with evidence, unrecorded "
                         "answers, and as unrecorded_questions each question an AskUserQuestion of the triage "
-                        "workspace still waits on that no record accounts for")
+                        "workspace still waits on that no record accounts for",
+        description="List pending items, including answers whose forwarded key has no presentation 30 minutes after "
+                    "the recipient's first info report.")
     pending_command.add_argument("--summary", action="store_true", help="print one line per item with its age and question")
     answer_evidence.add_arguments(pending_command)
     get = commands.add_parser("get", help="read one saved question, handoff, request, user wait, or left row")
