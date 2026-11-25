@@ -4312,6 +4312,13 @@ class ScanCommandTests(unittest.TestCase):
         held, = json.loads(out.getvalue())
         self.assertIn(command, " ".join(held["cleanup_blockers"]))
 
+        first.write_text(f"{url}\n  Asana: 完了 True → False（{command} で直る）\n"
+                         f"  直す作業場: {path}（状態修正（Asana）、agent なし）\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        legacy, = json.loads(out.getvalue())
+        self.assertIn(command, " ".join(legacy["cleanup_blockers"]))
+
         retry.write_text("照合 1 件・食い違い 0 件・読めない 0 件\n")
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(scan.main(["--from", str(saved)]), 0)
@@ -9615,6 +9622,20 @@ class HourlyReadTests(unittest.TestCase):
                                   datetime.now(timezone.utc))
             self.assertIn("直す作業場: /worktrees/example/a", out.getvalue())
             self.assertIn("直す作業場: /worktrees/example/b", out.getvalue())
+
+    def test_topic_fixer_is_printed_when_only_json_survives_a_timeout(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "topic-check.stdout"
+            pr = "https://github.com/acme/example/pull/81"
+            fixer = {"pr": pr, "worktree": "/worktrees/app（修正）/lane", "commands": [f"asana_sync.py {pr}"]}
+            path.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n")
+            retry = path.with_name("topic-check.retry.stdout")
+            retry.touch()
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
+                                  datetime.now(timezone.utc))
+            self.assertIn(f"直す作業場: {fixer['worktree']}", out.getvalue())
 
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")

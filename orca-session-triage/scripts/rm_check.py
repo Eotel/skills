@@ -48,6 +48,7 @@ CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 TOPIC_FIX = re.compile(r"（(.+) で直る）\s*$")
+TOPIC_FIXER_JSON = "topic-fixer-json: "
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
@@ -1748,32 +1749,38 @@ def topic_check_outputs(directory: Path) -> list[Path]:
     return [first, retry] if first.is_file() else [retry]
 
 
-def scan_topic_blockers(scan_file: Path) -> dict[Path, list[str]]:
+def scan_topic_blockers(scan_file: Path, worktrees: list[Path]) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     for path in topic_check_outputs(scan_file.expanduser().parent):
-        for target, reasons in topic_drift_blockers(path).items():
+        for target, reasons in topic_drift_blockers(path, worktrees).items():
             blockers[target] = list(dict.fromkeys((*blockers.get(target, []), *reasons)))
     return blockers
 
 
-def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
+def topic_fixer_record(line: str, path: Path) -> tuple[str, Path, list[str]] | None:
+    if not line.startswith(TOPIC_FIXER_JSON):
+        return None
+    item = json.loads(line.removeprefix(TOPIC_FIXER_JSON))
+    if (not isinstance(item, dict) or not TOPIC_PR.fullmatch(str(item.get("pr") or ""))
+            or not isinstance(item.get("worktree"), str) or not Path(item["worktree"]).is_absolute()
+            or not isinstance(item.get("commands"), list)
+            or not all(isinstance(command, str) for command in item["commands"])):
+        raise ValueError(f"invalid topic fixer record in {path}")
+    return item["pr"], Path(item["worktree"]), item["commands"]
+
+
+def topic_drift_blockers(path: Path, worktrees: list[Path] | None = None) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     structured: set[str] = set()
     pr = None
     target = None
     commands: list[str] = []
     for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
-        if line.startswith("topic-fixer-json: "):
-            item = json.loads(line.removeprefix("topic-fixer-json: "))
-            if (not isinstance(item, dict) or not TOPIC_PR.fullmatch(str(item.get("pr") or ""))
-                    or not isinstance(item.get("worktree"), str) or not Path(item["worktree"]).is_absolute()
-                    or not isinstance(item.get("commands"), list)
-                    or not all(isinstance(command, str) for command in item["commands"])):
-                raise ValueError(f"invalid topic fixer record in {path}")
-            fix = "・".join(dict.fromkeys(item["commands"])) or "修正コマンドの記録なし"
-            blockers.setdefault(Path(item["worktree"]), []).append(
-                f"topic check で修正担当に指定されています（{item['pr']}、{fix}）")
-            structured.add(item["pr"])
+        if record := topic_fixer_record(line, path):
+            reference, workspace, fixes = record
+            fix = "・".join(dict.fromkeys(fixes)) or "修正コマンドの記録なし"
+            blockers.setdefault(workspace, []).append(f"topic check で修正担当に指定されています（{reference}、{fix}）")
+            structured.add(reference)
             continue
         if line and not line[0].isspace():
             if pr and pr not in structured and target and target.is_absolute():
@@ -1789,7 +1796,10 @@ def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
             elif detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場: "):
-                target = Path(detail.removeprefix("直す作業場: ").rsplit("（", 1)[0])
+                named = detail.removeprefix("直す作業場: ")
+                target = max((worktree for worktree in worktrees or [] if named.startswith(f"{worktree}（")),
+                             key=lambda worktree: len(str(worktree)), default=None)
+                target = target or Path(named.rsplit("（", 1)[0])
     return blockers
 
 
@@ -1980,8 +1990,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     decided = [keep_blocker] if keep_blocker else []
     if args.topic_check or args.from_file:
         try:
-            drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check
-                     else scan_topic_blockers(args.from_file))
+            worktrees = [Path(worktree)]
+            drift = (topic_drift_blockers(args.topic_check.expanduser(), worktrees) if args.topic_check
+                     else scan_topic_blockers(args.from_file, worktrees))
             decided.extend(reason for target, reasons in drift.items()
                            if target.resolve() == Path(worktree) for reason in reasons)
         except (OSError, ValueError) as error:
