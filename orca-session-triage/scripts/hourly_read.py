@@ -35,6 +35,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 from bash_timeout import LOAD_LIMIT
+from rm_check import TOPIC_FIXER_JSON, legacy_topic_worktree, topic_check_outputs, topic_fixer_record
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
                "read_at", "next_offset")
@@ -69,7 +70,8 @@ def read_task(task: ReadTask, directory: Path, timeout: float, *, retry: bool = 
               "stdout": str(stdout), "stderr": str(stderr)}
     with stdout.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
         try:
-            completed = subprocess.run(task.command, stdout=output, stderr=errors, text=True, timeout=timeout)
+            env = {**os.environ, "TOPIC_CHECK_FIXER_JSON": "1"} if task.name == "topic-check" else None
+            completed = subprocess.run(task.command, stdout=output, stderr=errors, text=True, timeout=timeout, env=env)
             result["exit_code"] = completed.returncode
         except subprocess.TimeoutExpired as error:
             result.update(exit_code=124, error=str(error))
@@ -296,9 +298,42 @@ def print_read(result: dict, now: datetime) -> None:
                 for alert in row["alerts"]:
                     print(f"  {row['key']} {alert}")
     if name == "topic-check":
-        for line in Path(result["stdout"]).read_text(encoding="utf-8").splitlines():
-            if line.lstrip().startswith("直す作業場: "):
-                print(line)
+        display: dict[str, str] = {}
+        outputs = {path: path.read_text(encoding="utf-8").splitlines()
+                   for path in topic_check_outputs(Path(result["stdout"]).parent)}
+        structured_prs: dict[str, set[Path]] = {}
+        structured_paths: dict[str, str] = {}
+        for path, lines in outputs.items():
+            for line in lines:
+                try:
+                    record = topic_fixer_record(line, path)
+                except ValueError as error:
+                    print(f"topic-check: {error}", file=sys.stderr)
+                    continue
+                if record:
+                    pr, workspace, _ = record
+                    structured_prs.setdefault(pr, set()).add(workspace)
+                    structured_paths.setdefault(str(workspace), f"  直す作業場: {workspace}")
+        for lines in outputs.values():
+            record_key = ""
+            for line in lines:
+                if line and not line[0].isspace() and not line.startswith(TOPIC_FIXER_JSON):
+                    record_key = line
+                if line.lstrip().startswith("直す作業場:"):
+                    detail = line.lstrip().removeprefix("直す作業場:").strip()
+                    if not detail:
+                        display.setdefault(f"unreadable:{record_key}", "  直す作業場: 要確認（担当行が途中で切れています）")
+                        continue
+                    try:
+                        worktree = legacy_topic_worktree(detail, structured_prs.get(record_key, ()))
+                    except ValueError:
+                        display.setdefault(f"unreadable:{record_key}:{detail}", f"  直す作業場: 要確認（{detail}）")
+                        continue
+                    display.setdefault(str(worktree) if worktree else detail, line)
+        for worktree, label in structured_paths.items():
+            display.setdefault(worktree, label)
+        for line in display.values():
+            print(line)
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))

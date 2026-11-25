@@ -4294,6 +4294,37 @@ class ScanCommandTests(unittest.TestCase):
         clear, = json.loads(out.getvalue())
         self.assertFalse(clear["cleanup_blockers"])
 
+    def test_saved_scan_keeps_structured_fixer_after_incomplete_topic_retry(self) -> None:
+        saved = self.dir / "scan.json"
+        path = "/remote/worktrees/app（修正）/lane"
+        url = "https://github.com/acme/example/pull/81"
+        command = f"asana_sync.py {url}"
+        saved.write_text(json.dumps([{"path": path, "environment": "mbp16", "repo": "app",
+                                     "terminals": [], "class": "finished"}]))
+        first = self.dir / "topic-check.stdout"
+        first.write_text(f'topic-fixer-json: {json.dumps({"pr": url, "worktree": path, "commands": [command]})}\n'
+                         f"{url}\n  Asana: 完了 True → False（{command} で直る）\n"
+                         f"  直す作業場: {path}（状態修正（Asana）、agent なし）\n")
+        retry = self.dir / "topic-check.retry.stdout"
+        retry.write_text("照合 1 件・食い違い 0 件・読めない 1 件\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        held, = json.loads(out.getvalue())
+        self.assertIn(command, " ".join(held["cleanup_blockers"]))
+
+        first.write_text(f"{url}\n  Asana: 指摘対応済み（未承認） → 承認済み（{command} で直る）\n"
+                         f"  直す作業場: {path}（状態修正（Asana）、agent なし）\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        legacy, = json.loads(out.getvalue())
+        self.assertIn(f"topic check で修正担当に指定されています（{url}、{command}）", legacy["cleanup_blockers"])
+
+        retry.write_text("照合 1 件・食い違い 0 件・読めない 0 件\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        clear, = json.loads(out.getvalue())
+        self.assertFalse(clear["cleanup_blockers"])
+
     def test_row_lists_both_agents_transcript_paths(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
@@ -5946,17 +5977,58 @@ class RmCheckTests(unittest.TestCase):
         saved.write_text("[]")
         topic = folder / "topic-check.stdout"
         url = "https://github.com/acme/example/pull/81"
+        alias = folder / "alias（別名）"
+        alias.symlink_to(self.wt, target_is_directory=True)
         topic.write_text(f"{url}\n  Asana: 完了 True → False（asana_sync.py {url} で直る）\n"
-                         f"  直す作業場: {self.wt}（merge-pr merged、2026-11-24T11:13:06+09:00、agent なし）\n"
+                         f"  直す作業場: {alias}（状態修正（Asana）、2026-11-24T11:13:06+09:00、agent なし）\n"
                          "https://github.com/acme/example/pull/82\n  直す作業場: なし（作業場はもう無い）\n")
 
         code, result = self.run_main("--from", str(saved))
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
         self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
+        self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        for action in ("手順 1）を修正", "手順 1（を修正", "手順 1）を修正（追記", "原因調査\n結果追記"):
+            topic.write_text(f"{url}\n  直す作業場: {alias}（{action}、agent なし）\n")
+            code, result = self.run_main("--from", str(saved))
+            self.assertEqual(code, 1)
+            self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
+            self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        topic.write_text(f"{url}\n  直す作業場: {alias}（手順 1")
+        self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
+        self.assertEqual(self.run_main("--from", str(saved))[0], 1)
 
+        for fragment in (f"  Asana: 完了 False → True（asana_sync.py {url} で直る）",
+                         "  Asana: Asana のタスクが 2 件", "  直す作業場:"):
+            topic.write_text(f"{url}\n{fragment}\n")
+            self.assertEqual(self.run_main("--from", str(saved))[0], 1)
+            self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
         topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
+
+    def test_legacy_topic_worktree_is_held_when_another_path_matches_the_truncated_name(self) -> None:
+        folder = self.wt.parent
+        topic, saved = folder / "topic-check.stdout", folder / "scan.json"
+        url = "https://github.com/acme/example/pull/81"
+        decoy = folder / f"{self.wt.name}（topic link 手順 1）を修正"
+        multiline = folder / f"{self.wt.name}（旧）\n追記"
+        for branch, path in (("decoy", decoy), ("newline", multiline)):
+            git(self.main, "worktree", "add", "-q", "-b", branch, str(path))
+        saved.write_text(json.dumps([{"path": str(path)} for path in (self.wt, decoy, multiline)]))
+        for path, action in ((self.wt, "手順 1）を修正（追記"), (multiline, "状態修正")):
+            with self.subTest(path=path):
+                topic.write_text(f"{url}\n  直す作業場: {path}（topic link {action}、"
+                                 "2026-11-25T10:00:00+09:00、agent なし）\n")
+                rows = [topic.read_text()]
+                if path == multiline:
+                    rows.append(rows[0].split("追記", 1)[0])
+                for report in rows:
+                    topic.write_text(report)
+                    for mode, source in (("--from", saved), ("--topic-check", topic)):
+                        code, result = self.run_main("--worktree", str(path), mode, str(source))
+                        self.assertEqual(code, 1)
+                        self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
 
     def test_ignored_tool_output_is_regenerable_only_while_it_holds_no_other_work(self) -> None:
         (self.main / ".git" / "info" / "exclude").write_text("site/\nweb/var/\nweb/test_*.sqlite3\n")
@@ -6851,6 +6923,28 @@ class LeadDecisionProposalTests(unittest.TestCase):
         with redirect_stdout(out):
             code = self.lead.main(["--decisions-file", str(self.log), *args])
         return code, out.getvalue()
+
+    def test_record_preserves_the_answering_terminal_and_session(self) -> None:
+        answer = self.root / "answer.md"
+        answer.write_text("担当が修正する\n")
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_lead", "CODEX_THREAD_ID": "lead-session"}):
+            code, out = self.call("record", "--decision", "review:acme/app#1", "--answer-file", str(answer))
+        self.assertEqual(code, 0, out)
+        decision, = list(self.lead.records(self.log))
+        self.assertIsNotNone(decision.sender)
+        assert decision.sender is not None
+        self.assertEqual((decision.sender["handle"], decision.sender["session"]), ("term_lead", "lead-session"))
+
+    def test_explicit_sent_decision_preserves_the_answering_terminal_and_session(self) -> None:
+        sync = importlib.import_module("answer_sync")
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_lead", "CODEX_THREAD_ID": "lead-session"}):
+            sync.record([], "担当が修正する", "send --decision",
+                        at="2026-11-25T15:00:00+09:00", decisions={"review:acme/app#1": "担当が修正する"},
+                        decisions_file=self.log, state_file=self.root / "hourly.json", handed_off_file=self.handed)
+        decision, = list(self.lead.records(self.log))
+        self.assertIsNotNone(decision.sender)
+        assert decision.sender is not None
+        self.assertEqual((decision.sender["handle"], decision.sender["session"]), ("term_lead", "lead-session"))
 
     def test_show_match_searches_keys_and_answers_with_any_word_ignoring_case(self) -> None:
         self.lead.append(self.log,
@@ -7751,10 +7845,13 @@ class HourlyStateTests(unittest.TestCase):
 
         sync = importlib.import_module("answer_sync")
         with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "ORCA_TERMINAL_HANDLE": "term_answerer", "CODEX_THREAD_ID": "answer-session",
                                       "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
             sync.record([f"{ask_id}:2"], "Second answer", "send", at="2026-11-13T09:02:00Z",
                         state_file=self.state, decisions_file=self.root / "lead.jsonl",
                         handed_off_file=self.root / "handed.jsonl")
+        sender = inbox_read.answer_records(self.root / "answers.jsonl")[f"{ask_id}:2"]["sender"]
+        self.assertEqual((sender["handle"], sender["session"]), ("term_answerer", "answer-session"))
         questions = self.call("show")[1]["questions"]
         self.assertIsNone(questions[recorded[0]["id"]]["answer"])
         self.assertEqual(questions[recorded[1]["id"]]["answer"], "Second answer")
@@ -8420,17 +8517,20 @@ class HourlyStateTests(unittest.TestCase):
                              "--final-message-file", message, "--question-file", message,
                              "--asked-at", "2026-10-28T01:00:00Z", "--covers", "first", "--covers", "second")
         log = self.root / "decisions.jsonl"
-        records = [{"id": key, "decision": key, "answer": f"answer {key}", "decided_at": at}
+        records: list[dict[str, str | dict[str, str]]] = [{"id": key, "decision": key, "answer": f"answer {key}", "decided_at": at}
                    for key, at in (("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T01:00:00Z"))]
         write_jsonl(log, records)
         self.assertEqual(self.call("pending")[1]["questions"][0]["id"], asked["id"])
+        sender = {"handle": "term_lead", "session": "lead-session"}
         records.append({"id": "later", "decision": "second", "answer": "second settled",
-                        "decided_at": "2026-10-28T03:00:00Z"})
+                        "decided_at": "2026-10-28T03:00:00Z", "sender": sender})
         write_jsonl(log, records)
         _, pending = self.call("pending")
         self.assertEqual(pending["questions"], [])
         self.assertEqual([(item["decision"], item["decided_at"]) for item in pending["settled"][0]["evidence"]],
                          [("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T03:00:00Z")])
+        proof = pending["settled"][0]["evidence"][1]
+        self.assertEqual((proof["id"], proof["sender"]), ("later", sender))
         self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
 
     def test_hourly_state_accepts_decision_keys_and_guides_crossed_close_commands(self) -> None:
@@ -9558,7 +9658,7 @@ class HourlyReadTests(unittest.TestCase):
                 stream.write(b'{"incomplete":')
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
-                    timeout: float) -> subprocess.CompletedProcess[str]:
+                    timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 if args[1:2] == ["read"]:
                     with redirect_stdout(stdout), patch.object(inbox_read, "later_runs", return_value=[]):
                         return subprocess.CompletedProcess(args, inbox_read.main(args[1:]))
@@ -9592,6 +9692,38 @@ class HourlyReadTests(unittest.TestCase):
             self.assertIn("直す作業場: /worktrees/example/a", out.getvalue())
             self.assertIn("直す作業場: /worktrees/example/b", out.getvalue())
 
+    def test_topic_fixer_is_printed_when_only_json_survives_a_timeout(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "topic-check.stdout"
+            pr = "https://github.com/acme/example/pull/81"
+            fixer = {"pr": pr, "worktree": "/worktrees/app（修正）/lane", "commands": [f"asana_sync.py {pr}"]}
+            path.write_text(f"  直す作業場: {fixer['worktree']}（再調査）（agent なし）\n"
+                            f"topic-fixer-json: {json.dumps(fixer)}\n")
+            retry = path.with_name("topic-check.retry.stdout")
+            retry.touch()
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
+                                  datetime.now(timezone.utc))
+            self.assertEqual(out.getvalue().splitlines(),
+                             [f"  直す作業場: {fixer['worktree']}（再調査）（agent なし）",
+                              f"  直す作業場: {fixer['worktree']}"])
+            path.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n{pr}\n"
+                            f"  直す作業場: {fixer['worktree']}（手順 1）を修正、agent なし）\n")
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
+                                  datetime.now(timezone.utc))
+            self.assertIn("直す作業場: 要確認", out.getvalue())
+            self.assertEqual(out.getvalue().splitlines()[-1], f"  直す作業場: {fixer['worktree']}")
+            path.write_text(f"{pr}\n  直す作業場: {fixer['worktree']}（topic link 手順 1）を修正（追記、"
+                            "2026-11-25T10:00:00+09:00、agent なし）\n")
+            retry.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n")
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
+                                  datetime.now(timezone.utc))
+            self.assertIn("直す作業場: 要確認", out.getvalue())
+            self.assertEqual(out.getvalue().splitlines()[-1], f"  直す作業場: {fixer['worktree']}")
+
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
@@ -9619,11 +9751,12 @@ class HourlyReadTests(unittest.TestCase):
             calls = []
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
-                    timeout: float) -> subprocess.CompletedProcess[str]:
+                    timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 name = Path(args[0]).name
                 if args[1:2] == ["read"]:
                     stdout.write("NEXT_OFFSET=0\n")
                 elif name == "topic":
+                    self.assertEqual((env or {}).get("TOPIC_CHECK_FIXER_JSON"), "1")
                     calls.append(name)
                     stderr.write("error connecting to api.github.com\n")
                     return subprocess.CompletedProcess(args, 1)
@@ -9677,7 +9810,7 @@ class HourlyReadTests(unittest.TestCase):
             calls: list[tuple[str, float]] = []
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 command = Path(args[0]).name
                 calls.append((command, timeout))
                 if args[1:2] == ["read"]:
@@ -9753,7 +9886,7 @@ class HourlyReadTests(unittest.TestCase):
             initial = Barrier(7, timeout=5)
             seen = []
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 seen.append(args)
                 if args[1:2] == ["read"]:
                     stdout.write("NEXT_OFFSET=0\n")
@@ -9810,7 +9943,7 @@ class HourlyReadTests(unittest.TestCase):
         hourly_read = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 return subprocess.CompletedProcess(args, 3 if "--review-out" in args else 0)
             with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()):
                 hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
