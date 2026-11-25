@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from typing import NamedTuple, NotRequired, TypedDict
+from unicodedata import normalize
 from urllib.parse import urlsplit
 
 import lead_decisions
@@ -1277,6 +1278,21 @@ def file_stamp(path: Path) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
+def disk_entry(directory: Path, name: str) -> Path:
+    path = directory / name
+    identity = path.lstat()
+    spelling = normalize("NFC", name).casefold()
+    alias = None
+    for entry in directory.iterdir():
+        if entry.name == name:
+            return entry
+        if normalize("NFC", entry.name).casefold() == spelling and os.path.samestat(entry.lstat(), identity):
+            alias = entry
+    if alias is not None:
+        return alias
+    raise FileNotFoundError(path)
+
+
 def optional_stamp(path: Path) -> list[int] | None:
     try:
         return file_stamp(path)
@@ -1655,11 +1671,7 @@ def named_archive_path(worktree: Path, requested: PurePosixPath) -> Path:
         candidate = source / part
         if not (candidate.exists() or candidate.is_symlink()):
             raise ValueError("パスがありません")
-        for entry in source.iterdir():
-            if entry.name != part and entry.name.casefold() == part.casefold() and entry.samefile(candidate):
-                candidate = entry
-                break
-        source = candidate
+        source = disk_entry(source, part)
     rel = source.relative_to(worktree).as_posix()
     tracked = [git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", rel),
                git(worktree, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", rel)]
@@ -2321,7 +2333,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         break
                     try:
                         for rel in paths:
-                            path = copy / rel
+                            path = copy
+                            for part in Path(rel).parts:
+                                path = disk_entry(path, part)
                             restored[str(path.relative_to(root))] = file_stamp(path)
                     except OSError as error:
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")

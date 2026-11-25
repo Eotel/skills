@@ -6458,6 +6458,30 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((copies[0] / "app.txt").read_text(), "before scan\n")
         self.assertEqual((copies[1] / "app.txt").read_text(), "saved during preflight\n")
 
+    def test_nested_restore_records_actual_directory_spelling(self) -> None:
+        folder = self.main / "folder"
+        folder.mkdir()
+        (folder / "app.txt").write_text("tracked\n")
+        git(self.main, "add", "folder/app.txt")
+        git(self.main, "commit", "-qm", "track nested fixture file")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (copy / "folder").rename(copy / "Folder")
+        if not (copy / "folder").exists():
+            self.skipTest("requires a case-insensitive filesystem")
+        filename = copy / "Folder/app.txt"
+        filename.write_text("changed\n")
+        since = datetime.now(timezone.utc).isoformat()
+
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 0, result)
+        self.assertIn("local-deps/library/Folder/app.txt", result["restored_file_stamps"])
+        self.assertEqual(filename.read_text(), "tracked\n")
+
     def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
