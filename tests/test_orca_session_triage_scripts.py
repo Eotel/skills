@@ -7289,6 +7289,48 @@ class HandoffProposalTests(unittest.TestCase):
 
 
 class HourlyStateTests(unittest.TestCase):
+    def test_stale_asks_recovers_handed_off_keys_and_unanswered_orca_comments(self) -> None:
+        sent = "2026-11-25T01:00:00Z"
+        saved = self.source("scan.json", json.dumps([{"path": "/w/lane", "class": "stalled",
+            "agents": [], "terminals": [], "comment": "記録の保持期間を調べてください",
+            "verdict": {"class": "in_progress", "next_step": "Orca コメントの問い「記録の保持期間」に答える"}}]))
+        (self.root / "inbox.jsonl").touch()
+        handoffs = self.root / "handed.jsonl"
+        write_jsonl(handoffs, [{"decision": "deploy:reports", "handed_off_at": sent}] * 2)
+        code, rows = self.call("stale-asks", "--from", saved, "--handed-off-file", str(handoffs))
+        self.assertEqual(code, 0)
+        by_state = {row["state"]: row for row in rows}
+        handoff_item = by_state["unpresented_handoff"]
+        self.assertEqual((handoff_item["id"], handoff_item["handoff_count"]), ("deploy:reports", 2))
+        self.assertIn("presented --key deploy:reports", handoff_item["present_command"])
+        self.assertIn("記録の保持期間", by_state["unanswered_user_comment"]["question"])
+
+    def test_stale_asks_combines_duplicate_presentations_and_applies_direct_answer_keys(self) -> None:
+        at = "2026-11-24T01:00:00Z"
+        first = "1Password の拡張を on に戻して Add Browser をする"
+        second = "公開先はどこですか？"
+        saved = self.source("scan.json", json.dumps([
+            {"path": "/w/browser", "repo": "app", "class": "waiting",
+             "claude": {"final_at": at, "final_text": first}},
+            {"path": "/w/release", "repo": "app", "class": "waiting",
+             "claude": {"final_at": at, "final_text": second}},
+        ]))
+        ask_id = "a1234567-1234-4567-8888-123456789abc"
+        write_jsonl(self.root / "inbox.jsonl", [
+            {"id": ask_id, "kind": "ask", "repo": "app", "worktree": "release", "ts": at, "text": second}])
+        self.call("presented", "--key", "user:browser::add-browser", "--text-file",
+                  self.source("item.txt", f"（{first}）。担当が連携を確認する"), "--since", at, "--owner", "/w/browser")
+        log = self.root / "decisions.jsonl"
+        key = "answer:app/release::a1234567"
+        write_jsonl(log, [{"id": "d1", "decision": key, "decided_at": "2026-11-24T01:30:00Z",
+                          "answer": "検証環境"}])
+        code, rows = self.call("stale-asks", "--from", saved)
+        self.assertEqual(code, 0)
+        self.assertEqual(sum(row["row"] == "/w/browser" for row in rows), 1)
+        self.assertEqual(sum(row["row"] == "/w/release" for row in rows), 1)
+        release = next(row for row in rows if row["row"] == "/w/release")
+        self.assertEqual((release["state"], release["evidence"][0]["answer"]), ("settled", "検証環境"))
+
     def test_hourly_reads_publish_complete_json_files_without_stdout(self) -> None:
         saved = self.root / "scan.json"
         saved.write_text("[]")

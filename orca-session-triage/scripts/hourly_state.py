@@ -20,6 +20,7 @@ import argparse
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from difflib import SequenceMatcher
 import fcntl
 from functools import cached_property
 import hashlib
@@ -429,6 +430,71 @@ def presented_now(data: dict, decisions: Mapping[str, lead_decisions.Decision], 
     return items
 
 
+def merge_presentations(rows: list[dict], presented: list[dict], entries: list[dict]) -> list[dict]:
+    def normalized(value: str) -> str:
+        return re.sub(r"[\W_]+", "", (value or "").casefold())
+
+    known = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    kept = list(rows)
+    for item in presented:
+        ref = lead_decisions.answer_key_ref(item["id"], known) or ask_state.reference(item["id"], entries)
+        text = normalized(item["question"])
+        for candidate in kept:
+            if not item["row"] or item["row"] != candidate["row"]:
+                continue
+            ask = candidate.get("ask") or {}
+            candidate_numbers = frozenset(ask.get("question_numbers") or [])
+            ask_matches = bool(ref and ask.get("id") == ref[0]
+                               and (not ref[1] or ref[1] == candidate_numbers))
+            other = normalized(candidate["question"])
+            first, second = map(scan_sessions.parse_time, (item["since"], candidate["since"]))
+            near = bool(first and second and abs((first - second).total_seconds()) < 1)
+            overlap = SequenceMatcher(None, text, other, autojunk=False).find_longest_match().size if near else 0
+            same_subject = (len(other) >= 8 and other == text) or (
+                overlap >= 12 and overlap * 5 >= min(len(text), len(other)) * 4
+                and set(GITHUB_REF.findall(item["question"])) == set(GITHUB_REF.findall(candidate["question"])))
+            user_wait = (item["id"].startswith("user:") and candidate["state"] == "unasked" and same_subject)
+            same_ask = candidate["state"] == "unanswered" and (
+                item["id"] in (candidate.get("decisions") or []) or ask_matches or (near and same_subject))
+            if user_wait or same_ask:
+                kept.remove(candidate)
+                item.update(ask=candidate.get("ask"), asking=candidate.get("asking", []),
+                            final_at=candidate.get("final_at"), related_issues=candidate.get("related_issues", []))
+                break
+        kept.append(item)
+    return kept
+
+
+def unpresented_handoffs(history: list[lead_decisions.HandOff], data: dict,
+                         decisions: dict[str, list[lead_decisions.Decision]], answers: Mapping[str, dict],
+                         entries: list[dict], now: datetime) -> list[dict]:
+    registered = set(data["presented"])
+    questions = list(data["questions"].values())
+    registered.update(key for question in questions if not question.get("withdrawn_at")
+                      for key in (question.get("decision"), *(question.get("covers") or [])) if key)
+    pending: dict[str, list[lead_decisions.HandOff]] = {}
+    for item in history:
+        if item.decision not in registered:
+            pending.setdefault(item.decision, []).append(item)
+    asks = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
+    rows = []
+    for key, items in pending.items():
+        decided = decisions.get(key) or []
+        bound = next((item.ask_id for item in reversed(items) if item.ask_id), None)
+        if lead_decisions.handoff_resolution(key, decided[-1] if decided else None, True, bound, answers, asks, questions):
+            continue
+        since = scan_sessions.parse_time(items[0].handed_off_at) or now
+        ref = ask_state.handoff_target(key, bound, list(asks.values()), questions)
+        ask = asks.get(ref[0]) if ref else None
+        rows.append({"id": key, "row": None, "name": (ask or {}).get("worktree") or key,
+                     "state": "unpresented_handoff", "since": since.isoformat(), "handoff_count": len(items),
+                     "question": excerpt((ask or {}).get("text") or key), "ask": report_view(ask) if ask else None,
+                     "age_minutes": int((now - since).total_seconds() // 60),
+                     "present_command": shlex.join(["hourly_state.py", "presented", "--key", key,
+                                                   "--since", since.isoformat(), "--text-file", "/dev/stdin"])})
+    return rows
+
+
 def presented_resolutions(items: list[dict], data: dict, projects: Path, state_file: Path) -> None:
     selected: dict[str, list[lead_decisions.PullRequest]] = {}
     by_repo: dict[str, set[int]] = {}
@@ -760,6 +826,15 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                     and answer.ask_id and (ask := ask_entries.get(answer.ask_id.partition(":")[0]))
                     and (asked_at := inbox_read.asked_at(ask)) and answer.at >= asked_at]
     closed_ids = [*answered_ids, *withdrawn]
+    direct: dict[str, list[tuple[tuple[str, frozenset[int]], lead_decisions.Decision]]] = {}
+    for key, decision in latest_decisions.items():
+        if ((ref := lead_decisions.answer_key_ref(key, ask_entries))
+                and (at := scan_sessions.parse_time(decision.decided_at))
+                and (opened := inbox_read.asked_at(ask_entries[ref[0]])) and at >= opened):
+            direct.setdefault(ref[0], []).append((ref, decision))
+    direct_ids = [f"{ask_id}:{number}" if number else ask_id for ask_id, proofs in direct.items()
+                  for (_, numbers), _ in proofs for number in numbers or (0,)]
+    all_answered = [*closed_ids, *direct_ids]
     questions = state.get("questions", {}).values()
     handoff_refs = {item.decision: ask_state.handoff_target(item.decision, item.ask_id, known_asks, questions)
                     for item in handed}
@@ -829,6 +904,10 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         in_progress = (row.get("verdict") or {}).get("class") == "in_progress"
         progress_question = in_progress and bool(row.get("prompt_waiting") or
                                                   (row.get("claude") or {}).get("pending_questions"))
+        next_step = str((row.get("verdict") or {}).get("next_step") or "")
+        unanswered_comment = (in_progress and not row.get("agents") and not row.get("terminals")
+                              and bool(row.get("comment")) and bool(re.search(
+                                  r"コメント.{0,100}(?:問い|質問).{0,160}(?:答え|回答)", next_step)))
         counted = [(at, item, answer_evidence.answers_to(item, answers, retained_questions.get(item["id"]), shared))
                    for at, item in lane
                    if item.get("kind") == "ask" and item.get("id")
@@ -846,7 +925,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         if (((row.get("verdict") or {}).get("class") or row.get("class")) != "waiting"
                 and not blocked_by_user(row) and not any(keys.values()) and not shared_pending
                 and not received
-                and not (in_progress and (progress_question or counted))):
+                and not (in_progress and (progress_question or counted or unanswered_comment))):
             continue
         comment = row.get("comment") or ""
         question = row_question(row, final)
@@ -865,6 +944,22 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
             proven = [answer for _, _, proof in counted for answer in proof]
             if proven:
                 view["answer"] = answer_view(max(proven, key=lambda answer: answer.at))
+        remaining_asks = []
+        for at, ask, proof in counted:
+            answers_for_ask = direct.get(ask["id"], [])
+            parts = retained_questions.get(ask["id"])
+            if not answers_for_ask or not ask_state.covered((ask["id"], frozenset(parts or [])), all_answered, known_asks):
+                remaining_asks.append((at, ask, proof))
+                continue
+            decisions = [decision for _, decision in answers_for_ask]
+            newest = max(decisions, key=lambda decision: scan_sessions.parse_time(decision.decided_at) or now)
+            found.append((scan_sessions.parse_time(newest.decided_at) or now, {
+                **view, "state": "settled", "since": newest.decided_at,
+                "question": excerpt("\n".join(answer_evidence.questions_of(ask)) or ask.get("text")) or view["question"],
+                "ask": report_view(ask), "evidence": [decision.view() for decision in decisions]}))
+        if counted and not remaining_asks and not (shared_pending or progress_question or unanswered_comment):
+            continue
+        counted = remaining_asks
         unanswered = [(at, item) for at, item, proof in counted if not proof or keys.get(item["id"])]
         if unanswered:
             oldest = min(unanswered, key=itemgetter(0))
@@ -872,7 +967,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 if (asked_at, ask) != oldest and not keys.get(ask["id"]):
                     continue
                 remaining = [(number, question) for number, question in enumerate(answer_evidence.questions_of(ask), 1)
-                             if not ask_state.covered((ask["id"], frozenset((number,))), closed_ids, known_asks)]
+                             if not ask_state.covered((ask["id"], frozenset((number,))), all_answered, known_asks)]
                 asked = "\n".join(question for _, question in remaining) or ask.get("text")
                 found.append((asked_at, {
                     **view, "state": "unanswered", "since": ask.get("ts"),
@@ -923,6 +1018,11 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
                 **view, "state": "settled", "since": newest.decided_at,
                 "evidence": [{"decision": item.decision, "decided_at": item.decided_at, "answer": item.answer}
                              for item in keyed]}))
+            continue
+        if unanswered_comment:
+            since = said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
+            found.append((since, {**view, "state": "unanswered_user_comment", "since": since.isoformat(),
+                                  "question": excerpt(next_step)}))
             continue
         prompt_at = (row.get("prompt_waiting") or {}).get("asked_at")
         since = scan_sessions.parse_time(prompt_at) or said_at or scan_sessions.parse_time(row.get("scanned_at")) or now
@@ -1765,6 +1865,10 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
         name = item.get("name") or row.rsplit("::", 1)[-1].rstrip("/").rsplit("/", 1)[-1] or "-"
         state = item.get("state") or {"handoffs": "undelivered", "requests": "open", "user_waits": "user_wait",
                                       "left": "left"}.get(kind, kind)
+        if state == "unpresented_handoff":
+            state = f"未提示（指揮へ {item['handoff_count']} 回持ち越し）"
+        elif state == "unanswered_user_comment":
+            state = "三浦さんの問いに担当が未回答"
         ask_id = (item.get("ask") or {}).get("id")
         question = (item.get("question") or item.get("original") or item.get("task") or item.get("text")
                     or item.get("final_message"))
@@ -1774,7 +1878,7 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
             line += f" | {item['link']}"
         if item.get("evidence"):
             line += " | 済み: " + "; ".join(
-                f"{proof['decision']}@{proof['decided_at']}" if "decision" in proof
+                f"{proof['decision']}@{proof['decided_at']} {excerpt(proof.get('answer'))}" if "decision" in proof
                 else f"{proof['repo']}#{proof['number']} {proof['state']}@{proof.get('updatedAt') or '-'}"
                 for proof in item["evidence"])
         if item.get("pr"):
@@ -1807,6 +1911,8 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
             line += f" | 解消の候補: {candidate.get('pr') or candidate['source']} {candidate['at']} {headline(candidate['text'])}"
         if item.get("close_command"):
             line += f" | {item['close_command']}"
+        if item.get("present_command"):
+            line += f" | {item['present_command']}"
         if item.get("lead_unseen"):
             line += " | 指揮が未読"
         if item.get("waits_on"):
@@ -2069,7 +2175,7 @@ def main(argv: list[str] | None = None) -> int:
                 if lead_decisions.decision_for_handoff(decided[key][-1].view(), True) is None:
                     del decided[key]
             known = {row["id"]: row for row in entries if row.get("kind") == "ask" and row.get("id")}
-            evidence = lead_decisions.ask_answers(answers_log) if data["presented"] else {}
+            evidence = lead_decisions.ask_answers(answers_log) if data["presented"] or history else {}
             presented_answers = {}
             for key in data["presented"]:
                 ask_id = latest_handoffs[key].ask_id if key in latest_handoffs else None
@@ -2091,9 +2197,14 @@ def main(argv: list[str] | None = None) -> int:
                                 decided=decided, rejected=rejected,
                                 proposals=scan_sessions.ledger_proposals() if any(
                                     Path(row["path"]).name.startswith(CONSOLIDATE_PREFIX) for row in rows) else None)
-            result = sorted([*result, *user_waits_now(data, datetime.now(timezone.utc)), *presented_now(
-                data, {key: items[-1] for key, items in decided.items()}, datetime.now(timezone.utc),
-                entries, presented_answers)], key=lambda item: -item["age_minutes"])
+            now = datetime.now(timezone.utc)
+            presented = presented_now(data, {key: items[-1] for key, items in decided.items()}, now,
+                                      entries, presented_answers)
+            result = merge_presentations(result, presented, entries)
+            missing = unpresented_handoffs(history, data, decided, evidence, entries, now)
+            missing_keys = {item["id"] for item in missing}
+            result = sorted([*(item for item in result if not set(item.get("decisions") or []) & missing_keys),
+                             *missing, *user_waits_now(data, now)], key=lambda item: -item["age_minutes"])
             presented_resolutions(result, data, args.claude_projects.expanduser(), path)
             unseen: set[str] = set()
             if lead := appointed_lead(data):

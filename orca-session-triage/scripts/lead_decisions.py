@@ -568,6 +568,46 @@ def bound_handoff_answer(key: str, ask_id: str | None, answers: Mapping[str, dic
     return ask_answer(ask_id, answers, asks) if ask_id else None
 
 
+def answer_key_ref(key: str, asks: Mapping[str, dict]) -> tuple[str, frozenset[int]] | None:
+    if not key.startswith("answer:"):
+        return None
+    source, _, _ = key.removeprefix("answer:").rpartition("::")
+    ref = ask_state.reference(key, list(asks.values()))
+    if not ref:
+        return None
+    ask = asks[ref[0]]
+    lane = ask.get("worktree")
+    if not lane or source not in (lane, inbox_read.source_of(ask)):
+        return None
+    return ref if all(0 < number <= len(inbox_read.questions_of(ask)) for number in ref[1]) else None
+
+
+def handoff_resolution(key: str, decision: Decision | None, handed_off: bool, ask_id: str | None,
+                       answers: Mapping[str, dict], asks: Mapping[str, dict],
+                       questions: Iterable[dict]) -> dict | None:
+    if found := decision_for_handoff(decision.view() if decision else None, handed_off):
+        return found
+    if (proof := bound_handoff_answer(key, ask_id, answers, asks, questions)) and genuine_answer(proof):
+        return proof
+    if ask_id or (ref := answer_key_ref(key, asks)) is None:
+        return None
+    original, numbers = ref
+    ids = [f"{original}:{number}" for number in sorted(numbers)] if numbers else [original]
+    parts = [ask_answer(key, answers, asks) for key in ids]
+    opened = moment(asks[original].get("ts"))
+
+    def confirmed(part: dict) -> bool:
+        if "answers" in part:
+            return bool(part["answers"]) and all(confirmed(row) for row in part["answers"])
+        at = moment(part.get("ts"))
+        return bool(at and (not opened or at >= opened)
+                    and (genuine_answer(part) or part.get("how") == "inbox_read.py answered"))
+
+    if all(part and confirmed(part) for part in parts):
+        return parts[0] if len(parts) == 1 else {"answers": parts}
+    return None
+
+
 def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], read_prs: PrStates,
                   answers: Mapping[str, dict], entries: list[dict], asana: Mapping[str, object],
                   workers: IssueWorkers, decisions: list[str] | None = None,
@@ -589,12 +629,8 @@ def open_handoffs(handed: Iterable[HandOff], answered: Mapping[str, Decision], r
     for key in keys:
         item = history[key][-1] if key in history else None
         latest_id = binding.ask_id if (binding := bound_asks.get(key)) else None
-        decision = decision_for_handoff(answered[key].view() if key in answered else None, item is not None)
-        answer = decision
-        if answer is None:
-            answer = bound_handoff_answer(key, latest_id, answers, asks, questions)
-        delivered = answer is not None and (answer is decision or genuine_answer(answer))
-        if delivered:
+        answer = handoff_resolution(key, answered.get(key), item is not None, latest_id, answers, asks, questions)
+        if answer is not None:
             settled.append({"decision": key, "answer": answer})
         else:
             last[key] = item
@@ -646,16 +682,18 @@ class ShownAnswer:
     item: Decision
     when: datetime | None
     marks: tuple[str, ...]
+    ask_id: str | None = None
 
     def line(self) -> str:
         stamp = self.when.astimezone(JST).isoformat(timespec="seconds") if self.when else self.item.decided_at
         answer = " ".join(self.item.answer.split())
         cut = answer[:EXCERPT] + (CUT if len(answer) > EXCERPT else "")
         marks = "".join(f" {mark}" for mark in self.marks)
-        return f"{stamp} {self.item.decision}{marks}  {cut}"
+        return f"{stamp} {self.item.decision}{marks}" + (f" ask={self.ask_id}" if self.ask_id else "") + f"  {cut}"
 
     def view(self) -> dict[str, object]:
-        return {**self.item.view(), "marks": list(self.marks)}
+        return {**self.item.view(), "marks": list(self.marks),
+                **({"ask_id": self.ask_id} if self.ask_id else {})}
 
 
 def show_answers(items: Iterable[Decision], words: list[str], since: datetime | None,
@@ -676,6 +714,31 @@ def show_answers(items: Iterable[Decision], words: list[str], since: datetime | 
         pending = item.decision.startswith("remove:") and Path(path).expanduser().exists()
         marks = (("未実行",) if pending else ()) + (("置き換え済み",) if item.id in replaced else ())
         shown.append(ShownAnswer(item, when, marks))
+    return shown
+
+
+def matching_ask_answers(entries: list[dict], answers: Mapping[str, dict], decisions: Iterable[Decision],
+                         words: list[str], since: datetime | None) -> list[ShownAnswer]:
+    asks = {item["id"]: item for item in entries if item.get("kind") == "ask" and item.get("id")}
+    known: dict[tuple[str, frozenset[int]], datetime] = {}
+    for decision in decisions:
+        if (ref := answer_key_ref(decision.decision, asks)) and (at := moment(decision.decided_at)):
+            known[ref] = max(at, known.get(ref, at))
+    shown = []
+    for key, record in answers.items():
+        full_id, _, part = key.partition(":")
+        if not (ask := asks.get(full_id)) or record.get("how") == "triage-notify --withdraws":
+            continue
+        at = moment(record.get("ts"))
+        newest = known.get((full_id, frozenset((int(part),)) if part.isdecimal() else frozenset()))
+        if at is None or (since is not None and at < since) or (newest is not None and at <= newest):
+            continue
+        note = inbox_read.answer_note(record) if not record.get("note") else str(record["note"])
+        decision_key = f"answer:{inbox_read.source_of(ask)}::{key}"
+        searchable = " ".join((decision_key, inbox_read.full_text(ask), note)).casefold()
+        if any(word.casefold() in searchable for word in words):
+            shown.append(ShownAnswer(Decision(key, decision_key, note, record["ts"], from_ask=True),
+                                     at, (), ask_id=key))
     return shown
 
 
@@ -785,6 +848,12 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                         raise ValueError(f"invalid handoff sent_at: {saved.sent_at}")
                 replaced = frozenset(item.id for found in keys.values() for item in found[:-1])
                 shown = show_answers(items, args.match, since, replaced)
+                if args.match:
+                    inbox = inbox_read.paths()[0].expanduser()
+                    entries = inbox_read.inbox_entries(inbox) if inbox.exists() else []
+                    shown.extend(matching_ask_answers(entries, ask_answers(inbox_read.answers_path()), items,
+                                                      args.match, since))
+                    shown.sort(key=lambda row: row.when or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
                 if args.json:
                     print(json.dumps([answer.view() for answer in shown], ensure_ascii=False, indent=2))
                 else:
