@@ -19,6 +19,7 @@ from difflib import unified_diff
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
@@ -36,6 +37,8 @@ class Question:
     answered_at: str | None = None
     answer: str | None = None
     result_received: bool = False
+    header: str = ""
+    selector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,8 @@ def conversation(path: Path) -> Conversation:
                     continue
                 if entry.get("type") == "assistant" and block.get("name") == "AskUserQuestion":
                     tool_id = str(block.get("id") or "")
-                    asked[tool_id] = [Question(tool_id, str(question.get("question") or ""), at)
+                    asked[tool_id] = [Question(tool_id, str(question.get("question") or ""), at,
+                                               header=str(question.get("header") or ""))
                                       for question in (block.get("input") or {}).get("questions") or []
                                       if isinstance(question, dict)]
                 elif block.get("type") == "tool_result":
@@ -114,6 +118,48 @@ def run_of(record: dict[str, Any], home: Path) -> Run:
                started=local_time(record.get("startedAt")),
                precheck=said.splitlines()[0] if record.get("status") == "skipped_precheck" and said else "",
                pane=record.get("terminalPaneKey") or "", transcript=str(transcript) if transcript else "")
+
+
+def selector_headers(screen: dict, pane: str) -> set[str] | None:
+    if screen.get("source") != "screen":
+        return None
+    if not scan_sessions.question_prompt(screen, pane):
+        return set()
+    lines = [line.strip() for line in scan_sessions.screen_lines(screen) if line.strip()]
+    footer = max(index for index, line in enumerate(lines) if scan_sessions.SELECTOR_FOOTER.search(line))
+    tabs = next((line for line in reversed(lines[:footer]) if "✔ Submit" in line), "")
+    return {header.strip() for header in re.split(r"[☐☒]", tabs.split("✔ Submit", 1)[0])[1:]}
+
+
+def locate_selectors(orca: str, runs: list[Run], conversations: list[Conversation | None]) -> None:
+    pending = [(run.pane, question) for run, found in zip(runs, conversations)
+               for question in (found.questions if found else []) if not question.result_received]
+    if not pending:
+        return
+    terminals = None
+    if any(pane for pane, _ in pending):
+        try:
+            terminals = {hourly_runtime.pane_key(term): term["handle"]
+                         for term in hourly_runtime.orca_result(orca, "terminal", "list")["terminals"]
+                         if term.get("handle")}
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+            pass
+    headers: dict[str, set[str] | None] = {"": set()}
+    for pane, question in pending:
+        if pane not in headers:
+            headers[pane] = None
+            if terminals is not None:
+                if handle := terminals.get(pane):
+                    try:
+                        read = hourly_runtime.orca_result(orca, "terminal", "read", "--terminal", handle, "--screen")
+                        headers[pane] = selector_headers(read.get("terminal") or read, pane)
+                    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+                        pass
+                else:
+                    headers[pane] = set()
+        visible = headers[pane]
+        question.selector = ("未確認" if visible is None or (visible and not question.header)
+                             else "表示中" if question.header in visible else "消えた")
 
 
 def triage_automation(orca: str, workspace: str) -> dict[str, Any]:
@@ -198,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"hourly runs: could not read a transcript: {error}", file=sys.stderr)
         return 1
+    if args.questions:
+        locate_selectors(args.orca, runs, conversations)
     if args.json:
         print(json.dumps([{**asdict(run), **({"tail": found.tail if found else None,
                                                "ask_user_question_waiting": found.waiting if found else None}
@@ -215,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         for question in found.questions if found and args.questions else []:
             print(f"  asked {question.asked_at or '-'}: {question.question}")
             print(f"  answered {question.answered_at or '-'}: {question.answer or '-'}")
+            if question.selector is not None:
+                print(f"  selector: {question.selector}")
     return 0
 
 

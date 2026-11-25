@@ -9677,6 +9677,26 @@ def tool_result(content: str, result: dict) -> dict:
 
 
 class HourlyRunsTests(unittest.TestCase):
+    def test_unanswered_questions_report_which_headers_are_on_the_recorded_screen(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            prompt = {"type": "tool_use", "name": "AskUserQuestion", "id": "toolu_1", "input": {"questions": [
+                {"header": "Release", "question": "Which release?"},
+                {"header": "Schedule", "question": "When does it ship?"}]}}
+            write_jsonl(home / ".claude/projects/-w-triage/waiting.jsonl", [assistant(prompt)])
+            runs = [{"status": "dispatch_failed", "terminalPaneKey": "tab:leaf",
+                     "usage": {"providerSessionId": "waiting"}, "workspaceId": "repo::/w/triage"}]
+            replies = {("terminal", "list"): {"terminals": [{"recordedPaneKey": "tab:leaf", "handle": "term_1"}]},
+                       ("terminal", "read", "--terminal", "term_1", "--screen"): {"terminal": {
+                           "source": "screen", "tail": ["←  ☒ Release  ✔ Submit  →", "Which release?",
+                               "❯ 1. A", "Enter to select · ↑/↓ to navigate · Esc to cancel"]}}}
+            with patch.object(hourly_runtime, "scheduled_runs", return_value=runs), \
+                    patch.object(hourly_runtime, "orca_result", side_effect=lambda _orca, *args: replies[args]), \
+                    patch.object(Path, "home", return_value=home), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(hourly_runs.main(["--workspace", "/w/triage", "--questions", "--json"]), 0)
+            questions = json.loads(out.getvalue())[0]["questions"]
+            self.assertEqual([question["selector"] for question in questions], ["表示中", "消えた"])
+
     def test_tail_and_questions_read_each_runs_last_utterance_and_match_results_by_tool_id(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             home = Path(root)
