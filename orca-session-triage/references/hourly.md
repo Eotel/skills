@@ -298,6 +298,18 @@ workspace has no agent, goes to the lead.
 read under the same output root. A current `tracker:<key>` decision starting
 with `放置:` marks a gap `ignored` and preserves the decision text and time.
 Leave marked items with their recorded decision.
+With a Harness release whose `project-status --gaps --json` returns
+`backlog_deadlines`, the standard output lists overdue issues, deadlines up
+to three days away, and deadline changes made by someone else in the last
+24 hours. Use these alerts in the hourly report. Route tracker fixes from
+the `gaps` rows.
+
+When deploying deadline alerts, update the running orca-board collector and
+let it refresh Backlog into the Board database. Install the matching Harness
+release on the target Macs and update this skill through APM. Verify the
+scheduled entry point above prints the issue key and deadline alert, including
+the old and new deadline, editor, and time for a recent change.
+
 Asana status and Backlog Watch compare with the most recent successful read of
 their own command in the same directory history, ordered by command read time.
 Backlog compares issue rows without elapsed wait times. New notifications
@@ -482,7 +494,7 @@ until the lead observes that its recorded symptom is gone. Then:
 - Send each `topic check --all` drift row to a live agent of the workspace it
   names with `send`, quoting the row and the fix it prints. When another lead
   is appointed, put the rows in the handoff instead.
-- Send the `tracker-gaps` rows to their `workspace` with `send` (on its
+- Send the `tracker-gaps.json` rows in `gaps` to their `workspace` with `send` (on its
   `host`), one message per workspace quoting each row's `text` and `fix`. When
   another lead is appointed, put the rows in the handoff instead.
 - Every run, process the "次の一手" rows in asana99_status.py output with the
