@@ -290,6 +290,11 @@ def print_read(result: dict, now: datetime) -> None:
         for kind, rows in changes.items():
             if rows:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
+        if name == "tracker-gaps":
+            document = json.loads(Path(result["result"]).read_text(encoding="utf-8"))
+            for row in document.get("backlog_deadlines", []):
+                for alert in row["alerts"]:
+                    print(f"  {row['key']} {alert}")
     if name == "topic-check":
         for line in Path(result["stdout"]).read_text(encoding="utf-8").splitlines():
             if line.lstrip().startswith("直す作業場: "):
