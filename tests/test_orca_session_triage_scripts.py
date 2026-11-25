@@ -3698,7 +3698,7 @@ class ScanCommandTests(unittest.TestCase):
             return json.loads(out.getvalue())
 
         shown = final("report")
-        self.assertEqual(shown["final"], {"source": "card", "at": "2026-11-09T03:00:00Z", "text": report})
+        self.assertEqual(shown["final"], {"source": "card", "at": "2026-11-09T12:00:00+09:00", "text": report})
         self.assertEqual([(card["prompt"], card["last_message"]) for card in shown["done_cards"]],
                          [(prompt, report)])
         self.assertEqual([final(name)["final"]["source"] for name in ("same", "older")], ["claude", "claude"])
@@ -3834,11 +3834,11 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main(["--from", str(saved), "--rows"]), 0)
 
         self.assertEqual(out.getvalue().splitlines(), [
-            "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T01:00:00Z"
+            "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T10:00:00+09:00"
             " | PR #10 を merge するか | reasons final message | git.dirty null | git.unpushed null",
-            "dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました"
+            "dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T11:00:00+09:00 | 設定を反映しました"
             " | reasons - | git.dirty null | git.unpushed null",
-            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか"
+            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T12:00:00+09:00 | どちらにしますか"
             " | reasons - | git.dirty null | git.unpushed null",
             "mbp16::fix-login | working | - | tabs 0 | - | "
             " | reasons - | git.dirty null | git.unpushed null",
@@ -4158,7 +4158,7 @@ class ScanCommandTests(unittest.TestCase):
         row = json.loads(out.getvalue())
         self.assertEqual((row["path"], row["github"], row["class"], row["comment"]),
                          (str(checkout), "Eotel/chezmoi-dotfiles", "unsure", "作業中"))
-        self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T02:00:00Z",
+        self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T11:00:00+09:00",
                                         "text": "設定を反映しました"})
         self.assertEqual(row["last_user"], "設定を反映して")
         self.assertEqual(row["transcripts"], {"claude": [], "codex": []})
@@ -8050,7 +8050,7 @@ class HourlyStateTests(unittest.TestCase):
             with patch.object(hourly_state.lead_decisions, "github_pr_states", return_value=states) as read:
                 code, result = self.call(*args, "--claude-projects", str(projects))
             self.assertEqual(code, 0)
-            read.assert_called_once_with("acme/app", [11, 12])
+            read.assert_called_once_with("acme/app", [11, 12], include_issues=True)
             items = result["presented"] if isinstance(result, dict) else result
             kept = {item["id"]: item for item in items}
             self.assertIn("merge:acme/app#11", kept["merge:acme/app#11"]["close_command"])
@@ -8224,7 +8224,7 @@ class HourlyStateTests(unittest.TestCase):
                 self.assertEqual(hourly_state.main(["--state-file", str(self.state), *argv]), 0)
                 lines = out.getvalue().splitlines()
                 self.assertEqual(len(lines), 1)
-                self.assertIn("lane | unanswered | since=2026-10-28T01:00:00", lines[0])
+                self.assertIn("lane | unanswered | since=2026-10-28T10:00:00+09:00", lines[0])
                 self.assertRegex(lines[0], r"age_minutes=\d+")
                 self.assertIn(identity, lines[0])
                 self.assertIn("Choose a release", lines[0])
@@ -8320,6 +8320,49 @@ class HourlyStateTests(unittest.TestCase):
         self.assertEqual([(item["decision"], item["decided_at"]) for item in pending["settled"][0]["evidence"]],
                          [("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T03:00:00Z")])
         self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
+
+    def test_hourly_state_accepts_decision_keys_and_guides_crossed_close_commands(self) -> None:
+        text = self.source("text.txt", "配備しますか？")
+        _, old = self.call("asked", "--row", "/w/lane", "--decision", "old-deploy",
+                           "--final-message-file", text, "--question-file", text)
+        _, new = self.call("asked", "--row", "/w/lane", "--decision", "new-deploy",
+                           "--final-message-file", text, "--question-file", text)
+        code, result = self.call("withdraw", "--decision", "old-deploy", "--replaced-by", "new-deploy",
+                                 "--reason-file", text, "--json")
+        self.assertEqual((code, result["id"], result["replaced_by"]), (0, old["id"], new["id"]))
+        self.call("presented", "--key", "user:deploy", "--text-file", text, "--since", "2026-11-25T01:00:00Z")
+        with redirect_stderr(io.StringIO()) as error, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "user-wait-close", "--id",
+                                                "user:deploy", "--evidence-file", text]), 1)
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "requests-needing-owner",
+                                                "--summary"]), 0)
+        self.assertIn("presented-close --key user:deploy", error.getvalue())
+        self.assertEqual(output.getvalue().strip(), "needs_owner 0 | closed_issues 0")
+
+    def test_presented_issue_reference_displays_state_and_updated_time(self) -> None:
+        text = self.source("text.txt", "課題を確認しますか？")
+        self.call("presented", "--key", "schedule:acme/app#12", "--text-file", text,
+                  "--since", "2026-11-25T01:00:00Z")
+        issue = {"item_12": {"__typename": "Issue", "state": "OPEN", "updatedAt": "2026-11-25T02:15:00Z"}}
+        with patch.object(scan, "graphql_repository", return_value=issue):
+            code, state = self.call("pending")
+        self.assertEqual(code, 0)
+        [reference] = state["presented"][0]["prs"]
+        self.assertEqual((reference["type"], reference["state"], reference["updatedAt"]),
+                         ("issue", "OPEN", "2026-11-25T02:15:00Z"))
+
+    def test_scan_rows_and_stale_summary_display_the_last_message_time_in_jst(self) -> None:
+        saved = self.source("scan.json", json.dumps([{"path": "/w/example", "repo": "app", "class": "waiting",
+            "claude": {"final_at": "2026-11-24T23:12:03.456Z", "final_text": "確認しますか？"}}]))
+        (self.root / "inbox.jsonl").touch()
+        for args in (["--rows"], ["--row", "example"]):
+            with self.subTest(args=args), redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(scan.main(["--from", saved, "--state-file", str(self.state), *args]), 0)
+                self.assertIn("2026-11-25T08:12:03.456+09:00", out.getvalue())
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hourly_state.main(["--state-file", str(self.state), "stale-asks", "--from", saved,
+                                                "--summary"]), 0)
+        self.assertIn("since=2026-11-25T08:12:03.456+09:00", out.getvalue())
 
     def test_withdraw_keeps_a_reason_and_time_without_recording_a_user_answer(self) -> None:
         message = self.source("message.txt", "Proceed?")
@@ -10087,6 +10130,17 @@ class InboxWatchServiceTests(unittest.TestCase):
 
 
 class InboxReadTests(unittest.TestCase):
+    def test_read_displays_answer_times_in_jst_even_when_recorded_in_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            inbox, answers = (Path(root) / name for name in ("inbox.jsonl", "answers.jsonl"))
+            write_jsonl(inbox, [{"kind": "ask", "id": "aaaabbbb", "text": "公開しますか？"}])
+            write_jsonl(answers, [{"id": "aaaabbbb", "ts": "2026-11-24T23:12:00Z", "how": "send"}])
+            with (patch.dict(os.environ, {"TRIAGE_INBOX": str(inbox), "TRIAGE_ASK_ANSWERS": str(answers),
+                                          "TRIAGE_READ_OFFSET": str(Path(root) / "read.offset")}),
+                  redirect_stdout(io.StringIO()) as out):
+                self.assertEqual(inbox_read.main(["read", "--summary"]), 0)
+            self.assertIn("回答済み（11/25 08:12・send）", out.getvalue())
+
     def test_since_can_resume_from_a_byte_offset_before_the_acknowledged_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             inbox, cursor = (Path(root) / name for name in ("inbox.jsonl", "read.offset"))

@@ -2454,6 +2454,13 @@ def parse_time(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def jst_timestamp(value: str | None) -> str:
+    if (at := parse_time(value)) is None:
+        return value or ""
+    timespec = "milliseconds" if at.microsecond and at.microsecond % 1000 == 0 else "auto"
+    return at.astimezone(JST).isoformat(timespec=timespec)
+
+
 WORKER_MAIL = ("worker_done", "question", "escalation")
 MAIL_GRACE_MINUTES = 5  # Orca types its own notice into an idle lead first
 
@@ -4225,7 +4232,8 @@ def row_line(view: dict) -> str:
                          for session in view.get("claude_sessions") or [])
     approvals = " ; ".join(f"{item['tab']} {item.get('target') or item['question']} [{'; '.join(item['choices'])}]"
                            for item in view.get("codex_approvals") or [])
-    return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
+    return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | "
+            f"{jst_timestamp(view['final']['at']) or '-'} | {note}"
             f" | reasons {reasons} | git.dirty {dirty} | git.unpushed {unpushed}"
             + (f" | Claude sessions {sessions}" if sessions else "")
             + (f" | Codex approvals {approvals}" if approvals else ""))
@@ -4422,6 +4430,8 @@ def print_row(args: argparse.Namespace, rows: list[dict], key: str) -> int:
         if not any(view["transcripts"].values()):
             print(missing_transcripts(row), file=sys.stderr)
         return 0
+    if not args.recheck:
+        view["final"]["at"] = jst_timestamp(view["final"]["at"])
     json.dump(view, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
