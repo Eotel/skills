@@ -600,6 +600,29 @@ class RunTests(unittest.TestCase):
             clock.now.return_value = now
             return stall.main(["run", "--scan", str(self.scan)])
 
+    def test_open_ask_choices_are_not_promises_but_the_same_text_in_another_lane_is(self) -> None:
+        said = "2026-11-15T19:22:08+09:00"
+        option = "明日の朝に確認します。"
+        legacy = "どちらで進めますか？\n- 選択肢: " + option
+        structured = {"options": [{"label": "確認する", "description": option}]}
+        self.inbox.write_text("".join(json.dumps(item) + "\n" for item in (
+            {"id": "plain-ask", "ts": said, "worktree": "plain", "kind": "ask", "text": legacy},
+            {"id": "structured-ask", "ts": said, "worktree": "structured", "kind": "ask",
+             "text": "どちらで進めますか？", "questions": [structured]},
+        )))
+        self.scan.write_text(json.dumps([
+            row("plain", claude=claude(said, option)),
+            row("structured", codex=codex(said, option)),
+            row("promised", claude=claude(said, option)),
+        ]))
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = stall.main(["replay", "--scan", str(self.scan), "--now", NOW.isoformat()])
+        self.assertEqual(code, 0)
+        promises = [line for line in out.getvalue().splitlines() if "promise_unscheduled" in line]
+        self.assertEqual(len(promises), 1, out.getvalue())
+        self.assertIn("promised", promises[0])
+
     def test_new_signals_go_out_as_one_ask_from_stall_watch_and_are_not_sent_again(self) -> None:
         board, taken = self.dir / "board-check", self.dir / "board-records.jsonl"
         board.write_text("#!/usr/bin/env python3\nimport json, sys\nrecord = json.load(sys.stdin)\n"
