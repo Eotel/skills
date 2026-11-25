@@ -1737,8 +1737,8 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
             covered = direct or covered
             settled.append({**view, "state": "settled", "since": max(
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
-                            "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
-                                          "answer": answer.answer} for answer in covered]})
+                            "evidence": [{"id": answer.id, "decision": answer.decision, "decided_at": answer.decided_at,
+                                          "answer": answer.answer, "sender": answer.sender} for answer in covered]})
         elif ((refs := references.get(key, [])) and all(ref.get("state") == "CLOSED" for ref in refs)
               and item.get("ask_id") not in open_keys):
             settled.append({**view, "state": "settled", "since": max(ref.get("updatedAt") or "" for ref in refs),

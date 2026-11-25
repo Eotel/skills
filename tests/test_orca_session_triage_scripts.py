@@ -8507,17 +8507,20 @@ class HourlyStateTests(unittest.TestCase):
                              "--final-message-file", message, "--question-file", message,
                              "--asked-at", "2026-10-28T01:00:00Z", "--covers", "first", "--covers", "second")
         log = self.root / "decisions.jsonl"
-        records = [{"id": key, "decision": key, "answer": f"answer {key}", "decided_at": at}
+        records: list[dict[str, str | dict[str, str]]] = [{"id": key, "decision": key, "answer": f"answer {key}", "decided_at": at}
                    for key, at in (("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T01:00:00Z"))]
         write_jsonl(log, records)
         self.assertEqual(self.call("pending")[1]["questions"][0]["id"], asked["id"])
+        sender = {"handle": "term_lead", "session": "lead-session"}
         records.append({"id": "later", "decision": "second", "answer": "second settled",
-                        "decided_at": "2026-10-28T03:00:00Z"})
+                        "decided_at": "2026-10-28T03:00:00Z", "sender": sender})
         write_jsonl(log, records)
         _, pending = self.call("pending")
         self.assertEqual(pending["questions"], [])
         self.assertEqual([(item["decision"], item["decided_at"]) for item in pending["settled"][0]["evidence"]],
                          [("first", "2026-10-28T02:00:00Z"), ("second", "2026-10-28T03:00:00Z")])
+        proof = pending["settled"][0]["evidence"][1]
+        self.assertEqual((proof["id"], proof["sender"]), ("later", sender))
         self.assertIsNone(self.call("get", "--id", asked["id"])[1]["answer"])
 
     def test_hourly_state_accepts_decision_keys_and_guides_crossed_close_commands(self) -> None:
