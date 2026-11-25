@@ -559,8 +559,7 @@ def transcript_writes(host: SessionHost, window: Window) -> Iterator[Event]:
         yield from readers[transcript.agent](transcript.path, window, host)
 
 
-def timeline(records: Records, host: SessionHost, window: Window, lane: str | None = None) -> list[Event]:
-    """The window's events in time order; with `lane` (a workspace's name, path, or a tab's handle), its own."""
+def timeline(records: Records, host: SessionHost, window: Window) -> tuple[list[Event], Names]:
     inbox = entries(records.inbox)
     board = entries(records.board)
     lanes = names(inbox, board, host)
@@ -569,9 +568,7 @@ def timeline(records: Records, host: SessionHost, window: Window, lane: str | No
         *board_events(board, window, lanes), *holds(records.briefs / "holds.sqlite", window, lanes),
         *undelivered(records.briefs / "undelivered", window, lanes),
         *adoptions(records.adoption, records.adoption_imports, window), *transcript_writes(host, window)]
-    wanted = lanes.of(lane) if lane and lane.startswith("term_") else Path(lane).name if lane else None
-    return sorted((event for event in found if wanted is None or wanted in (event.lane, event.to)),
-                  key=lambda event: event.at)
+    return sorted(found, key=lambda event: event.at), lanes
 
 
 def moment(value: str, now: datetime, *, past_wall_clock: bool = True) -> datetime:
@@ -598,7 +595,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--until",
                         help="この時刻まで（時刻だけの指定は当日。開始も時刻だけで前日なら直近の過去を使用し、"
                              "終了が開始より前になる場合は当日を使用。省くと今まで）")
-    parser.add_argument("--lane", help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle）")
+    parser.add_argument("--lane", action="append", default=[],
+                        help="この作業場が出した・受けた出来事だけ（名前、<repo>/<名前>、パス、端末の handle。繰り返し指定可）")
     parser.add_argument("--match", help="本文にこの文字列を含む出来事だけ（大文字と小文字を区別しない）")
     parser.add_argument("--json", action="store_true", help="1 件 1 オブジェクトの JSON の配列で、本文を全文出す")
     parser.add_argument("--orca", default="orca", help="Orca の CLI（既定: orca）")
@@ -619,15 +617,23 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--until: {error}")
     reason = "--since が未来" if since > now else "--since が --until より後" if since > until else None
     events: list[Event] = []
+    wanted: dict[str, None] = {}
     if reason is None:
         host = OrcaHost.from_environment(args.orca)
-        events = timeline(Records.from_environment(), host, Window(since, until), args.lane)
+        events, lanes = timeline(Records.from_environment(), host, Window(since, until))
+        wanted = dict.fromkeys(lanes.of(lane) if lane.startswith("term_") else Path(lane).name for lane in args.lane)
+        if wanted:
+            events = [event for event in events if event.lane in wanted or event.to in wanted]
         if args.match:
             events = [event for event in events if args.match.casefold() in event.text.casefold()]
     if not events:
         print("0 件" + (f"（{reason}）" if reason else "（指定した条件に該当するイベントなし）"), file=sys.stderr)
     if args.json:
         print(json.dumps([event.row() for event in events], ensure_ascii=False, indent=2))
+    elif len(wanted) > 1:
+        print("\n\n".join("\n".join([f"## {lane}",
+                                  *(event.line() for event in events if lane in (event.lane, event.to))])
+                          for lane in wanted))
     else:
         print("\n".join(event.line() for event in events))
     return 0
