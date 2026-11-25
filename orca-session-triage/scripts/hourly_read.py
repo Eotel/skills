@@ -15,7 +15,7 @@ safety checks.
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import argparse
 import json
 import os
@@ -33,6 +33,7 @@ import hourly_state
 import inbox_read
 import json_output
 import lead_decisions
+import scan_sessions
 from bash_timeout import LOAD_LIMIT
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
@@ -48,6 +49,9 @@ BACKLOG_CURSOR = Path("~/.cache/orca-briefs/backlog-watch/state.json")
 ASANA_PARTIAL = re.compile(r"^Eotel へのレビュー依頼: 未取得", re.MULTILINE)
 BACKLOG_READ_FAILURE = re.compile(r"backlog API.{0,30}(?:fail|失敗|取得でき|読み込め)|"
                                  r"failed to read.{0,30}backlog", re.IGNORECASE)
+OPEN_PRS = ("fragment Linked on PullRequest { url state isDraft updatedAt headRefName "
+            "headRepository { nameWithOwner } }")
+ISSUE_LINK = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/issues/(\d+)")
 
 
 @dataclass(frozen=True)
@@ -290,17 +294,86 @@ def print_read(result: dict, now: datetime) -> None:
         for line in Path(result["stdout"]).read_text(encoding="utf-8").splitlines():
             if line.lstrip().startswith("直す作業場: "):
                 print(line)
-    if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks"):
+    if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))
     if name == "stale-asks":
         if summary := hourly_state.summary(rows, now):
             print(summary)
+    elif name == "pr-followups":
+        print(f"{name}: 48時間以上更新なし {sum(row['stale'] for row in rows)}件"
+              f" | 作業場なし {sum(not row['worktrees'] for row in rows)}件")
+        for row in rows:
+            status = ["Draft"] if row["draft"] else []
+            status.extend(["48時間以上更新なし"] if row["stale"] else [])
+            status.extend(["作業場なし"] if not row["worktrees"] else row["worktrees"])
+            print(f"  {row['url']} | {' / '.join(status)} | " + " ".join(row["issues"]))
     else:
         for row in rows:
             text = " ".join((row.get("text") or "").split())
+            status = inbox_read.open_ask_status(row)
             print(f"{row.get('ts') or '-'} {row.get('source') or '-'} id={row['id']} {text[:160]}"
-                  + ("…" if len(text) > 160 else ""))
+                  + ("…" if len(text) > 160 else "") + (f" | {status}" if status else ""))
+
+
+def linked_open_prs() -> dict[str, dict]:
+    limit = hourly_state.ISSUE_LIMIT
+    assigned, error = hourly_state.gh_json(["search", "issues", "--assignee", "Eotel", "--state", "open",
+                                            "--limit", str(limit), "--json", "url"])
+    if not isinstance(assigned, list) or len(assigned) >= limit:
+        raise ValueError(error or "GitHub issue search did not return a complete result")
+    repos: dict[str, set[int]] = {}
+    for row in assigned:
+        if found := ISSUE_LINK.fullmatch(row.get("url") or ""):
+            repos.setdefault(found[1], set()).add(int(found[2]))
+    prs: dict[str, dict] = {}
+    for repo, refs in repos.items():
+        owner, name = repo.split("/", 1)
+        numbers = sorted(refs)
+        for start in range(0, len(numbers), scan_sessions.GRAPHQL_CHUNK):
+            part = numbers[start:start + scan_sessions.GRAPHQL_CHUNK]
+            fields = " ".join(f"i{number}: issue(number: {number}) {{ url state "
+                              + hourly_state.LINKED_PRS.format(n=scan_sessions.GRAPHQL_CHUNK) + " }" for number in part)
+            query = f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {fields} }} }} {OPEN_PRS}"
+            document = scan_sessions.graphql_repository(repo, query)
+            if document is None:
+                raise ValueError(f"Could not read linked PRs in {repo}")
+            for number in part:
+                issue = document.get(f"i{number}") or {}
+                if issue.get("state") != "OPEN":
+                    continue
+                closed_by = (issue.get("closedByPullRequestsReferences") or {}).get("nodes") or []
+                mentioned = ((event or {}).get("source")
+                             for event in (issue.get("timelineItems") or {}).get("nodes") or [])
+                for pr in [*closed_by, *mentioned]:
+                    if isinstance(pr, dict) and pr.get("state") == "OPEN" and pr.get("url"):
+                        prs.setdefault(pr["url"], {**pr, "issues": set()})["issues"].add(issue["url"])
+    return prs
+
+
+def pr_followups(rows: list[dict], now: datetime) -> list[dict]:
+    prs = linked_open_prs()
+    if not prs:
+        return []
+    checkouts = [(row, scan_sessions.github_of(row).casefold()) for row in rows]
+    followups = []
+    for url, pr in prs.items():
+        head_repo = ((pr.get("headRepository") or {}).get("nameWithOwner") or "").casefold()
+        branch = pr.get("headRefName")
+        worktrees = []
+        for row, repo in checkouts:
+            details = row.get("git") or {}
+            if (any((row.get(key) or {}).get("url") == url for key in ("linked_pr", "pr"))
+                    or head_repo and repo == head_repo and branch
+                    and (details.get("branch") or row.get("branch") or "").removeprefix("refs/heads/") == branch):
+                worktrees.append(scan_sessions.row_identity(row))
+        updated = scan_sessions.parse_time(pr.get("updatedAt"))
+        stale = updated is not None and now - updated >= timedelta(hours=48)
+        if stale or not worktrees:
+            followups.append({"url": url, "draft": bool(pr.get("isDraft")), "stale": stale,
+                              "updated_at": updated.astimezone(lead_decisions.JST).isoformat() if updated else None,
+                              "issues": sorted(pr["issues"]), "worktrees": sorted(set(worktrees))})
+    return sorted(followups, key=lambda pr: (bool(pr["worktrees"]), pr["updated_at"] or "", pr["url"]))
 
 
 def print_completion(result: dict) -> None:
@@ -368,10 +441,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bin-dir", type=Path, default=Path("~/.local/share/eotel-harness/current/bin"),
                         help="installed backlog-watch, asana99_status.py, topic and project-status commands")
     parser.add_argument("--timeout", type=float, default=600, help="seconds per command (default: %(default)s)")
+    parser.add_argument("--scan-prs", type=Path, metavar="SCAN_JSON",
+                        help="read stale or unowned PRs referenced by assigned open issues, using these scanned worktrees")
     args = parser.parse_args(argv)
-    if not args.workspace or args.timeout <= 0:
+    if not args.scan_prs and (not args.workspace or args.timeout <= 0):
         parser.error("--workspace (or ORCA_WORKTREE_ID) and a positive --timeout are required")
     try:
+        if args.scan_prs:
+            json_output.emit(pr_followups(scan_sessions.saved_rows(str(args.scan_prs.expanduser())),
+                                          datetime.now(timezone.utc)))
+            return 0
         root = args.output_root.expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         history = earlier_reads(root)
@@ -411,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         retry_network(tasks, finished, directory, timeout, backlog_before, reachable)
         results = [inbox, *(finished[task.name] for task in tasks)]
         scan = next(item for item in results if item["name"] == "scan")
-        dependent = ("stale-asks", "requests-needing-owner")
+        dependent = ("stale-asks", "requests-needing-owner", "pr-followups")
         if scan["exit_code"] == 0:
             stale_file = directory / "stale-asks.partial.json"
             command = [str(Path(__file__).with_name("hourly_state.py")), "--state-file", str(args.state_file.expanduser())]
@@ -419,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             followups = [
                 ReadTask("stale-asks", [*command, "stale-asks", *common, "--out", str(stale_file)], True, stale_file),
                 ReadTask("requests-needing-owner", [*command, "requests-needing-owner", *common], True),
+                ReadTask("pr-followups", [str(Path(__file__)), "--scan-prs", str(scan["result"])], True),
             ]
             with ThreadPoolExecutor(max_workers=len(followups)) as pool:
                 after_scan = {}

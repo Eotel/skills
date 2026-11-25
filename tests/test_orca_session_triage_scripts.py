@@ -9357,6 +9357,39 @@ class HourlyCleanupCommandTests(unittest.TestCase):
 
 
 class HourlyReadTests(unittest.TestCase):
+    def test_pr_followups_include_stale_drafts_and_fresh_prs_without_worktrees(self) -> None:
+        hourly = load_script("hourly_read")
+        now = datetime.now(timezone.utc)
+        issue = "https://github.com/acme/app/issues/10"
+
+        def pull(number: int, *, hours: int, draft: bool = False, state: str = "OPEN") -> dict:
+            return {"number": number, "url": f"https://github.com/acme/app/pull/{number}", "state": state,
+                    "updatedAt": (now - timedelta(hours=hours)).isoformat(), "isDraft": draft,
+                    "headRefName": f"pr-{number}", "headRepository": {"nameWithOwner": "acme/app"}}
+
+        stale, absent, fresh, closed = (pull(1, hours=50, draft=True), pull(2, hours=3),
+                                        pull(3, hours=3), pull(4, hours=70, state="CLOSED"))
+        with tempfile.TemporaryDirectory() as root:
+            saved = Path(root) / "scan.json"
+            saved.write_text(json.dumps([
+                {"path": f"/w/pr-{number}", "git": {"github": "acme/app", "branch": f"pr-{number}"}}
+                for number in (1, 3)]))
+            graphql = {"i10": {"url": issue, "state": "OPEN",
+                               "closedByPullRequestsReferences": {"nodes": [fresh, closed]},
+                               "timelineItems": {"nodes": [{"source": pr} for pr in (stale, absent)]}}}
+            with (patch.object(hourly.hourly_state, "gh_json", return_value=([{"url": issue}], None)) as search,
+                  patch.object(hourly.scan_sessions, "graphql_repository", return_value=graphql),
+                  redirect_stdout(io.StringIO()) as out):
+                self.assertEqual(hourly.main(["--scan-prs", str(saved)]), 0)
+        self.assertIn("Eotel", search.call_args.args[0])
+        reports = {row["url"]: row for row in json.loads(out.getvalue())}
+        self.assertEqual(set(reports), {stale["url"], absent["url"]})
+        self.assertEqual(reports[stale["url"]]["worktrees"], ["/w/pr-1"])
+        self.assertTrue(reports[stale["url"]]["draft"])
+        self.assertTrue(reports[stale["url"]]["stale"])
+        self.assertEqual(reports[absent["url"]]["worktrees"], [])
+        self.assertFalse(reports[absent["url"]]["stale"])
+
     def test_hourly_read_publishes_the_inbox_offset_and_current_run_before_other_reads(self) -> None:
         hourly = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
@@ -9558,7 +9591,7 @@ class HourlyReadTests(unittest.TestCase):
                 if args[1:2] == ["read"]:
                     stdout.write("NEXT_OFFSET=0\n")
                     return subprocess.CompletedProcess(args, 0)
-                dependent = "stale-asks" in args or "requests-needing-owner" in args
+                dependent = any(arg in args for arg in ("stale-asks", "requests-needing-owner", "--scan-prs"))
                 reads_answers = any(command in args for command in ("lead-state", "unanswered", "pending", "--review-out"))
                 if reads_answers:
                     self.assertTrue((directory / "current" / "open-asks.json").is_file())
@@ -9587,12 +9620,12 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual(code, 1)
             run_dir = (directory / "current").resolve()
             result = json.loads((run_dir / "results.json").read_text())
-            self.assertEqual(len(seen), 14)
+            self.assertEqual(len(seen), 15)
             self.assertEqual({item["name"]: item["exit_code"] for item in result}, {
                 "inbox": 0, "cleanup-hourly-tabs": 0, "lead-state": 0, "open-asks": 0, "unanswered": 0,
                 "pending": 0, "handoff-last": 0, "scan": 0, "backlog-watch": 124,
                 "asana99-status": 0, "topic-check": 7, "tracker-gaps": 0, "stale-asks": 0,
-                "requests-needing-owner": 0})
+                "requests-needing-owner": 0, "pr-followups": 0})
             self.assertEqual(json.loads((run_dir / "scan.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "lead-state.json").read_text()), [])
             self.assertEqual(json.loads((run_dir / "asana99-status.json").read_text()), [])
@@ -9619,7 +9652,7 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual({tuple(item) for item in result},
                              {("name", "command", "exit_code", "stdout", "stderr", "result", "error",
                                "retry", "compared_to", "changes", "read_at", "next_offset")})
-            self.assertEqual({item["error"] for item in result[-2:]}, {"skipped: scan failed"})
+            self.assertEqual({item["error"] for item in result[-3:]}, {"skipped: scan failed"})
 
 
 class HourlyTabCleanupTests(unittest.TestCase):
