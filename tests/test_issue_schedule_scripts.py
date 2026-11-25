@@ -74,6 +74,15 @@ class IssueScheduleTests(unittest.TestCase):
             "body": "既存の本文。\n\n## 予定\n- 着手: From / To\n- 予定工数: 0.5 人日\n",
         })
 
+    def test_start_completes_an_existing_to_only_schedule(self) -> None:
+        result, edit = self.run_schedule(
+            "## 予定\n- 着手: To 2026-12-01\n- 予定工数: 人日\n", "--start", "2026-11-25",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNotNone(edit)
+        assert edit is not None
+        self.assertEqual(edit["body"], "## 予定\n- 着手: From 2026-11-25 / To 2026-12-01\n- 予定工数: 人日\n")
+
     def test_refuses_ambiguous_schedule_without_editing_the_issue(self) -> None:
         result, edit = self.run_schedule(
             "## 予定\n- 着手: From / To\n- 着手: From / To\n- 予定工数:\n", "--start",
