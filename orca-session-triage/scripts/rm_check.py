@@ -699,6 +699,7 @@ class NestedRestore:
     requested: set[Path]
     discard: frozenset[Path] = frozenset()
     since: datetime | None = None
+    already_missing: frozenset[Path] = frozenset()
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
 
@@ -734,7 +735,8 @@ class NestedRestore:
                 last_change = stamp if stamp is not None else file_stamp(next(parent for parent in path.parents if parent.exists()))
             except OSError:
                 return False
-            if cutoff is not None and max(last_change[3:]) > cutoff:
+            if (cutoff is not None and max(last_change[3:]) > cutoff
+                    and not (stamp is None and path in self.already_missing)):
                 return False
             changes[rel] = stamp
         if changes:
@@ -2028,6 +2030,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--discard-before-restore", action="append", default=[], metavar="PATH",
                         help="when planning --restore-nested, a file the batch will discard first")
     parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
+    parser.add_argument("--missing-restore-file", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--restored-file-stamps", type=json.loads, default={}, help=argparse.SUPPRESS)
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
@@ -2078,14 +2081,17 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--archive-path takes a path inside the worktree, relative to it")
     restore_paths = [PurePosixPath(rel) for rel in args.restore_nested]
     discard_paths = [PurePosixPath(rel) for rel in args.discard_before_restore]
+    missing_paths = [PurePosixPath(rel) for rel in args.missing_restore_file]
     if any(path.is_absolute() or not path.parts or ".." in path.parts
-           or any(part.casefold() == ".git" for part in path.parts) for path in (*restore_paths, *discard_paths)):
+           or any(part.casefold() == ".git" for part in path.parts) for path in (*restore_paths, *discard_paths, *missing_paths)):
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
     if args.apply_restore_nested and not restore_paths:
         parser.error("--apply-restore-nested needs --restore-nested")
     if args.restore_approval and (not args.apply_restore_nested or not args.from_file
                                   or not re.fullmatch(r"[0-9a-f]{64}", args.restore_approval)):
         parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
+    if missing_paths and not args.restore_approval:
+        parser.error("--missing-restore-file needs --restore-approval")
     if discard_paths and (not restore_paths or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
         parser.error("--discard-before-restore can only be used to plan --restore-nested")
     restored = args.restored_file_stamps
@@ -2246,7 +2252,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                       decided=tuple(decided), since=since, restored=restored,
                       scan_file=args.from_file.expanduser().absolute() if args.from_file else None)
     restore = (NestedRestore(root, {root / path for path in restore_paths},
-                             frozenset(root / path for path in discard_paths), since)
+                             frozenset(root / path for path in discard_paths), since,
+                             frozenset(root / path for path in missing_paths))
                if restore_paths else None)
     result = recheck(restore=restore)
 
@@ -2293,7 +2300,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
-            latest = NestedRestore(root, set(restore.plans), since=since)
+            latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
             for copy in restore.plans:
                 latest.allows_changes(copy)
             with restoration_lock():
@@ -2327,6 +2334,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             result["blockers"].append(NESTED_RESTORE + ", ".join(restore.display()))
             result["ok"] = False
             result["restore_nested"] = restore.display()
+            result["restore_missing_files"] = [str((copy / rel).relative_to(root))
+                                               for copy, plan in restore.plans.items()
+                                               for rel, stamp in plan.files.items() if stamp is None]
 
     copied = []
     # Nothing is written to main while anything else keeps the worktree.
