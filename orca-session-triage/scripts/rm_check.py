@@ -1278,18 +1278,19 @@ def file_stamp(path: Path) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
-def disk_entry(directory: Path, name: str) -> Path:
+def disk_entry(directory: Path, name: str, listings: dict[Path, dict[str, Path]]) -> Path:
+    if directory not in listings:
+        listings[directory] = {entry.name: entry for entry in directory.iterdir()}
+    entries = listings[directory]
+    if name in entries:
+        return entries[name]
     path = directory / name
     identity = path.lstat()
-    spelling = normalize("NFC", name).casefold()
-    alias = None
-    for entry in directory.iterdir():
-        if entry.name == name:
+    spelling = normalize("NFD", normalize("NFD", name).casefold())
+    for entry in entries.values():
+        normalized = normalize("NFD", normalize("NFD", entry.name).casefold())
+        if normalized == spelling and os.path.samestat(entry.lstat(), identity):
             return entry
-        if normalize("NFC", entry.name).casefold() == spelling and os.path.samestat(entry.lstat(), identity):
-            alias = entry
-    if alias is not None:
-        return alias
     raise FileNotFoundError(path)
 
 
@@ -2336,10 +2337,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
                         break
                     try:
+                        listings: dict[Path, dict[str, Path]] = {}
                         for rel in paths:
                             path = copy
                             for part in Path(rel).parts:
-                                path = disk_entry(path, part)
+                                path = disk_entry(path, part, listings)
                             restored[str(path.relative_to(root))] = file_stamp(path)
                     except OSError as error:
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")

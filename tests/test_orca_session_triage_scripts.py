@@ -5716,10 +5716,12 @@ class RmCheckTests(unittest.TestCase):
         if not tracked.exists():
             self.skipTest("requires normalization-insensitive file lookup")
 
-        code, result = self.run_main("--archive-path", tracked.name, "--archive-dir", str(self.wt.parent / "archive"))
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--archive-path", tracked.name, "--archive-dir", str(self.wt.parent / "archive"))
 
         self.assertEqual((code, result["archived"]), (1, []), result)
         self.assertEqual(on_disk.read_text(), "tracked file\n")
+        self.assertTrue(any("追跡済みのファイル" in reason for reason in result["reasons"]), result)
 
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")
@@ -6476,28 +6478,38 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((copies[1] / "app.txt").read_text(), "saved during preflight\n")
 
     def test_nested_restore_records_actual_directory_spelling(self) -> None:
-        folder = self.main / "folder"
-        folder.mkdir()
-        (folder / "app.txt").write_text("tracked\n")
-        git(self.main, "add", "folder/app.txt")
+        spellings = (("folder", "Folder"), ("Μαΐου", "ΜΑΪ́ΟΥ"))
+        generated = self.main / "__generated__"
+        ignore = self.main / ".gitignore"
+        ignore.write_text(ignore.read_text() + "__generated__/\n")
+        git(self.main, "add", ".gitignore")
+        for original, _ in spellings:
+            folder = generated / original
+            folder.mkdir(parents=True)
+            (folder / "app.txt").write_text("tracked\n")
+            git(self.main, "add", "-f", f"__generated__/{original}/app.txt")
         git(self.main, "commit", "-qm", "track nested fixture file")
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
         copy = self.wt / "local-deps/library"
         git(self.main, "clone", "-q", str(remote), str(copy))
         (self.main / ".git/info/exclude").write_text("local-deps/\n")
-        (copy / "folder").rename(copy / "Folder")
-        if not (copy / "folder").exists():
-            self.skipTest("requires a case-insensitive filesystem")
-        filename = copy / "Folder/app.txt"
-        filename.write_text("changed\n")
+        generated = copy / "__generated__"
+        for original, on_disk in spellings:
+            (generated / original).rename(generated / on_disk)
+            if not (generated / original).exists():
+                self.skipTest("requires a case-insensitive filesystem with normalized lookup")
+            (generated / on_disk / "app.txt").write_text("changed\n")
         since = datetime.now(timezone.utc).isoformat()
 
-        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
 
         self.assertEqual(code, 0, result)
-        self.assertIn("local-deps/library/Folder/app.txt", result["restored_file_stamps"])
-        self.assertEqual(filename.read_text(), "tracked\n")
+        disk_names = {str((child / "app.txt").relative_to(self.wt.resolve())) for child in generated.resolve().iterdir()}
+        self.assertEqual(set(result["restored_file_stamps"]), disk_names)
+        for _, on_disk in spellings:
+            self.assertEqual((generated / on_disk / "app.txt").read_text(), "tracked\n")
 
     def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
