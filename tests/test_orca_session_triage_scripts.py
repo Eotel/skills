@@ -5827,6 +5827,40 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(changed["review"], [".env (differs from main checkout)",
                                              "out/ (not in main checkout)"])
 
+    def test_a_valid_cache_directory_tag_makes_ignored_tool_output_regenerable(self) -> None:
+        (self.main / ".git/info/exclude").write_text(".uv-cache/\nother-cache/\n")
+        tagged = self.wt / ".uv-cache"
+        untagged = self.wt / "other-cache"
+        for path in (tagged, untagged):
+            path.mkdir()
+            (path / "rows.db").write_text("contents")
+        (tagged / "CACHEDIR.TAG").write_bytes(b"Signature: 8a477f597d28d172789f06886806bc55\n# uv cache\n")
+        (untagged / "CACHEDIR.TAG").symlink_to(tagged / "CACHEDIR.TAG")
+
+        code, result = self.run_main()
+        self.assertEqual((code, result["regenerable"]), (1, [".uv-cache/"]))
+        self.assertEqual([item["path"] for item in result["held"]], ["other-cache/"])
+        self.assertTrue(any(".uv-cache/" in note and "CACHEDIR.TAG" in note for note in result["notes"]))
+
+    def test_same_run_topic_drift_holds_the_named_worktree_until_the_next_clean_scan(self) -> None:
+        folder = self.wt.parent / "hourly"
+        folder.mkdir()
+        saved = folder / "scan.json"
+        saved.write_text("[]")
+        topic = folder / "topic-check.stdout"
+        url = "https://github.com/acme/example/pull/81"
+        topic.write_text(f"{url}\n  Asana: 完了 True → False（asana_sync.py {url} で直る）\n"
+                         f"  直す作業場: {self.wt}（merge-pr merged、2026-11-24T11:13:06+09:00、agent なし）\n"
+                         "https://github.com/acme/example/pull/82\n  直す作業場: なし（作業場はもう無い）\n")
+
+        code, result = self.run_main("--from", str(saved))
+        self.assertEqual((code, result["ok"]), (1, False))
+        self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
+        self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
+
+        topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
+        self.assertEqual(self.run_main("--from", str(saved))[0], 0)
+
     def test_ignored_tool_output_is_regenerable_only_while_it_holds_no_other_work(self) -> None:
         (self.main / ".git" / "info" / "exclude").write_text("site/\nweb/var/\nweb/test_*.sqlite3\n")
         (self.wt / "mkdocs.yaml").write_text("site_name: docs\n")
@@ -9228,6 +9262,20 @@ class HourlyCleanupCommandTests(unittest.TestCase):
 
 
 class HourlyReadTests(unittest.TestCase):
+    def test_topic_drift_workspace_lines_are_printed_even_when_the_check_exits_one(self) -> None:
+        hourly = load_script("hourly_read")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "topic-check.stdout"
+            path.write_text("https://github.com/acme/example/pull/81\n"
+                            "  直す作業場: /worktrees/example/a（agent なし）\n"
+                            "https://github.com/acme/example/pull/82\n"
+                            "  直す作業場: /worktrees/example/b（agent なし）\n")
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 1, "stdout": str(path)},
+                                  datetime.now(timezone.utc))
+            self.assertIn("直す作業場: /worktrees/example/a", out.getvalue())
+            self.assertIn("直す作業場: /worktrees/example/b", out.getvalue())
+
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
