@@ -4273,6 +4273,27 @@ class ScanCommandTests(unittest.TestCase):
         command = next(line for line in shown.splitlines() if "close_tabs.py" in line)
         self.assertTrue(command.endswith(" term_agent"), command)
 
+    def test_saved_scan_holds_remote_removal_candidates_named_by_that_runs_topic_check(self) -> None:
+        saved = self.dir / "scan.json"
+        path = "/remote/worktrees/app/lane"
+        saved.write_text(json.dumps([{"path": path, "environment": "mbp16", "repo": "app",
+                                     "terminals": [], "class": "finished"}]))
+        topic = self.dir / "topic-check.stdout"
+        url = "https://github.com/acme/example/pull/81"
+        topic.write_text(f"{url}\n  Asana: 完了 True → False（asana_sync.py {url} で直る）\n"
+                         f"  直す作業場: {path}（agent なし）\n")
+
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        held, = json.loads(out.getvalue())
+        self.assertIn(f"asana_sync.py {url}", " ".join(held["cleanup_blockers"]))
+
+        topic.write_text("照合 1 件・食い違い 0 件・読めない 0 件\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        clear, = json.loads(out.getvalue())
+        self.assertFalse(clear["cleanup_blockers"])
+
     def test_row_lists_both_agents_transcript_paths(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
