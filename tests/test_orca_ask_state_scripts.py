@@ -64,6 +64,39 @@ class AskStateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)[0]
 
+    def test_both_question_recording_commands_refuse_an_ask_claimed_elsewhere(self) -> None:
+        self.write_lines(self.claims, [{"id": f"{self.ASK}:1", "by": "/w/lead", "ts": self.AT}])
+        item = {"row": "/w/worker", "decision": self.KEY, "final_message": "公開しますか？",
+                "question": "公開しますか？"}
+        text = self.root / "question.txt"
+        text.write_text(item["question"])
+        commands = [
+            (("asked-many", "--no-comment"), json.dumps(item)),
+            (("asked", "--no-comment", "--row", item["row"], "--decision", self.KEY,
+              "--final-message-file", str(text), "--question-file", str(text)), None),
+        ]
+        for args, stdin in commands:
+            with self.subTest(command=args[0]):
+                result = self.run_tool("hourly_state.py", *args, stdin=stdin)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("/w/lead", result.stderr)
+                self.assertIn(self.ASK, result.stderr)
+                self.assertFalse(self.state.exists())
+
+    def test_open_asks_explains_a_partial_claim_and_an_answered_question(self) -> None:
+        second = {**self.question, "header": "日付", "question": "日付を変更しますか？"}
+        self.write_lines(self.inbox, [{"id": self.ASK, "ts": self.AT, "kind": "ask",
+                                      "worktree": "worker", "questions": [self.question, second, self.question]}])
+        self.write_lines(self.answers, [{"id": f"{self.ASK}:1", "ts": self.AT, "how": "send", "note": "公開する"}])
+        self.write_lines(self.claims, [{"id": f"{self.ASK}:2", "by": "/w/lead", "ts": self.AT}])
+        shown = self.run_tool("inbox_read.py", "open-asks", "--json", "--orca", "false")
+        [ask] = json.loads(shown.stdout)
+        self.assertEqual(ask["answered_questions"], [1])
+        self.assertEqual(ask["open_questions"][0]["claimed"], {"by": "/w/lead", "at": self.AT})
+        line = self.run_tool("inbox_read.py", "open-asks", "--orca", "false")
+        self.assertIn("Q1 回答済み", line.stdout)
+        self.assertIn("Q2 伺い中 /w/lead", line.stdout)
+
     def python(self, code: str) -> subprocess.CompletedProcess[str]:
         result = subprocess.run([sys.executable, "-c", code], cwd=SCRIPTS, env=self.env,
                                 capture_output=True, text=True, timeout=30)

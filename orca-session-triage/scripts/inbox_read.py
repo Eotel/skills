@@ -768,12 +768,34 @@ def overlapping_claims(claims: dict[str, Claim], claimed: str, open_keys: frozen
     return [claims[key] for key in keys if key in claims and key in open_keys]
 
 
+def open_claim_keys(asks: Iterable[OpenAsk]) -> frozenset[str]:
+    return frozenset(key for ask in asks for key in (
+        ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+
+
+def claim_conflicts(claims: dict[str, Claim], ids: Iterable[str], by: str, open_keys: frozenset[str]) -> list[Claim]:
+    import ask_state
+
+    return list({claim.id: claim for claimed in ids for claim in overlapping_claims(claims, claimed, open_keys)
+                 if not ask_state.same_workspace(claim.by, by)}.values())
+
+
+def check_claim_lead(ids: Iterable[str], entries: list[dict], by: str, since: str | None = None, *,
+                    state_file: Path | None = None, orca: str | None = None) -> None:
+    import handoff
+
+    ask_ids = {key.partition(":")[0] for key in ids}
+    sources = {str(report[field]) for report in entries if report.get("id") in ask_ids
+               for field in ("handle", "worktree") if report.get(field)}
+    if sources and (why := handoff.require_lead_stopped(sources, since, allow_lead=by, state_file=state_file, orca=orca)):
+        raise ValueError(f"{why}。指揮が伺うため、この回では重ねて伺わないでください")
+
+
+
 def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str],
                   take_over: bool = False) -> list[Claim]:
     """Append one claim line per id under a lock, unless another worktree already claims an open ask or
     question they cover: then return those claims and write nothing, so two tabs never both go on to ask."""
-    import ask_state
-
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")
     with ExitStack() as locks:
@@ -783,8 +805,7 @@ def record_claims(path: Path, ids: list[str], by: str, open_keys: frozenset[str]
         if stream is not None:
             fcntl.flock(stream, fcntl.LOCK_EX)
         held = read_claims(path)
-        taken = list({claim.id: claim for claimed in ids for claim in overlapping_claims(held, claimed, open_keys)
-                      if not ask_state.same_workspace(claim.by, by)}.values())
+        taken = claim_conflicts(held, ids, by, open_keys)
         if taken and not take_over:
             return taken
         # Taking over an ask also takes its questions another worktree claimed one by one.
@@ -849,7 +870,8 @@ def checked_claims(claims: dict[str, Claim], now: datetime, orca: str, projects:
             for key, claim in claims.items()}
 
 
-def open_ask_view(ask: OpenAsk, now: datetime, claims: dict[str, Claim] | None = None) -> dict:
+def open_ask_view(ask: OpenAsk, now: datetime, claims: dict[str, Claim] | None = None,
+                  answered: frozenset[str] = frozenset()) -> dict:
     report, claims = ask.report, claims or {}
     claimed = ask_claim(ask, claims)
     return {"id": report["id"], "ts": report.get("ts") or "", "host": report.get("host") or "",
@@ -858,7 +880,22 @@ def open_ask_view(ask: OpenAsk, now: datetime, claims: dict[str, Claim] | None =
                                 "claimed": (found.view() if (found := question_claim(claims, report["id"], number))
                                             else None)} for number in ask.open_questions],
             "claimed": claimed.view() if claimed else None,
+            "answered_questions": [number for number in range(1, len(questions_of(report)) + 1)
+                                   if f"{report['id']}:{number}" in answered],
             "age_minutes": minutes_since(ask.at, now)}
+
+
+def open_ask_status(row: dict) -> str:
+    def label(claim: dict) -> str:
+        return claim_label(Claim(row["id"], claim["by"], claim["at"], claim.get("inactive_minutes")))
+
+    parts = [f"Q{number} 回答済み" for number in row.get("answered_questions", [])]
+    if claim := row.get("claimed"):
+        parts.append(label(claim))
+    else:
+        parts.extend(f"Q{part['number']} {label(part['claimed'])}" for part in row.get("open_questions", [])
+                     if part.get("claimed"))
+    return " | ".join(parts)
 
 
 def pending_questions(asks: list[OpenAsk]) -> list[PendingQuestion]:
@@ -1261,22 +1298,19 @@ def main(argv: list[str] | None = None) -> int:
                 lane_input.reconcile_answers(inbox, answers_path(), getattr(args, "orca", None)
                                              or os.environ.get("ORCA_CLI_COMMAND", "orca"))
             entries = inbox_entries(inbox)
-            asks = open_asks(entries, answered_ids(answers_path()) | set(withdrawal_times(entries)))
-            open_keys = frozenset(key for ask in asks for key in (
-                ask.report["id"], *(f"{ask.report['id']}:{number}" for number in ask.open_questions)))
+            answers = answer_records(answers_path())
+            withdrawn = set(withdrawal_times(entries))
+            answered = frozenset(key for key, record in answers.items()
+                                 if record.get("how") != "triage-notify --withdraws" and key not in withdrawn)
+            asks = open_asks(entries, frozenset(answers) | withdrawn)
+            open_keys = open_claim_keys(asks)
             claims = {key: claim for key, claim in read_claims(claims_path()).items() if key in open_keys}
             now = datetime.now().astimezone()
             if args.action == "claim":
                 if not args.by.strip():
                     raise ValueError("--by names the worktree asking")
                 ids = checked_answer_ids(args.ids, entries)
-                import handoff
-
-                reports = {item["id"]: item for item in entries if item.get("id")}
-                sources = {str(reports[key.partition(":")[0]].get(field) or "")
-                           for key in ids for field in ("handle", "worktree")} - {""}
-                if why := handoff.require_lead_stopped(sources, args.since, allow_lead=args.by.strip()):
-                    raise ValueError(why)
+                check_claim_lead(ids, entries, args.by.strip(), args.since)
                 taken = record_claims(claims_path(), ids, args.by.strip(), open_keys, args.take_over)
                 for claim in taken:
                     print(f"inbox-read: {claim.id} は {claim_label(claim)}。重ねて伺わない"
@@ -1333,13 +1367,13 @@ def main(argv: list[str] | None = None) -> int:
             elif args.json or args.out:
                 claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 asks = close_held_notices(asks, answers_path())
-                json_output.emit([open_ask_view(ask, now, claims) for ask in asks], args.out)
+                json_output.emit([open_ask_view(ask, now, claims, answered) for ask in asks], args.out)
             else:
                 claims = checked_claims(claims, now, args.orca, args.claude_projects)
                 for ask in close_held_notices(asks, answers_path()):
                     age = minutes_since(ask.at, now)
-                    claim = ask_claim(ask, claims)
-                    print(f"{claim_label(claim) + ' ' if claim else ''}"
+                    status = open_ask_status(open_ask_view(ask, now, claims, answered))
+                    print(f"{status + ' | ' if status else ''}"
                           f"unanswered {'?' if age is None else age} min: {summary_line(ask.report)}")
             return 0
         data = inbox.read_bytes()
