@@ -773,7 +773,7 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
     tracked: dict[str, list[tuple[Path, str, str]]] = {}
     for entry in index.split("\0"):
         metadata, _, name = entry.partition("\t")
-        if metadata.startswith(("100644 ", "100755 ")):
+        if metadata.startswith(("100644 ", "100755 ", "120000 ")):
             mode, blob, _ = metadata.split()
             tracked.setdefault(filename_key(name), []).append((Path(name), mode, blob))
     listings: dict[Path, dict[str, Path]] = {}
@@ -784,16 +784,26 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
             return True
         try:
             actual = disk_path(copy, Path(name), listings)
-            if actual.is_symlink() or not actual.is_file():
+            if actual.is_symlink():
+                mode = "120000"
+            elif actual.is_file():
+                mode = "100755" if actual.stat().st_mode & 0o100 else "100644"
+            else:
                 return True
-            mode = "100755" if actual.stat().st_mode & 0o100 else "100644"
             expected = {blob for path, tracked_mode, blob in aliases
                         if tracked_mode == mode and disk_path(copy, path, listings) == actual}
             if not expected:
                 return True
-            hashed = git(copy, "hash-object", "--no-filters", "--", str(actual))
-            if hashed.returncode or hashed.stdout.strip() not in expected:
-                return True
+            if mode == "120000":
+                target = os.readlink(os.fsencode(actual))  # noqa: PTH115 - Git hashes the raw symlink target.
+                hashed_link = subprocess.run(["git", "-C", str(copy), "hash-object", "--stdin"],
+                                             input=target, capture_output=True)
+                if hashed_link.returncode or os.fsdecode(hashed_link.stdout).strip() not in expected:
+                    return True
+            else:
+                hashed = git(copy, "hash-object", "--no-filters", "--", str(actual))
+                if hashed.returncode or hashed.stdout.strip() not in expected:
+                    return True
         except OSError:
             return True
     return False

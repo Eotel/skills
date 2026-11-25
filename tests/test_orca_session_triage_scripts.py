@@ -6582,7 +6582,8 @@ class RmCheckTests(unittest.TestCase):
         versioned = self.main / original / "inside/app.txt"
         versioned.parent.mkdir(parents=True)
         versioned.write_text("tracked\n")
-        git(self.main, "add", str(versioned.relative_to(self.main)))
+        versioned.with_name("link").symlink_to("app.txt")
+        git(self.main, "add", str(versioned.parent.relative_to(self.main)))
         git(self.main, "commit", "-qm", "track Unicode file")
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6596,12 +6597,15 @@ class RmCheckTests(unittest.TestCase):
             self.skipTest("requires a case-insensitive filesystem with normalized lookup")
         file = copy / alias / "inside/app.txt"
         file.unlink()
+        link = file.with_name("link")
+        link.unlink()
 
         with patch.object(rmcheck, "processes_in", return_value=[]):
             code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested")
 
         self.assertEqual((code, result["ok"]), (0, True), result)
         self.assertEqual(file.read_text(), "tracked\n")
+        self.assertEqual(link.readlink(), Path("app.txt"))
         (self.main / ".git/info/exclude").write_text("")
         with patch.object(rmcheck, "processes_in", return_value=[]):
             code, retry = self.run_main("--restore-nested", rel, "--apply-restore-nested")
