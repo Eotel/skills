@@ -35,6 +35,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 from bash_timeout import LOAD_LIMIT
+from rm_check import topic_check_outputs
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
                "read_at", "next_offset")
@@ -69,7 +70,8 @@ def read_task(task: ReadTask, directory: Path, timeout: float, *, retry: bool = 
               "stdout": str(stdout), "stderr": str(stderr)}
     with stdout.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
         try:
-            completed = subprocess.run(task.command, stdout=output, stderr=errors, text=True, timeout=timeout)
+            env = {**os.environ, "TOPIC_CHECK_FIXER_JSON": "1"} if task.name == "topic-check" else None
+            completed = subprocess.run(task.command, stdout=output, stderr=errors, text=True, timeout=timeout, env=env)
             result["exit_code"] = completed.returncode
         except subprocess.TimeoutExpired as error:
             result.update(exit_code=124, error=str(error))
@@ -291,9 +293,11 @@ def print_read(result: dict, now: datetime) -> None:
             if rows:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
     if name == "topic-check":
-        for line in Path(result["stdout"]).read_text(encoding="utf-8").splitlines():
-            if line.lstrip().startswith("直す作業場: "):
-                print(line)
+        lines = dict.fromkeys(line for path in topic_check_outputs(Path(result["stdout"]).parent)
+                              for line in path.read_text(encoding="utf-8").splitlines()
+                              if line.lstrip().startswith("直す作業場: "))
+        for line in lines:
+            print(line)
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))

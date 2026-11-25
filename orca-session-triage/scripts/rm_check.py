@@ -1737,20 +1737,46 @@ def print_check(result: dict, summary: bool) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def topic_check_output(scan_file: Path) -> Path | None:
-    directory = scan_file.expanduser().parent
-    return next((path for name in ("topic-check.retry.stdout", "topic-check.stdout")
-                 if (path := directory / name).is_file()), None)
+def topic_check_outputs(directory: Path) -> list[Path]:
+    retry = directory / "topic-check.retry.stdout"
+    first = directory / "topic-check.stdout"
+    if not retry.is_file():
+        return [first] if first.is_file() else []
+    lines = retry.read_text(encoding="utf-8").splitlines()
+    if lines and re.fullmatch(r"照合 .*・読めない 0 件", lines[-1]):
+        return [retry]
+    return [first, retry] if first.is_file() else [retry]
+
+
+def scan_topic_blockers(scan_file: Path) -> dict[Path, list[str]]:
+    blockers: dict[Path, list[str]] = {}
+    for path in topic_check_outputs(scan_file.expanduser().parent):
+        for target, reasons in topic_drift_blockers(path).items():
+            blockers[target] = list(dict.fromkeys((*blockers.get(target, []), *reasons)))
+    return blockers
 
 
 def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
+    structured: set[str] = set()
     pr = None
     target = None
     commands: list[str] = []
     for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
+        if line.startswith("topic-fixer-json: "):
+            item = json.loads(line.removeprefix("topic-fixer-json: "))
+            if (not isinstance(item, dict) or not TOPIC_PR.fullmatch(str(item.get("pr") or ""))
+                    or not isinstance(item.get("worktree"), str) or not Path(item["worktree"]).is_absolute()
+                    or not isinstance(item.get("commands"), list)
+                    or not all(isinstance(command, str) for command in item["commands"])):
+                raise ValueError(f"invalid topic fixer record in {path}")
+            fix = "・".join(dict.fromkeys(item["commands"])) or "修正コマンドの記録なし"
+            blockers.setdefault(Path(item["worktree"]), []).append(
+                f"topic check で修正担当に指定されています（{item['pr']}、{fix}）")
+            structured.add(item["pr"])
+            continue
         if line and not line[0].isspace():
-            if pr and target and target.is_absolute():
+            if pr and pr not in structured and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
                 blockers.setdefault(target, []).append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
             pr = line if TOPIC_PR.fullmatch(line) else None
@@ -1952,12 +1978,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
-    topic = args.topic_check
-    if topic is None and args.from_file:
-        topic = topic_check_output(args.from_file)
-    if topic is not None:
+    if args.topic_check or args.from_file:
         try:
-            decided.extend(reason for target, reasons in topic_drift_blockers(topic.expanduser()).items()
+            drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check
+                     else scan_topic_blockers(args.from_file))
+            decided.extend(reason for target, reasons in drift.items()
                            if target.resolve() == Path(worktree) for reason in reasons)
         except (OSError, ValueError) as error:
             decided.append(f"topic check の結果を確認できません（{error}）")

@@ -4294,6 +4294,30 @@ class ScanCommandTests(unittest.TestCase):
         clear, = json.loads(out.getvalue())
         self.assertFalse(clear["cleanup_blockers"])
 
+    def test_saved_scan_keeps_structured_fixer_after_incomplete_topic_retry(self) -> None:
+        saved = self.dir / "scan.json"
+        path = "/remote/worktrees/app（修正）/lane"
+        url = "https://github.com/acme/example/pull/81"
+        command = f"asana_sync.py {url}"
+        saved.write_text(json.dumps([{"path": path, "environment": "mbp16", "repo": "app",
+                                     "terminals": [], "class": "finished"}]))
+        first = self.dir / "topic-check.stdout"
+        first.write_text(f'topic-fixer-json: {json.dumps({"pr": url, "worktree": path, "commands": [command]})}\n'
+                         f"{url}\n  Asana: 完了 True → False（{command} で直る）\n"
+                         f"  直す作業場: {path}（状態修正（Asana）、agent なし）\n")
+        retry = self.dir / "topic-check.retry.stdout"
+        retry.write_text("照合 1 件・食い違い 0 件・読めない 1 件\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        held, = json.loads(out.getvalue())
+        self.assertIn(command, " ".join(held["cleanup_blockers"]))
+
+        retry.write_text("照合 1 件・食い違い 0 件・読めない 0 件\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved)]), 0)
+        clear, = json.loads(out.getvalue())
+        self.assertFalse(clear["cleanup_blockers"])
+
     def test_row_lists_both_agents_transcript_paths(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
