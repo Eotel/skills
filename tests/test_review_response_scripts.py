@@ -486,7 +486,7 @@ class WatchPrsTests(unittest.TestCase):
                 kind = args[-1].split("?")[0].rsplit("/", 1)[-1]
                 if kind not in (billing or {}):
                     return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
-                body = (billing or {})[kind]
+                body = {"budgets": []} if "scope=organization" in args[-1] else (billing or {})[kind]
             else:
                 body = [feeds.get(args[-1].split("?")[0], [])]
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")

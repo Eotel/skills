@@ -92,7 +92,7 @@ def actions_billing_note(owner: str) -> str:
         return values if isinstance(values, list) and all(isinstance(item, dict) for item in values) else None
 
     now = datetime.now(timezone.utc)
-    budgets = get("budgets?scope=organization&per_page=100", "budgets") or []
+    budgets = get("budgets?per_page=100", "budgets") or []
     amounts = []
     for budget in budgets:
         products = budget.get("budget_product_skus")
