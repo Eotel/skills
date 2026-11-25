@@ -132,6 +132,7 @@ MORNING, AFTERNOON, EVENING, NIGHT = 9, 13, 17, 21
 PR_REF = re.compile(r"gh\s+pr\s+(?:checks|view|status|merge)\s+(\d+)|/pull/(\d+)")
 REPO_FLAG = re.compile(r"(?:-R|--repo)[ =]([\w.-]+/[\w.-]+)|github\.com/([\w.-]+/[\w.-]+)/pull/")
 SENTENCE = re.compile(r"[^。\n]+[。]?")
+OPTION_LINE = re.compile(r"^\s*-\s*選択肢\s*[:：]\s*(.*)")
 QUOTED = re.compile(r"「[^」]*」|『[^』]*』|`[^`]*`")
 PROMISE_VERB = re.compile(r"(?:行い|進め|確かめ|確認し|対応し|流し|再開し|直し|送り|知らせ|伺い|見直し|やり|し)ます(?:。|$)")
 NOT_PROMISE = re.compile(r"ました|でした|予定です|ません|ですか|ますか|お願い|ください|いただ|提案")
@@ -161,6 +162,8 @@ class Report:
     text: str
     handle: str
     questions: int = 0
+    choices: tuple[tuple[str, ...], ...] = ()
+    repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -425,8 +428,28 @@ def kept_elsewhere(row: Mapping, records: Records) -> bool:
                 or claude.get("one_shot_schedules"))
 
 
+def option_sentence(text: str) -> str:
+    return " ".join(text.split()).strip(" -・「」『』`。")
+
+
+def open_options(reports: Sequence[Report], records: Records) -> set[str]:
+    options = set()
+    for ask in reports:
+        if ask.kind != "ask" or covering_answers(ask, records):
+            continue
+        for number, choices in enumerate(ask.choices, 1):
+            if f"{ask.id}:{number}" not in records.answers_by_ask:
+                options.update(option_sentence(sentence) for choice in choices for sentence in SENTENCE.findall(choice))
+        for line in ask.text.splitlines():
+            if match := OPTION_LINE.match(line):
+                options.update(option_sentence(sentence) for text in (line, *re.split(r"\s+/\s+|[／、]", match[1]))
+                               for sentence in SENTENCE.findall(text))
+    return options
+
+
 def promise_signals(row: Mapping, act: Activity, records: Records, now: datetime) -> list[Signal]:
-    reports = lane_reports(row, records)
+    repos = scan.row_repos(row)
+    reports = [report for report in lane_reports(row, records) if not report.repo or not repos or report.repo in repos]
     said: list[tuple[str, str, datetime]] = [(reports[-1].id, reports[-1].text, reports[-1].at)] if reports else []
     claude, codex = row.get("claude") or {}, (row.get("codex") or [{}])[-1]
     if claude.get("final_text") and (at := parse(claude.get("final_at"))):
@@ -435,11 +458,13 @@ def promise_signals(row: Mapping, act: Activity, records: Records, now: datetime
         said.append(("rollout", codex["last_assistant"], at))
     if kept_elsewhere(row, records):
         return []
+    options = open_options(reports, records)
     for source, text, at in sorted(said, key=lambda item: item[2], reverse=True):
-        due = promise_due(text, at)
+        sentences = [sentence for sentence in SENTENCE.findall(text) if option_sentence(sentence) not in options]
+        due = promise_due("\n".join(sentences), at)
         if due is None or now < due or moved_since(act, due):
             continue
-        line = next(sentence.strip() for sentence in SENTENCE.findall(text) if promise_due(sentence, at) == due)
+        line = next(sentence.strip() for sentence in sentences if promise_due(sentence, at) == due)
         return [base_signal(
             row, act, records, "promise_unscheduled", f"{source[:8]}@{due:%Y%m%dT%H%M}",
             f"{short(at)} に「{line[:120]}」と書いたが、{short(due)} を過ぎても動いておらず、hold・引き継ぎ・期日・"
@@ -771,6 +796,18 @@ def safe_json(line: str) -> object:
         return None
 
 
+def question_options(question: object) -> tuple[str, ...]:
+    if not isinstance(question, dict) or not isinstance(question.get("options"), list):
+        return ()
+    choices = []
+    for option in question["options"]:
+        if isinstance(option, dict):
+            label = str(option.get("label") or "")
+            description = str(option.get("description") or "")
+            choices.extend((label, description, f"{label}: {description}"))
+    return tuple(choices)
+
+
 def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
     """The records as they stood at `now`; a later entry is left out so a replay sees that moment."""
     inbox, answers, holds, board, hourly_state, remotes = INBOX, ANSWERS, HOLDS, BOARD, HOURLY_STATE, REMOTES
@@ -780,9 +817,11 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
             continue
         at = parse(item.get("ts"))
         if at and at <= now and item.get("worktree") and item.get("kind") in ("ask", "done", "info"):
+            questions = inbox_read.questions_of(item)
+            choices = tuple(map(question_options, questions))
             reports.setdefault(item["worktree"], []).append(
                 Report(str(item.get("id") or ""), item["kind"], at, str(item.get("text") or ""),
-                       str(item.get("handle") or ""), len(inbox_read.questions_of(item))))
+                       str(item.get("handle") or ""), len(questions), choices, str(item.get("repo") or "")))
     given: dict[str, list[Answer]] = {}
     for item in read_jsonl(answers):
         at = parse(item.get("ts"))
