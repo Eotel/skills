@@ -298,10 +298,11 @@ workspace has no agent, goes to the lead.
 read under the same output root. A current `tracker:<key>` decision starting
 with `放置:` marks a gap `ignored` and preserves the decision text and time.
 Leave marked items with their recorded decision.
-The standard output also lists the `backlog_deadlines` alerts for overdue
-issues, deadlines up to three days away, and deadline changes made by someone
-else in the last 24 hours. Use these alerts in the hourly report. Route tracker
-fixes from the `gaps` rows.
+With a Harness release whose `project-status --gaps --json` returns
+`backlog_deadlines`, the standard output lists overdue issues, deadlines up
+to three days away, and deadline changes made by someone else in the last
+24 hours. Use these alerts in the hourly report. Route tracker fixes from
+the `gaps` rows.
 
 Asana status and Backlog Watch compare with the most recent successful read of
 their own command in the same directory history, ordered by command read time.
