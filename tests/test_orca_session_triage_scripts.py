@@ -6413,12 +6413,46 @@ class RmCheckTests(unittest.TestCase):
         repo_file = Path("locale/de/LC_MESSAGES/django.po")
         for copy in (linked, clone):
             (copy / repo_file).write_text("changed\n")
-        code, result = self.run_main("--restore-nested", "local-deps/library", "--restore-nested", "local-deps/pushed",
-                                     "--apply-restore-nested", "--detach-nested")
+        options = ("--restore-nested", "local-deps/library", "--restore-nested", "local-deps/pushed")
+        exclude = self.main / ".git/info/exclude"
+        exclude.write_text("")
+        _, preview = self.run_main(*options)
+        self.assertEqual(set(preview["restore_nested"]), {"local-deps/library", "local-deps/pushed"}, preview)
+
+        exclude.write_text("local-deps/\n")
+        code, result = self.run_main(*options, "--apply-restore-nested", "--detach-nested")
         self.assertEqual(code, 0, result)
         self.assertEqual(set(result["restored_nested"]), {"local-deps/library", "local-deps/pushed"})
         self.assertFalse(linked.exists())
         self.assertFalse(git(clone, "status", "--porcelain"))
+
+    def test_nested_restore_revalidates_every_repository_before_the_first_write(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copies = [(self.wt / "local-deps" / name).resolve() for name in ("first", "second")]
+        for copy in copies:
+            git(self.main, "clone", "-q", str(remote), str(copy))
+            (copy / "app.txt").write_text("before scan\n")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        since = datetime.now(timezone.utc).isoformat()
+        actual_git = rmcheck.git
+        index_calls = 0
+
+        def save_during_index_lookup(cwd: str | Path, *args: str,
+                                     env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal index_calls
+            if Path(cwd) == copies[1] and args[-2:] == ("--git-path", "index"):
+                index_calls += 1
+                if index_calls == 2:
+                    (copies[1] / "app.txt").write_text("saved during preflight\n")
+            return actual_git(cwd, *args, env=env)
+
+        with patch.object(rmcheck, "git", side_effect=save_during_index_lookup):
+            code, result = self.run_main("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested", "--since", since)
+        self.assertEqual((code, index_calls), (1, 2), result)
+        self.assertEqual((copies[0] / "app.txt").read_text(), "before scan\n")
+        self.assertEqual((copies[1] / "app.txt").read_text(), "saved during preflight\n")
 
     def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"

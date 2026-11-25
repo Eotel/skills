@@ -661,6 +661,17 @@ def dependency_clones(worktree: Path, rel: str, linked: Sequence[Path] = ()) -> 
                                    and not (copy / ".git").is_symlink() for copy in copies) else []
 
 
+def nested_dependencies(worktree: Path, rel: str) -> tuple[list[Path], list[Path]]:
+    source = worktree / rel
+    linked = nested_worktrees(source)
+    if linked == [source]:
+        return [], linked
+    clones = dependency_clones(worktree, rel, linked)
+    if linked and set(source.iterdir()) != set(linked + clones):
+        return [], []
+    return clones, linked
+
+
 class CloneResult(NamedTuple):
     blockers: list[str]
     details: list[str]
@@ -669,8 +680,16 @@ class CloneResult(NamedTuple):
 @dataclass(frozen=True)
 class NestedRestorePlan:
     head: str
-    index: list[int]
+    index: Path
+    index_stamp: list[int]
     files: dict[str, list[int] | None]
+
+    def matches(self, copy: Path) -> bool:
+        try:
+            return (file_stamp(self.index) == self.index_stamp
+                    and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
+        except OSError:
+            return False
 
 
 @dataclass
@@ -689,7 +708,8 @@ class NestedRestore:
         head = git(copy, "rev-parse", "--verify", "HEAD")
         status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
         tracked = git(copy, "ls-tree", "-rz", "HEAD")
-        if head.returncode or status.returncode or tracked.returncode:
+        index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        if head.returncode or status.returncode or tracked.returncode or index.returncode:
             return False
         entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
                    for info, _, rel in (item.partition("\t"),)}
@@ -709,25 +729,21 @@ class NestedRestore:
                            for parent in path.parents if parent.is_relative_to(copy))):
                 return False
             try:
-                stamp = file_stamp(path)
-            except FileNotFoundError:
-                stamp = None
+                stamp = optional_stamp(path)
             except OSError:
                 return False
             if cutoff is not None and stamp is not None and max(stamp[3:]) > cutoff:
                 return False
             changes[rel] = stamp
         if changes:
-            index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
-            if index.returncode:
-                return False
+            index_path = Path(index.stdout.strip())
             try:
-                stamp = file_stamp(Path(index.stdout.strip()))
+                stamp = file_stamp(index_path)
             except OSError:
                 return False
             if cutoff is not None and max(stamp[3:]) > cutoff:
                 return False
-            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), stamp, changes)
+            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), index_path, stamp, changes)
         return True
 
     def display(self) -> dict[str, list[str]]:
@@ -813,7 +829,7 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
             continue
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel if main is not None else None
-        if source in discard and (source.is_file() or source.is_symlink()):
+        if any(path.is_relative_to(source) for path in discard) and all(path in discard for path in files_in(source)):
             continue
         if holds_nothing(source) or (copy is not None and same_tree(source, copy)):
             continue
@@ -823,9 +839,8 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
             else:
                 regenerable.append(rel)
             continue
-        found = nested_worktrees(source)
-        clones = dependency_clones(Path(worktree), rel, found) if found != [source] else []
-        if found and (found == [source] or set(source.iterdir()) == set(found + clones)):
+        clones, found = nested_dependencies(Path(worktree), rel)
+        if found:
             nested.extend(found)
             if not clones:
                 continue
@@ -1256,6 +1271,13 @@ def file_stamp(path: Path) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
 
 
+def optional_stamp(path: Path) -> list[int] | None:
+    try:
+        return file_stamp(path)
+    except FileNotFoundError:
+        return None
+
+
 def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]]) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
@@ -1302,8 +1324,12 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     changes, bytecode = working_changes(worktree)
     clone_notes = []
     clone_checks: dict[Path, CloneResult] = {}
+    untracked_nested: list[Path] = []
     for rel in changes[:]:
-        if clones := dependency_clones(Path(worktree), rel):
+        if PurePosixPath(rel).parts[:1] != ("local-deps",):
+            continue
+        clones, linked = nested_dependencies(Path(worktree), rel)
+        if clones or linked:
             if tracked(Path(worktree), PurePosixPath(rel)):
                 continue
             checked = [(clone, clone_check(clone, clone_checks, restore).blockers) for clone in clones]
@@ -1315,6 +1341,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
             if all(not problems for _, problems in checked):
                 changes.remove(rel)
                 bytecode.append(rel)
+                untracked_nested.extend(linked)
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -1354,7 +1381,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
         worktree, main, clone_checks=clone_checks, restore=restore)
     notes.extend(clone_notes)
     notes.extend(merge_notes)
-    nested = [nested_check(copy, restore) for copy in nested]
+    nested = [nested_check(copy, restore) for copy in dict.fromkeys([*untracked_nested, *nested])]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
     if ready:
@@ -2231,10 +2258,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
-            for copy, approved in restore.plans.items():
-                latest = NestedRestore(root, {copy}, since=since)
-                if not latest.allows_changes(copy) or latest.plans.get(copy) != approved:
-                    decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
+            latest = NestedRestore(root, set(restore.plans), since=since)
+            for copy in restore.plans:
+                latest.allows_changes(copy)
+            changed = [copy for copy, plan in restore.plans.items() if latest.plans.get(copy) != plan or not plan.matches(copy)]
+            for copy in changed:
+                decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
+            for copy, approved in (() if changed else restore.plans.items()):
+                if not approved.matches(copy):
+                    decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                     break
                 paths = list(approved.files)
                 done = git(copy, "--literal-pathspecs", "restore", f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
