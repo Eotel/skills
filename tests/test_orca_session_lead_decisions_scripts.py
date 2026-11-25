@@ -100,6 +100,28 @@ class LeadDecisionsTests(unittest.TestCase):
                          [("merge:Eotel/skills#80", "merge する")])
         self.assertEqual(self.log.read_text(encoding="utf-8").splitlines()[0], first_line)
 
+    def test_unanswered_and_match_find_the_inbox_answer_to_an_implicit_key(self) -> None:
+        ask_id = "a1234567-1234-4567-8888-123456789abc"
+        key = "answer:app/lane::a1234567"
+        Path(self.env["TRIAGE_INBOX"]).write_text(json.dumps({
+            "id": ask_id, "kind": "ask", "repo": "app", "worktree": "lane", "text": "次の配備先は？",
+            "ts": "2026-11-25T01:00:00Z"}) + "\n")
+        Path(self.env["TRIAGE_ASK_ANSWERS"]).write_text(json.dumps({
+            "id": ask_id, "ts": "2026-11-25T02:00:00Z", "how": "inbox_read.py answered",
+            "note": "検証環境に配備する"}) + "\n")
+        self.handed_off.write_text(json.dumps({"decision": key, "handed_off_at": "2026-11-25T01:30:00Z"}) + "\n")
+        unresolved = self.run_tool("unanswered", "--handed-off-file", str(self.handed_off), "--decision", key,
+                                   "--state-file", str(self.root / "state.json"), "--orca", "false")
+        self.assertEqual(unresolved.returncode, 0, unresolved.stderr)
+        result = json.loads(unresolved.stdout)
+        self.assertEqual(result["unanswered"], [])
+        self.assertEqual(result["settled"][0]["answer"]["note"], "検証環境に配備する")
+        found = self.run_tool("show", "--match", "配備先", "--json")
+        self.assertEqual(found.returncode, 0, found.stderr)
+        [answer] = json.loads(found.stdout)
+        self.assertEqual((answer["ask_id"], answer["decided_at"], answer["answer"]),
+                         (ask_id, "2026-11-25T02:00:00Z", "検証環境に配備する"))
+
     def test_summary_lists_open_keys_without_dumping_settled_answers(self) -> None:
         self.record("remove:/w/done", "回答の長い本文" * 100)
         result = self.run_tool("unanswered", "--decision", "remove:/w/done",
