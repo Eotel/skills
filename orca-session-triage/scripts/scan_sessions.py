@@ -4446,8 +4446,24 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError:
             entries = []
         asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers))
-        return with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(),
+        rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(),
                                         open_asks=asks, known_tabs=known_tabs)
+        if args.from_file and (topic := rm_check.topic_check_output(Path(args.from_file))):
+            try:
+                drift = rm_check.topic_drift_blockers(topic)
+            except (OSError, ValueError) as error:
+                for row in rows:
+                    row["cleanup_blockers"].append(f"topic check の結果を確認できません（{error}）")
+            else:
+                for row in rows:
+                    path = Path(row["path"])
+                    reasons = drift.get(path, []) if row.get("environment") else [
+                        reason for target, blockers in drift.items() if target.resolve() == path.resolve()
+                        for reason in blockers]
+                    if reasons:
+                        row["cleanup_blockers"].extend(reasons)
+                        row["closable"] = []
+        return rows
 
     if args.from_file:
         try:
