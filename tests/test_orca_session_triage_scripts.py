@@ -4197,6 +4197,82 @@ class ScanCommandTests(unittest.TestCase):
                 self.assertIn("candidates: /w/app/fix-login (environment local, repo app), "
                               "mbp16::fix-login (environment mbp16, repo app)", err.getvalue())
 
+    def test_row_accepts_the_github_owner_and_repo_from_rows(self) -> None:
+        saved, _ = self.saved_scan()
+        rows = json.loads(saved.read_text())
+        rows[0]["git"] = {"github": "example/app"}
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", "example/app/fix-login"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["path"], "/w/app/fix-login")
+
+    def test_row_can_inspect_a_remote_main_checkout_absent_from_the_scan(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text("[]")
+        path = "/remote/projects/app"
+        tab = terminal(path, None, "term_shell")
+        tab["lastOutputAt"] = 1_797_072_000_000
+        replies = [{"worktrees": [worktree(path, main=True)]}, {"terminals": [tab]}]
+        with patch.object(scan, "orca_payload", side_effect=replies), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--row", f"mbp16::{path}"]), 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual((result["main"], result["class"], result["tab_count"]), (True, "unstarted", 1))
+        self.assertEqual(result["last_output_at"], "2026-12-12T10:40:00Z")
+
+    def test_recheck_reads_current_transcript_and_pending_question_instead_of_saved_verdict(self) -> None:
+        saved = self.dir / "scan.json"
+        path = "/w/app/lane"
+        saved.write_text(json.dumps([{"path": path, "repo": "app", "class": "finished",
+                                     "claude": {"final_text": "以前の回答"}}]))
+        projects = self.dir / "projects"
+        asked = {"type": "tool_use", "id": "call-1", "name": "AskUserQuestion",
+                 "input": {"questions": [{"header": "変更", "question": "変更を適用しますか？"}]}}
+        write_jsonl(scan.claude_project_dir(projects, path) / "current.jsonl", [
+            user("continue"), {**assistant(text("現在の進捗")), "timestamp": "2026-11-25T04:00:00Z"},
+            {**assistant(asked), "timestamp": "2026-11-25T04:02:00Z"},
+        ])
+        replies = [{"worktrees": [worktree(path, "waiting")]},
+                   {"terminals": [terminal(path, "claude")]},
+                   {"terminal": {"source": "screen",
+                                 "tail": ["変更を適用しますか？", "❯ 1. 適用する", "2. 保留する",
+                                          "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]}}]
+        with patch.object(scan, "orca_payload", side_effect=replies), redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--recheck", "app/lane",
+                                        "--claude-projects", str(projects), "--codex-sessions", str(self.dir / "none")]), 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual((result["final"]["text"], result["final"]["at"]), ("現在の進捗", "2026-11-25T04:00:00Z"))
+        self.assertEqual(result["pending_questions"][0]["questions"][0]["header"], "変更")
+        self.assertEqual(result["prompt_waiting"]["asked_at"], "2026-11-25T04:02:00Z")
+
+    def test_codex_update_notice_appears_in_summary_and_wake(self) -> None:
+        path = "/w/app/lane"
+        notice = ["Update available", "1. Update now", "2. Skip", "enter continue · esc skip"]
+        terms = [terminal(path, "codex", "term_update", preview="\n".join(notice))]
+        rows = scan.build_inventory([worktree(path, "working", agent="codex")], terms, self.dir, {}, "要判断")
+        self.assertIn("Update available", " ".join(rows[0]["reasons"]))
+        self.assertNotIn("term_update", rows[0]["closable"])
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps(rows))
+        with redirect_stdout(io.StringIO()) as summary:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        self.assertIn("Update available", summary.getvalue())
+        with redirect_stdout(io.StringIO()) as wake:
+            self.assertEqual(scan.main(["--from", str(saved), "--wake"]), 0)
+        self.assertIn("terminal send --terminal term_update --text $'\\x1b'", wake.getvalue())
+
+    def test_finished_summary_offers_a_close_command_for_agent_tabs_only(self) -> None:
+        saved = self.dir / "scan.json"
+        saved.write_text(json.dumps([{"path": "/w/app/lane", "repo": "app", "class": "finished",
+                                    "terminals": [{"handle": "term_agent", "agent": "claude"},
+                                                  {"handle": "term_shell", "agent": None}],
+                                    "closable": ["term_agent", "term_shell"]}]))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(scan.main(["--from", str(saved), "--summary"]), 0)
+        shown = out.getvalue()
+        self.assertIn("closable: agent 1 / shell 1", shown)
+        command = next(line for line in shown.splitlines() if "close_tabs.py" in line)
+        self.assertTrue(command.endswith(" term_agent"), command)
+
     def test_row_lists_both_agents_transcript_paths(self) -> None:
         saved, _ = self.saved_scan()
         rows = json.loads(saved.read_text())
