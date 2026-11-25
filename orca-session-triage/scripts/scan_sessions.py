@@ -4311,7 +4311,10 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
     options = [*from_scan, "--summary"]
-    plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
+    restore = (row.get("removal_decision") or {}).get("restore_nested")
+    if restore and (requirement := batch_requirement(row)):
+        return requirement
+    plan_cleanup = bool((row.get("open_pr_cleanup") or restore) and scan_file and batch_has_preview())
     if not remove_ok and not plan_cleanup and not environment:
         return shlex.join([str(RM_CHECK), *options, *decision_options(decisions_file),
                            row["path"], pr_spec(row)])

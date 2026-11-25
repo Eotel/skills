@@ -3224,6 +3224,16 @@ class ScanCommandTests(unittest.TestCase):
         self.assertNotIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
         self.assertNotIn("rm-check-batch", out.getvalue())
 
+    def test_finished_row_with_restore_approval_uses_batch_preview(self) -> None:
+        row = {"path": "/w/app/finished", "repo": "app", "class": "finished",
+               "removal_decision": {"approve": True, "restore_nested": ["local-deps/library"]}}
+        saved = self.dir / "scan.json"
+        with patch.object(scan, "batch_help", return_value="--preview --decisions-file LOG recorded restore_nested"):
+            command = shlex.split(scan.rm_check_command(row, saved))
+        self.assertEqual(Path(command[0]).name, "rm-check-batch")
+        self.assertIn("--preview", command)
+        self.assertNotIn("--remove-ok", command)
+
     def test_remote_cleanup_hides_commands_for_keep_and_pending_handoff(self) -> None:
         saved = self.dir / "scan.json"
         base = {"path": "/w/app/remote", "repo": "app", "class": "finished", "terminals": [],
@@ -6359,6 +6369,56 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(filename.read_text(), original)
         self.assertFalse(git(copy, "status", "--porcelain"))
+
+    def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = (self.wt / "local-deps/library").resolve()
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        actual_git = rmcheck.git
+        for stage in (False, True):
+            with self.subTest(stage=stage):
+                filename.write_text("before the scan\n")
+                since = datetime.now(timezone.utc).isoformat()
+                calls = 0
+
+                def edit_during_recheck(cwd: str | Path, *args: str,
+                                        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    nonlocal calls
+                    if Path(cwd) == copy and "--no-renames" in args:
+                        calls += 1
+                        if calls == 2:
+                            if stage:
+                                git(copy, "add", "app.txt")
+                            else:
+                                filename.write_text("after the scan\n")
+                    return actual_git(cwd, *args, env=env)
+
+                with patch.object(rmcheck, "git", side_effect=edit_during_recheck):
+                    code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                                 "--since", since)
+                self.assertEqual((calls, code), (2, 1), result)
+                if stage:
+                    self.assertEqual(git(copy, "show", ":app.txt").strip(), "before the scan")
+                else:
+                    self.assertEqual(filename.read_text(), "after the scan\n")
+
+    def test_nested_restore_allows_clones_and_linked_worktrees_in_one_directory(self) -> None:
+        linked = self.nested_catalog()
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        repo_file = Path("locale/de/LC_MESSAGES/django.po")
+        for copy in (linked, clone):
+            (copy / repo_file).write_text("changed\n")
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--restore-nested", "local-deps/pushed",
+                                     "--apply-restore-nested", "--detach-nested")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(set(result["restored_nested"]), {"local-deps/library", "local-deps/pushed"})
+        self.assertFalse(linked.exists())
+        self.assertFalse(git(clone, "status", "--porcelain"))
 
     def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"

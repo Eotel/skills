@@ -205,7 +205,7 @@ def working_changes(worktree: str | Path) -> tuple[list[str], list[str]]:
     """(uncommitted, regenerable): paths `git status` reports, split off the untracked bytecode in them."""
     uncommitted, regenerable = [], []
     # -z gives each path unquoted; a rename's second entry names its source and is skipped.
-    entries = iter(git(worktree, "status", "--porcelain", "-z").stdout.split("\0"))
+    entries = iter(git(worktree, "--no-optional-locks", "status", "--porcelain", "-z").stdout.split("\0"))
     for entry in entries:
         if not entry:
             continue
@@ -648,7 +648,7 @@ class IgnoredPaths(NamedTuple):
     held: list[Held]
 
 
-def dependency_clones(worktree: Path, rel: str) -> list[Path]:
+def dependency_clones(worktree: Path, rel: str, linked: Sequence[Path] = ()) -> list[Path]:
     """Standalone clones at an untracked/ignored local-deps path containing nothing else."""
     path = PurePosixPath(rel)
     if not path.parts or path.parts[0] != "local-deps" or len(path.parts) > 2:
@@ -656,7 +656,7 @@ def dependency_clones(worktree: Path, rel: str) -> list[Path]:
     source = worktree / rel
     if source.is_symlink() or not source.is_dir():
         return []
-    copies = sorted(source.iterdir()) if len(path.parts) == 1 else [source]
+    copies = sorted(set(source.iterdir()) - set(linked)) if len(path.parts) == 1 else [source]
     return copies if copies and all(not copy.is_symlink() and (copy / ".git").is_dir()
                                    and not (copy / ".git").is_symlink() for copy in copies) else []
 
@@ -666,12 +666,20 @@ class CloneResult(NamedTuple):
     details: list[str]
 
 
+@dataclass(frozen=True)
+class NestedRestorePlan:
+    head: str
+    index: list[int]
+    files: dict[str, list[int] | None]
+
+
 @dataclass
 class NestedRestore:
     root: Path
     requested: set[Path]
     discard: frozenset[Path] = frozenset()
-    plans: dict[Path, tuple[str, list[str]]] = field(default_factory=dict)
+    since: datetime | None = None
+    plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
 
     def allows_changes(self, copy: Path) -> bool:
@@ -679,13 +687,13 @@ class NestedRestore:
             return False
         self.found.add(copy)
         head = git(copy, "rev-parse", "--verify", "HEAD")
-        status = git(copy, "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
+        status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
         tracked = git(copy, "ls-tree", "-rz", "HEAD")
         if head.returncode or status.returncode or tracked.returncode:
             return False
         entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
                    for info, _, rel in (item.partition("\t"),)}
-        changes = []
+        changes: dict[str, list[int] | None] = {}
         for item in filter(None, status.stdout.split("\0")):
             rel = item[3:]
             path = copy / rel
@@ -699,13 +707,27 @@ class NestedRestore:
                     or any(parent.exists() and not parent.is_dir()
                            for parent in path.parents if parent.is_relative_to(copy))):
                 return False
-            changes.append(rel)
+            try:
+                changes[rel] = file_stamp(path)
+            except FileNotFoundError:
+                changes[rel] = None
+            except OSError:
+                return False
         if changes:
-            self.plans[copy] = (head.stdout.strip(), changes)
+            index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+            if index.returncode:
+                return False
+            try:
+                stamp = file_stamp(Path(index.stdout.strip()))
+            except OSError:
+                return False
+            if self.since and stamp[3] > self.since.timestamp() * 1e9:
+                return False
+            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), stamp, changes)
         return True
 
     def display(self) -> dict[str, list[str]]:
-        return {str(copy.relative_to(self.root)): paths for copy, (_, paths) in self.plans.items()}
+        return {str(copy.relative_to(self.root)): list(plan.files) for copy, plan in self.plans.items()}
 
 
 def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None) -> CloneResult:
@@ -716,7 +738,7 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
     blockers = []
     branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
     details = [f"branch {branch or '(detached HEAD)'}"]
-    status = git(copy, "status", "--porcelain", "--untracked-files=all")
+    status = git(copy, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all")
     approved = restore is not None and restore.allows_changes(copy)
     if status.returncode or (status.stdout.strip() and not approved):
         blockers.append("uncommitted changes or git status failed")
@@ -782,7 +804,7 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
     root = Path(worktree).resolve()
     cache_tags: dict[Path, bool] = {}
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
-    for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
+    for entry in git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
             continue
         rel = entry[3:]
@@ -798,10 +820,12 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
                 regenerable.append(rel)
             continue
         found = nested_worktrees(source)
-        if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
+        clones = dependency_clones(Path(worktree), rel, found) if found != [source] else []
+        if found and (found == [source] or set(source.iterdir()) == set(found + clones)):
             nested.extend(found)
-            continue
-        if clones := dependency_clones(Path(worktree), rel):
+            if not clones:
+                continue
+        if clones:
             for clone in clones:
                 examined = clone_check(clone, clone_checks, restore)
                 if examined.blockers:
@@ -888,7 +912,7 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     repository = main_checkout(copy) or ""
     blockers = []
     changes, _ = working_changes(copy)
-    modified = set(git(copy, "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
+    modified = set(git(copy, "--no-optional-locks", "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
     regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
                    and (copy / rel).with_suffix(".po").is_file()
                    and str(Path(rel).with_suffix(".po")) not in changes]
@@ -2181,7 +2205,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
                       decided=tuple(decided), since=since, restored=restored,
                       scan_file=args.from_file.expanduser().absolute() if args.from_file else None)
-    restore = (NestedRestore(root, {root / path for path in restore_paths}, frozenset(root / path for path in discard_paths))
+    restore = (NestedRestore(root, {root / path for path in restore_paths},
+                             frozenset(root / path for path in discard_paths), since)
                if restore_paths else None)
     result = recheck(restore=restore)
 
@@ -2197,12 +2222,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=args.detach_nested, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
-            for copy, (head, paths) in restore.plans.items():
-                latest = NestedRestore(root, {copy})
-                if not latest.allows_changes(copy) or latest.plans.get(copy) != (head, paths):
+            for copy, approved in restore.plans.items():
+                latest = NestedRestore(root, {copy}, since=since)
+                if not latest.allows_changes(copy) or latest.plans.get(copy) != approved:
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                     break
-                done = git(copy, "--literal-pathspecs", "restore", f"--source={head}", "--staged", "--worktree", "--", *paths)
+                paths = list(approved.files)
+                done = git(copy, "--literal-pathspecs", "restore", f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
                 if done.returncode:
                     decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
                     break
