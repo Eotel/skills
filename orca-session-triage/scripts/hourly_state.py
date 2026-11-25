@@ -1233,14 +1233,14 @@ def new_references(data: dict, askings: list[Asking]) -> dict[str, list[dict]]:
                                 for asking in askings if current_question(data, asking) is None})
 
 
-def record_question(data: dict, asking: Asking, references: dict[str, list[dict]]) -> dict:
-    """Record the question, or, when every issue and PR it names is CLOSED, record nothing and give that evidence.
-    A question another session already put (`asking.session`) is recorded all the same: it only accounts for that
-    call. A recorded question names its session (CLAUDE_CODE_SESSION_ID by default), its transcript's name."""
+def record_question(data: dict, asking: Asking, references: dict[str, list[dict]], *,
+                    open_asks: frozenset[str] = frozenset()) -> dict:
+    """Record the question unless every reference is CLOSED and there is no open inbox ask or existing call."""
     refs = references.get(asking.key) or []
     existing = current_question(data, asking)
-    if (existing is None and asking.session is None and refs
-            and all(ref.get("state") == "CLOSED" for ref in refs)):
+    closed = bool(refs) and all(ref.get("state") == "CLOSED" for ref in refs)
+    backed = asking.ask in open_asks
+    if existing is None and asking.session is None and closed and not backed:
         return {"state": "settled", "recorded": False, "row": asking.row, "question": asking.question,
                 "evidence": refs}
     new = existing is None
@@ -1255,6 +1255,7 @@ def record_question(data: dict, asking: Asking, references: dict[str, list[dict]
                                               "asked_in": str(worktree()), "covers": list(dict.fromkeys(asking.covers)),
                                               "answer": None})
     return {"id": key, **data["questions"][key], "asking": ask_state.asking(data, None, {}, row=data["questions"][key]["row"]),
+            **({"closed_references": refs} if new and backed and closed else {}),
             **({"merged_after_basis": merged} if new and (merged := merged_after(asking, refs)) else {})}
 
 
@@ -1377,8 +1378,29 @@ class Inbox:
 
     @cached_property
     def asks(self) -> list[dict]:
-        return [item for item in inbox_read.inbox_entries(inbox_read.paths()[0])
+        return [item for item in inbox_entries()
                 if item.get("kind") == "ask" and item.get("id")]
+
+    def check_claims(self, questions: list[Asking], state_file: Path, orca: str) -> frozenset[str]:
+        if not questions:
+            return frozenset()
+        entries = inbox_entries()
+        refs = [ref for question in questions for ref in ask_state.references(
+            {"decision": question.decision, "ask_id": question.ask, "covers": question.covers}, entries)]
+        if not refs:
+            return frozenset()
+        open_keys = inbox_read.open_claim_keys(inbox_read.open_asks(
+            entries, inbox_read.answered_ids(inbox_read.answers_path()) | set(inbox_read.withdrawal_times(entries))))
+        wanted = {f"{ask_id}:{number}" if number else ask_id for ask_id, numbers in refs for number in numbers or (0,)}
+        ids = wanted & open_keys
+        if ids:
+            by = str(worktree())
+            inbox_read.check_claim_lead(ids, entries, by, state_file=state_file, orca=orca)
+            taken = inbox_read.claim_conflicts(inbox_read.read_claims(inbox_read.claims_path()), ids, by, open_keys)
+            if taken:
+                raise ValueError("。".join(f"ask {claim.id} は {inbox_read.claim_label(claim)}" for claim in taken)
+                                 + "。重ねて伺わないでください")
+        return open_keys
 
     @cached_property
     def rows(self) -> list[dict]:
@@ -1542,6 +1564,8 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
     asked questions never recorded (`unrecorded`, from unrecorded_questions). An unanswered question carries
     `reissued` (withdrawn_by) from the inbox `entries`."""
     questions, settled = [], []
+    open_keys = inbox_read.open_claim_keys(inbox_read.open_asks(
+        entries or [], inbox_read.answered_ids(inbox_read.answers_path()) | set(inbox_read.withdrawal_times(entries or []))))
     references = question_references({key: item for key, item in data["questions"].items()
                                       if item["answer"] is None and not item.get("withdrawn_at")})
     for key, item in data["questions"].items():
@@ -1560,7 +1584,8 @@ def pending(data: dict, decisions: dict[str, lead_decisions.Decision],
                 covered, key=lambda answer: scan_sessions.parse_time(answer.decided_at) or now).decided_at,
                             "evidence": [{"decision": answer.decision, "decided_at": answer.decided_at,
                                           "answer": answer.answer} for answer in covered]})
-        elif (refs := references.get(key, [])) and all(ref.get("state") == "CLOSED" for ref in refs):
+        elif ((refs := references.get(key, [])) and all(ref.get("state") == "CLOSED" for ref in refs)
+              and item.get("ask_id") not in open_keys):
             settled.append({**view, "state": "settled", "since": max(ref.get("updatedAt") or "" for ref in refs),
                             "evidence": refs})
         else:
@@ -1667,7 +1692,8 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
                         covers=tuple(args.covers), session=args.session, header=args.header)
         if selected_rows is not None:
             reuse_question_rows(data, [asking], selected_rows)
-        return record_question(data, asking, new_references(data, [asking]))
+        open_keys = Inbox(args.from_file).check_claims([asking], Path(args.state_file).expanduser(), args.orca)
+        return record_question(data, asking, new_references(data, [asking]), open_asks=open_keys)
     if args.action == "answered":
         return record_answer(data, Answering(
             answer=file_text(args.answer_file), id=args.id, answered_at=args.answered_at,
@@ -1936,7 +1962,7 @@ def main(argv: list[str] | None = None) -> int:
                            '8 or more characters; N selects one question), whose lane and text become the row and final message, or "row" and '
                            '"final_message"; every line is checked first, and a wrong one writes nothing. A line '
                            'whose #numbers are all CLOSED is not recorded: each is named after the output '
-                           '(記録しなかった: 行 N), and the exit code is 2')
+                           '(記録しなかった: 行 N), and the exit code is 2. A line bound to an open ask is still recorded')
     asked_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
     asked_many.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                             help="the rows scan_sessions.py printed as JSON, where an ask's worktree (and its tab, "
@@ -2170,13 +2196,17 @@ def main(argv: list[str] | None = None) -> int:
                 planned = [line for _, line in askings if isinstance(line, Asking)]
                 if inbox.scan is not None:
                     reuse_question_rows(data, planned, inbox.rows)
+                open_keys = inbox.check_claims(planned, path, args.orca)
                 references = new_references(data, planned)
-                result = record_lines(askings, lambda asking: record_question(data, asking, references))
+                result = record_lines(askings, lambda asking: record_question(
+                    data, asking, references, open_asks=open_keys))
                 # record_lines returned, so every line was read: the results follow the lines.
                 unrecorded = [f"記録しなかった: 行 {number}（問いの #番号がすべて閉じている: " + "、".join(
                     f"{ref['repo']}#{ref['number']} {ref['state']}" for ref in item["evidence"]) + "）"
                     for (number, _), item in zip(askings, result) if item.get("recorded") is False]
                 notices.extend(unrecorded)
+                notices.extend(f"注意: 行 {number} の参照はすべて CLOSED です。未回答の ask {item['ask_id']} の問いを記録しました"
+                               for (number, _), item in zip(askings, result) if item.get("closed_references"))
                 skipped = bool(unrecorded)
             elif args.action == "answered-many":
                 answerings = checked_lines(given, answering_line)

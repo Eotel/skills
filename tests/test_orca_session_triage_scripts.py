@@ -8283,6 +8283,25 @@ class HourlyStateTests(unittest.TestCase):
             _, remote = self.call("asked", *args[1:2], f"mbp16::{lane}", *args[3:])
         self.assertIsNone(remote["answer"])
 
+    def test_asked_many_keeps_a_linked_unanswered_ask_even_when_its_issue_is_closed(self) -> None:
+        lane = self.root / "lane"
+        subprocess.run(["git", "init", "-q", str(lane)], check=True)
+        subprocess.run(["git", "-C", str(lane), "remote", "add", "origin", "git@github.com:acme/app.git"], check=True)
+        scan_file = self.source("scan.json", json.dumps([{"path": str(lane), "repo": "app"}]))
+        ask = {"id": "abcd1234-0000-ask", "kind": "ask", "worktree": "lane", "repo": "app",
+               "ts": "2026-11-25T00:00:00Z", "text": "閉じた #10 の変更を配備しますか？"}
+        write_jsonl(self.root / "inbox.jsonl", [ask])
+        questions = self.source("questions.jsonl", json.dumps(
+            {"ask": ask["id"], "decision": "deploy", "question": ask["text"]}))
+        closed = {"item_10": {"state": "CLOSED", "updatedAt": "2026-11-24T00:00:00Z"}}
+        with (patch.object(scan, "graphql_repository", return_value=closed), redirect_stderr(io.StringIO()) as err):
+            code, [recorded] = self.call("asked-many", "--from", scan_file, "--file", questions, "--no-comment")
+            pending = self.call("pending")[1]
+        self.assertEqual(code, 0)
+        self.assertIn("CLOSED", err.getvalue())
+        self.assertEqual(recorded["ask_id"], ask["id"])
+        self.assertEqual([item["id"] for item in pending["questions"]], [recorded["id"]])
+
     def test_pending_settles_covers_only_after_every_keys_answer_is_later_than_the_question(self) -> None:
         message = self.source("message.txt", "Choose both releases?")
         _, asked = self.call("asked", "--row", "/w/lane", "--decision", "both",
@@ -11579,6 +11598,48 @@ class StopCheckTests(unittest.TestCase):
             os.environ["ORCA_PANE_KEY"] = "new-pane"
             cursor.write_text(str(inbox.stat().st_size - len('{"kind":"ask","worktree":"partial"')))
             self.assertIsNone(self.check(active=True, cwd="/w/triage", orca=orca))
+
+    def test_an_older_run_displays_the_default_cursor_owner_without_blocking_stop(self) -> None:
+        inbox = self.root / "inbox.jsonl"
+        cursor = self.root / "read.offset"
+        write_jsonl(inbox, [{"kind": "ask", "worktree": "waiting-lane", "text": "question"}])
+        later = {**automation_run("completed", "2026-11-25T13:00:00+09:00"),
+                 "scheduledFor": 1795579200000, "trigger": "scheduled", "terminalPaneKey": "new-pane",
+                 "workspaceId": "repo1::/w/triage"}
+        orca = self.fake_orca([triage_automation("a1", "/w/triage")], {"a1": [
+            later, {**later, "scheduledFor": later["scheduledFor"] - 3600000, "terminalPaneKey": "old-pane"}]})
+        with (patch.dict(os.environ, {"TRIAGE_READ_OFFSET": "", "ORCA_PANE_KEY": "old-pane",
+                                       "ORCA_WORKTREE_ID": "repo1::/w/triage"}),
+              patch.object(inbox_read, "paths", return_value=(inbox, cursor))):
+            result = self.check(active=True, cwd="/w/triage", orca=orca)
+        assert result is not None
+        self.assertNotIn("decision", result)
+        self.assertIn("new-pane", result["systemMessage"])
+        self.assertIn(hourly_runtime.local_minute(later["scheduledFor"]), result["systemMessage"])
+
+    def test_question_gate_names_a_replacement_ask_delivered_during_the_check(self) -> None:
+        ask_id = "a1234567-1234-4567-8888-123456789abc"
+        new_id = "b1234567-1234-4567-8888-123456789abc"
+        question = {"header": "配備", "question": "配備しますか？", "options": [
+            {"label": "配備", "description": "配備する"}, {"label": "保留", "description": "保留する"}]}
+        ask = {"id": ask_id, "kind": "ask", "repo": "app", "worktree": "lane",
+               "ts": "2026-11-25T03:00:00+00:00", "questions": [question]}
+        replacement = {**ask, "id": new_id, "ts": "2026-11-25T03:01:00+00:00", "withdraws": [ask_id]}
+        (self.root / "hourly-state.json").write_text(json.dumps({"lead": {"worktree": "/w/triage"}}))
+        hook = {"tool_name": "AskUserQuestion", "cwd": "/w/triage", "session_id": "test",
+                "tool_use_id": "toolu_1", "tool_input": {"questions": [{
+                    **question, "question": f"ask {ask_id}:1 配備しますか？"}]}}
+        with (patch.object(hourly_state, "inbox_entries", side_effect=[[ask], [ask, replacement]]),
+              patch.object(inbox_read, "answer_records", return_value={}),
+              patch.object(inbox_read, "read_claims", return_value={}),
+              patch.object(stopcheck.lane_input, "inferred_answers", return_value={}),
+              patch.object(stopcheck.lane_input, "direct_prompts", return_value={}),
+              patch.object(stopcheck.inbox_read, "later_runs", return_value=[])):
+            result = stopcheck.question_decision(hook, "unused-orca", self.root)
+        assert result is not None
+        reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+        for fragment in (ask_id + ":1", "app/lane", "取り下げ", "新しい ask", new_id):
+            self.assertIn(fragment, reason)
 
     def test_an_ask_the_scheduled_tab_sent_itself_is_not_unread(self) -> None:
         inbox = self.root / "inbox.jsonl"
