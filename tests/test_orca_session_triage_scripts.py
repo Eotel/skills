@@ -5704,6 +5704,23 @@ class RmCheckTests(unittest.TestCase):
             self.assertEqual((code, result["archived"]), (1, []))
             self.assertTrue(tracked.is_file())
 
+    def test_explicit_archive_preserves_a_tracked_file_with_normalized_disk_spelling(self) -> None:
+        tracked = self.wt / "caf\u00e9.txt"
+        on_disk = self.wt / "cafe\u0301.txt"
+        git(self.main, "config", "core.precomposeunicode", "false")
+        tracked.write_text("tracked file\n")
+        git(self.wt, "add", tracked.name)
+        git(self.wt, "commit", "-qm", "track composed file name")
+        git(self.main, "merge", "-q", "feature")
+        tracked.rename(on_disk)
+        if not tracked.exists():
+            self.skipTest("requires normalization-insensitive file lookup")
+
+        code, result = self.run_main("--archive-path", tracked.name, "--archive-dir", str(self.wt.parent / "archive"))
+
+        self.assertEqual((code, result["archived"]), (1, []), result)
+        self.assertEqual(on_disk.read_text(), "tracked file\n")
+
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")
         (self.wt / "notes/child").mkdir(parents=True)

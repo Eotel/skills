@@ -1671,7 +1671,11 @@ def named_archive_path(worktree: Path, requested: PurePosixPath) -> Path:
         candidate = source / part
         if not (candidate.exists() or candidate.is_symlink()):
             raise ValueError("パスがありません")
-        source = disk_entry(source, part)
+        for entry in source.iterdir():
+            if entry.name != part and entry.name.casefold() == part.casefold() and entry.samefile(candidate):
+                candidate = entry
+                break
+        source = candidate
     rel = source.relative_to(worktree).as_posix()
     tracked = [git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", rel),
                git(worktree, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", rel)]
