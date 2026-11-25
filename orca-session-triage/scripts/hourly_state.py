@@ -1929,6 +1929,8 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
             line += f" | {item['close_command']}"
         if item.get("present_command"):
             line += f" | {item['present_command']}"
+        for missed in item.get("unpresented", []):
+            line += f" | 未提示（指揮へ {missed['handoff_count']} 回持ち越し） {missed['present_command']}"
         if item.get("lead_unseen"):
             line += " | 指揮が未読"
         if item.get("waits_on"):
@@ -2223,10 +2225,13 @@ def main(argv: list[str] | None = None) -> int:
             presented = presented_now(data, {key: items[-1] for key, items in decided.items()}, now,
                                       entries, presented_answers)
             result = merge_presentations(result, presented, entries)
-            missing = unpresented_handoffs(history, data, decided, evidence, entries, now)
-            missing_keys = {item["id"] for item in missing}
-            result = sorted([*(item for item in result if not set(item.get("decisions") or []) & missing_keys),
-                             *missing, *user_waits_now(data, now)], key=lambda item: -item["age_minutes"])
+            missing = {item["id"]: item for item in unpresented_handoffs(history, data, decided, evidence, entries, now)}
+            for item in result:
+                missed = [missing.pop(key) for key in item.get("decisions", []) if key in missing]
+                if missed:
+                    item["unpresented"] = [{"id": extra["id"], "handoff_count": extra["handoff_count"],
+                                            "present_command": extra["present_command"]} for extra in missed]
+            result = sorted([*result, *missing.values(), *user_waits_now(data, now)], key=lambda item: -item["age_minutes"])
             presented_resolutions(result, data, args.claude_projects.expanduser(), path)
             unseen: set[str] = set()
             if lead := appointed_lead(data):

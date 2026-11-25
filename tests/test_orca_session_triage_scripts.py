@@ -8809,6 +8809,7 @@ class HourlyStateTests(unittest.TestCase):
                          ("/w/lane", "unanswered", True))
         self.assertEqual(stale[0]["question"], "Earlier question")
         self.assertEqual(stale[0]["decisions"], ["ask-89d59136"])
+        self.assertEqual(stale[0]["unpresented"][0]["id"], "ask-89d59136")
 
     def test_blocked_on_miura_includes_current_pr_state_update_and_time_since_answer(self) -> None:
         scan_json = self.root / "scan.json"
