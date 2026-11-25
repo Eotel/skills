@@ -1814,6 +1814,7 @@ def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Pat
             structured.add(reference)
     pr = None
     target = None
+    has_drift = has_owner = False
     commands: list[str] = []
     for line in [*lines, "-"]:
         if line.startswith(TOPIC_FIXER_JSON):
@@ -1822,22 +1823,32 @@ def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Pat
                 TOPIC_BOUNDARY.fullmatch(line) or line.startswith("  直し方: ")):
             raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
         if line and not line[0].isspace():
+            if pr and has_drift and not has_owner:
+                raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
             if pr and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
                 blockers.setdefault(target, []).append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
             pr = line if line not in structured and TOPIC_PR.fullmatch(line) else None
             target = None
+            has_drift = has_owner = False
             commands = []
         elif pr:
             detail = line.strip()
-            if detail.startswith("直し方: "):
+            if detail.startswith("違い: "):
+                has_drift = True
+            elif detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
-            elif detail.startswith("直す作業場: "):
+            elif detail.startswith("直す作業場:"):
+                display = detail.removeprefix("直す作業場:").strip()
                 try:
-                    target = legacy_topic_worktree(detail.removeprefix("直す作業場: "), scanned, require_known=True)
+                    target = legacy_topic_worktree(display, scanned, require_known=True)
+                    has_owner = target is not None or display.startswith("なし（")
+                    if not has_owner:
+                        raise ValueError("cannot identify the topic repair worktree")
                 except ValueError as error:
                     raise ValueError(f"{error} for {pr} in {path}") from error
             elif detail.endswith(" で直る）"):
+                has_drift = True
                 _, suffix = split_topic_suffix(detail)
                 if suffix:
                     commands.append(suffix.removesuffix(" で直る"))

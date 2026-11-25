@@ -108,6 +108,14 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
             previous = recorded.get(key)
             if replacement and part:
                 previous = next(iter(inbox_read.answer_parts(whole, (int(part),), recorded)), None)
+            elif replacement and previous is None:
+                entry = next((ask for ask in entries if ask.get("id") == whole), {})
+                numbers = range(1, len(inbox_read.questions_of(entry)) + 1)
+                parts = inbox_read.answer_parts(whole, numbers, recorded)
+                if parts and len(parts) == len(numbers) and all(
+                        item.get("how") in inbox_read.SUBSTANTIVE_ANSWERS for item in parts):
+                    newest = max(parts, key=lambda item: datetime.fromisoformat(item["ts"]))
+                    previous = {**newest, "note": answer_text(parts)}
             if previous is None or previous.get("how") not in inbox_read.SUBSTANTIVE_ANSWERS:
                 how, at = inbox_read.HOURLY_ANSWER, item["answered_at"]
             elif (replacement and previous.get("note") != item["answer"] and previous.get("ts")

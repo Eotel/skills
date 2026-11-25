@@ -5999,6 +5999,11 @@ class RmCheckTests(unittest.TestCase):
         topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 1)
 
+        for fragment in (f"  Asana: 完了 False → True（asana_sync.py {url} で直る）",
+                         "  直す作業場:"):
+            topic.write_text(f"{url}\n{fragment}\n")
+            self.assertEqual(self.run_main("--from", str(saved))[0], 1)
+            self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
         topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
 
@@ -9708,14 +9713,16 @@ class HourlyReadTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as out:
                 hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
                                   datetime.now(timezone.utc))
-            self.assertEqual(out.getvalue().splitlines(), [f"  直す作業場: {fixer['worktree']}"])
+            self.assertIn("直す作業場: 要確認", out.getvalue())
+            self.assertEqual(out.getvalue().splitlines()[-1], f"  直す作業場: {fixer['worktree']}")
             path.write_text(f"{pr}\n  直す作業場: {fixer['worktree']}（topic link 手順 1）を修正（追記、"
                             "2026-11-25T10:00:00+09:00、agent なし）\n")
             retry.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n")
             with redirect_stdout(io.StringIO()) as out:
                 hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
                                   datetime.now(timezone.utc))
-            self.assertEqual(out.getvalue().splitlines(), [f"  直す作業場: {fixer['worktree']}"])
+            self.assertIn("直す作業場: 要確認", out.getvalue())
+            self.assertEqual(out.getvalue().splitlines()[-1], f"  直す作業場: {fixer['worktree']}")
 
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")
