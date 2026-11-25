@@ -67,6 +67,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from typing import NamedTuple, Protocol, cast
 
 import answer_evidence
@@ -379,9 +380,22 @@ def lead_state(projects: Path, worktree: str) -> str:
     if claude is None:
         return f"指揮（{name}）の会話記録が見つかりません。"
     said = " ".join((claude.get("final_text") or "").split())
-    queued = queued_instructions(Path(claude["transcript"]))
+    transcript = Path(claude["transcript"])
+    queued = queued_instructions(transcript)
+    if said:
+        latest = f"最後の発言 {claude.get('final_at') or '-'}: {said[:200]}" + ("…" if len(said) > 200 else "")
+    else:
+        now = datetime.now(timezone.utc)
+        questions = transcript_questions(scan_sessions.load_jsonl(transcript))
+        latest = "最後の発言なし" + "".join(
+            f"\n未回答の質問（{call.get('asked_at') or '-'}"
+            + (f"、{max(0, int((now - at).total_seconds() // 60))} 分経過"
+               if (at := scan_sessions.parse_time(call.get("asked_at"))) else "")
+            + "）: " + "・".join(str(question.get("header") or question.get("question") or "-")
+                               for question in call["questions"])
+            for call in questions)
     return (f"指揮の今（{name}）: 未回答の質問 {len(claude['pending_questions'])} 件。"
-            f"最後の発言 {claude.get('final_at') or '-'}: {said[:200]}" + ("…" if len(said) > 200 else "")
+            + latest
             + "".join(f"\n未配信の指示（{item['enqueued_at'] or '-'}、{item['minutes']} 分経過）: {item['text']}"
                       for item in queued if not item.get("handled_at"))
             + unseen_lines(lead_unseen_asks(projects, worktree)))
@@ -532,6 +546,24 @@ def annotate_elsewhere(pending: list[dict], state: dict, tabs: list[dict]) -> No
                                           for hint in ("Enter to select", "enter select"))]
 
 
+def transcript_questions(entries: list[dict]) -> list[dict]:
+    questions = {}
+    last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
+    for entry in entries[last + 1:]:
+        content = scan_sessions.message_of(entry).get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                    and block.get("name") == "AskUserQuestion"):
+                questions[block.get("id")] = {"id": block.get("id"), "asked_at": entry.get("timestamp"),
+                                               "questions": [dict(question) for question in
+                                                             (block.get("input") or {}).get("questions", [])]}
+            elif block.get("type") == "tool_result":
+                questions.pop(block.get("tool_use_id"), None)
+    return list(questions.values())
+
+
 def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
                  state: dict | None = None, grep: str | None = None, since: datetime | None = None) -> dict[str, object]:
     """The lead's Orca state, newest transcript, unanswered questions, questions closed unanswered since the
@@ -557,7 +589,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
         claude.update(api_error=None, api_error_kind=None)
     final: dict[str, str | None] = {"at": None, "text": None}
     said_at = None
-    questions = {}
+    questions = []
     queued = []
     transcript = None
     events = []
@@ -569,26 +601,13 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
         said_at = scan_sessions.parse_time(final["at"])
         if resumed and resumed.text:
             final = {"at": None, "text": resumed.text}
-        # As the scan reads it: only the turn since the last real user message, so a question left behind is gone.
-        last = max((i for i, entry in enumerate(entries) if scan_sessions.is_real_user_message(entry)), default=-1)
-        for entry in entries[last + 1:]:
-            content = scan_sessions.message_of(entry).get("content")
-            for block in content if isinstance(content, list) else []:
-                if not isinstance(block, dict):
-                    continue
-                if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
-                        and block.get("name") == "AskUserQuestion"):
-                    questions[block.get("id")] = {"id": block.get("id"), "asked_at": entry.get("timestamp"),
-                                                   "questions": [dict(question) for question in
-                                                                 (block.get("input") or {}).get("questions", [])]}
-                elif block.get("type") == "tool_result":
-                    questions.pop(block.get("tool_use_id"), None)
+        questions = transcript_questions(entries)
         queued = queued_instructions(transcript)
     transcripts = lead_transcripts(projects, worktree, claude)
     handoff_since = last_sent_at(handoffs)
     rejected = answer_evidence.rejected_questions(transcripts, handoff_since)
     if questions:
-        annotate_elsewhere(list(questions.values()),
+        annotate_elsewhere(questions,
                            state if state is not None else hourly_state.read(Path(hourly_state.DEFAULT_STATE).expanduser()), tabs)
     agents = [{"type": agent.get("agentType"), "state": agent.get("state"),
                "state_started_at": scan_sessions.iso_time(agent.get("stateStartedAt")),
@@ -601,7 +620,7 @@ def lead_details(projects: Path, worktree: str, orca: str, handoffs: Path, *,
                               if event["kind"] == "user" and (handoff_since is None
                                   or (at := scan_sessions.parse_time(event["at"])) is not None and at >= handoff_since)],
             "api_error": claude.get("api_error") if claude else None,
-            "pending_questions": list(questions.values()),
+            "pending_questions": questions,
             "answered": answer_evidence.answered_questions(transcripts, handoff_since), "rejected": rejected,
             "unseen_asks": unseen_asks(transcripts, said_at), "terminals": tabs, "queued_input": queued}
     if grep is not None:
@@ -639,6 +658,49 @@ def session_signature() -> str | None:
     return f"{name}（{started:%H:%M} の定時）"
 
 
+def lead_changes(args: argparse.Namespace, since: datetime | None) -> list[str]:
+    if not args.lead_worktree or since is None:
+        return []
+    try:
+        state = lead_details(args.claude_projects.expanduser(), args.lead_worktree, args.orca,
+                             args.handoffs_dir.expanduser(), state=hourly_state.read(args.state_file.expanduser()))
+    except (OSError, ValueError, LookupError, subprocess.SubprocessError) as error:
+        return [f"指揮の今を再確認できません: {(getattr(error, 'stderr', None) or str(error)).strip()}"]
+    changes = []
+    for answer in cast(list[dict], state["answered"]):
+        if (at := scan_sessions.parse_time(answer["answered_at"])) and at >= since:
+            choices = "・".join(f"{question} → {choice}" for question, choice in answer["answers"].items())
+            changes.append((at, f"{answer['answered_at']} 指揮の質問 {answer['id']} への回答: {excerpt(choices)}"))
+    for call in cast(list[dict], state["pending_questions"]):
+        for question in call["questions"]:
+            if (at := scan_sessions.parse_time(question.get("answered_elsewhere"))) and at >= since:
+                changes.append((at, f"{question['answered_elsewhere']} 指揮の質問 {call['id']} への回答を記録: "
+                                    f"{question.get('header') or question.get('question') or '-'}"))
+    for agent in cast(list[dict], state["agents"]):
+        if (at := scan_sessions.parse_time(agent["state_started_at"])) and at >= since:
+            changes.append((at, f"{agent['state_started_at']} 指揮の {agent['type']} が {agent['state']} に移行"))
+    return [line for _, line in sorted(set(changes))]
+
+
+def record_handoff_keys(path: Path, entries: tuple[lead_decisions.HandOff, ...]) -> None:
+    remaining = entries
+    for delay in (0.25, 0.5, None):
+        try:
+            lead_decisions.append(path, *remaining)
+            return
+        except CommitmentWriteError as error:
+            if delay is None or "database is locked" not in str(error).casefold():
+                raise
+            time.sleep(delay)
+            try:
+                saved = set(lead_decisions.handed_off(path))
+            except OSError:
+                continue
+            remaining = tuple(entry for entry in remaining if entry not in saved)
+            if not remaining:
+                return
+
+
 def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) -> int:
     answered = lead_decisions.latest(lead_decisions.records(args.decisions_file.expanduser()))
     keys = list(dict.fromkeys(args.decision))
@@ -657,50 +719,56 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
             settled.append(f"{key}: {answered[key].answer}")
         elif key in checked and (proof := lead_decisions.bound_handoff_answer(key, selected.get(key), choices, asks, questions)):
             settled.append(f"{key}: ask {proof.get('id') or selected.get(key) or key} の回答を記録済みです")
-    if settled:
-        print("handoff: the lead already answered; follow each answer and drop it from the handoff:",
-              *settled, sep="\n", file=sys.stderr)
-        return 1
     body = args.body_file.read_text(encoding="utf-8").strip()
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
     since = args.since if args.since is not None else saved_read_offset(args.reads_dir.expanduser(), inbox)
     before, after, end = inbox_around(inbox, since)
+    blockers = []
+    if settled:
+        blockers.extend(["the lead already answered; follow each answer and drop it from the handoff:", *settled])
     if not args.force:
         later = inbox_read.later_runs(args.orca, "handoff")
         if any(run.get("status") != "skipped_precheck" for run in later):
-            print("handoff: not sent: a later scheduled run began. Leave the handoff to the run "
-                  "that owns the read position; --force sends it as written:",
-                  *(hourly_runtime.later_run_note(run) for run in later), sep="\n", file=sys.stderr)
-            return 1
-        for run in later:
-            print(hourly_runtime.later_run_note(run), file=sys.stderr)
+            blockers.extend(["a later scheduled run began. Leave the handoff to the run "
+                             "that owns the read position; --force sends it as written:",
+                             *(hourly_runtime.later_run_note(run) for run in later)])
+        else:
+            for run in later:
+                print(hourly_runtime.later_run_note(run), file=sys.stderr)
+    cutoff = read_time(before)
     found = overtaken(body, before, after, sender, os.environ.get("ORCA_TERMINAL_HANDLE", ""),
                       inbox_read.answers_path())
     found.extend(removal_reports(keys, after))
     if args.lead_worktree:
         found.extend(handed_work(timeline.entries(args.board_events.expanduser()), [*before, *after],
-                                 args.lead_worktree, read_time(before), body, keys))
+                                 args.lead_worktree, cutoff, body, keys))
     if own := [reason.line for reason in found if reason.own]:
         print("handoff: this run's deliveries need no --seen:", *own, sep="\n", file=sys.stderr)
     if not args.force and (left := unseen(found, args.seen)):
-        print("handoff: not sent: after --since, another tab of this workspace reported, or an ask the body names "
-              "was answered, or a removal target sent an ask/info, or the lead handed work (send, spawn-lane) to a "
-              "worktree the body or a remove: key names. Read each one in full (inbox_read.py read --id ID; a send "
-              "or spawn-lane with timeline.py --since HH:MM --lane NAME --json) and fix the body; then pass --seen ID "
-              "for each one the body reflects, or --force to send it as written:",
-              *(reason.line for reason in left),
-              " ".join(f"--seen {shlex.quote(reason_id)}" for reason_id in
-                       dict.fromkeys(reason.id for reason in left)), sep="\n", file=sys.stderr)
+        blockers.extend(["after --since, another tab reported, an ask was answered, a removal target reported, "
+                         "or the lead handed work to a named worktree. Read each event in full, update the body, "
+                         "then include these --seen arguments:",
+                         *(reason.line for reason in left),
+                         " ".join(f"--seen {shlex.quote(reason_id)}" for reason_id in
+                                  dict.fromkeys(reason.id for reason in left)),
+                         *lead_changes(args, cutoff)])
+    if blockers:
+        print("handoff: 未送信", *blockers, sep="\n", file=sys.stderr)
         return 1
     reports = late_reports(after)
     facts = ["—— 送る直前に道具が足した事実 ——",
              f"走査の開始後に届いた報告: {len(reports)} 件" + ("" if reports else "（なし）"), *reports]
-    if args.lead_worktree:
-        facts.append(lead_state(args.claude_projects.expanduser(), args.lead_worktree))
+    lead_now = lead_state(args.claude_projects.expanduser(), args.lead_worktree) if args.lead_worktree else None
+    if lead_now:
+        facts.append(lead_now)
     if keys:
-        lead_decisions.append(args.handed_off_file.expanduser(),
-                              *(lead_decisions.HandOff.now(key, bound.get(key)) for key in keys))
+        try:
+            record_handoff_keys(args.handed_off_file.expanduser(),
+                                tuple(lead_decisions.HandOff.now(key, bound.get(key)) for key in keys))
+        except CommitmentWriteError as error:
+            print(f"handoff: 未送信。引き継ぎの鍵を記録できません: {error}", file=sys.stderr)
+            return 1
     signature = session_signature()
     text = "\n\n".join([SIGNATURE_LINE.sub("", body).rstrip() if signature else body, "\n".join(facts),
                          *([signature] if signature else [])])
@@ -719,6 +787,9 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     except OSError as error:
         print(f"handoff: sent, but it could not be kept for `last`: {error}", file=sys.stderr)
     print(f"NEXT_OFFSET={end}")
+    print(f"handoff: 送信済み（{sent.isoformat(timespec='seconds')}）", file=sys.stderr)
+    if lead_now:
+        print(lead_now, file=sys.stderr)
     return 0
 
 

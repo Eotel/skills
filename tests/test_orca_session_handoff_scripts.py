@@ -133,6 +133,94 @@ class HandoffTests(unittest.TestCase):
         self.assertFalse(self.sent.exists())
         self.assertFalse(self.handed_off.exists())
 
+    def test_refusal_includes_settled_keys_late_events_and_the_leads_current_state(self) -> None:
+        report = {"id": "eeeeeeee-ask", "kind": "ask", "ts": "2026-11-10T09:00:00+09:00",
+                  "worktree": "lane", "handle": "term_lane", "text": "どちらで進めますか？"}
+        self.inbox.write_text(seen := json.dumps(report) + "\n")
+        self.body.write_text("lane の ask eeeeeeee を確認してください。")
+        self.decisions.write_text(json.dumps({"id": "decision", "decision": "remove:/w/a", "answer": "保留",
+                                              "decided_at": "2026-11-10T09:01:00+09:00"}) + "\n")
+        (self.root / "ask-answers.jsonl").write_text(json.dumps({"id": report["id"], "how": "send",
+                                                               "note": "先に修正",
+                                                               "ts": "2026-11-10T09:02:00+09:00"}) + "\n")
+        self.board.write_text(json.dumps({"id": "aaaaaaaa-send", "type": "send", "source": "send", "to": "term_lane",
+                                          "from": "term_lead", "worktree": "triage-lead", "text": "修正を開始",
+                                          "ts": "2026-11-10T09:03:00+09:00"}) + "\n")
+        start = int(datetime.fromisoformat("2026-11-10T09:02:30+09:00").timestamp() * 1000)
+        orca = self.root / "orca"
+        records = {"worktrees": [{"path": "/w/triage-lead", "worktreeId": "lead",
+                                  "agents": [{"agentType": "claude", "state": "working", "stateStartedAt": start}]}],
+                   "terminals": []}
+        orca.write_text(f"#!{sys.executable}\nimport json\nprint(json.dumps({records!r}))\n")
+        orca.chmod(0o755)
+
+        result = self.run_tool("--since", str(len(seen.encode())), "--decision", "remove:/w/a",
+                               "--lead-worktree", "/w/triage-lead", "--orca", str(orca))
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("remove:/w/a: 保留", result.stderr)
+        self.assertIn("--seen eeeeeeee-ask --seen aaaaaaaa-send", result.stderr)
+        self.assertIn("2026-11-10T00:02:30Z", result.stderr)
+        self.assertIn("working", result.stderr)
+        self.assertFalse(self.sent.exists())
+
+    def test_send_prints_pending_question_details_and_confirms_delivery_without_changing_the_offset_format(self) -> None:
+        self.inbox.write_text("")
+        lead = self.projects / "-w-triage-lead" / "s.jsonl"
+        lead.parent.mkdir(parents=True)
+        asked = "2026-11-24T15:18:00Z"
+        lead.write_text(json.dumps({"type": "assistant", "timestamp": asked, "message": {"role": "assistant",
+                                   "content": [{"type": "tool_use", "name": "AskUserQuestion", "id": "pending",
+                                                "input": {"questions": [{"header": "依存更新",
+                                                                         "question": "進めますか？"}]}}]}}) + "\n")
+
+        result = self.run_tool("--since", "0", "--lead-worktree", "/w/triage-lead")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "NEXT_OFFSET=0")
+        sent = json.loads(self.sent.read_text())[-1]
+        for shown in (sent, result.stderr):
+            self.assertIn("依存更新", shown)
+            self.assertIn(asked, shown)
+            self.assertIn("分経過", shown)
+        self.assertIn("送信済み", result.stderr)
+
+    def test_commitment_lock_is_retried_without_resending_the_handoff(self) -> None:
+        self.inbox.write_text("")
+        binary = self.root / "bin"
+        binary.mkdir()
+        fail_for = binary / "fail-for"
+        counter = binary / "counter"
+        (binary / "orca_board_commitments.py").write_text(
+            "from contextlib import contextmanager\nfrom pathlib import Path\n"
+            "class CommitmentWriteError(RuntimeError): pass\n"
+            "def read_lines(path): return path.read_text().splitlines(keepends=True) if path.exists() else []\n"
+            "def read_document(path): return path.read_text() if path.exists() else None\n"
+            "@contextmanager\ndef writing(path, *, lines=None, document=None):\n"
+            f"    counter = Path({str(counter)!r})\n"
+            "    attempt = (int(counter.read_text()) if counter.exists() else 0) + 1\n"
+            "    counter.write_text(str(attempt))\n"
+            f"    if attempt <= int(Path({str(fail_for)!r}).read_text()):\n"
+            "        raise CommitmentWriteError('database is locked')\n"
+            "    yield True\n")
+        args = ("--since", "0", "--decision", "remove:/w/a")
+        env = {"ORCA_BRIEFS_BIN": str(binary)}
+        fail_for.write_text("4")
+
+        failed = self.run_tool(*args, env=env)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("未送信", failed.stderr)
+        self.assertIn("database is locked", failed.stderr)
+        self.assertEqual(counter.read_text(), "3")
+        self.assertFalse(self.sent.exists())
+        self.assertFalse(self.handed_off.exists())
+
+        sent = self.run_tool(*args, env=env)
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        self.assertEqual(counter.read_text(), "5")
+        self.assertEqual(len(self.handed_off.read_text().splitlines()), 1)
+        self.assertTrue(self.sent.exists())
+
     def test_removal_waits_for_each_late_ask_and_info_to_be_seen(self) -> None:
         previous = json.dumps({"id": "old", "kind": "ask", "worktree": "lane", "text": "before"}) + "\n"
         reports = [{"id": "aaaaaaaa-1111", "kind": "ask", "worktree": "lane", "text": "keep working"},

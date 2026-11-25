@@ -1737,16 +1737,22 @@ def print_check(result: dict, summary: bool) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def topic_drift_blockers(path: Path, worktree: str) -> list[str]:
-    blockers = []
+def topic_check_output(scan_file: Path) -> Path | None:
+    directory = scan_file.expanduser().parent
+    return next((path for name in ("topic-check.retry.stdout", "topic-check.stdout")
+                 if (path := directory / name).is_file()), None)
+
+
+def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
+    blockers: dict[Path, list[str]] = {}
     pr = None
     target = None
     commands: list[str] = []
     for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
         if line and not line[0].isspace():
-            if pr and target and target.is_absolute() and target.resolve() == Path(worktree):
+            if pr and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
-                blockers.append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
+                blockers.setdefault(target, []).append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
             pr = line if TOPIC_PR.fullmatch(line) else None
             target = None
             commands = []
@@ -1948,12 +1954,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     decided = [keep_blocker] if keep_blocker else []
     topic = args.topic_check
     if topic is None and args.from_file:
-        directory = args.from_file.parent
-        topic = next((output for name in ("topic-check.retry.stdout", "topic-check.stdout")
-                      if (output := directory / name).is_file()), None)
+        topic = topic_check_output(args.from_file)
     if topic is not None:
         try:
-            decided.extend(topic_drift_blockers(topic.expanduser(), worktree))
+            decided.extend(reason for target, reasons in topic_drift_blockers(topic.expanduser()).items()
+                           if target.resolve() == Path(worktree) for reason in reasons)
         except (OSError, ValueError) as error:
             decided.append(f"topic check の結果を確認できません（{error}）")
     root = Path(worktree)

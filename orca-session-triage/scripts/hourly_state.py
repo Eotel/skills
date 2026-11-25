@@ -502,14 +502,14 @@ def presented_resolutions(items: list[dict], data: dict, projects: Path, state_f
         if item.get("state") != PRESENTED:
             continue
         key = item["id"]
-        link = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)/?", item.get("link") or "")
+        link = re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/(?:pull|issues)/(\d+)/?", item.get("link") or "")
         refs = lead_decisions.pull_requests(key)
         if link:
             refs.append(lead_decisions.PullRequest(link[1], int(link[2])))
         selected[key] = list(dict.fromkeys(refs))
         for ref in refs:
             by_repo.setdefault(ref.repo.casefold(), set()).add(ref.number)
-    states = {repo: lead_decisions.github_pr_states(repo, sorted(numbers)) or {}
+    states = {repo: lead_decisions.github_pr_states(repo, sorted(numbers), include_issues=True) or {}
               for repo, numbers in by_repo.items()}
     transcripts: dict[Path, list[answer_evidence.Answer]] = {}
     lead = appointed_lead(data)
@@ -520,9 +520,14 @@ def presented_resolutions(items: list[dict], data: dict, projects: Path, state_f
             continue
         refs = selected[key]
         resolved = [(ref, states[ref.repo.casefold()].get(ref.number)) for ref in refs]
+        if resolved:
+            item["prs"] = [{"repo": ref.repo, "number": ref.number, "type": state.type if state else None,
+                            "state": state.state if state else None, "head": state.head if state else None,
+                            "updatedAt": state.updated_at if state else None} for ref, state in resolved]
         candidates = [{"source": "GitHub", "pr": f"{ref.repo}#{ref.number}", "state": state.state,
                        "at": state.closed_at or state.updated_at,
-                       "text": "PR がマージ済み" if state.state == "MERGED" else "PR がクローズ済み"}
+                       "text": ("PR がマージ済み" if state.state == "MERGED"
+                                else f"{'Issue' if state.type == 'issue' else 'PR'} がクローズ済み")}
                       for ref, state in resolved if state and state.state in CLOSED_STATES]
         if len(candidates) != len(refs):
             candidates = []
@@ -932,6 +937,7 @@ def stale_asks(rows: list[dict], entries: list[dict], open_ids: frozenset[str],
         view = {"row": identity, "name": scan_sessions.row_name(row),
                 "question": excerpt(question), "merge_question": scan_sessions.asks_merge(question, comment),
                 "review": scan_sessions.review_result(row, scan_sessions.github_of(row)),
+                "final_at": scan_sessions.jst_timestamp(final["at"]),
                 "ask": None, "answer": None, "candidates": [], "choices_in_info": []}
         view.update(waits_on=verdict.get("waits_on"), next_step=verdict.get("next_step"))
         view["waiting_reports"] = received
@@ -1752,6 +1758,9 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
                                             "checks": checks, "closed_at": None, "closure_evidence": None})
         return {"id": key, **data["user_waits"][key]}
     if args.action == "user-wait-close":
+        if args.id not in data["user_waits"] and args.id in data["presented"]:
+            raise ValueError("use " + shlex.join(["presented-close", "--key", args.id,
+                                                 "--evidence-file", args.evidence_file]))
         wait = data["user_waits"][args.id]
         evidence = file_text(args.evidence_file)
         if wait["closed_at"] is not None and wait["closure_evidence"] != evidence:
@@ -1773,6 +1782,9 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
             "presented_at": kept["presented_at"] if kept else stamp(), "closed_at": None, "closure_evidence": None}
         return {"id": key, **data["presented"][key]}
     if args.action == "presented-close":
+        if args.key not in data["presented"] and args.key in data["user_waits"]:
+            raise ValueError("use " + shlex.join(["user-wait-close", "--id", args.key,
+                                                 "--evidence-file", args.evidence_file]))
         item = data["presented"][args.key]
         evidence = file_text(args.evidence_file)
         if item["closed_at"] is not None and item["closure_evidence"] != evidence:
@@ -1800,13 +1812,17 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
             decision=args.decision.strip() if args.decision is not None else None,
             replace_reason=file_text(args.replace_reason_file) if args.replace_reason_file else None))
     if args.action == "withdraw":
-        question = data["questions"][args.id]
+        key = args.id if args.id is not None else asked_under(data, args.decision.strip())
+        question = data["questions"][key]
         reason = file_text(args.reason_file)
+        replacement_id = None
         if args.replaced_by is not None:
-            replacement = data["questions"].get(args.replaced_by)
-            if replacement is None or args.replaced_by == args.id or replacement.get("withdrawn_at"):
+            replacement_id = (args.replaced_by if args.replaced_by in data["questions"]
+                              else asked_under(data, args.replaced_by.strip()))
+            replacement = data["questions"][replacement_id]
+            if replacement_id == key or replacement.get("withdrawn_at"):
                 raise ValueError("--replaced-by must name another existing question that is not withdrawn")
-            if question.get("replaced_by") not in (None, args.replaced_by):
+            if question.get("replaced_by") not in (None, replacement_id):
                 raise ValueError("question already has a different replacement")
         if question["answer"] is not None:
             raise ValueError("question already has an answer")
@@ -1814,9 +1830,9 @@ def change(data: dict, args: argparse.Namespace, selected_rows: list[dict] | Non
             raise ValueError("question already withdrawn; inspect its reason before changing it")
         if not question.get("withdrawn_at"):
             question.update(withdrawn_at=stamp(), withdrawal_reason=reason)
-        if args.replaced_by is not None:
-            question["replaced_by"] = args.replaced_by
-        return {"id": args.id, **question}
+        if replacement_id is not None:
+            question["replaced_by"] = replacement_id
+        return {"id": key, **question}
     if args.action == "promise":
         key = identifier(args.from_row, args.to_row, args.condition, args.task)
         data["handoffs"].setdefault(key, {"from": args.from_row, "to": args.to_row,
@@ -1872,7 +1888,7 @@ def summary(items: list[dict], now: datetime, kind: str = "") -> str:
         ask_id = (item.get("ask") or {}).get("id")
         question = (item.get("question") or item.get("original") or item.get("task") or item.get("text")
                     or item.get("final_message"))
-        line = (f"{name} | {state} | since={since or '-'} | age_minutes={age} "
+        line = (f"{name} | {state} | since={scan_sessions.jst_timestamp(since) or '-'} | age_minutes={age} "
                 f"| {f'ask={ask_id}' if ask_id else f'id={item.get('id') or '-'}'} | {excerpt(question)}")
         if item.get("link"):
             line += f" | {item['link']}"
@@ -1967,6 +1983,7 @@ def main(argv: list[str] | None = None) -> int:
              "or to a PR that closes it")
     needs_owner.add_argument("--live-owner", action="append", default=[],
                              help="active scan row identity (PATH or ENVIRONMENT::PATH); repeat per owner")
+    needs_owner.add_argument("--summary", action="store_true", help="print counts of needs_owner and closed_issues")
     needs_owner.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                              help="read the rows scan_sessions.py printed as JSON instead of Orca: each row with an "
                                   "agent tab whose class (the verdict's, else the scan's) is not finished is a live "
@@ -2070,6 +2087,7 @@ def main(argv: list[str] | None = None) -> int:
                            'whose #numbers are all CLOSED is not recorded: each is named after the output '
                            '(記録しなかった: 行 N), and the exit code is 2. A line bound to an open ask is still recorded')
     asked_many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
+    asked_many.add_argument("--summary", action="store_true", help="print one ID and decision key per recorded question")
     asked_many.add_argument("--from", dest="from_file", metavar="SCAN_JSON",
                             help="the rows scan_sessions.py printed as JSON, where an ask's worktree (and its tab, "
                                  "when the same path is on two Macs) finds its row; needed for an \"ask\" line")
@@ -2097,9 +2115,11 @@ def main(argv: list[str] | None = None) -> int:
     answered_many.add_argument("--skip-recorded", action="store_true",
                                 help="report existing answers and record the other lines; explicit replacements still apply")
     withdraw = commands.add_parser("withdraw", help="close an unanswered question with a reason, without a user's answer")
-    withdraw.add_argument("--id", required=True)
+    which = withdraw.add_mutually_exclusive_group(required=True)
+    which.add_argument("--id")
+    which.add_argument("--decision", metavar="KEY", help="decision key as in answered --decision")
     withdraw.add_argument("--reason-file", required=True)
-    withdraw.add_argument("--replaced-by", metavar="ID", help="the existing question that replaces this one")
+    withdraw.add_argument("--replaced-by", metavar="ID|KEY", help="the existing question that replaces this one")
     presented = commands.add_parser(
         "presented", help="record an item the hourly report listed for the user; pending and stale-asks show it as "
                           f"{PRESENTED} until an answer or a lead decision under its key after its first listing, "
@@ -2145,6 +2165,8 @@ def main(argv: list[str] | None = None) -> int:
                              help="Orca CLI that writes the comment (default: $ORCA_CLI_COMMAND or orca); answered "
                                   "and withdraw rewrite the comment of the workspace the question was asked in, "
                                   "once this script has written it")
+    for command in commands.choices.values():
+        command.add_argument("--json", action="store_true", help="print JSON (the default output format)")
     args = parser.parse_args(argv)
     path = Path(args.state_file).expanduser()
     if args.action == "stale-asks":
@@ -2390,6 +2412,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "pending" and args.summary and isinstance(result, dict):
         print("\n".join(line for kind, items in result.items()
                         if (line := summary(items, datetime.now(timezone.utc), kind))))
+    elif args.action == "requests-needing-owner" and args.summary and isinstance(result, dict):
+        print(f"needs_owner {len(result['needs_owner'])} | closed_issues {len(result['closed_issues'])}")
+    elif args.action == "asked-many" and args.summary and isinstance(result, list):
+        for item in result:
+            if item.get("id"):
+                print(f"{item['id']} {item['decision']}")
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     sys.stdout.flush()

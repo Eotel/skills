@@ -574,11 +574,13 @@ def answered_ids(path: Path) -> frozenset[str]:
 
 
 def answer_note(record: dict | None) -> str:
-    """「MM/DD HH:MM・how」 at the time the record gives, as it was recorded; empty without a record."""
+    """「MM/DD HH:MM・how」 in JST; empty without a record."""
     if record is None:
         return ""
     try:
-        when = datetime.fromisoformat(str(record.get("ts"))).strftime("%m/%d %H:%M")
+        at = datetime.fromisoformat(str(record.get("ts")))
+        when = (at if at.tzinfo else at.replace(tzinfo=timezone.utc)).astimezone(
+            timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
     except ValueError:
         when = str(record.get("ts") or "-")
     return f"{when}・{record.get('how') or '-'}"
