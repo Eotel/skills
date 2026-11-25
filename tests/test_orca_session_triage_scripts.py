@@ -9582,7 +9582,7 @@ class HourlyReadTests(unittest.TestCase):
                 stream.write(b'{"incomplete":')
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
-                    timeout: float) -> subprocess.CompletedProcess[str]:
+                    timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 if args[1:2] == ["read"]:
                     with redirect_stdout(stdout), patch.object(inbox_read, "later_runs", return_value=[]):
                         return subprocess.CompletedProcess(args, inbox_read.main(args[1:]))
@@ -9643,11 +9643,12 @@ class HourlyReadTests(unittest.TestCase):
             calls = []
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO, text: bool,
-                    timeout: float) -> subprocess.CompletedProcess[str]:
+                    timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 name = Path(args[0]).name
                 if args[1:2] == ["read"]:
                     stdout.write("NEXT_OFFSET=0\n")
                 elif name == "topic":
+                    self.assertEqual((env or {}).get("TOPIC_CHECK_FIXER_JSON"), "1")
                     calls.append(name)
                     stderr.write("error connecting to api.github.com\n")
                     return subprocess.CompletedProcess(args, 1)
@@ -9701,7 +9702,7 @@ class HourlyReadTests(unittest.TestCase):
             calls: list[tuple[str, float]] = []
 
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 command = Path(args[0]).name
                 calls.append((command, timeout))
                 if args[1:2] == ["read"]:
@@ -9766,7 +9767,7 @@ class HourlyReadTests(unittest.TestCase):
             initial = Barrier(7, timeout=5)
             seen = []
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 seen.append(args)
                 if args[1:2] == ["read"]:
                     stdout.write("NEXT_OFFSET=0\n")
@@ -9823,7 +9824,7 @@ class HourlyReadTests(unittest.TestCase):
         hourly_read = load_script("hourly_read")
         with tempfile.TemporaryDirectory() as root:
             def run(args: list[str], *, stdout: TextIO, stderr: TextIO,
-                    text: bool, timeout: float) -> subprocess.CompletedProcess[str]:
+                    text: bool, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
                 return subprocess.CompletedProcess(args, 3 if "--review-out" in args else 0)
             with patch("subprocess.run", side_effect=run), redirect_stdout(io.StringIO()):
                 hourly_read.main(["--workspace", "/w/triage", "--output-root", root])
