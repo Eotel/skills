@@ -48,6 +48,7 @@ CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 TOPIC_FIXER_JSON = "topic-fixer-json: "
+TOPIC_BOUNDARY = re.compile(r"https://\S+|[A-Z][A-Z0-9_]*-\d+|\d+|照合 \d+ 件・.*")
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
@@ -1786,13 +1787,15 @@ def split_topic_suffix(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def legacy_topic_worktree(display: str) -> Path | None:
+def legacy_topic_worktree(display: str, known: Collection[Path] = (), *, require_known: bool = False) -> Path | None:
     named, suffix = split_topic_suffix(display)
     worktree = Path(named)
     if not worktree.is_absolute():
         return None
-    unbalanced_name = named.count("（") != named.count("）")
-    if not suffix or unbalanced_name and not worktree.is_dir():
+    candidates = {path for delimiter in re.finditer("（", display)
+                  if (path := Path(display[:delimiter.start()])) in known or (path / ".git").exists()}
+    unbalanced = named.count("（") != named.count("）")
+    if not suffix or ((candidates or require_known or unbalanced) and candidates != {worktree}):
         raise ValueError("cannot identify the topic repair worktree")
     return worktree
 
@@ -1813,6 +1816,9 @@ def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Pat
     for line in [*lines, "-"]:
         if line.startswith(TOPIC_FIXER_JSON):
             continue
+        if target and line and line != "-" and not (
+                TOPIC_BOUNDARY.fullmatch(line) or line.startswith("  直し方: ")):
+            raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
         if line and not line[0].isspace():
             if pr and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
@@ -1826,9 +1832,7 @@ def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Pat
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場: "):
                 try:
-                    target = legacy_topic_worktree(detail.removeprefix("直す作業場: "))
-                    if target is not None and target not in scanned and not (target / ".git").exists():
-                        raise ValueError("cannot identify the topic repair worktree")
+                    target = legacy_topic_worktree(detail.removeprefix("直す作業場: "), scanned, require_known=True)
                 except ValueError as error:
                     raise ValueError(f"{error} for {pr} in {path}") from error
             elif detail.endswith(" で直る）"):

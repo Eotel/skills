@@ -296,7 +296,7 @@ def print_read(result: dict, now: datetime) -> None:
         display: dict[str, str] = {}
         outputs = {path: path.read_text(encoding="utf-8").splitlines()
                    for path in topic_check_outputs(Path(result["stdout"]).parent)}
-        structured_prs: set[str] = set()
+        structured_prs: dict[str, set[Path]] = {}
         structured_paths: dict[str, str] = {}
         for path, lines in outputs.items():
             for line in lines:
@@ -307,7 +307,7 @@ def print_read(result: dict, now: datetime) -> None:
                     continue
                 if record:
                     pr, workspace, _ = record
-                    structured_prs.add(pr)
+                    structured_prs.setdefault(pr, set()).add(workspace)
                     structured_paths.setdefault(str(workspace), f"  直す作業場: {workspace}")
         for lines in outputs.values():
             record_key = ""
@@ -317,7 +317,7 @@ def print_read(result: dict, now: datetime) -> None:
                 if line.lstrip().startswith("直す作業場: "):
                     detail = line.lstrip().removeprefix("直す作業場: ")
                     try:
-                        worktree = legacy_topic_worktree(detail)
+                        worktree = legacy_topic_worktree(detail, structured_prs.get(record_key, ()))
                     except ValueError:
                         if record_key in structured_prs:
                             continue

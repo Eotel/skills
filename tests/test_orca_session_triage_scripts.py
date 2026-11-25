@@ -6002,6 +6002,24 @@ class RmCheckTests(unittest.TestCase):
         topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
 
+    def test_legacy_topic_worktree_is_held_when_another_path_matches_the_truncated_name(self) -> None:
+        folder = self.wt.parent
+        topic, saved = folder / "topic-check.stdout", folder / "scan.json"
+        url = "https://github.com/acme/example/pull/81"
+        decoy = folder / f"{self.wt.name}（topic link 手順 1）を修正"
+        multiline = folder / f"{self.wt.name}（旧）\n追記"
+        for branch, path in (("decoy", decoy), ("newline", multiline)):
+            git(self.main, "worktree", "add", "-q", "-b", branch, str(path))
+        saved.write_text(json.dumps([{"path": str(path)} for path in (self.wt, decoy, multiline)]))
+        for path, action in ((self.wt, "手順 1）を修正（追記"), (multiline, "状態修正")):
+            with self.subTest(path=path):
+                topic.write_text(f"{url}\n  直す作業場: {path}（topic link {action}、"
+                                 "2026-11-25T10:00:00+09:00、agent なし）\n")
+                for mode, source in (("--from", saved), ("--topic-check", topic)):
+                    code, result = self.run_main("--worktree", str(path), mode, str(source))
+                    self.assertEqual(code, 1)
+                    self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
+
     def test_ignored_tool_output_is_regenerable_only_while_it_holds_no_other_work(self) -> None:
         (self.main / ".git" / "info" / "exclude").write_text("site/\nweb/var/\nweb/test_*.sqlite3\n")
         (self.wt / "mkdocs.yaml").write_text("site_name: docs\n")
@@ -9683,7 +9701,8 @@ class HourlyReadTests(unittest.TestCase):
                 hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
                                   datetime.now(timezone.utc))
             self.assertEqual(out.getvalue().splitlines(), [f"  直す作業場: {fixer['worktree']}"])
-            path.write_text(f"{pr}\n  直す作業場: {fixer['worktree']}（手順 1）を修正、agent なし）\n")
+            path.write_text(f"{pr}\n  直す作業場: {fixer['worktree']}（topic link 手順 1）を修正（追記、"
+                            "2026-11-25T10:00:00+09:00、agent なし）\n")
             retry.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n")
             with redirect_stdout(io.StringIO()) as out:
                 hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
