@@ -10155,7 +10155,14 @@ class HourlyReadTests(unittest.TestCase):
                 elif "requests-needing-owner" in args:
                     result = {"needs_owner": [{"id": "r1"}], "closed_issues": [{"id": "r2"}]}
                 elif command == "project-status":
-                    result = {"gaps": [{"key": "backlog:NEW-1", "missing": ["start date"]}]}
+                    result = {
+                        "gaps": [{"key": "backlog:NEW-1", "missing": ["start date"]}],
+                        "backlog_deadlines": [
+                            {"key": "DEMO-9", "alerts": ["期限超過 2026-11-17（1日超過）"]},
+                            {"key": "DEMO-10", "alerts": ["期限間近 2026-11-21（あと3日）",
+                                                         "期限変更 2026-11-19 → 2026-11-21（Aki 2026-11-18T10:00:00+09:00）"]},
+                        ],
+                    }
                 elif command == "asana99_status.py":
                     result = [{"url": "https://example.test/pr/2"}]
                     Path(args[1]).write_text(json.dumps(result))
@@ -10187,6 +10194,10 @@ class HourlyReadTests(unittest.TestCase):
             self.assertTrue(gaps["gaps"][0]["ignored"])
             self.assertTrue(gaps["new"][0]["ignored"])
             self.assertEqual(gaps["gone"], former["gaps"])
+            self.assertEqual(results["tracker-gaps"]["changes"]["new"], ["backlog:NEW-1"])
+            self.assertIn("DEMO-9 期限超過 2026-11-17（1日超過）", out.getvalue())
+            self.assertIn("DEMO-10 期限間近 2026-11-21（あと3日）", out.getvalue())
+            self.assertIn("DEMO-10 期限変更 2026-11-19 → 2026-11-21（Aki 2026-11-18T10:00:00+09:00）", out.getvalue())
             owners = results["requests-needing-owner"]
             self.assertIn("--from", owners["command"])
             self.assertEqual(owners["changes"], {"new": ["r1"], "closed_issues": ["r2"]})

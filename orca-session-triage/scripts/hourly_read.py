@@ -292,6 +292,11 @@ def print_read(result: dict, now: datetime) -> None:
         for kind, rows in changes.items():
             if rows:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
+        if name == "tracker-gaps":
+            document = json.loads(Path(result["result"]).read_text(encoding="utf-8"))
+            for row in document.get("backlog_deadlines", []):
+                for alert in row["alerts"]:
+                    print(f"  {row['key']} {alert}")
     if name == "topic-check":
         display: dict[str, str] = {}
         outputs = {path: path.read_text(encoding="utf-8").splitlines()
