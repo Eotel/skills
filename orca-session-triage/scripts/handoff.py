@@ -203,7 +203,7 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
     source = inbox_read.answer_sender()
     records = list(inbox_read.answer_entries(answers))
     own_deliveries = {record["id"] for record in records
-                      if source["session"] and record.get("sender") == source
+                      if inbox_read.same_answer_session(record.get("sender"), source)
                       and record.get("how") in answer_evidence.DELIVERED}
     for record in records:
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
@@ -211,7 +211,7 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
             lane_answer = record.get("how") == inbox_read.LANE_ANSWER
             report = re.search(r"報告 ([0-9a-f-]{36})", str(record.get("note") or "")) if lane_answer else None
             own = (record["id"] in own_deliveries or ask in own_deliveries) if lane_answer else (
-                bool(source["session"] and record.get("sender") == source
+                bool(inbox_read.same_answer_session(record.get("sender"), source)
                      and record.get("how") in answer_evidence.DELIVERED))
             found.append(Reason(str(record["id"]), f"- answered {record['id']} at {record.get('ts') or '-'} "
                                 f"({record.get('how') or '-'})" + ("（この回の送信）" if own else "")

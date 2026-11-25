@@ -47,7 +47,9 @@ CACHE_PREFIXES = ("playwright-report", "blob-report")
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
-TOPIC_FIX = re.compile(r"（(.+) で直る）\s*$")
+TOPIC_FIXER_JSON = "topic-fixer-json: "
+TOPIC_STATE = re.compile(r"(?:^|、)(?:agent なし|生きている agent: .+|作業場はもう無い)$")
+TOPIC_BOUNDARY = re.compile(r"https://\S+|[A-Z][A-Z0-9_]*-\d+|\d+|照合 \d+ 件・.*")
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
@@ -1809,33 +1811,118 @@ def print_check(result: dict, summary: bool) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def topic_check_output(scan_file: Path) -> Path | None:
-    directory = scan_file.expanduser().parent
-    return next((path for name in ("topic-check.retry.stdout", "topic-check.stdout")
-                 if (path := directory / name).is_file()), None)
+def topic_check_outputs(directory: Path) -> list[Path]:
+    retry = directory / "topic-check.retry.stdout"
+    first = directory / "topic-check.stdout"
+    if not retry.is_file():
+        return [first] if first.is_file() else []
+    lines = retry.read_text(encoding="utf-8").splitlines()
+    if lines and re.fullmatch(r"照合 .*・読めない 0 件", lines[-1]):
+        return [retry]
+    return [first, retry] if first.is_file() else [retry]
 
 
-def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
+def scan_topic_blockers(scan_file: Path) -> dict[Path, list[str]]:
+    from scan_sessions import saved_rows
+
     blockers: dict[Path, list[str]] = {}
+    outputs = topic_check_outputs(scan_file.expanduser().parent)
+    worktrees = {Path(row["path"]) for row in saved_rows(str(scan_file))} if outputs else set()
+    for path in outputs:
+        for target, reasons in topic_drift_blockers(path, worktrees).items():
+            blockers[target] = list(dict.fromkeys((*blockers.get(target, []), *reasons)))
+    return blockers
+
+
+def topic_fixer_record(line: str, path: Path) -> tuple[str, Path, list[str]] | None:
+    if not line.startswith(TOPIC_FIXER_JSON):
+        return None
+    item = json.loads(line.removeprefix(TOPIC_FIXER_JSON))
+    if (not isinstance(item, dict) or not TOPIC_PR.fullmatch(str(item.get("pr") or ""))
+            or not isinstance(item.get("worktree"), str) or not Path(item["worktree"]).is_absolute()
+            or not isinstance(item.get("commands"), list)
+            or not all(isinstance(command, str) for command in item["commands"])):
+        raise ValueError(f"invalid topic fixer record in {path}")
+    return item["pr"], Path(item["worktree"]), item["commands"]
+
+
+def split_topic_suffix(line: str) -> tuple[str, str]:
+    if not line.endswith("）"):
+        return line, ""
+    depth = 1
+    for index in range(len(line) - 2, -1, -1):
+        if line[index] == "）":
+            depth += 1
+        elif line[index] == "（":
+            depth -= 1
+            if depth == 0:
+                return line[:index], line[index + 1:-1]
+    return line, ""
+
+
+def legacy_topic_worktree(display: str, known: Collection[Path] = (), *, require_known: bool = False) -> Path | None:
+    named, suffix = split_topic_suffix(display)
+    worktree = Path(named)
+    if not worktree.is_absolute():
+        return None
+    candidates = {path for delimiter in re.finditer("（", display)
+                  if (path := Path(display[:delimiter.start()])) in known or (path / ".git").exists()}
+    unbalanced = named.count("（") != named.count("）")
+    if (not TOPIC_STATE.search(suffix) or require_known and candidates != {worktree}
+            or (candidates or unbalanced) and worktree not in candidates):
+        raise ValueError("cannot identify the topic repair worktree")
+    return worktree
+
+
+def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Path, list[str]]:
+    blockers: dict[Path, list[str]] = {}
+    structured: set[str] = set()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        if record := topic_fixer_record(line, path):
+            reference, workspace, fixes = record
+            fix = "・".join(dict.fromkeys(fixes)) or "修正コマンドの記録なし"
+            blockers.setdefault(workspace, []).append(f"topic check で修正担当に指定されています（{reference}、{fix}）")
+            structured.add(reference)
     pr = None
     target = None
+    has_drift = has_owner = False
     commands: list[str] = []
-    for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
+    for line in [*lines, "-"]:
+        if line.startswith(TOPIC_FIXER_JSON):
+            continue
+        if target and line and line != "-" and not (
+                TOPIC_BOUNDARY.fullmatch(line) or line.startswith("  直し方: ")):
+            raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
         if line and not line[0].isspace():
+            if pr and has_drift and not has_owner:
+                raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
             if pr and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
                 blockers.setdefault(target, []).append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
-            pr = line if TOPIC_PR.fullmatch(line) else None
+            pr = line if line not in structured and TOPIC_PR.fullmatch(line) else None
             target = None
+            has_drift = has_owner = False
             commands = []
         elif pr:
             detail = line.strip()
-            if match := TOPIC_FIX.search(detail):
-                commands.append(match[1])
-            elif detail.startswith("直し方: "):
+            has_drift |= detail.startswith(("違い:", "Asana:"))
+            if detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
-            elif detail.startswith("直す作業場: "):
-                target = Path(detail.removeprefix("直す作業場: ").rsplit("（", 1)[0])
+            elif detail.startswith("直す作業場:"):
+                display = detail.removeprefix("直す作業場:").strip()
+                try:
+                    target = legacy_topic_worktree(display, scanned, require_known=True)
+                    has_owner = target is not None or display.startswith("なし（")
+                    if not has_owner:
+                        raise ValueError("cannot identify the topic repair worktree")
+                except ValueError as error:
+                    raise ValueError(f"{error} for {pr} in {path}") from error
+            elif detail.endswith(" で直る）"):
+                has_drift = True
+                _, suffix = split_topic_suffix(detail)
+                if suffix:
+                    commands.append(suffix.removesuffix(" で直る"))
     return blockers
 
 
@@ -1859,7 +1946,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--from", dest="from_file", type=Path, metavar="SCAN_JSON",
                         help="a saved scan_sessions.py JSON whose scanned_at is the default --since")
     parser.add_argument("--topic-check", type=Path, metavar="TOPIC_STDOUT",
-                        help="topic check output for this run (default: next to --from, if present); keep named worktrees")
+                        help="topic check --fixers-json output for this run (default: next to --from, if present); "
+                             "keep named worktrees")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                         help="the lead's answers in an append-only JSONL log (default: %(default)s)")
@@ -2045,12 +2133,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
-    topic = args.topic_check
-    if topic is None and args.from_file:
-        topic = topic_check_output(args.from_file)
-    if topic is not None:
+    if args.topic_check or args.from_file:
         try:
-            decided.extend(reason for target, reasons in topic_drift_blockers(topic.expanduser()).items()
+            drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check
+                     else scan_topic_blockers(args.from_file))
+            decided.extend(reason for target, reasons in drift.items()
                            if target.resolve() == Path(worktree) for reason in reasons)
         except (OSError, ValueError) as error:
             decided.append(f"topic check の結果を確認できません（{error}）")

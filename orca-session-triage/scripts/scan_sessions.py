@@ -4454,12 +4454,13 @@ def main(argv: list[str] | None = None) -> int:
         asks = inbox_read.open_asks(entries, inbox_read.answered_ids(answers))
         rows = with_cleanup_constraints(rows, args.state_file.expanduser(), args.decisions_file.expanduser(),
                                         open_asks=asks, known_tabs=known_tabs)
-        if args.from_file and (topic := rm_check.topic_check_output(Path(args.from_file))):
+        if args.from_file:
             try:
-                drift = rm_check.topic_drift_blockers(topic)
+                drift = rm_check.scan_topic_blockers(Path(args.from_file))
             except (OSError, ValueError) as error:
                 for row in rows:
                     row["cleanup_blockers"].append(f"topic check の結果を確認できません（{error}）")
+                    row["closable"] = []
             else:
                 for row in rows:
                     path = Path(row["path"])
