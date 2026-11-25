@@ -3698,7 +3698,7 @@ class ScanCommandTests(unittest.TestCase):
             return json.loads(out.getvalue())
 
         shown = final("report")
-        self.assertEqual(shown["final"], {"source": "card", "at": "2026-11-09T03:00:00Z", "text": report})
+        self.assertEqual(shown["final"], {"source": "card", "at": "2026-11-09T12:00:00+09:00", "text": report})
         self.assertEqual([(card["prompt"], card["last_message"]) for card in shown["done_cards"]],
                          [(prompt, report)])
         self.assertEqual([final(name)["final"]["source"] for name in ("same", "older")], ["claude", "claude"])
@@ -3834,11 +3834,11 @@ class ScanCommandTests(unittest.TestCase):
             self.assertEqual(scan.main(["--from", str(saved), "--rows"]), 0)
 
         self.assertEqual(out.getvalue().splitlines(), [
-            "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T01:00:00Z"
+            "fix-login | waiting (scan: stalled) | Eotel/app#10 OPEN | tabs 1 | 2026-10-27T10:00:00+09:00"
             " | PR #10 を merge するか | reasons final message | git.dirty null | git.unpushed null",
-            "dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T02:00:00Z | 設定を反映しました"
+            "dotfiles-73 | unsure | Eotel/chezmoi-dotfiles | tabs 0 | 2026-10-27T11:00:00+09:00 | 設定を反映しました"
             " | reasons - | git.dirty null | git.unpushed null",
-            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T03:00:00Z | どちらにしますか"
+            "mbp16::app | waiting | - | tabs 1 | 2026-10-27T12:00:00+09:00 | どちらにしますか"
             " | reasons - | git.dirty null | git.unpushed null",
             "mbp16::fix-login | working | - | tabs 0 | - | "
             " | reasons - | git.dirty null | git.unpushed null",
@@ -4158,7 +4158,7 @@ class ScanCommandTests(unittest.TestCase):
         row = json.loads(out.getvalue())
         self.assertEqual((row["path"], row["github"], row["class"], row["comment"]),
                          (str(checkout), "Eotel/chezmoi-dotfiles", "unsure", "作業中"))
-        self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T02:00:00Z",
+        self.assertEqual(row["final"], {"source": "codex", "at": "2026-10-27T11:00:00+09:00",
                                         "text": "設定を反映しました"})
         self.assertEqual(row["last_user"], "設定を反映して")
         self.assertEqual(row["transcripts"], {"claude": [], "codex": []})

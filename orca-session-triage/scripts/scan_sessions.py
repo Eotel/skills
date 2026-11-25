@@ -4181,7 +4181,7 @@ def row_view(row: dict, entries: Sequence[dict] = ()) -> dict:
         "stop": row.get("stop"),
         "waits_on": verdict.get("waits_on") or row.get("waits_on") or "",
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
-        "final": {**final, "at": jst_timestamp(final["at"])}, "last_user": asked or "", "transcripts": transcripts,
+        "final": final, "last_user": asked or "", "transcripts": transcripts,
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
         "prompt_waiting": row.get("prompt_waiting"), "codex_approvals": row.get("codex_approvals") or [],
         "queued_input": row.get("queued_input") or [],
@@ -4232,7 +4232,8 @@ def row_line(view: dict) -> str:
                          for session in view.get("claude_sessions") or [])
     approvals = " ; ".join(f"{item['tab']} {item.get('target') or item['question']} [{'; '.join(item['choices'])}]"
                            for item in view.get("codex_approvals") or [])
-    return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | {view['final']['at'] or '-'} | {note}"
+    return (f"{view['name']} | {klass} | {where} | tabs {len(view['tabs'])} | "
+            f"{jst_timestamp(view['final']['at']) or '-'} | {note}"
             f" | reasons {reasons} | git.dirty {dirty} | git.unpushed {unpushed}"
             + (f" | Claude sessions {sessions}" if sessions else "")
             + (f" | Codex approvals {approvals}" if approvals else ""))
@@ -4429,6 +4430,8 @@ def print_row(args: argparse.Namespace, rows: list[dict], key: str) -> int:
         if not any(view["transcripts"].values()):
             print(missing_transcripts(row), file=sys.stderr)
         return 0
+    if not args.recheck:
+        view["final"]["at"] = jst_timestamp(view["final"]["at"])
     json.dump(view, sys.stdout, ensure_ascii=False, indent=2)
     print()
     return 0
