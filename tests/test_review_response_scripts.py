@@ -29,9 +29,9 @@ WORKTREE_SETUP = ROOT / "codex-tdd-orchestration" / "scripts" / "worktree-setup.
 BILLING = {
     "budgets": {"budgets": [{"budget_product_skus": ["actions"], "budget_scope": "organization",
                              "budget_amount": 50, "prevent_further_usage": True},
-                            {"budget_product_sku": "actions", "budget_scope": "repository",
+                            {"budget_product_skus": ["actions"], "budget_scope": "repository",
                              "budget_amount": 9, "prevent_further_usage": False},
-                            {"budget_product_sku": "packages", "budget_scope": "organization",
+                            {"budget_product_skus": ["packages"], "budget_scope": "organization",
                              "budget_amount": 19, "prevent_further_usage": False}]},
     "usage": {"usageItems": [
         {"product": "Actions", "netAmount": 14.75, "grossAmount": 42.25},
@@ -827,7 +827,7 @@ class WatchPrsTests(unittest.TestCase):
                                   "repos/acme/api/check-runs/12/annotations?per_page=1"])
 
     def test_actions_budget_can_be_on_a_later_page(self) -> None:
-        page_one = {"budgets": [{"budget_scope": "repository", "budget_product_sku": "actions",
+        page_one = {"budgets": [{"budget_scope": "repository", "budget_product_skus": ["actions"],
                                  "budget_amount": 9}], "has_next_page": True}
         page_two = {**BILLING["budgets"], "has_next_page": False}
         with patch.object(prs, "gh_json", side_effect=[page_one, page_two, BILLING["usage"]]) as gh:
