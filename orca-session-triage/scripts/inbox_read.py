@@ -745,6 +745,11 @@ def answer_sender() -> dict[str, str | None]:
     return {"worktree": str(path), "session": session if isinstance(session, str) and session else None}
 
 
+def same_answer_session(sender: Mapping[str, str | None] | None, source: Mapping[str, str | None]) -> bool:
+    return bool(sender and source.get("session") and sender.get("session") == source["session"]
+                and sender.get("worktree") == source.get("worktree"))
+
+
 def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: str | None = None,
                    sender: Mapping[str, str | None] | None = None, sent_text: str | None = None,
                    answer_at: str | None = None, transcript_input: str | None = None,

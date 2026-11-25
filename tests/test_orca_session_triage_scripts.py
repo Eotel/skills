@@ -5988,7 +5988,7 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
         self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
         self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
-        for action in ("手順 1）を修正", "手順 1（を修正", "原因調査\n結果追記"):
+        for action in ("手順 1）を修正", "手順 1（を修正", "手順 1）を修正（追記", "原因調査\n結果追記"):
             topic.write_text(f"{url}\n  直す作業場: {alias}（{action}、agent なし）\n")
             code, result = self.run_main("--from", str(saved))
             self.assertEqual(code, 1)
@@ -5997,7 +5997,7 @@ class RmCheckTests(unittest.TestCase):
         topic.write_text(f"{url}\n  直す作業場: {alias}（手順 1")
         self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
         topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
-        self.assertEqual(self.run_main("--from", str(saved))[0], 0)
+        self.assertEqual(self.run_main("--from", str(saved))[0], 1)
 
         topic.write_text("照合 2 件・食い違い 0 件・読めない 0 件\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
@@ -7817,10 +7817,13 @@ class HourlyStateTests(unittest.TestCase):
 
         sync = importlib.import_module("answer_sync")
         with patch.dict(os.environ, {"TRIAGE_INBOX": str(self.root / "inbox.jsonl"),
+                                      "ORCA_TERMINAL_HANDLE": "term_answerer", "CODEX_THREAD_ID": "answer-session",
                                       "TRIAGE_ASK_ANSWERS": str(self.root / "answers.jsonl")}):
             sync.record([f"{ask_id}:2"], "Second answer", "send", at="2026-11-13T09:02:00Z",
                         state_file=self.state, decisions_file=self.root / "lead.jsonl",
                         handed_off_file=self.root / "handed.jsonl")
+        sender = inbox_read.answer_records(self.root / "answers.jsonl")[f"{ask_id}:2"]["sender"]
+        self.assertEqual((sender["handle"], sender["session"]), ("term_answerer", "answer-session"))
         questions = self.call("show")[1]["questions"]
         self.assertIsNone(questions[recorded[0]["id"]]["answer"])
         self.assertEqual(questions[recorded[1]["id"]]["answer"], "Second answer")

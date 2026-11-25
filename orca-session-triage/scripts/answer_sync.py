@@ -219,7 +219,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                         obsolete |= earlier_revision
                         continue
                 if manual:
-                    same_session = sender["session"] and all(item.get("sender") == sender for item in manual)
+                    same_session = all(inbox_read.same_answer_session(item.get("sender"), sender) for item in manual)
                     if not same_session and original != answer:
                         raise ValueError(f"ask {key}: answer already recorded by another session")
                 if (previous and corrected and source_at == previous.get("answer_at")
@@ -284,7 +284,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                     # Completing a whole-ask key must not replace a selected part with combined answers.
                     bindings = [value for value in bindings if (ref := refs_by_key.get(value)) is None
                                 or ref[0] != source[0] or ref[1] and ref[1] <= source[1]]
-                if (matched and sender["session"] and sender == item.get("answered_by") and item.get("answer") is not None
+                if (matched and inbox_read.same_answer_session(item.get("answered_by"), sender) and item.get("answer") is not None
                         and how in inbox_read.DELIVERY_ANSWERS):
                     continue
                 if bindings:
@@ -311,9 +311,9 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 text = "\n".join(parts) or answer
                 changed.append(hourly_state.record_answer(data, hourly_state.Answering(id=key, answer=text, answered_at=when),
                                                           prechecked=bool(refs) and (is_delivery or bool(bindings))))
-            decision_sender = {**sender, "handle": os.environ.get("ORCA_TERMINAL_HANDLE")}
+            recorded_sender = {**sender, "handle": os.environ.get("ORCA_TERMINAL_HANDLE")}
             new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when,
-                                           from_ask=key not in explicit, sender=decision_sender)
+                                           from_ask=key not in explicit, sender=recorded_sender)
                    for key, text in keys.items() if key not in latest
                    or (key in explicit and (latest[key].answer != text or key in auto_keys))
                    or (key in auto_keys and latest[key].answer != text)]
@@ -322,7 +322,7 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
             if changed:
                 hourly_state.save(state_file, data)
             for key, (text, source_at) in new_delivery.items():
-                inbox_read.record_answers(log, [key], how, text, at=when, sender=sender, answer_at=source_at,
+                inbox_read.record_answers(log, [key], how, text, at=when, sender=recorded_sender, answer_at=source_at,
                                           sent_text=answer if answer != text else None,
                                           hold_id=hold_id, hold_due_at=hold_due_at)
     return {"questions": [item["id"] for item in changed], "decisions": list(keys), "at": when}

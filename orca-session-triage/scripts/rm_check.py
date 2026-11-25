@@ -1749,9 +1749,13 @@ def topic_check_outputs(directory: Path) -> list[Path]:
 
 
 def scan_topic_blockers(scan_file: Path) -> dict[Path, list[str]]:
+    from scan_sessions import saved_rows
+
     blockers: dict[Path, list[str]] = {}
-    for path in topic_check_outputs(scan_file.expanduser().parent):
-        for target, reasons in topic_drift_blockers(path).items():
+    outputs = topic_check_outputs(scan_file.expanduser().parent)
+    worktrees = {Path(row["path"]) for row in saved_rows(str(scan_file))} if outputs else set()
+    for path in outputs:
+        for target, reasons in topic_drift_blockers(path, worktrees).items():
             blockers[target] = list(dict.fromkeys((*blockers.get(target, []), *reasons)))
     return blockers
 
@@ -1793,7 +1797,7 @@ def legacy_topic_worktree(display: str) -> Path | None:
     return worktree
 
 
-def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
+def topic_drift_blockers(path: Path, scanned: Collection[Path] = ()) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     structured: set[str] = set()
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -1823,6 +1827,8 @@ def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
             elif detail.startswith("直す作業場: "):
                 try:
                     target = legacy_topic_worktree(detail.removeprefix("直す作業場: "))
+                    if target is not None and target not in scanned and not (target / ".git").exists():
+                        raise ValueError("cannot identify the topic repair worktree")
                 except ValueError as error:
                     raise ValueError(f"{error} for {pr} in {path}") from error
             elif detail.endswith(" で直る）"):
