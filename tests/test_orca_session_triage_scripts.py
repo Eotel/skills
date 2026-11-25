@@ -6602,10 +6602,15 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["ok"]), (0, True), result)
         self.assertEqual(file.read_text(), "tracked\n")
+        (self.main / ".git/info/exclude").write_text("")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, retry = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+        self.assertEqual((code, retry["ok"]), (0, True), retry)
+
         unknown = file.with_name("unapproved.txt")
         unknown.write_text("keep this file\n")
         with patch.object(rmcheck, "processes_in", return_value=[]):
-            code, blocked = self.run_main("--restored-file-stamps", json.dumps(result["restored_file_stamps"]))
+            code, blocked = self.run_main("--restore-nested", rel, "--apply-restore-nested")
         self.assertEqual(code, 1, blocked)
         self.assertEqual(unknown.read_text(), "keep this file\n")
 
