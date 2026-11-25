@@ -48,6 +48,7 @@ CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
 CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 TOPIC_FIXER_JSON = "topic-fixer-json: "
+TOPIC_STATE = re.compile(r"(?:^|、)(?:agent なし|生きている agent: .+|作業場はもう無い)$")
 TOPIC_BOUNDARY = re.compile(r"https://\S+|[A-Z][A-Z0-9_]*-\d+|\d+|照合 \d+ 件・.*")
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
@@ -1795,7 +1796,8 @@ def legacy_topic_worktree(display: str, known: Collection[Path] = (), *, require
     candidates = {path for delimiter in re.finditer("（", display)
                   if (path := Path(display[:delimiter.start()])) in known or (path / ".git").exists()}
     unbalanced = named.count("（") != named.count("）")
-    if not suffix or ((candidates or require_known or unbalanced) and candidates != {worktree}):
+    if (not TOPIC_STATE.search(suffix) or require_known and candidates != {worktree}
+            or (candidates or unbalanced) and worktree not in candidates):
         raise ValueError("cannot identify the topic repair worktree")
     return worktree
 

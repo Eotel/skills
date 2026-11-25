@@ -319,9 +319,11 @@ def print_read(result: dict, now: datetime) -> None:
                     try:
                         worktree = legacy_topic_worktree(detail, structured_prs.get(record_key, ()))
                     except ValueError:
-                        if record_key in structured_prs:
+                        known = structured_prs.get(record_key, ())
+                        if any(detail.startswith(f"{path}（") for path in known):
                             continue
-                        worktree = None
+                        display.setdefault(f"unreadable:{record_key}:{detail}", f"  直す作業場: 要確認（{detail}）")
+                        continue
                     display.setdefault(str(worktree) if worktree else detail, line)
         for worktree, label in structured_paths.items():
             display.setdefault(worktree, label)

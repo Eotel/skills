@@ -6015,10 +6015,15 @@ class RmCheckTests(unittest.TestCase):
             with self.subTest(path=path):
                 topic.write_text(f"{url}\n  直す作業場: {path}（topic link {action}、"
                                  "2026-11-25T10:00:00+09:00、agent なし）\n")
-                for mode, source in (("--from", saved), ("--topic-check", topic)):
-                    code, result = self.run_main("--worktree", str(path), mode, str(source))
-                    self.assertEqual(code, 1)
-                    self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
+                rows = [topic.read_text()]
+                if path == multiline:
+                    rows.append(rows[0].split("追記", 1)[0])
+                for report in rows:
+                    topic.write_text(report)
+                    for mode, source in (("--from", saved), ("--topic-check", topic)):
+                        code, result = self.run_main("--worktree", str(path), mode, str(source))
+                        self.assertEqual(code, 1)
+                        self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
 
     def test_ignored_tool_output_is_regenerable_only_while_it_holds_no_other_work(self) -> None:
         (self.main / ".git" / "info" / "exclude").write_text("site/\nweb/var/\nweb/test_*.sqlite3\n")

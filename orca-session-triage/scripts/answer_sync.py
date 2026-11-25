@@ -119,6 +119,8 @@ def hourly_answers(items: list[tuple[int | None, dict]]) -> list[InboxAnswer]:
             recorded.pop(key, None)
             recorded[key] = {"note": item["answer"], "how": how, "ts": at}
         sender = item.get("answered_by") or {"worktree": None, "session": None}
+        if (handle := item.get("answered_in")) and not handle.startswith("/"):
+            sender = {**sender, "handle": handle}
         planned.extend(InboxAnswer(keys, how, item["answer"], at, item["id"], number, sender)
                        for (how, at), keys in grouped.items())
     return planned
@@ -150,11 +152,13 @@ def update_corrected_keys(items: list[dict], questions: Iterable[dict]) -> None:
                     or not ask_state.covered(ref, list(records), entries)):
                 continue
             parts = answer_parts(ref, records, entries)
-            newest = max((part["ts"] for part in parts if part.get("how") == inbox_read.HOURLY_CORRECTION),
-                         key=datetime.fromisoformat, default=None)
+            newest = max((part for part in parts if part.get("how") == inbox_read.HOURLY_CORRECTION),
+                         key=lambda part: datetime.fromisoformat(part["ts"]), default=None)
             answer = answer_text(parts)
-            if newest and datetime.fromisoformat(newest) >= datetime.fromisoformat(previous.decided_at) and answer != previous.answer:
-                updates.append(lead_decisions.Decision(uuid.uuid4().hex, key, answer, newest, from_ask=True))
+            if (newest and datetime.fromisoformat(newest["ts"]) >= datetime.fromisoformat(previous.decided_at)
+                    and answer != previous.answer):
+                updates.append(lead_decisions.Decision(uuid.uuid4().hex, key, answer, newest["ts"], from_ask=True,
+                                                       sender=newest.get("sender")))
         if updates:
             append_decisions(*updates)
 

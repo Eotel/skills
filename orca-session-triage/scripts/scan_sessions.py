@@ -4454,6 +4454,7 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, ValueError) as error:
                 for row in rows:
                     row["cleanup_blockers"].append(f"topic check の結果を確認できません（{error}）")
+                    row["closable"] = []
             else:
                 for row in rows:
                     path = Path(row["path"])
