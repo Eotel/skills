@@ -5939,6 +5939,22 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in result["held"]], ["other-cache/"])
         self.assertTrue(any(".uv-cache/" in note and "CACHEDIR.TAG" in note for note in result["notes"]))
 
+    def test_uv_cache_children_inherit_the_cache_tag(self) -> None:
+        for name in (".uv-cache", "data"):
+            folder = self.wt / name
+            (folder / "sdists-v9").mkdir(parents=True)
+            (folder / ".gitignore").write_text("*\n")
+            (folder / "sdists-v9/.git").write_text("fixture\n")
+            (folder / "CACHEDIR.TAG").write_bytes(
+                b"Signature: 8a477f597d28d172789f06886806bc55\n" if name == ".uv-cache" else b"invalid\n")
+
+        code, result = self.run_main()
+
+        self.assertEqual(code, 1, result)
+        self.assertTrue({".uv-cache/.gitignore", ".uv-cache/CACHEDIR.TAG", ".uv-cache/sdists-v9/"}
+                        <= set(result["regenerable"]), result)
+        self.assertEqual({Path(item["path"]).parts[0] for item in result["held"]}, {"data"}, result)
+
     def test_same_run_topic_drift_holds_the_named_worktree_until_the_next_clean_scan(self) -> None:
         folder = self.wt.parent / "hourly"
         folder.mkdir()
@@ -6235,6 +6251,37 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
 
+    def test_nested_restore_only_applies_to_the_approved_clone_after_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        original = filename.read_text()
+        filename.write_text("staged change\n")
+        git(copy, "add", "app.txt")
+        filename.write_text("unstaged change\n")
+        options = ("--restore-nested", "local-deps/library")
+
+        code, preview = self.run_main(*options)
+        self.assertEqual((code, preview["restore_nested"]), (1, {"local-deps/library": ["app.txt"]}), preview)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+
+        unpublished = copy / "keep.txt"
+        unpublished.write_text("untracked data\n")
+        code, blocked = self.run_main(*options, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        self.assertEqual(unpublished.read_text(), "untracked data\n")
+        unpublished.unlink()
+
+        before = datetime.now(timezone.utc).isoformat()
+        code, result = self.run_main(*options, "--apply-restore-nested", "--since", before)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(filename.read_text(), original)
+        self.assertFalse(git(copy, "status", "--porcelain"))
+
     def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6429,6 +6476,17 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"], result["detached"]), (1, False, []))
         self.assertEqual(result["nested_worktrees"][0]["blockers"], ["2 uncommitted changes"])
         self.assertTrue(copy.exists())
+
+    def test_approved_tracked_changes_in_a_nested_worktree_are_restored_before_detaching(self) -> None:
+        copy = self.nested_catalog()
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (copy / rel).write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
+
+        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested", "--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (0, [str(copy.resolve())]), result)
+        self.assertIn(rel, result["restored_nested"]["local-deps/pushed"])
+        self.assertFalse(copy.exists())
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run

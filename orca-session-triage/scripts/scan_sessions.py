@@ -3227,6 +3227,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                         **({"archive_path": list(answer.removal.archive_path)}
                            if answer.removal and answer.removal.archive_path else {}),
                         **({"approve": True} if answer.removal and answer.removal.approve else {}),
+                        **({"restore_nested": list(answer.removal.restore_nested)}
+                           if answer.removal and answer.removal.restore_nested else {}),
                 }
         removal_at = EPOCH
         if by_key:
@@ -3273,6 +3275,7 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         if len(candidates) > 1 and selected["allows_removal"]:
             cleanup_terms = {(frozenset(map(PurePosixPath, removal.get("discard") or ())),
                               frozenset(map(PurePosixPath, removal.get("archive_path") or ())),
+                              frozenset(map(PurePosixPath, removal.get("restore_nested") or ())),
                               removal.get("compose_down") is True)
                              for removal in candidates}
             if len(cleanup_terms) > 1:
@@ -3302,7 +3305,8 @@ def removal_answer_approves(decision: Mapping) -> bool:
         return False
     if decision.get("after"):
         return decision.get("after_state") == "MERGED"
-    if decision.get("approve") is True or decision.get("discard") or decision.get("compose_down") or decision.get("archive_path"):
+    if (decision.get("approve") is True or decision.get("discard") or decision.get("compose_down")
+            or decision.get("archive_path") or decision.get("restore_nested")):
         return True
     text = str(decision.get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
@@ -4278,6 +4282,8 @@ def batch_has_preview() -> bool:
 def batch_requirement(row: dict) -> str | None:
     if (row.get("removal_decision") or {}).get("archive_path") and "recorded archive_path" not in batch_help():
         return f"{row['path']}: 記録済みの --archive-path に対応した Harness が必要です"
+    if (row.get("removal_decision") or {}).get("restore_nested") and "recorded restore_nested" not in batch_help():
+        return f"{row['path']}: 記録済みの --restore-nested に対応した Harness が必要です"
     if any(char.isspace() for char in row["path"]) and not batch_has_preview():
         return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
     return None
