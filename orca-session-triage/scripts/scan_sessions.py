@@ -2431,6 +2431,13 @@ def parse_time(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def jst_timestamp(value: str | None) -> str:
+    if (at := parse_time(value)) is None:
+        return value or ""
+    timespec = "milliseconds" if at.microsecond and at.microsecond % 1000 == 0 else "auto"
+    return at.astimezone(JST).isoformat(timespec=timespec)
+
+
 WORKER_MAIL = ("worker_done", "question", "escalation")
 MAIL_GRACE_MINUTES = 5  # Orca types its own notice into an idle lead first
 
@@ -4127,7 +4134,7 @@ def row_view(row: dict, entries: Sequence[dict] = ()) -> dict:
         "stop": row.get("stop"),
         "waits_on": verdict.get("waits_on") or row.get("waits_on") or "",
         "next_step": verdict.get("next_step") or "", "verdict": verdict or None,
-        "final": final, "last_user": asked or "", "transcripts": transcripts,
+        "final": {**final, "at": jst_timestamp(final["at"])}, "last_user": asked or "", "transcripts": transcripts,
         "comment": row.get("comment") or "", "pr": row.get("pr"), "git": row.get("git"),
         "prompt_waiting": row.get("prompt_waiting"), "codex_approvals": row.get("codex_approvals") or [],
         "queued_input": row.get("queued_input") or [],
