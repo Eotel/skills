@@ -532,6 +532,18 @@ Check the external watch with
 The Stop hook names a stopped service. Do not start a replacement Monitor in
 the tab.
 
+## Actions の未起動
+
+GitHub Actions がジョブを起動しなかった理由は `gh api repos/O/R/check-runs/JOB_ID/annotations` で確認する。
+
+組織の予算額と、上限に達した際に停止するかは
+`gh api 'organizations/ORG/settings/billing/budgets?per_page=100&page=1'` で確認する。
+`has_next_page` が `true` の間は `page` を進める。`budget_scope` が `organization` で、
+`budget_product_skus` に `actions` を含む予算を確認する。単数形の `budget_product_sku` で返る場合は
+値が `actions` の予算を確認する。
+当月の純利用額は `gh api 'organizations/ORG/settings/billing/usage?year=Y&month=M'` の
+`usageItems` から Actions の `netAmount` を集計する。Billing API へのアクセス権限は組織ごとに確認する。
+
 ## Permission and trust prompts
 
 When a lane waits for permission to run a tool or asks whether to trust a

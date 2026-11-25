@@ -29,8 +29,10 @@ WORKTREE_SETUP = ROOT / "codex-tdd-orchestration" / "scripts" / "worktree-setup.
 BILLING = {
     "budgets": {"budgets": [{"budget_product_skus": ["actions"], "budget_scope": "organization",
                              "budget_amount": 50, "prevent_further_usage": True},
-                            {"budget_product_skus": ["actions_linux"], "budget_scope": "repository",
-                             "budget_amount": 9, "prevent_further_usage": False}]},
+                            {"budget_product_skus": ["actions"], "budget_scope": "repository",
+                             "budget_amount": 9, "prevent_further_usage": False},
+                            {"budget_product_skus": ["packages"], "budget_scope": "organization",
+                             "budget_amount": 19, "prevent_further_usage": False}]},
     "usage": {"usageItems": [
         {"product": "Actions", "netAmount": 14.75, "grossAmount": 42.25},
         {"product": "actions", "netAmount": 35.25, "grossAmount": 47.09},
@@ -486,7 +488,7 @@ class WatchPrsTests(unittest.TestCase):
                 kind = args[-1].split("?")[0].rsplit("/", 1)[-1]
                 if kind not in (billing or {}):
                     return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
-                body = (billing or {})[kind]
+                body = {"budgets": []} if "scope=organization" in args[-1] else (billing or {})[kind]
             else:
                 body = [feeds.get(args[-1].split("?")[0], [])]
             return subprocess.CompletedProcess(command, 0, json.dumps(body), "")
@@ -823,6 +825,15 @@ class WatchPrsTests(unittest.TestCase):
                 self.assertEqual([args[-1] for args in calls if "annotations" in args[-1]],
                                  ["repos/acme/api/check-runs/11/annotations?per_page=1",
                                   "repos/acme/api/check-runs/12/annotations?per_page=1"])
+
+    def test_actions_budget_can_be_on_a_later_page(self) -> None:
+        page_one = {"budgets": [{"budget_scope": "repository", "budget_product_skus": ["actions"],
+                                 "budget_amount": 9}], "has_next_page": True}
+        page_two = {**BILLING["budgets"], "has_next_page": False}
+        with patch.object(prs, "gh_json", side_effect=[page_one, page_two, BILLING["usage"]]) as gh:
+            note = prs.actions_billing_note("acme")
+        self.assertEqual(note, " | Actions 予算 $50.00（上限で停止）・当月の純利用額 $50.00")
+        self.assertTrue(gh.call_args_list[1].args[0][-1].endswith("&page=2"))
 
     def test_low_graphql_budget_waits_for_reset_without_reading_prs(self) -> None:
         reset = 1793160542

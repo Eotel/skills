@@ -83,16 +83,29 @@ def not_started_note(reasons: dict[str, str], billing: Callable[[], str] = str) 
 
 
 def actions_billing_note(owner: str) -> str:
-    def get(suffix: str, field: str) -> list[dict] | None:
+    def get(suffix: str) -> dict:
         try:
             data = gh_json(["api", f"organizations/{owner}/settings/billing/{suffix}"])
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            return None
-        values = data.get(field) if isinstance(data, dict) else None
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def items(data: dict, field: str) -> list[dict] | None:
+        values = data.get(field)
         return values if isinstance(values, list) and all(isinstance(item, dict) for item in values) else None
 
     now = datetime.now(timezone.utc)
-    budgets = get("budgets?scope=organization&per_page=100", "budgets") or []
+    budgets = []
+    page = 1
+    while True:
+        data = get(f"budgets?per_page=100&page={page}")
+        batch = items(data, "budgets")
+        if not batch:
+            break
+        budgets.extend(batch)
+        if data.get("has_next_page") is not True:
+            break
+        page += 1
     amounts = []
     for budget in budgets:
         products = budget.get("budget_product_skus")
@@ -104,7 +117,7 @@ def actions_billing_note(owner: str) -> str:
         if type(amount) in (int, float):
             setting = {True: "（上限で停止）", False: "（上限で停止しない）"}[stopped] if isinstance(stopped, bool) else ""
             amounts.append(f"予算 ${amount:,.2f}{setting}")
-    usage = get(f"usage?year={now.year}&month={now.month}", "usageItems")
+    usage = items(get(f"usage?year={now.year}&month={now.month}"), "usageItems")
     if usage is not None:
         total = 0.0
         for item in usage:
