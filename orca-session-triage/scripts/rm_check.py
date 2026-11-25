@@ -204,10 +204,12 @@ def log_note(rel: str, files: list[Path]) -> str:
         rel, sum(stat.st_size for stat in stats), latest.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
-def working_changes(worktree: str | Path) -> tuple[list[str], list[str], list[str]]:
+def working_changes(worktree: str | Path, *, all_untracked: bool = False) -> tuple[list[str], list[str], list[str]]:
     tracked_changes, untracked, regenerable = [], [], []
     # -z gives each path unquoted; a rename's second entry names its source and is skipped.
-    entries = iter(git(worktree, "--no-optional-locks", "status", "--porcelain", "-z").stdout.split("\0"))
+    mode = "all" if all_untracked else "normal"
+    entries = iter(git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", f"--untracked-files={mode}")
+                   .stdout.split("\0"))
     for entry in entries:
         if not entry:
             continue
@@ -721,12 +723,17 @@ class NestedRestore:
                    for info, _, rel in (item.partition("\t"),)}
         cutoff = self.since.timestamp() * 1e9 if self.since else None
         changes: dict[str, list[int] | None] = {}
+        listings: dict[Path, dict[str, Path]] = {}
         for item in filter(None, status.stdout.split("\0")):
             rel = item[3:]
             path = copy / rel
             if item.startswith("?? "):
-                if path in self.discard:
-                    continue
+                if self.discard:
+                    try:
+                        if disk_path(copy, Path(rel), listings) in self.discard:
+                            continue
+                    except OSError:
+                        pass
                 return False
             if (entries.get(rel) not in {"100644", "100755", "120000"}
                     or (item.startswith("D ") and (path.exists() or path.is_symlink()))
@@ -939,7 +946,12 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
-    tracked_changes, untracked, _ = working_changes(copy)
+    head = git(copy, "rev-parse", "HEAD").stdout.strip()
+    if not head or not on_remote(copy, head):
+        blockers.append("HEAD %s is on no remote branch" % head[:8])
+    elif git(copy, "rev-parse", "HEAD").stdout.strip() != head:
+        blockers.append("HEAD changed during the remote check")
+    tracked_changes, untracked, _ = working_changes(copy, all_untracked=True)
     changes = [*tracked_changes, *untracked]
     modified = set(git(copy, "--no-optional-locks", "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
     regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
@@ -949,6 +961,8 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     approved = restore is not None and restore.allows_changes(copy)
     if changes and not approved:
         blockers.append("%d uncommitted changes" % len(changes))
+    if restore is not None and copy in restore.requested and not approved:
+        blockers.append("--restore-nested の復元条件を満たしません")
     discard = restore.discard if approved and restore else frozenset()
     ignored = ignored_paths(copy, repository, discard=discard)
     review, deeper = ignored.review, ignored.nested
@@ -956,13 +970,10 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
         blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
     if ignored.lock_holders:
         blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
-    head = git(copy, "rev-parse", "HEAD").stdout.strip()
-    if not head or not on_remote(copy, head):
-        blockers.append("HEAD %s is on no remote branch" % head[:8])
     return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
             "regenerable": regenerable,
             "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
-            "detach": ["git", "-C", repository, "worktree", "remove", "--force", str(copy)]}
+            "detach": ["git", "-C", repository, "-c", "status.showUntrackedFiles=all", "worktree", "remove", str(copy)]}
 
 
 def patches_in_base(worktree: str | Path, head: str, base: str) -> list[str] | None:
@@ -1297,6 +1308,12 @@ def disk_entry(directory: Path, name: str, listings: dict[Path, dict[str, Path]]
     raise FileNotFoundError(path)
 
 
+def disk_path(root: Path, relative: Path, listings: dict[Path, dict[str, Path]]) -> Path:
+    for part in relative.parts:
+        root = disk_entry(root, part, listings)
+    return root
+
+
 def optional_stamp(path: Path) -> list[int] | None:
     try:
         return file_stamp(path)
@@ -1304,7 +1321,7 @@ def optional_stamp(path: Path) -> list[int] | None:
         return None
 
 
-def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]]) -> list[str]:
+def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]], *, include_ctime: bool = False) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
     moved = []
@@ -1314,16 +1331,17 @@ def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]])
             try:
                 path = Path(top) / name
                 stamp = file_stamp(path)
-                if stamp[3] > after * 1e9 and restored.get(str(path.relative_to(worktree))) != stamp:
-                    moved.append(path)
+                latest_ns = max(stamp[3], stamp[4]) if include_ctime else stamp[3]
+                if latest_ns > after * 1e9 and restored.get(str(path.relative_to(worktree))) != stamp:
+                    moved.append((latest_ns, path))
             except OSError:
                 continue
     blockers = []
     if moved:
-        latest = max(moved, key=lambda path: path.lstat().st_mtime)
+        latest_ns, latest = max(moved)
         blockers.append("走査（%s）の後に作業場のファイルが %d 個変わりました（最新 %s の %s）。別の担当が使っているかもしれません"
                         % (since.isoformat(timespec="seconds"), len(moved),
-                           datetime.fromtimestamp(latest.lstat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                           datetime.fromtimestamp(latest_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
                            latest.relative_to(worktree)))
     # The reflog dates every move of HEAD (commit, checkout, reset); the commit date stands in without one.
     moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
@@ -2042,7 +2060,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--detach-nested", action="store_true",
                         help="when nested worktrees are all that block the removal and each has no changes beyond "
                              "recompiled catalogs, nothing ignored to open, and HEAD on a remote, restore those "
-                             "catalogs and remove the copies with git worktree remove --force, then check again")
+                             "catalogs and remove the copies with git worktree remove, then check again")
     parser.add_argument("--restore-nested", action="append", default=[], metavar="PATH",
                         help="plan restoration of tracked changes in a nested Git repository named by a relative path")
     parser.add_argument("--apply-restore-nested", action="store_true",
@@ -2342,9 +2360,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     try:
                         listings: dict[Path, dict[str, Path]] = {}
                         for rel in paths:
-                            path = copy
-                            for part in Path(rel).parts:
-                                path = disk_entry(path, part, listings)
+                            path = disk_path(copy, Path(rel), listings)
                             restored[str(path.relative_to(root))] = file_stamp(path)
                     except OSError as error:
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")
@@ -2392,8 +2408,14 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             detach_error = ""
             for item in nested if removable else ():
                 copy = Path(item["path"])
-                if nested_check(copy) != item:
+                current = nested_check(copy)
+                prefix = f"{copy.relative_to(root)}/"
+                written = {name.removeprefix(prefix): stamp for name, stamp in restored.items() if name.startswith(prefix)}
+                movement = moved_since(copy, since, written, include_ctime=True) if since and restore else []
+                if current != item or movement:
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
+                    if movement:
+                        decided.extend(movement)
                     break
                 if item["restore"]:
                     applied = subprocess.run(item["restore"], capture_output=True, text=True)

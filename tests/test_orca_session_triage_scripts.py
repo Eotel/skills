@@ -6541,6 +6541,27 @@ class RmCheckTests(unittest.TestCase):
         for _, on_disk in spellings:
             self.assertEqual((generated / on_disk / "app.txt").read_text(), "tracked\n")
 
+    def test_nested_restore_plans_discard_using_the_actual_untracked_filename(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = self.wt / rel
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = "cafe\u0301.tmp"
+        disposable = copy / filename
+        disposable.write_text("explicitly approved\n")
+        (copy / "app.txt").write_text("edit to restore\n")
+        if not (copy / "caf\u00e9.tmp").exists():
+            self.skipTest("requires normalization-insensitive file lookup")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--discard-before-restore", f"{rel}/{filename}")
+
+        self.assertEqual((code, result.get("restore_nested")), (1, {rel: ["app.txt"]}), result)
+        self.assertEqual(disposable.read_text(), "explicitly approved\n")
+
     def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6815,7 +6836,7 @@ class RmCheckTests(unittest.TestCase):
 
         def create_after_first(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
             result = run(cmd, **kwargs)
-            if cmd[-4:] == ["worktree", "remove", "--force", str(first)] and result.returncode == 0:
+            if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd and cmd[-1] == str(first) and result.returncode == 0:
                 created.write_text("keep this file\n")
             return result
 
@@ -6827,6 +6848,51 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["detached"]), (1, [str(first)]), result)
         self.assertIn("local-deps/second", " ".join(result["blockers"]))
         self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_nested_detach_checks_untracked_files_even_when_git_config_hides_them(self) -> None:
+        copy = self.nested_catalog()
+        git(copy, "config", "status.showUntrackedFiles", "no")
+        created = copy / "private.txt"
+        created.write_text("keep this file\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_native_nested_removal_refuses_untracked_files_created_after_the_last_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        git(copy, "config", "status.showUntrackedFiles", "no")
+        created = copy / "private.txt"
+        run = subprocess.run
+
+        def create_before_remove(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd and cmd[-1] == str(copy):
+                created.write_text("keep this file\n")
+            return run(cmd, **kwargs)
+
+        with (patch.object(rmcheck.subprocess, "run", side_effect=create_before_remove),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_nested_catalog_written_after_the_scan_stops_approved_detach(self) -> None:
+        copy = self.nested_catalog()
+        catalog = copy / "locale/de/LC_MESSAGES/django.mo"
+        stamp = catalog.stat()
+        since = datetime.now(timezone.utc)
+        catalog.write_bytes(b"updated since the scan")
+        os.utime(catalog, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested",
+                                         "--since", since.isoformat())
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(catalog.read_bytes(), b"updated since the scan")
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
