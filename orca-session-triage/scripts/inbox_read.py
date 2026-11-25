@@ -760,7 +760,7 @@ def record_answers(path: Path, ids: list[str], how: str, note: str = "", *, at: 
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = at or datetime.now().astimezone().isoformat(timespec="seconds")
-    source = answer_sender() if sender is None else sender
+    source = {**answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")} if sender is None else sender
     lines = [json.dumps({"id": answer, "ts": stamp, "how": how, "sender": source,
                                **({"note": note} if note else {}),
                                **({"sent_text": sent_text} if sent_text is not None else {}),

@@ -767,9 +767,12 @@ def covering_answers(question: dict, decisions: dict[str, lead_decisions.Decisio
 
 def current_decisions(
     state: dict, log: Path, handoffs: Path, *, reports: list[dict] | None = None,
+    scoped_refs: Mapping[str, list[tuple[str, frozenset[int]]]] | None = None,
+    decisions: dict[str, lead_decisions.Decision] | None = None,
 ) -> tuple[dict[str, lead_decisions.Decision], dict[str, ask_state.HandoffBinding],
            dict[str, list[lead_decisions.Decision]]]:
-    decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
+    if decisions is None:
+        decisions = lead_decisions.latest(lead_decisions.records(log.expanduser()))
     history = list(lead_decisions.handed_off(handoffs.expanduser()))
     bindings = ask_state.handoff_bindings((item.decision, item.ask_id) for item in history if item.ask_id)
     handoff_keys = {item.decision for item in history}
@@ -785,7 +788,9 @@ def current_decisions(
         if item.get("answer") is not None or item.get("withdrawn_at"):
             continue
         manual = covering_answers(item, decisions, bindings)
-        refs = ask_state.references(item, entries, bindings=bindings)
+        refs = (scoped_refs or {}).get(identifier)
+        if refs is None:
+            refs = ask_state.references(item, entries, bindings=bindings)
         if not refs:
             if manual and len(manual) == len(item.get("covers") or []):
                 resolved[identifier] = manual
