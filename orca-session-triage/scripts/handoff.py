@@ -664,7 +664,8 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     body = args.body_file.read_text(encoding="utf-8").strip()
     if not body:
         raise ValueError(f"empty handoff: {args.body_file}")
-    before, after, end = inbox_around(inbox, args.since)
+    since = args.since if args.since is not None else saved_read_offset(args.reads_dir.expanduser(), inbox)
+    before, after, end = inbox_around(inbox, since)
     if not args.force:
         later = inbox_read.later_runs(args.orca, "handoff")
         if any(run.get("status") != "skipped_precheck" for run in later):
@@ -721,6 +722,23 @@ def send(args: argparse.Namespace, deliver: Deliver, sender: inbox_read.Sender) 
     return 0
 
 
+def saved_read_offset(reads: Path, inbox: Path) -> int:
+    pane = os.environ.get("ORCA_PANE_KEY")
+    if pane:
+        source = str(inbox.resolve())
+        for path in sorted(reads.glob("*/inbox.json"), reverse=True):
+            if path.parent.is_symlink():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (isinstance(data, dict) and data.get("pane") == pane and data.get("inbox") == source
+                    and type(data.get("next_offset")) is int):
+                return data["next_offset"]
+    raise ValueError("no saved NEXT_OFFSET for this pane and inbox; pass --since with the initial read's NEXT_OFFSET")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     kept = argparse.ArgumentParser(add_help=False)
@@ -764,8 +782,10 @@ def main(argv: list[str] | None = None) -> int:
                                        help="add the reports and lead state of the moment and the run's signature, "
                                             "then send")
     send_command.add_argument("--body-file", type=Path, required=True, help="UTF-8 file with the handoff the run wrote")
-    send_command.add_argument("--since", type=int, required=True,
-                              help="the NEXT_OFFSET of the inbox read at the start of the run")
+    send_command.add_argument("--since", type=int,
+                              help="the initial inbox read's NEXT_OFFSET (default: this pane's saved hourly read)")
+    send_command.add_argument("--reads-dir", type=Path, default=Path("~/.cache/orca-session-triage/reads"),
+                              help="the hourly_read.py --output-root to search when --since is omitted")
     send_command.add_argument("--decision", action="append", default=[],
                               help="a handed-off question's key, as given to lead_decisions.py; repeat per question")
     send_command.add_argument("--decision-ask", action="append", default=[], metavar="KEY=ID",
