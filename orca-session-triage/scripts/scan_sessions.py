@@ -4325,9 +4325,11 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     if remove_ok:
         if not scan_file:
             return "削除前に承認ログを再検査するため、走査を保存し、--from で指定してください"
-        options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
+        options.extend(("--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
-        options.extend(("--preview", "--detach-nested"))
+        options.append("--preview")
+    if (remove_ok or plan_cleanup) and not restore:
+        options.append("--detach-nested")
     try:
         log_options = batch_decision_options(decisions_file, required=remove_ok) if scan_file else []
     except ValueError as error:

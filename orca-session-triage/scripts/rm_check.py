@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import filecmp
 from functools import partial
+from hashlib import sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -730,9 +731,10 @@ class NestedRestore:
                 return False
             try:
                 stamp = optional_stamp(path)
+                last_change = stamp if stamp is not None else file_stamp(next(parent for parent in path.parents if parent.exists()))
             except OSError:
                 return False
-            if cutoff is not None and stamp is not None and max(stamp[3:]) > cutoff:
+            if cutoff is not None and max(last_change[3:]) > cutoff:
                 return False
             changes[rel] = stamp
         if changes:
@@ -2022,6 +2024,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         help="apply the approved --restore-nested paths if preflight permits cleanup, then recheck")
     parser.add_argument("--discard-before-restore", action="append", default=[], metavar="PATH",
                         help="when planning --restore-nested, a file the batch will discard first")
+    parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
     parser.add_argument("--restored-file-stamps", type=json.loads, default={}, help=argparse.SUPPRESS)
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
@@ -2077,6 +2080,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
     if args.apply_restore_nested and not restore_paths:
         parser.error("--apply-restore-nested needs --restore-nested")
+    if args.restore_approval and (not args.apply_restore_nested or not args.from_file
+                                  or not re.fullmatch(r"[0-9a-f]{64}", args.restore_approval)):
+        parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
     if discard_paths and (not restore_paths or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
         parser.error("--discard-before-restore can only be used to plan --restore-nested")
     restored = args.restored_file_stamps
@@ -2251,6 +2257,25 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         return args.detach_nested or bool(args.apply_restore_nested and restore and nested
                                           and all(Path(item["path"]) in restore.requested for item in nested))
 
+    def restore_approval_error() -> str | None:
+        if not args.restore_approval:
+            return None
+        command = [sys.executable, str(Path(__file__).with_name("scan_sessions.py")),
+                   "--from", str(args.from_file.expanduser()), "--decisions-file", str(args.decisions_file.expanduser())]
+        try:
+            replay = subprocess.run(command, capture_output=True, text=True, check=True, timeout=60)
+            rows = [row for row in json.loads(replay.stdout) if row.get("path") == worktree and not row.get("environment")]
+            if len(rows) == 1:
+                row = rows[0]
+                decision = row.get("removal_decision") or {}
+                digest = sha256(json.dumps(decision, sort_keys=True).encode()).hexdigest()
+                if (decision.get("allows_removal") is True and digest == args.restore_approval
+                        and not any(row.get(key) for key in ("cleanup_blockers", "automation_blocker", "pending_handoffs"))):
+                    return None
+        except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+            return "--restore-nested の削除承認を復元直前に確認できません"
+        return "--restore-nested の削除承認が変わりました。再検査してください"
+
     restored_nested: dict[str, list[str]] = {}
     if restore and restore.plans:
         detach = may_detach(result["nested_worktrees"])
@@ -2261,10 +2286,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             latest = NestedRestore(root, set(restore.plans), since=since)
             for copy in restore.plans:
                 latest.allows_changes(copy)
+            approval_error = restore_approval_error()
+            if approval_error:
+                decided.append(approval_error)
             changed = [copy for copy, plan in restore.plans.items() if latest.plans.get(copy) != plan or not plan.matches(copy)]
             for copy in changed:
                 decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
-            for copy, approved in (() if changed else restore.plans.items()):
+            for copy, approved in (() if changed or approval_error else restore.plans.items()):
                 if not approved.matches(copy):
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                     break
@@ -2297,6 +2325,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             result = recheck()
     if may_detach(result["nested_worktrees"]):
         nested = result["nested_worktrees"]
+        if nested and (approval_error := restore_approval_error()):
+            result["blockers"].append(approval_error)
+            result["ok"] = False
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
         # Records --archive-scratch and --archive-path move next do not keep it.
         others = [blocker for blocker in result["blockers"]

@@ -3230,9 +3230,13 @@ class ScanCommandTests(unittest.TestCase):
         saved = self.dir / "scan.json"
         with patch.object(scan, "batch_help", return_value="--preview --decisions-file LOG recorded restore_nested"):
             command = shlex.split(scan.rm_check_command(row, saved))
+            removal = shlex.split(scan.rm_check_command(row, saved, remove_ok=True))
         self.assertEqual(Path(command[0]).name, "rm-check-batch")
         self.assertIn("--preview", command)
         self.assertNotIn("--remove-ok", command)
+        self.assertIn("--remove-ok", removal)
+        self.assertNotIn("--detach-nested", command)
+        self.assertNotIn("--detach-nested", removal)
 
     def test_remote_cleanup_hides_commands_for_keep_and_pending_handoff(self) -> None:
         saved = self.dir / "scan.json"
@@ -6471,6 +6475,13 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(code, 1, result)
         self.assertEqual(filename.read_text(), "copied after scan\n")
+
+        before_deletion = datetime.now(timezone.utc).isoformat()
+        filename.unlink()
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                     "--since", before_deletion)
+        self.assertEqual(code, 1, result)
+        self.assertFalse(filename.exists())
 
     def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
