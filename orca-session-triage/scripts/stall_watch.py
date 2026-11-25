@@ -164,6 +164,7 @@ class Report:
     questions: int = 0
     choices: tuple[tuple[str, ...], ...] = ()
     repo: str = ""
+    host: str = ""
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,7 @@ class Answer:
     at: datetime
     how: str
     note: str = ""
+    sender_worktree: str = ""
 
 
 @dataclass(frozen=True)
@@ -373,7 +375,19 @@ def answer_signals(row: Mapping, act: Activity, records: Records, now: datetime)
         covering = covering_answers(ask, records)
         if not covering or any(answer.how in DELIVERED or answer.how == WITHDRAWN for answer in answers):
             continue
+        own_parts = {key for key, given in records.answers_by_ask.items()
+                     if (key == ask.id or key.startswith(ask.id + ":"))
+                     and any(answer.how == inbox_read.LANE_ANSWER and answer.sender_worktree == row["path"]
+                             and answer.at >= ask.at for answer in given)}
+        if ask.id in own_parts or ask.questions and all(
+                f"{ask.id}:{number}" in own_parts for number in range(1, ask.questions + 1)):
+            continue
         answered = max(answer.at for answer in covering)
+        if any(report.at > answered and (
+                bool(ask.handle) and report.handle == ask.handle
+                or bool(ask.host and ask.repo) and (report.host, report.repo) == (ask.host, ask.repo)
+        ) for report in reports):
+            continue
         sent = [at for handle in {ask.handle, *handles(row)} for at in records.sends_by_handle.get(handle, ()) if at > ask.at]
         if sent or now - answered < GRACE or moved_since(act, answered):
             continue
@@ -821,12 +835,16 @@ def load_records(now: datetime, rows: Sequence[Mapping]) -> Records:
             choices = tuple(map(question_options, questions))
             reports.setdefault(item["worktree"], []).append(
                 Report(str(item.get("id") or ""), item["kind"], at, str(item.get("text") or ""),
-                       str(item.get("handle") or ""), len(questions), choices, str(item.get("repo") or "")))
+                       str(item.get("handle") or ""), len(questions), choices, str(item.get("repo") or ""),
+                       str(item.get("host") or "")))
     given: dict[str, list[Answer]] = {}
     for item in read_jsonl(answers):
         at = parse(item.get("ts"))
         if at and at <= now and item.get("id"):
-            given.setdefault(str(item["id"]), []).append(Answer(at, str(item.get("how") or ""), str(item.get("note") or "")))
+            sender = item.get("sender")
+            worktree = str(sender.get("worktree") or "") if isinstance(sender, dict) else ""
+            given.setdefault(str(item["id"]), []).append(
+                Answer(at, str(item.get("how") or ""), str(item.get("note") or ""), worktree))
     sends: dict[str, list[datetime]] = {}
     due: set[str] = set()
     agent_done: dict[str, datetime] = {}

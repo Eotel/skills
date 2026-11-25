@@ -173,6 +173,20 @@ def morning() -> tuple[list[tuple[dict, dict | None]], Any]:
 
 
 class MorningLanesTests(unittest.TestCase):
+    def test_a_workers_own_answer_or_later_report_suppresses_the_delivery_signal(self) -> None:
+        lanes, records = morning()
+        lane, verdict = next((lane, verdict) for lane, verdict in lanes if lane["path"].endswith("/answer-left"))
+        ask = records.reports_by_worktree["answer-left"][0]
+        original = records.answers_by_ask[ask.id][0]
+        own_answer = replace(original, how="triage-notify --answered", sender_worktree=lane["path"])
+        own = replace(records, answers_by_ask={ask.id: (own_answer,)})
+        progress = report("progress", "ask", (original.at + timedelta(minutes=1)).isoformat(),
+                          "別の質問", ask.handle)
+        moved = replace(records, reports_by_worktree={"answer-left": (ask, progress)})
+        for seen in (own, moved):
+            signals = [item.signal for item in stall.judge(lane, verdict, seen, NOW, FakeProbe(), live=False)]
+            self.assertNotIn("answer_undelivered", signals)
+
     def signals(self, probe: FakeProbe) -> dict[str, set[str]]:
         lanes, records = morning()
         found: dict[str, set[str]] = {}

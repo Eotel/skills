@@ -180,6 +180,7 @@ class Reason(NamedTuple):
     id: str
     line: str
     own: bool = False
+    report_id: str | None = None
 
 
 def read_time(before: list[dict]) -> datetime | None:
@@ -199,20 +200,28 @@ def overtaken(body: str, before: list[dict], after: list[dict], sender: inbox_re
              and len(item["id"]) >= 8 and re.search(rf"(?<![0-9a-f]){re.escape(item['id'][:8])}", body)}
     read_at = read_time(before)
     source = inbox_read.answer_sender()
-    for record in inbox_read.answer_entries(answers):
+    records = list(inbox_read.answer_entries(answers))
+    own_deliveries = {record["id"] for record in records
+                      if source["session"] and record.get("sender") == source
+                      and record.get("how") in answer_evidence.DELIVERED}
+    for record in records:
         ask, at = str(record.get("id") or "").partition(":")[0], scan_sessions.parse_time(record.get("ts"))
         if ask in named and (read_at is None or at is None or at > read_at):
-            own = bool(source["session"] and record.get("sender") == source
-                       and record.get("how") in answer_evidence.DELIVERED)
+            lane_answer = record.get("how") == inbox_read.LANE_ANSWER
+            report = re.search(r"報告 ([0-9a-f-]{36})", str(record.get("note") or "")) if lane_answer else None
+            own = (record["id"] in own_deliveries or ask in own_deliveries) if lane_answer else (
+                bool(source["session"] and record.get("sender") == source
+                     and record.get("how") in answer_evidence.DELIVERED))
             found.append(Reason(str(record["id"]), f"- answered {record['id']} at {record.get('ts') or '-'} "
                                 f"({record.get('how') or '-'})" + ("（この回の送信）" if own else "")
-                                + f"  {excerpt(record.get('note'))}", own))
+                                + f"  {excerpt(record.get('note'))}", own, report[1] if report else None))
     return found
 
 
 def unseen(reasons: list[Reason], seen: list[str]) -> list[Reason]:
     return [reason for reason in reasons if not reason.own
-            and not any(inbox_read.names(reason.id, wanted) for wanted in seen)]
+            and not any(inbox_read.names(reason.id, wanted)
+                        or reason.report_id and inbox_read.names(reason.report_id, wanted) for wanted in seen)]
 
 
 def removal_targets(keys: list[str]) -> set[str]:

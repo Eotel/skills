@@ -375,6 +375,28 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(both.returncode, 0, both.stderr)
         self.assertTrue(self.sent.exists())
 
+    def test_worker_answer_can_be_seen_by_its_report_or_covered_by_this_runs_send(self) -> None:
+        ask_id = "886522fe-1111-4444-8000-111111111111"
+        report_id = "2bc8ae16-2222-4444-8000-222222222222"
+        ask = {"id": ask_id, "kind": "ask", "ts": "2026-11-11T00:00:00Z", "worktree": "worker"}
+        seen = json.dumps(ask) + "\n"
+        self.inbox.write_text(seen)
+        self.body.write_text(f"質問 {ask_id[:8]} に回答があります")
+        answers = self.root / "ask-answers.jsonl"
+        lane_answer = {"id": ask_id, "ts": "2026-11-11T00:01:00Z", "how": "triage-notify --answered",
+                       "note": f"担当のタブで回答（報告 {report_id}）"}
+        answers.write_text(json.dumps(lane_answer, ensure_ascii=False) + "\n")
+        args = ("--since", str(len(seen.encode())))
+        self.assertEqual(self.run_tool(*args).returncode, 1)
+        by_report = self.run_tool(*args, "--seen", report_id[:8])
+        self.assertEqual(by_report.returncode, 0, by_report.stderr)
+
+        with answers.open("a") as stream:
+            stream.write(json.dumps({"id": ask_id, "ts": "2026-11-11T00:02:00Z", "how": "send",
+                                     "sender": {"worktree": "/w/triage", "session": "same-run"}}) + "\n")
+        by_send = self.run_tool(*args, env={"CODEX_THREAD_ID": "same-run"})
+        self.assertEqual(by_send.returncode, 0, by_send.stderr)
+
     def test_a_skipped_later_run_warns_but_a_started_run_owns_the_handoff(self) -> None:
         self.inbox.write_text("")
         orca = self.root / "orca"
