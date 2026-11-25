@@ -1782,6 +1782,17 @@ def split_topic_suffix(line: str) -> tuple[str, str]:
     return line, ""
 
 
+def legacy_topic_worktree(display: str) -> Path | None:
+    named, suffix = split_topic_suffix(display)
+    worktree = Path(named)
+    if not worktree.is_absolute():
+        return None
+    unbalanced_name = named.count("（") != named.count("）")
+    if not suffix or unbalanced_name and not worktree.is_dir():
+        raise ValueError("cannot identify the topic repair worktree")
+    return worktree
+
+
 def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     structured: set[str] = set()
@@ -1810,13 +1821,10 @@ def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
             if detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場: "):
-                display = detail.removeprefix("直す作業場: ")
-                named, suffix = split_topic_suffix(display)
-                target = Path(named)
-                unbalanced_name = named.count("（") != named.count("）")
-                if (target.is_absolute() and display.endswith("）")
-                        and (not suffix or unbalanced_name and not target.is_dir())):
-                    raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
+                try:
+                    target = legacy_topic_worktree(detail.removeprefix("直す作業場: "))
+                except ValueError as error:
+                    raise ValueError(f"{error} for {pr} in {path}") from error
             elif detail.endswith(" で直る）"):
                 _, suffix = split_topic_suffix(detail)
                 if suffix:

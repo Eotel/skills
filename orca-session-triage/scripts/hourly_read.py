@@ -35,7 +35,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 from bash_timeout import LOAD_LIMIT
-from rm_check import TOPIC_FIXER_JSON, split_topic_suffix, topic_check_outputs, topic_fixer_record
+from rm_check import TOPIC_FIXER_JSON, legacy_topic_worktree, topic_check_outputs, topic_fixer_record
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
                "read_at", "next_offset")
@@ -294,9 +294,11 @@ def print_read(result: dict, now: datetime) -> None:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
     if name == "topic-check":
         display: dict[str, str] = {}
-        for path in topic_check_outputs(Path(result["stdout"]).parent):
-            lines = path.read_text(encoding="utf-8").splitlines()
-            structured = {}
+        outputs = {path: path.read_text(encoding="utf-8").splitlines()
+                   for path in topic_check_outputs(Path(result["stdout"]).parent)}
+        structured_prs: set[str] = set()
+        structured_paths: dict[str, str] = {}
+        for path, lines in outputs.items():
             for line in lines:
                 try:
                     record = topic_fixer_record(line, path)
@@ -305,16 +307,24 @@ def print_read(result: dict, now: datetime) -> None:
                     continue
                 if record:
                     pr, workspace, _ = record
-                    structured[pr] = workspace
+                    structured_prs.add(pr)
+                    structured_paths.setdefault(str(workspace), f"  直す作業場: {workspace}")
+        for lines in outputs.values():
             record_key = ""
             for line in lines:
                 if line and not line[0].isspace() and not line.startswith(TOPIC_FIXER_JSON):
                     record_key = line
-                if record_key not in structured and line.lstrip().startswith("直す作業場: "):
-                    worktree, _ = split_topic_suffix(line.lstrip().removeprefix("直す作業場: "))
-                    display.setdefault(worktree, line)
-            for workspace in structured.values():
-                display.setdefault(str(workspace), f"  直す作業場: {workspace}")
+                if line.lstrip().startswith("直す作業場: "):
+                    detail = line.lstrip().removeprefix("直す作業場: ")
+                    try:
+                        worktree = legacy_topic_worktree(detail)
+                    except ValueError:
+                        if record_key in structured_prs:
+                            continue
+                        worktree = None
+                    display.setdefault(str(worktree) if worktree else detail, line)
+        for worktree, label in structured_paths.items():
+            display.setdefault(worktree, label)
         for line in display.values():
             print(line)
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
