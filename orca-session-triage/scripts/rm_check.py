@@ -688,8 +688,11 @@ class NestedRestorePlan:
 
     def matches(self, copy: Path) -> bool:
         try:
-            return (file_stamp(self.index) == self.index_stamp
-                    and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
+            if (file_stamp(self.index) != self.index_stamp
+                    or any(optional_stamp(copy / rel) != stamp for rel, stamp in self.files.items())):
+                return False
+            head = git(copy, "rev-parse", "--verify", "HEAD")
+            return head.returncode == 0 and head.stdout.strip() == self.head
         except OSError:
             return False
 
@@ -2385,11 +2388,27 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     result["blockers"].extend(["子 worktree が削除直前に変わりました", *movement])
                     result["ok"] = False
                     removable = False
-            detached = [item["path"] for item in nested if removable
-                        and (not item["restore"]
-                             or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
-                        and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
-        if detached:
+            detached = []
+            detach_error = ""
+            for item in nested if removable else ():
+                copy = Path(item["path"])
+                if nested_check(copy) != item:
+                    detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
+                    break
+                if item["restore"]:
+                    applied = subprocess.run(item["restore"], capture_output=True, text=True)
+                    if applied.returncode or nested_check(copy)["blockers"]:
+                        detach_error = f"子 worktree {copy.relative_to(root)} の生成ファイル復元後に削除を確認できません"
+                        break
+                removed = subprocess.run(item["detach"], capture_output=True, text=True)
+                if removed.returncode:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除できません: {removed.stderr.strip()}"
+                    break
+                detached.append(item["path"])
+        if detach_error:
+            decided.append(detach_error)
+            recheck = partial(recheck, decided=tuple(decided))
+        if detached or detach_error:
             result = recheck()
         elif nested:
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "

@@ -6428,6 +6428,36 @@ class RmCheckTests(unittest.TestCase):
                 else:
                     self.assertEqual(filename.read_text(), "after the scan\n")
 
+    def test_nested_restore_preserves_changes_when_head_moves_after_preflight(self) -> None:
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        filename.write_text("staged change\n")
+        git(copy, "add", "app.txt")
+        filename.write_text("unstaged change\n")
+        matches = rmcheck.NestedRestorePlan.matches
+        calls = 0
+
+        def move_head(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                git(path, "reset", "--soft", "HEAD^")
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", move_head),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("復元直前に変わりました", " ".join(result["blockers"]))
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        self.assertEqual(git(copy, "show", ":app.txt"), "staged change")
+
     def test_nested_restore_allows_clones_and_linked_worktrees_in_one_directory(self) -> None:
         linked = self.nested_catalog()
         remote = Path(self.tmp.name) / "deps.git"
@@ -6529,10 +6559,12 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(filename.read_text(), "copied after scan\n")
 
-        before_deletion = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        before_deletion = datetime.now(timezone.utc) + timedelta(seconds=1)
         filename.unlink()
+        after_deletion = (before_deletion + timedelta(seconds=1)).timestamp()
+        os.utime(filename.parent, (after_deletion, after_deletion))
         code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
-                                     "--since", before_deletion)
+                                     "--since", before_deletion.isoformat())
         self.assertEqual(code, 1, result)
         self.assertFalse(filename.exists())
 
@@ -6773,6 +6805,28 @@ class RmCheckTests(unittest.TestCase):
             code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(filename.read_text(), "new edit before detach\n")
+
+    def test_nested_detach_preserves_new_files_in_later_worktrees(self) -> None:
+        first = self.nested_catalog().resolve()
+        later = first.with_name("second")
+        git(first, "worktree", "add", "-q", "--detach", str(later), "HEAD")
+        created = later / "new.txt"
+        run = subprocess.run
+
+        def create_after_first(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+            result = run(cmd, **kwargs)
+            if cmd[-4:] == ["worktree", "remove", "--force", str(first)] and result.returncode == 0:
+                created.write_text("keep this file\n")
+            return result
+
+        with (patch.object(rmcheck.subprocess, "run", side_effect=create_after_first),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, [str(first)]), result)
+        self.assertIn("local-deps/second", " ".join(result["blockers"]))
+        self.assertEqual(created.read_text(), "keep this file\n")
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
