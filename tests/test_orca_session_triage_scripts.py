@@ -5988,11 +5988,12 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
         self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
         self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
-        topic.write_text(f"{url}\n  直す作業場: {alias}（手順 1）を修正、agent なし）\n")
-        code, result = self.run_main("--from", str(saved))
-        self.assertEqual(code, 1)
-        self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
-        self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        for action in ("手順 1）を修正", "手順 1（を修正"):
+            topic.write_text(f"{url}\n  直す作業場: {alias}（{action}、agent なし）\n")
+            code, result = self.run_main("--from", str(saved))
+            self.assertEqual(code, 1)
+            self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
+            self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
         topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
 

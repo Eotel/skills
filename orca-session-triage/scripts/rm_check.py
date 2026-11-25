@@ -1812,9 +1812,11 @@ def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
             elif detail.startswith("直す作業場: "):
                 display = detail.removeprefix("直す作業場: ")
                 named, suffix = split_topic_suffix(display)
-                if Path(display).is_absolute() and display.endswith("）") and not suffix:
-                    raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
                 target = Path(named)
+                unbalanced_name = named.count("（") != named.count("）")
+                if (target.is_absolute() and display.endswith("）")
+                        and (not suffix or unbalanced_name and not target.is_dir())):
+                    raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
             elif detail.endswith(" で直る）"):
                 _, suffix = split_topic_suffix(detail)
                 if suffix:
