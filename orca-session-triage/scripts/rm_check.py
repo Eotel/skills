@@ -45,6 +45,9 @@ CACHE_PARTS = {
 # blob reporter to blob-report/.
 CACHE_PREFIXES = ("playwright-report", "blob-report")
 CACHE_SUFFIXES = (".pyc", ".mo", ".tsbuildinfo")
+CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+TOPIC_PR = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+TOPIC_FIX = re.compile(r"（(.+) で直る）\s*$")
 BYTECODE_SUFFIX = ".pyc"
 # Generated sources and e2e output a setup or a test run writes again. Matched by
 # path, not by any part, so a hand-made docs/screenshots/ still goes to review.
@@ -155,6 +158,19 @@ def is_cache(relpath: str) -> bool:
     # pip writes <name>.egg-info beside an editable install's sources again on each install.
     return (bool(CACHE_PARTS.intersection(parts)) or relpath.endswith(CACHE_SUFFIXES)
             or any(part.endswith(".egg-info") or part.startswith(CACHE_PREFIXES) for part in parts))
+
+
+def has_cache_tag(directory: Path) -> bool:
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    tag = directory / "CACHEDIR.TAG"
+    try:
+        if not stat.S_ISREG(tag.lstat().st_mode):
+            return False
+        with tag.open("rb") as stream:
+            return stream.read(len(CACHE_TAG_SIGNATURE)) == CACHE_TAG_SIGNATURE
+    except OSError:
+        return False
 
 
 def holds_only_bytecode(path: Path) -> bool:
@@ -743,6 +759,10 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
                 else:
                     regenerable.append(str(clone.relative_to(worktree)))
                     notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
+            continue
+        if has_cache_tag(source):
+            regenerable.append(rel)
+            notes.append(f"{rel}: cache (CACHEDIR.TAG)")
             continue
         if holds_only_regenerable(source, Path(worktree)) or generated(Path(worktree), rel):
             regenerable.append(rel)
@@ -1717,6 +1737,30 @@ def print_check(result: dict, summary: bool) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def topic_drift_blockers(path: Path, worktree: str) -> list[str]:
+    blockers = []
+    pr = None
+    target = None
+    commands: list[str] = []
+    for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
+        if line and not line[0].isspace():
+            if pr and target and target.is_absolute() and target.resolve() == Path(worktree):
+                fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
+                blockers.append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
+            pr = line if TOPIC_PR.fullmatch(line) else None
+            target = None
+            commands = []
+        elif pr:
+            detail = line.strip()
+            if match := TOPIC_FIX.search(detail):
+                commands.append(match[1])
+            elif detail.startswith("直し方: "):
+                commands.append(detail.removeprefix("直し方: "))
+            elif detail.startswith("直す作業場: "):
+                target = Path(detail.removeprefix("直す作業場: ").rsplit("（", 1)[0])
+    return blockers
+
+
 def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNotes()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", nargs="?", metavar="PATH", help="worktree path to check, the same as --worktree")
@@ -1736,6 +1780,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "else may be using it (default: the scanned_at of --from)" % ", ".join(sorted(UNWATCHED_DIRS)))
     parser.add_argument("--from", dest="from_file", type=Path, metavar="SCAN_JSON",
                         help="a saved scan_sessions.py JSON whose scanned_at is the default --since")
+    parser.add_argument("--topic-check", type=Path, metavar="TOPIC_STDOUT",
+                        help="topic check output for this run (default: next to --from, if present); keep named worktrees")
     parser.add_argument("--no-docker", action="store_true", help="skip the docker compose project lookup")
     parser.add_argument("--decisions-file", type=Path, default=lead_decisions.DEFAULT_LOG,
                         help="the lead's answers in an append-only JSONL log (default: %(default)s)")
@@ -1900,6 +1946,16 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    topic = args.topic_check
+    if topic is None and args.from_file:
+        directory = args.from_file.parent
+        topic = next((output for name in ("topic-check.retry.stdout", "topic-check.stdout")
+                      if (output := directory / name).is_file()), None)
+    if topic is not None:
+        try:
+            decided.extend(topic_drift_blockers(topic.expanduser(), worktree))
+        except (OSError, ValueError) as error:
+            decided.append(f"topic check の結果を確認できません（{error}）")
     root = Path(worktree)
     requested_archives: list[Path] = []
     for path in named:

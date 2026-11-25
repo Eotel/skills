@@ -286,6 +286,10 @@ def print_read(result: dict, now: datetime) -> None:
         for kind, rows in changes.items():
             if rows:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
+    if name == "topic-check":
+        for line in Path(result["stdout"]).read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("直す作業場: "):
+                print(line)
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))

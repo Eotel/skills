@@ -159,6 +159,23 @@ with patch.object(timeline, "datetime", wraps=datetime) as fixed:
         # The lane's tab is gone from Orca; its handle still names it through the records.
         self.assertEqual(json.loads(self.run_tool("--since", "2026-11-15T18:00", "--lane", OTHER, "--json").stdout), rows)
 
+    def test_repeated_lane_filters_group_text_and_keep_json_chronological(self) -> None:
+        self.append(".cache/orca-briefs/triage-inbox.jsonl",
+                    self.report("2026-11-15T16:31:00+09:00", OTHER, "fix-orders", "info", "注文を確認"),
+                    self.report("2026-11-15T16:33:00+09:00", LANE, "fix-checklist", "info", "項目を確認"),
+                    self.report("2026-11-15T16:34:00+09:00", LEAD, "triage-lead", "info", "別の進捗"))
+        self.append(".local/share/orca-board/events.jsonl",
+                    self.send("2026-11-15T16:32:00+09:00", LANE, "項目の追加"))
+        args = ("--since", "2026-11-15T16:30", "--lane", LANE, "--lane", "app/fix-orders")
+
+        lines = self.run_tool(*args).stdout.splitlines()
+        self.assertEqual([line for line in lines if line.startswith("## ")], ["## fix-checklist", "## fix-orders"])
+        self.assertIn("項目の追加", lines[1])
+        self.assertIn("項目を確認", lines[2])
+        self.assertIn("注文を確認", lines[-1])
+        rows = json.loads(self.run_tool(*args, "--json").stdout)
+        self.assertEqual([row["text"] for row in rows], ["注文を確認", "項目の追加", "項目を確認"])
+
     def test_only_completed_writes_from_a_claude_transcript_count(self) -> None:
         lane = self.workspaces / "skills" / "adopt-x"
         project = self.home / ".claude" / "projects" / "".join(c if c.isalnum() else "-" for c in str(lane))
