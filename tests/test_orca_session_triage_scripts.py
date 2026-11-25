@@ -5988,6 +5988,11 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn(f"asana_sync.py {url}", "\n".join(result["blockers"]))
         self.assertNotIn("/pull/82", "\n".join(result["blockers"]))
         self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
+        topic.write_text(f"{url}\n  直す作業場: {alias}（手順 1）を修正、agent なし）\n")
+        code, result = self.run_main("--from", str(saved))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot identify the topic repair worktree", "\n".join(result["blockers"]))
+        self.assertEqual(self.run_main("--topic-check", str(topic))[0], 1)
         topic.write_text(f"{url}\n  直す作業場: {self.wt}（再調査）（agent なし）\n")
         self.assertEqual(self.run_main("--from", str(saved))[0], 0)
 
@@ -6894,6 +6899,17 @@ class LeadDecisionProposalTests(unittest.TestCase):
         with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_lead", "CODEX_THREAD_ID": "lead-session"}):
             code, out = self.call("record", "--decision", "review:acme/app#1", "--answer-file", str(answer))
         self.assertEqual(code, 0, out)
+        decision, = list(self.lead.records(self.log))
+        self.assertIsNotNone(decision.sender)
+        assert decision.sender is not None
+        self.assertEqual((decision.sender["handle"], decision.sender["session"]), ("term_lead", "lead-session"))
+
+    def test_explicit_sent_decision_preserves_the_answering_terminal_and_session(self) -> None:
+        sync = importlib.import_module("answer_sync")
+        with patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "term_lead", "CODEX_THREAD_ID": "lead-session"}):
+            sync.record([], "担当が修正する", "send --decision",
+                        at="2026-11-25T15:00:00+09:00", decisions={"review:acme/app#1": "担当が修正する"},
+                        decisions_file=self.log, state_file=self.root / "hourly.json", handed_off_file=self.handed)
         decision, = list(self.lead.records(self.log))
         self.assertIsNotNone(decision.sender)
         assert decision.sender is not None
@@ -9655,6 +9671,12 @@ class HourlyReadTests(unittest.TestCase):
             self.assertEqual(out.getvalue().splitlines(),
                              [f"  直す作業場: {fixer['worktree']}（再調査）（agent なし）",
                               f"  直す作業場: {fixer['worktree']}"])
+            path.write_text(f"topic-fixer-json: {json.dumps(fixer)}\n{pr}\n"
+                            f"  直す作業場: {fixer['worktree']}（手順 1）を修正、agent なし）\n")
+            with redirect_stdout(io.StringIO()) as out:
+                hourly.print_read({"name": "topic-check", "exit_code": 2, "stdout": str(retry)},
+                                  datetime.now(timezone.utc))
+            self.assertEqual(out.getvalue().splitlines(), [f"  直す作業場: {fixer['worktree']}"])
 
     def test_backlog_timeout_preserves_failure_when_the_notification_cursor_advanced(self) -> None:
         hourly = load_script("hourly_read")

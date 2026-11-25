@@ -1785,21 +1785,24 @@ def split_topic_suffix(line: str) -> tuple[str, str]:
 def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
     blockers: dict[Path, list[str]] = {}
     structured: set[str] = set()
-    pr = None
-    target = None
-    commands: list[str] = []
-    for line in [*path.read_text(encoding="utf-8").splitlines(), "-"]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
         if record := topic_fixer_record(line, path):
             reference, workspace, fixes = record
             fix = "・".join(dict.fromkeys(fixes)) or "修正コマンドの記録なし"
             blockers.setdefault(workspace, []).append(f"topic check で修正担当に指定されています（{reference}、{fix}）")
             structured.add(reference)
+    pr = None
+    target = None
+    commands: list[str] = []
+    for line in [*lines, "-"]:
+        if line.startswith(TOPIC_FIXER_JSON):
             continue
         if line and not line[0].isspace():
-            if pr and pr not in structured and target and target.is_absolute():
+            if pr and target and target.is_absolute():
                 fix = "・".join(dict.fromkeys(commands)) or "修正コマンドの記録なし"
                 blockers.setdefault(target, []).append(f"topic check で修正担当に指定されています（{pr}、{fix}）")
-            pr = line if TOPIC_PR.fullmatch(line) else None
+            pr = line if line not in structured and TOPIC_PR.fullmatch(line) else None
             target = None
             commands = []
         elif pr:
@@ -1807,7 +1810,10 @@ def topic_drift_blockers(path: Path) -> dict[Path, list[str]]:
             if detail.startswith("直し方: "):
                 commands.append(detail.removeprefix("直し方: "))
             elif detail.startswith("直す作業場: "):
-                named, _ = split_topic_suffix(detail.removeprefix("直す作業場: "))
+                display = detail.removeprefix("直す作業場: ")
+                named, suffix = split_topic_suffix(display)
+                if Path(display).is_absolute() and display.endswith("）") and not suffix:
+                    raise ValueError(f"cannot identify the topic repair worktree for {pr} in {path}")
                 target = Path(named)
             elif detail.endswith(" で直る）"):
                 _, suffix = split_topic_suffix(detail)

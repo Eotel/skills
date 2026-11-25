@@ -35,7 +35,7 @@ import json_output
 import lead_decisions
 import scan_sessions
 from bash_timeout import LOAD_LIMIT
-from rm_check import split_topic_suffix, topic_check_outputs, topic_fixer_record
+from rm_check import TOPIC_FIXER_JSON, split_topic_suffix, topic_check_outputs, topic_fixer_record
 
 RECORD_KEYS = ("name", "command", "exit_code", "stdout", "stderr", "result", "error", "retry", "compared_to", "changes",
                "read_at", "next_offset")
@@ -293,23 +293,30 @@ def print_read(result: dict, now: datetime) -> None:
             if rows:
                 print(f"  {kind} {len(rows)}: " + " | ".join(rows))
     if name == "topic-check":
-        lines = [(line, path) for path in topic_check_outputs(Path(result["stdout"]).parent)
-                 for line in path.read_text(encoding="utf-8").splitlines()]
-        display = dict.fromkeys(line for line, _ in lines if line.lstrip().startswith("直す作業場: "))
-        for line in display:
+        display: dict[str, str] = {}
+        for path in topic_check_outputs(Path(result["stdout"]).parent):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            structured = {}
+            for line in lines:
+                try:
+                    record = topic_fixer_record(line, path)
+                except ValueError as error:
+                    print(f"topic-check: {error}", file=sys.stderr)
+                    continue
+                if record:
+                    pr, workspace, _ = record
+                    structured[pr] = workspace
+            record_key = ""
+            for line in lines:
+                if line and not line[0].isspace() and not line.startswith(TOPIC_FIXER_JSON):
+                    record_key = line
+                if record_key not in structured and line.lstrip().startswith("直す作業場: "):
+                    worktree, _ = split_topic_suffix(line.lstrip().removeprefix("直す作業場: "))
+                    display.setdefault(worktree, line)
+            for workspace in structured.values():
+                display.setdefault(str(workspace), f"  直す作業場: {workspace}")
+        for line in display.values():
             print(line)
-        shown = {split_topic_suffix(line.lstrip().removeprefix("直す作業場: "))[0] for line in display}
-        for line, path in lines:
-            try:
-                record = topic_fixer_record(line, path)
-            except ValueError as error:
-                print(f"topic-check: {error}", file=sys.stderr)
-                continue
-            if record:
-                _, workspace, _ = record
-                if str(workspace) not in shown:
-                    print(f"  直す作業場: {workspace}")
-                    shown.add(str(workspace))
     if result["exit_code"] != 0 or name not in ("open-asks", "stale-asks", "pr-followups"):
         return
     rows = json.loads(Path(result["result"]).read_text(encoding="utf-8"))

@@ -311,7 +311,9 @@ def record(ids: list[str], answer: str, how: str, *, at: str | None = None,
                 text = "\n".join(parts) or answer
                 changed.append(hourly_state.record_answer(data, hourly_state.Answering(id=key, answer=text, answered_at=when),
                                                           prechecked=bool(refs) and (is_delivery or bool(bindings))))
-            new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when, from_ask=key not in explicit)
+            decision_sender = {**sender, "handle": os.environ.get("ORCA_TERMINAL_HANDLE")}
+            new = [lead_decisions.Decision(id=uuid.uuid4().hex, decision=key, answer=text, decided_at=when,
+                                           from_ask=key not in explicit, sender=decision_sender)
                    for key, text in keys.items() if key not in latest
                    or (key in explicit and (latest[key].answer != text or key in auto_keys))
                    or (key in auto_keys and latest[key].answer != text)]
