@@ -6789,6 +6789,36 @@ class RmCheckTests(unittest.TestCase):
                 self.assertEqual(git(target, "show", ":app.txt"), "keep staged work")
                 self.assertEqual((target / "app.txt").read_text(), "keep unstaged work\n")
 
+    def test_a_clone_arriving_during_preflight_keeps_the_other_approved_edits(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        first, second = (root / "local-deps" / name for name in ("first", "second"))
+        outside = Path(self.tmp.name) / "outside"
+        for clone in (first, outside):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = first / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(first, "add", "--", "app.txt")
+        changed.write_text("keep unstaged work\n")
+        matching = rmcheck.NestedRestorePlan.matches
+
+        def move_clone_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            if outside.exists():
+                outside.rename(second)
+            return matching(plan, copy)
+
+        options = ("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second", "--apply-restore-nested")
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", move_clone_during_preflight),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertTrue(second.is_dir())
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
     def test_live_scan_does_not_accept_a_clone_head_that_moves_during_the_scan(self) -> None:
         import lead_decisions
 

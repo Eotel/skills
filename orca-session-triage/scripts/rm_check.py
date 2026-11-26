@@ -2666,8 +2666,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         return nullcontext()
 
     def changed_checkouts(restore: NestedRestore) -> set[Path]:
-        checkout_changes = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
-        return checkout_changes | {copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs}
+        changed = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
+        changed.update(copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs)
+        changed.update(copy for copy, state in restore.expected.items() if state is None and optional_stamp(copy) is not None)
+        return changed
 
     restored_nested: dict[str, list[str]] = {}
     if restore and restore.plans:
