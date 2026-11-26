@@ -2506,17 +2506,25 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         print_check({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers}, args.summary)
         return 2
     since = args.since
+    if since is not None and since.tzinfo is None:
+        since = since.astimezone()
+    scanned_at = None
     saved_heads = {}
     if args.from_file and (since is None or restore_paths):
         rows = json.loads(args.from_file.read_text(encoding="utf-8"))
         local_row = next((row for row in rows if row.get("path") == worktree and not row.get("environment")), {})
-        if since is None:
-            scanned = local_row.get("scanned_at") or next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
-            since = datetime.fromisoformat(scanned) if scanned else None
+        scanned = local_row.get("scanned_at")
+        if not scanned and not restore_paths:
+            scanned = next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
+        if scanned:
+            with suppress(TypeError, ValueError):
+                scanned_at = datetime.fromisoformat(scanned)
+                if scanned_at.tzinfo is None:
+                    scanned_at = scanned_at.astimezone()
+        if scanned_at is not None:
+            since = scanned_at if since is None else min(since, scanned_at)
         saved_heads = {str(PurePosixPath(name)): state for name, state in
                        (local_row.get("restore_checkout_heads") or {}).items()}
-    if since is not None and since.tzinfo is None:
-        since = since.astimezone()
     checkout = args.main or main_checkout(worktree)
     if checkout is None:
         parser.error("could not locate the main checkout; pass --main")
@@ -2598,6 +2606,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    if restore_paths and args.from_file and scanned_at is None:
+        decided.append("--restore-nested の走査時刻を確認できません。新しい走査を保存して再試行してください")
     if args.from_file and (unobserved := {str(path) for path in restore_paths if saved_heads.get(str(path)) is None}):
         decided.append(f"--restore-nested の checkout 情報が走査にありません（{', '.join(sorted(unobserved))}）。"
                        "新しい走査を保存して再試行してください")

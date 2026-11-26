@@ -6590,6 +6590,25 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(changed.parent, "show", ":app.txt"), "keep staged")
         self.assertEqual(changed.read_text(), "keep working file\n")
 
+    def test_later_since_cannot_approve_edits_after_the_saved_scan(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/library", "--apply-restore-nested"))
+        changed = copy / "app.txt"
+        changed.write_text("new staged work\n")
+        git(copy, "add", "--", "app.txt")
+        changed.write_text("new unstaged work\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*options, "--since", datetime.now(timezone.utc).isoformat())
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "show", ":app.txt"), "new staged work")
+        self.assertEqual(changed.read_text(), "new unstaged work\n")
+
     def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -8114,7 +8133,8 @@ class RmCheckTests(unittest.TestCase):
         fixture = Path(tempfile.mkdtemp(prefix="recorded-restore-", dir=self.tmp.name))
         log, saved = fixture / "decisions.jsonl", fixture / "scan.json"
         names = tuple(argv[index + 1] for index, option in enumerate(argv) if option == "--restore-nested")
-        row = {"path": workspace, "class": "stalled", "agent_ownership_observed": True}
+        row = {"path": workspace, "class": "stalled", "agent_ownership_observed": True,
+               "scanned_at": datetime.now(timezone.utc).isoformat()}
         if "--from" in argv:
             index = argv.index("--from")
             rows = json.loads(Path(argv[index + 1]).read_text())
