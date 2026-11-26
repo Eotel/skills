@@ -6911,6 +6911,19 @@ class RmCheckTests(unittest.TestCase):
         loop.symlink_to(loop.name)
         self.assertIsNone(rmcheck.snapshot_checkout(loop))
 
+    def test_snapshot_does_not_accept_a_clone_moved_into_place_during_the_scan(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        copy = self.wt.resolve() / "local-deps/library"
+        copy.parent.mkdir()
+        moved = Path(self.tmp.name) / "outside"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(moved))
+        cutoff = datetime.now(timezone.utc).timestamp()
+        moved.rename(copy)
+
+        self.assertIsInstance(rmcheck.snapshot_checkout(copy), list)
+        self.assertIsNone(rmcheck.snapshot_checkout(copy, cutoff))
+
     def test_restoration_keeps_target_edits_written_while_checking_a_sibling(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -7884,6 +7897,70 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
 
+    def test_new_parent_lock_keeps_child_edits_during_the_remote_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        relative = "locale/de/LC_MESSAGES/django.po"
+        changed = copy / relative
+        changed.write_text("keep staged work\n")
+        git(copy, "add", relative)
+        changed.write_text("keep unstaged work\n")
+        probe = rmcheck.on_remote
+        checks = 0
+
+        def lock_parent_during_remote_check(repo: Path, head: str) -> bool:
+            nonlocal checks
+            if repo == copy:
+                checks += 1
+                if checks == 3:
+                    git(self.main, "worktree", "lock", str(self.wt))
+            return probe(repo, head)
+
+        with (patch.object(rmcheck, "on_remote", side_effect=lock_parent_during_remote_check),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("locked", git(self.main, "worktree", "list", "--porcelain"))
+        self.assertEqual(git(copy, "show", f":{relative}"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_new_local_branch_keeps_edits_after_the_last_ref_listing(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        copy = self.wt.resolve() / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        original = git(copy, "rev-parse", "HEAD")
+        git(copy, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-qm", "unpublished")
+        unpublished = git(copy, "rev-parse", "HEAD")
+        git(copy, "reset", "--hard", original)
+        path = copy / "app.txt"
+        path.write_text("keep staged work\n")
+        git(copy, "add", "app.txt")
+        path.write_text("keep unstaged work\n")
+        actual = rmcheck.git
+        listings = 0
+
+        def save_branch_after_last_listing(cwd: str | Path, *args: str,
+                                           env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal listings
+            found = actual(cwd, *args, env=env)
+            if Path(cwd) == copy and args[0] == "for-each-ref":
+                listings += 1
+                if listings == 8:
+                    git(copy, "branch", "rescue", unpublished)
+            return found
+
+        with (patch.object(rmcheck, "git", side_effect=save_branch_after_last_listing),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "rev-parse", "rescue"), unpublished)
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(path.read_text(), "keep unstaged work\n")
+
     def test_initialized_nested_submodule_refuses_before_restoring_its_files(self) -> None:
         copy = self.nested_catalog()
         deps = Path(self.tmp.name) / "deps"
@@ -8403,6 +8480,26 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main_without_base()
 
         self.assertEqual((code, result["blockers"]), (0, []))
+
+    def test_final_removal_snapshot_keeps_existing_remote_refs(self) -> None:
+        bare = Path(self.tmp.name) / "remote.git"
+        git(self.main, "clone", "--bare", "-q", str(self.main), str(bare))
+        git(self.main, "remote", "add", "origin", str(bare))
+        original = git(self.main, "rev-parse", "main")
+        git(self.main, "update-ref", "refs/remotes/origin/main", original)
+        git(self.main, "commit", "--allow-empty", "-qm", "new remote tip")
+        git(self.main, "push", "-q", str(bare), "main")
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                     "restore_checkout_heads": {"local-deps/absent": "absent"}}]))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--base", "origin/main", "--from", str(saved),
+                                         "--restore-nested", "local-deps/absent", "--removal-stamps")
+
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["removal_stamps"])
+        self.assertEqual(git(self.wt, "rev-parse", "origin/main"), original)
 
     def test_the_remote_the_branch_started_from_is_fetched_before_judging(self) -> None:
         bare = Path(self.tmp.name) / "upstream.git"

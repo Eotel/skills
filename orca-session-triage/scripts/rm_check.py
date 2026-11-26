@@ -856,6 +856,25 @@ def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
                                              for name, _, oid in (line.partition(" "),))]
 
 
+def clone_ignore_changes(copy: Path, plan: NestedRestorePlan) -> str | None:
+    listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard",
+                  "--directory", "--no-empty-directory", "-z")
+    if listing.returncode:
+        return "依存 clone の無視対象を確認できません"
+    if not listing.stdout:
+        return None
+    try:
+        rules = subprocess.run(["git", "-C", str(copy), "check-ignore", "--verbose", "-z", "--stdin"],
+                               input=listing.stdout, capture_output=True, text=True, check=True, timeout=30)
+        sources = {(copy / source).resolve() for source in rules.stdout.removesuffix("\0").split("\0")[::4]}
+        for name in plan.files:
+            if (copy / name).resolve() in sources:
+                return f"{name} は依存 clone 内の無視ルールに使われています"
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return "依存 clone の無視ルールを確認できません"
+    return None
+
+
 def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None) -> CloneResult:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
     copy = copy.resolve()
@@ -899,6 +918,8 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("commits absent from origin: none")
     status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
     approved = restore is not None and restore.allows_changes(copy)
+    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := clone_ignore_changes(copy, plan)):
+        blockers.append(ignore_change)
     if restore and copy in restore.moved:
         blockers.append("--restore-nested の checkout または HEAD が走査後に変わりました")
     elif status.returncode or (not approved and clone_has_local_changes(copy, status.stdout, entries.stdout)):
@@ -1172,19 +1193,6 @@ def worktree_entry_stamps(copy: Path, *, git_checkouts: set[Path] | None = None)
     return stamps
 
 
-def restore_entry_stamps(copy: Path, *, linked: bool = False) -> dict[Path, list[int] | None]:
-    stamps = worktree_entry_stamps(copy)
-    index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
-    if index.returncode:
-        raise OSError("Git index を確認できません")
-    path = Path(index.stdout.strip())
-    checkout: dict[Path, list[int] | None] = {**stamps, path: file_stamp(path)}
-    if linked:
-        checkout.update({path.with_name(name): optional_stamp(path.with_name(name))
-                         for name in ("locked", "gitdir", "modules")})
-    return checkout
-
-
 def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
     try:
         marker = file_stamp(copy / ".git")
@@ -1209,14 +1217,16 @@ def checkout_head(copy: Path) -> list[int | str] | None:
 
 def snapshot_checkout(copy: Path, cutoff: float | None = None) -> list[int | str] | Literal["absent"] | None:
     try:
-        copy.lstat()
+        initial = copy.lstat()
     except FileNotFoundError:
         return CHECKOUT_ABSENT
     except OSError:
         return None
     try:
         if copy.resolve() == copy and (state := checkout_head(copy)) is not None:
-            if cutoff is None or latest_head_change(copy) <= cutoff:
+            if cutoff is not None and (initial.st_ctime_ns > cutoff * 1e9 or latest_head_change(copy) > cutoff):
+                return None
+            if stat_stamp(copy.lstat()) == stat_stamp(initial):
                 return state
     except (OSError, RuntimeError):
         pass
@@ -1238,6 +1248,30 @@ def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
     return [optional_stamp(path) for path in head_storage_paths(private, common)]
 
 
+def checkout_metadata_stamps(copy: Path, directories: tuple[Path, Path], *,
+                             include_clone_refs: bool = True) -> dict[Path, list[int] | None]:
+    private, common = directories
+    index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if index.returncode:
+        raise OSError(f"Git index を確認できません（{copy}）")
+    index_path = Path(index.stdout.strip())
+    paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
+             *head_storage_paths(private, common)]
+    stamps: dict[Path, list[int] | None] = {}
+    if private != common:
+        stamps.update(worktree_entry_stamps(private))
+    elif include_clone_refs:
+        for name in ("refs", "logs", "reftable", "worktrees"):
+            storage = common / name
+            if optional_stamp(storage) is None:
+                stamps[storage] = None
+            else:
+                stamps.update(worktree_entry_stamps(storage))
+        paths.extend(common / name for name in ("packed-refs", "modules", "config"))
+    stamps.update({path: optional_stamp(path) for path in paths})
+    return stamps
+
+
 def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] | None]:
     visible: set[Path] = set()
     stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root, git_checkouts=visible))
@@ -1251,24 +1285,7 @@ def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] |
             if copy in required:
                 raise OSError(f"Git checkout を確認できません（{copy}）")
             continue
-        private, common = directories
-        index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
-        if index.returncode:
-            raise OSError(f"Git index を確認できません（{copy}）")
-        index_path = Path(index.stdout.strip())
-        paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
-                 *head_storage_paths(private, common)]
-        if private != common:
-            paths.extend(private / name for name in ("locked", "gitdir", "modules"))
-        elif copy != root:
-            for name in ("refs", "logs", "reftable", "worktrees"):
-                storage = common / name
-                if optional_stamp(storage) is None:
-                    stamps[storage] = None
-                else:
-                    stamps.update(worktree_entry_stamps(storage))
-            paths.extend(common / name for name in ("packed-refs", "modules", "config"))
-        stamps.update({path: optional_stamp(path) for path in paths})
+        stamps.update(checkout_metadata_stamps(copy, directories, include_clone_refs=copy != root))
     return {str(path): stamp for path, stamp in stamps.items()}
 
 
@@ -2634,7 +2651,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     remote_default = default_base(worktree)
     local_default = None if remote_default else local_base(worktree)
     fallback = remote_default or local_default
-    fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
+    fetch_note = None if args.removal_stamps else fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
     if fetch_note:
         notes.append(fetch_note)
     if not pr and not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree) or fallback):
@@ -2714,10 +2731,16 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads},
                              detached=frozenset(root / path for path in detached_paths))
                if restore_paths else None)
+    parent_stamps: dict[Path, list[int] | None] = {}
     checked_stamps = None
-    if args.removal_stamps and restore is not None:
+    if restore is not None:
         try:
-            checked_stamps = removal_stamps(root, restore.requested)
+            if args.removal_stamps:
+                checked_stamps = removal_stamps(root, restore.requested)
+            elif args.apply_restore_nested and (root / ".git").is_file():
+                if (parent := git_directories(root)) is None:
+                    raise OSError("親 worktree の登録を確認できません")
+                parent_stamps = checkout_metadata_stamps(root, parent, include_clone_refs=False)
         except (OSError, RuntimeError) as error:
             decided.append(f"削除前の作業場の状態を記録できません（{error}）")
             recheck = partial(recheck, decided=tuple(decided))
@@ -2765,6 +2788,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             return lead_decisions.decision_lock(args.decisions_file.expanduser())
         return nullcontext()
 
+    def parent_unchanged() -> bool:
+        try:
+            return all(optional_stamp(path) == stamp for path, stamp in parent_stamps.items())
+        except OSError:
+            return False
+
     def changed_checkouts(restore: NestedRestore) -> set[Path]:
         changed = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
         changed.update(copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs)
@@ -2804,6 +2833,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     blockers = nested_check(copy, fresh)["blockers"]
                 else:
                     blockers = clone_check(copy, {}, fresh).blockers
+                    if git(root, "check-ignore", "--", copy.relative_to(root).as_posix()).returncode:
+                        return False
                 return not blockers and fresh.plans.get(copy) == plan and (plan is None or plan.matches(copy))
 
             with restoration_lock():
@@ -2815,7 +2846,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 if not changed and not approval_error:
                     for copy in restore.observed:
                         try:
-                            pending[copy] = restore_entry_stamps(copy, linked=copy in linked)
+                            if (directories := git_directories(copy)) is None:
+                                raise OSError("Git checkout を確認できません")
+                            pending[copy] = {**worktree_entry_stamps(copy), **checkout_metadata_stamps(copy, directories)}
                         except OSError:
                             changed.add(copy)
                 if not changed and not approval_error:
@@ -2829,6 +2862,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                                  and all(optional_stamp(path) == stamp for sibling, entries in pending.items()
                                          if sibling != copy for path, stamp in entries.items())
                                  and not changed_absent_checkouts(restore)
+                                 and parent_unchanged()
                                  and all(optional_stamp(path) == stamp for path, stamp in pending[copy].items()))
                     except OSError:
                         ready = False
@@ -2906,7 +2940,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 prefix = f"{copy.relative_to(root)}/"
                 written = {name.removeprefix(prefix): stamp for name, stamp in restored.items() if name.startswith(prefix)}
                 movement = moved_since(copy, since, written, inspect_head=copy not in restore.expected) if since and restore else []
-                if current != item or movement:
+                if current != item or movement or not parent_unchanged():
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     if movement:
                         decided.extend(movement)
@@ -2941,6 +2975,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         raise ValueError("登録または HEAD が変わりました")
                     if any(file_stamp(path) != stamp for path, stamp in entries.items()):
                         raise ValueError("子 worktree のファイルが変わりました")
+                    if not parent_unchanged():
+                        raise ValueError("親 worktree の登録が変わりました")
                 except (OSError, ValueError) as error:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
                     break
