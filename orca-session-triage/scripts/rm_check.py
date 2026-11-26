@@ -692,11 +692,15 @@ class NestedRestorePlan:
 
     def matches(self, copy: Path) -> bool:
         try:
-            if (file_stamp(self.index) != self.index_stamp
-                    or any(optional_stamp(copy / rel) != stamp for rel, stamp in self.files.items())):
-                return False
             head = git(copy, "rev-parse", "--verify", "HEAD")
-            return head.returncode == 0 and head.stdout.strip() == self.head
+        except OSError:
+            return False
+        return head.returncode == 0 and head.stdout.strip() == self.head and self.matches_files(copy)
+
+    def matches_files(self, copy: Path) -> bool:
+        try:
+            return (file_stamp(self.index) == self.index_stamp
+                    and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
         except OSError:
             return False
 
@@ -1101,6 +1105,16 @@ def native_detach_blockers(copy: Path) -> list[str]:
     return blockers
 
 
+def nested_ignored_blockers(copy: Path, repository: str, discard: frozenset[Path] = frozenset()) -> list[str]:
+    ignored = ignored_paths(copy, repository, discard=discard)
+    blockers = [ignored.error] if ignored.error else []
+    if ignored.review or ignored.nested:
+        blockers.append("ignored paths to open: " + ", ".join([*ignored.review, *map(str, ignored.nested)]))
+    if ignored.lock_holders:
+        blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
+    return blockers
+
+
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
@@ -1135,14 +1149,7 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     if restore is not None and (plan := restore.plans.get(copy)) and (alias := linked_restore_alias(copy, plan.files)):
         blockers.append(f"--restore-nested の Git とディスクのパス表記が異なります（{alias}）")
     discard = restore.discard if approved and restore else frozenset()
-    ignored = ignored_paths(copy, repository, discard=discard)
-    if ignored.error:
-        blockers.append(ignored.error)
-    review, deeper = ignored.review, ignored.nested
-    if review or deeper:
-        blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
-    if ignored.lock_holders:
-        blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
+    blockers.extend(nested_ignored_blockers(copy, repository, discard))
     return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
             "regenerable": regenerable, "untracked_bytecode": cached,
             "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
@@ -2526,7 +2533,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
 
             def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
                 return (plan.matches(copy) and (not parent_linked or not worktree_registration_blockers(root))
-                        and (copy not in linked or not native_detach_blockers(copy)))
+                        and (copy not in linked or not native_detach_blockers(copy)) and plan.matches_files(copy))
 
             latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
             for copy in restore.plans:
@@ -2620,6 +2627,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     except (OSError, ValueError) as error:
                         detach_error = f"子 worktree {copy.relative_to(root)} のバイトコードを削除できません（{error}）"
                         break
+                if ignored_blockers := nested_ignored_blockers(copy, item["repository"]):
+                    detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
+                    decided.extend(ignored_blockers)
+                    break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除できません: {removed.stderr.strip()}"

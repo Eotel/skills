@@ -6924,6 +6924,24 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(result["nested_worktrees"][0]["blockers"], ["2 uncommitted changes"])
         self.assertTrue(copy.exists())
 
+    def test_nested_detach_keeps_ignored_data_created_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog()
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("private.sqlite3\n")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        database = copy / "private.sqlite3"
+        clean = rmcheck.clean_nested_bytecode
+
+        def finish_cleanup(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            database.write_bytes(b"keep this database")
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", finish_cleanup),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(database.read_bytes(), b"keep this database")
+
     def test_approved_tracked_changes_in_a_nested_worktree_are_restored_before_detaching(self) -> None:
         copy = self.nested_catalog()
         rel = "locale/de/LC_MESSAGES/django.po"
@@ -7008,6 +7026,36 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_nested_restore_retains_an_edit_made_during_the_final_head_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("approved edit\n")
+        matches = rmcheck.NestedRestorePlan.matches
+        actual_git = rmcheck.git
+        calls = 0
+
+        def save_during_head_check(cwd: str | Path, *args: str,
+                                   env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            result = actual_git(cwd, *args, env=env)
+            if Path(cwd) == copy and args == ("rev-parse", "--verify", "HEAD"):
+                changed.write_text("keep the newer edit\n")
+            return result
+
+        def check_before_restore(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with patch.object(rmcheck, "git", side_effect=save_during_head_check):
+                    return matches(plan, path)
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", check_before_restore),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep the newer edit\n")
 
     def test_nested_restore_refuses_a_replacement_with_mismatched_worktree_registration(self) -> None:
         copy = self.nested_catalog()
