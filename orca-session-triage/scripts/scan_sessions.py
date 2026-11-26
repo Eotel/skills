@@ -3281,7 +3281,12 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
             if len(cleanup_terms) > 1:
                 selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
         if selected["allows_removal"] and selected.get("restore_nested"):
-            if any((answer := decisions.get(removal.get("decision") or "")) is None
+            key = selected.get("decision")
+            if not isinstance(key, str) or lead_decisions.removal_worktree_path(key) is None:
+                row["cleanup_blockers"].append("--restore-nested の承認は作業場の絶対パスで記録してください")
+                row["closable"] = []
+                selected = {**selected, "allows_removal": False}
+            elif any((answer := decisions.get(removal.get("decision") or "")) is None
                    or answer.id != removal.get("record_id") for removal in candidates):
                 row["cleanup_blockers"].append("承認ログに現在有効な --restore-nested の承認がありません")
                 selected = {**selected, "allows_removal": False}
@@ -4622,14 +4627,13 @@ def main(argv: list[str] | None = None) -> int:
         if row.get("environment") or not decision.get("allows_removal") or not decision.get("restore_nested"):
             continue
         root = Path(row["path"]).resolve()
-        target = Path(decision["decision"].removeprefix("remove:").removeprefix("local::"))
         heads = {}
         for name in decision["restore_nested"]:
             relative = PurePosixPath(name)
             copy = root / relative
             current = (rm_check.snapshot_checkout(copy, scan_started.timestamp())
                        if relative.parts and not relative.is_absolute() and ".." not in relative.parts else None)
-            if ((copy in original_checkouts or target.is_absolute()) and original_checkouts.get(copy) != current):
+            if original_checkouts.get(copy) != current:
                 current = None
             heads[str(relative)] = current
         row["restore_checkout_heads"] = heads

@@ -894,10 +894,16 @@ def reference_paths(path: Path) -> set[Path]:
 
 
 def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
+    def identity(path: Path) -> tuple[int, int] | None:
+        stamp = optional_stamp(path)
+        return (stamp[0], stamp[1]) if stamp is not None else None
+
     try:
         sources = reference_paths(excludes_file(copy))
+        source_ids = {value for path in sources if (value := identity(path)) is not None}
         candidates = {name: copy / name for name in plan.files
-                      if copy / name in sources or Path(name).name == ".gitignore"}
+                      if (copy / name in sources or identity(copy / name) in source_ids
+                          or Path(name).name.casefold() == ".gitignore")}
         if not candidates:
             return None
         listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
@@ -909,8 +915,9 @@ def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
                                input=listing.stdout, capture_output=True, text=True, check=True, timeout=30)
         sources = {path for source in rules.stdout.removesuffix("\0").split("\0")[::4]
                    for path in reference_paths(copy / source)}
+        source_ids = {value for path in sources if (value := identity(path)) is not None}
         for name, path in candidates.items():
-            if path in sources:
+            if path in sources or identity(path) in source_ids:
                 return f"{name} は依存 clone 内の無視ルールに使われています"
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return "依存 clone の無視ルールを確認できません"

@@ -52,6 +52,15 @@ HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
 REMOVAL_KEYS = ("after", "discard", "compose_down", "archive_path", "approve", "restore_nested")
+
+
+def removal_worktree_path(key: str) -> Path | None:
+    if not key.startswith("remove:"):
+        return None
+    path = Path(key.removeprefix("remove:"))
+    if not path.is_absolute():
+        path = Path(str(path).partition("::")[2])
+    return path if path.is_absolute() else None
 DISCARD_IN_ANSWER = re.compile(
     r"(?<![\w/])(?:`([^`\n]+)`|([\w./-]*[./][\w./-]+))\s*(?:は|を)\s*捨て(?:て|る|、)")
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value", *REMOVAL_KEYS))
@@ -103,6 +112,8 @@ class RemovalTerms:
             return None
         if not decision.startswith("remove:"):
             raise ValueError("removal approval, conditions and cleanup go only with a remove: key")
+        if restore_nested and removal_worktree_path(decision) is None:
+            raise ValueError("--restore-nested requires a worktree's absolute path in the remove: key")
         if approve and after is not None:
             raise ValueError("approve is for removal without conditions")
         if after is not None and not (isinstance(after, str) and PR_MERGED.fullmatch(after.strip())):

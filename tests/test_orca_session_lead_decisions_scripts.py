@@ -59,6 +59,10 @@ class LeadDecisionsTests(unittest.TestCase):
         self.assertEqual(json.loads(self.run_tool("show").stdout)[0]["removal"]["restore_nested"], ["local-deps/library"])
         for path in ("../outside", "/w/other", "local-deps/library/.git"):
             self.assertNotEqual(self.run_tool(*command, path).returncode, 0)
+        result = self.run_tool("record", "--decision", "remove:app/cleanup", "--answer-file", str(answer),
+                               "--restore-nested", "local-deps/library")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute path", result.stderr)
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

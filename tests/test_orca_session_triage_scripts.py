@@ -6932,6 +6932,7 @@ class RmCheckTests(unittest.TestCase):
             "approved", f"remove:{root}", "削除してよい", "2026-01-01T00:00:00Z",
             removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
         collect = scan.collect_worktrees_and_terminals
+        snapshot = rmcheck.snapshot_checkout
 
         def move_during_inventory(*args: str | None) -> tuple[list[dict], list[dict]]:
             moved.rename(copy)
@@ -6939,6 +6940,7 @@ class RmCheckTests(unittest.TestCase):
 
         output = io.StringIO()
         with (patch.object(scan, "collect_worktrees_and_terminals", side_effect=move_during_inventory),
+              patch.object(rmcheck, "snapshot_checkout", side_effect=lambda path, cutoff=None: snapshot(path)),
               patch.object(scan, "read_mail", return_value={}), patch.object(scan, "jev_key", return_value=None),
               redirect_stdout(output), redirect_stderr(io.StringIO())):
             self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--decisions-file", str(decisions),
@@ -6949,6 +6951,23 @@ class RmCheckTests(unittest.TestCase):
         self.assertTrue(row["removal_decision"]["allows_removal"], row)
         self.assertEqual(row["restore_checkout_heads"], {name: None})
         self.assertEqual((copy / "app.txt").read_text(), "retain this edit\n")
+
+    def test_legacy_short_restore_approval_is_held_before_cleanup(self) -> None:
+        import lead_decisions
+
+        fixture = Path(self.tmp.name)
+        root = self.wt.resolve()
+        decisions = fixture / "decisions.jsonl"
+        row = {"path": str(root), "repo": "fixture", "class": "stalled", "closable": ["term_1"]}
+        lead_decisions.append(decisions, lead_decisions.Decision(
+            "approved", f"remove:fixture/{root.name}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=("local-deps/library",))))
+
+        [checked] = scan.with_cleanup_constraints([row], fixture / "state.json", decisions)
+
+        self.assertFalse(checked["removal_decision"]["allows_removal"])
+        self.assertIn("作業場の絶対パス", " ".join(checked["cleanup_blockers"]))
+        self.assertEqual(checked["closable"], [])
 
     def test_restoration_keeps_target_edits_written_while_checking_a_sibling(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
@@ -7046,14 +7065,15 @@ class RmCheckTests(unittest.TestCase):
             "approved", f"remove:{root}", "削除してよい", "2026-01-01T00:00:00Z",
             removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
         collect = scan.collect_worktrees_and_terminals
+        snapshot = rmcheck.snapshot_checkout
 
         def reset_during_scan(*args: str | None) -> tuple[list[dict], list[dict]]:
             git(copy, "reset", "--soft", "HEAD^")
             return collect(*args)
 
         output = io.StringIO()
-        time.sleep(1.05)
         with (patch.object(scan, "collect_worktrees_and_terminals", side_effect=reset_during_scan),
+              patch.object(rmcheck, "snapshot_checkout", side_effect=lambda path, cutoff=None: snapshot(path)),
               patch.object(scan, "read_mail", return_value={}), patch.object(scan, "jev_key", return_value=None),
               redirect_stdout(output), redirect_stderr(io.StringIO())):
             self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--decisions-file", str(decisions),
@@ -7110,6 +7130,36 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 0, result)
         self.assertEqual(target.read_text(), "v1\n")
         self.assertTrue(self.wt.is_dir())
+
+    def test_restore_keeps_the_case_alias_of_an_active_gitignore(self) -> None:
+        if not (self.main / ".GITIGNORE").exists():
+            self.skipTest("requires a case-insensitive filesystem")
+        git(self.main, "mv", ".gitignore", "ignore-fixture")
+        git(self.main, "mv", "ignore-fixture", ".GITIGNORE")
+        git(self.main, "commit", "-qm", "track uppercase ignore filename")
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("/local-deps/\n")
+        ignore = clone / ".GITIGNORE"
+        ignore.write_text("/scratch_cache/\n")
+        git(clone, "add", ignore.name)
+        target = clone / "app.txt"
+        target.write_text("approved edit\n")
+        cache = clone / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+        self.assertIn(".gitignore", git(clone, "check-ignore", "-v", "scratch_cache/cache.tmp").lower())
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(clone, "show", ":.GITIGNORE"), "/scratch_cache/")
+        self.assertEqual(target.read_text(), "approved edit\n")
 
     def test_nested_restore_revalidates_every_repository_before_the_first_write(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
