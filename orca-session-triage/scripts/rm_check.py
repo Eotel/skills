@@ -857,18 +857,23 @@ def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
 
 
 def clone_ignore_changes(copy: Path, plan: NestedRestorePlan) -> str | None:
-    listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard",
-                  "--directory", "--no-empty-directory", "-z")
-    if listing.returncode:
-        return "依存 clone の無視対象を確認できません"
-    if not listing.stdout:
-        return None
     try:
+        external = git(copy, "config", "--path", "--get", "core.excludesFile")
+        excludes = (copy / external.stdout.rstrip("\n")).resolve() if external.returncode == 0 else None
+        candidates = {name: path for name in plan.files if (path := (copy / name).resolve()) == excludes
+                      or Path(name).name == ".gitignore"}
+        if not candidates:
+            return None
+        listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+        if listing.returncode:
+            return "依存 clone の無視対象を確認できません"
+        if not listing.stdout:
+            return None
         rules = subprocess.run(["git", "-C", str(copy), "check-ignore", "--verbose", "-z", "--stdin"],
                                input=listing.stdout, capture_output=True, text=True, check=True, timeout=30)
         sources = {(copy / source).resolve() for source in rules.stdout.removesuffix("\0").split("\0")[::4]}
-        for name in plan.files:
-            if (copy / name).resolve() in sources:
+        for name, path in candidates.items():
+            if path in sources:
                 return f"{name} は依存 clone 内の無視ルールに使われています"
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return "依存 clone の無視ルールを確認できません"

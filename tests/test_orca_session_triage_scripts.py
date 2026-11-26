@@ -6911,18 +6911,42 @@ class RmCheckTests(unittest.TestCase):
         loop.symlink_to(loop.name)
         self.assertIsNone(rmcheck.snapshot_checkout(loop))
 
-    def test_snapshot_does_not_accept_a_clone_moved_into_place_during_the_scan(self) -> None:
-        remote = Path(self.tmp.name) / "deps.git"
-        copy = self.wt.resolve() / "local-deps/library"
+    def test_live_scan_does_not_accept_a_clone_moved_into_place(self) -> None:
+        import lead_decisions
+
+        fixture = Path(self.tmp.name)
+        root = self.wt.resolve()
+        name = "local-deps/library"
+        copy = root / name
         copy.parent.mkdir()
-        moved = Path(self.tmp.name) / "outside"
+        moved, remote = fixture / "outside", fixture / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
         git(self.main, "clone", "-q", str(remote), str(moved))
-        cutoff = datetime.now(timezone.utc).timestamp()
-        moved.rename(copy)
+        (moved / "app.txt").write_text("retain this edit\n")
+        ps, terms, decisions = (fixture / filename for filename in ("ps.json", "terms.json", "decisions.jsonl"))
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree(str(root))]}}))
+        terms.write_text(json.dumps({"result": {"terminals": []}}))
+        lead_decisions.append(decisions, lead_decisions.Decision(
+            "approved", f"remove:{root}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
+        collect = scan.collect_worktrees_and_terminals
 
-        self.assertIsInstance(rmcheck.snapshot_checkout(copy), list)
-        self.assertIsNone(rmcheck.snapshot_checkout(copy, cutoff))
+        def move_during_inventory(*args: str | None) -> tuple[list[dict], list[dict]]:
+            moved.rename(copy)
+            return collect(*args)
+
+        output = io.StringIO()
+        with (patch.object(scan, "collect_worktrees_and_terminals", side_effect=move_during_inventory),
+              patch.object(scan, "read_mail", return_value={}), patch.object(scan, "jev_key", return_value=None),
+              redirect_stdout(output), redirect_stderr(io.StringIO())):
+            self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--decisions-file", str(decisions),
+                                        "--claude-projects", str(fixture / "no-claude"), "--codex-sessions", str(fixture / "no-codex"),
+                                        "--inbox", str(fixture / "no-inbox"), "--ask-answers", str(fixture / "no-answers"),
+                                        "--state-file", str(fixture / "no-state")]), 0)
+        [row] = json.loads(output.getvalue())
+        self.assertTrue(row["removal_decision"]["allows_removal"], row)
+        self.assertEqual(row["restore_checkout_heads"], {name: None})
+        self.assertEqual((copy / "app.txt").read_text(), "retain this edit\n")
 
     def test_restoration_keeps_target_edits_written_while_checking_a_sibling(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
@@ -8486,9 +8510,9 @@ class RmCheckTests(unittest.TestCase):
         git(self.main, "clone", "--bare", "-q", str(self.main), str(bare))
         git(self.main, "remote", "add", "origin", str(bare))
         original = git(self.main, "rev-parse", "main")
-        git(self.main, "update-ref", "refs/remotes/origin/main", original)
         git(self.main, "commit", "--allow-empty", "-qm", "new remote tip")
         git(self.main, "push", "-q", str(bare), "main")
+        git(self.main, "update-ref", "refs/remotes/origin/main", original)
         saved = Path(self.tmp.name) / "scan.json"
         saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
                                      "restore_checkout_heads": {"local-deps/absent": "absent"}}]))

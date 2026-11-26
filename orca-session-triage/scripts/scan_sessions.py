@@ -4454,6 +4454,29 @@ def print_row(args: argparse.Namespace, rows: list[dict], key: str) -> int:
     return 0
 
 
+def recorded_restore_checkouts(decisions_file: Path) -> dict[Path, list[int | str] | Literal["absent"] | None]:
+    import lead_decisions
+
+    decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    observed: dict[Path, list[int | str] | Literal["absent"] | None] = {}
+    for key, decision in decisions.items():
+        if not key.startswith("remove:") or not decision.removal or not decision.removal.restore_nested:
+            continue
+        root = Path(key.removeprefix("remove:").removeprefix("local::"))
+        if not root.is_absolute():
+            continue
+        try:
+            root = root.resolve()
+        except (OSError, RuntimeError):
+            continue
+        for name in decision.removal.restore_nested:
+            relative = PurePosixPath(name)
+            if relative.parts and not relative.is_absolute() and ".." not in relative.parts:
+                copy = root / relative
+                observed[copy] = rm_check.snapshot_checkout(copy)
+    return observed
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     def constrain(rows: list[dict], known_tabs: Collection[tuple[str | None, str]]) -> list[dict]:
@@ -4505,6 +4528,7 @@ def main(argv: list[str] | None = None) -> int:
     # close_tabs.py keeps a tab whose worktree moved after this moment.
     scan_started = datetime.now(timezone.utc)
     scanned_at = scan_started.isoformat(timespec="seconds")
+    original_checkouts = recorded_restore_checkouts(args.decisions_file.expanduser())
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     known_tabs = {(term.get("_environment"), term["handle"]) for term in terminals
                   if term.get("handle") and (term.get("connected") or not term.get("orphaned"))}
@@ -4598,11 +4622,16 @@ def main(argv: list[str] | None = None) -> int:
         if row.get("environment") or not decision.get("allows_removal") or not decision.get("restore_nested"):
             continue
         root = Path(row["path"]).resolve()
+        target = Path(decision["decision"].removeprefix("remove:").removeprefix("local::"))
         heads = {}
         for name in decision["restore_nested"]:
-            copy = root / name
-            heads[str(PurePosixPath(name))] = (rm_check.snapshot_checkout(copy, scan_started.timestamp())
-                                              if copy.is_relative_to(root) else None)
+            relative = PurePosixPath(name)
+            copy = root / relative
+            current = (rm_check.snapshot_checkout(copy, scan_started.timestamp())
+                       if relative.parts and not relative.is_absolute() and ".." not in relative.parts else None)
+            if ((copy in original_checkouts or target.is_absolute()) and original_checkouts.get(copy) != current):
+                current = None
+            heads[str(relative)] = current
         row["restore_checkout_heads"] = heads
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
