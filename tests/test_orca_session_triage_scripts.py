@@ -6615,8 +6615,19 @@ class RmCheckTests(unittest.TestCase):
         original = changed.read_text()
         changed.write_text("approved edit\n")
         snapshot = Path(self.tmp.name) / "scan.json"
-        snapshot.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
-                                         "restore_checkout_heads": {name: rmcheck.checkout_head(copy.resolve())}}]))
+
+        def save_scan() -> None:
+            snapshot.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                             "restore_checkout_heads": {"./" + name: rmcheck.checkout_head(copy.resolve())}}]))
+
+        save_scan()
+        git(copy, "branch", "-m", "resumed-work")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(snapshot), "--restore-nested", name, "--apply-restore-nested")
+        self.assertEqual(code, 1, result)
+        self.assertEqual(changed.read_text(), "approved edit\n")
+
+        save_scan()
         git(copy, "pack-refs", "--all")
 
         with patch.object(rmcheck, "processes_in", return_value=[]):

@@ -4593,7 +4593,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         root = Path(row["path"]).resolve()
         row["restore_checkout_heads"] = {
-            name: state for name in decision["restore_nested"]
+            str(PurePosixPath(name)): state for name in decision["restore_nested"]
             if (copy := root / name).is_relative_to(root) and copy.resolve() == copy
             and (state := rm_check.checkout_head(copy)) is not None
         }

@@ -694,8 +694,13 @@ class NestedRestorePlan:
     def matches(self, copy: Path) -> bool:
         try:
             head = git(copy, "rev-parse", "--verify", "HEAD")
-            return (head.returncode == 0 and head.stdout.strip() == self.head
-                    and file_stamp(copy / ".git") == self.checkout_stamp
+            return head.returncode == 0 and head.stdout.strip() == self.head and self.files_match(copy)
+        except OSError:
+            return False
+
+    def files_match(self, copy: Path) -> bool:
+        try:
+            return (file_stamp(copy / ".git") == self.checkout_stamp
                     and file_stamp(self.index) == self.index_stamp
                     and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
         except OSError:
@@ -1156,8 +1161,22 @@ def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
 def checkout_head(copy: Path) -> list[int | str] | None:
     if state := linked_checkout_state(copy):
         marker, private, common, head = state
-        return [*marker[:2], private, common, head]
+        branch = git(copy, "symbolic-ref", "-q", "HEAD")
+        reflog = git(copy, "log", "-g", "-1", "--format=%H%x00%gD%x00%gs", "--date=unix", "HEAD")
+        if branch.returncode in (0, 1) and reflog.returncode == 0:
+            return [*marker[:2], private, common, head, branch.stdout.strip(), reflog.stdout.strip()]
     return None
+
+
+def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
+    head = private / "HEAD"
+    tables = common / "reftable/tables.list"
+    paths = [head, private / "logs/HEAD", private / "reftable/tables.list", tables]
+    pointer = head.read_text().strip()
+    if not tables.is_file() and pointer.startswith("ref: refs/"):
+        branch = pointer.removeprefix("ref: ")
+        paths.extend((common / branch, common / "logs" / branch, common / "packed-refs"))
+    return [optional_stamp(path) for path in paths]
 
 
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
@@ -2437,7 +2456,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         if since is None:
             scanned = local_row.get("scanned_at") or next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
             since = datetime.fromisoformat(scanned) if scanned else None
-        saved_heads = local_row.get("restore_checkout_heads") or {}
+        saved_heads = {str(PurePosixPath(name)): state for name, state in
+                       (local_row.get("restore_checkout_heads") or {}).items()}
     if since is not None and since.tzinfo is None:
         since = since.astimezone()
     checkout = args.main or main_checkout(worktree)
@@ -2621,8 +2641,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             linked = {Path(item["path"]) for item in result["nested_worktrees"]}
             parent_linked = (root / ".git").is_file()
 
-            def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
-                if (not plan.matches(copy) or (parent_linked and worktree_registration_blockers(root))
+            def restore_matches(copy: Path, plan: NestedRestorePlan | None) -> bool:
+                if ((plan is not None and not plan.matches(copy)) or (parent_linked and worktree_registration_blockers(root))
                         or (copy in linked and native_detach_blockers(copy))):
                     return False
                 fresh = NestedRestore(root, {copy}, since=since, already_missing=restore.already_missing,
@@ -2631,7 +2651,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     blockers = nested_check(copy, fresh)["blockers"]
                 else:
                     blockers = clone_check(copy, {}, fresh).blockers
-                return not blockers and fresh.plans.get(copy) == plan and plan.matches(copy)
+                return not blockers and fresh.plans.get(copy) == plan and (plan is None or plan.matches(copy))
 
             def changed_checkouts() -> set[Path]:
                 return {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
@@ -2642,11 +2662,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     decided.append(approval_error)
                 changed = changed_checkouts()
                 if not changed and not approval_error:
-                    changed = {copy for copy, plan in restore.plans.items() if not restore_matches(copy, plan)}
+                    changed = {copy for copy in restore.observed if not restore_matches(copy, restore.plans.get(copy))}
                 for copy in sorted(changed):
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                    if not restore_matches(copy, approved) or changed_checkouts():
+                    if not restore_matches(copy, approved) or changed_checkouts() or not approved.files_match(copy):
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
@@ -2726,12 +2746,23 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     except (OSError, ValueError) as error:
                         detach_error = f"子 worktree {copy.relative_to(root)} のバイトコードを削除できません（{error}）"
                         break
-                if linked_checkout_state(copy) != item["checkout_state"]:
-                    detach_error = f"子 worktree {copy.relative_to(root)} の登録または HEAD が削除直前に変わりました"
+                marker, private, common, _ = item["checkout_state"]
+                try:
+                    metadata = head_storage_stamps(Path(private), Path(common))
+                    if linked_checkout_state(copy) != item["checkout_state"]:
+                        raise ValueError("登録または HEAD が変わりました")
+                except (OSError, ValueError) as error:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
                     break
                 if ignored_blockers := nested_ignored_blockers(copy, item["repository"]):
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     decided.extend(ignored_blockers)
+                    break
+                try:
+                    if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
+                        raise ValueError("登録または HEAD が変わりました")
+                except (OSError, ValueError) as error:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
                     break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:
