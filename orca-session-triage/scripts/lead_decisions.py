@@ -51,7 +51,16 @@ DEFAULT_LOG = Path(os.environ.get("TRIAGE_LEAD_DECISIONS", "~/.cache/orca-sessio
 HANDED_OFF_LOG = Path(os.environ.get("TRIAGE_HANDED_OFF", "~/.cache/orca-session-triage/handed-off.jsonl"))
 # A PR a decision key names: `owner/repo#12`, or several of one repository as `owner/repo#12+#14`.
 PR_REFS = re.compile(r"(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)#(?P<numbers>\d+(?:\+#?\d+)*)")
-REMOVAL_KEYS = ("after", "discard", "compose_down", "archive_path", "approve")
+REMOVAL_KEYS = ("after", "discard", "compose_down", "archive_path", "approve", "restore_nested")
+
+
+def removal_worktree_path(key: str) -> Path | None:
+    if not key.startswith("remove:"):
+        return None
+    path = Path(key.removeprefix("remove:"))
+    if not path.is_absolute():
+        path = Path(str(path).partition("::")[2])
+    return path if path.is_absolute() else None
 DISCARD_IN_ANSWER = re.compile(
     r"(?<![\w/])(?:`([^`\n]+)`|([\w./-]*[./][\w./-]+))\s*(?:は|を)\s*捨て(?:て|る|、)")
 ANSWER_KEYS = frozenset(("decision", "answer", "decided_at", "value", *REMOVAL_KEYS))
@@ -81,10 +90,11 @@ class RemovalTerms:
     compose_down: bool = False  # docker compose -p <project> down -v for each project the check lists
     archive_path: tuple[str, ...] = ()
     approve: bool = False
+    restore_nested: tuple[str, ...] = ()
 
     @classmethod
     def checked(cls, decision: str, after: object, discard: object, compose_down: object, *,
-                archive_path: object = (), approve: object = False) -> RemovalTerms | None:
+                archive_path: object = (), approve: object = False, restore_nested: object = ()) -> RemovalTerms | None:
         """The terms an answer gives, or None without any; ValueError says why its key or a value cannot hold them."""
         if not isinstance(approve, bool):
             raise ValueError("approve must be true or false")
@@ -93,12 +103,19 @@ class RemovalTerms:
                 and all(part.casefold() != ".git" for part in PurePosixPath(path.strip()).parts)
                 for path in archive_path):
             raise ValueError("each archive_path must name a relative path inside the worktree, outside .git")
-        if after is None and not discard and compose_down is False and not archive_path and not approve:
+        if not isinstance(restore_nested, (list, tuple)) or not all(
+                isinstance(path, str) and inside(path)
+                and all(part.casefold() != ".git" for part in PurePosixPath(path.strip()).parts)
+                for path in restore_nested):
+            raise ValueError("each restore_nested path must name a nested repository relative to the worktree, outside .git")
+        if after is None and not discard and compose_down is False and not archive_path and not approve and not restore_nested:
             return None
         if not decision.startswith("remove:"):
             raise ValueError("removal approval, conditions and cleanup go only with a remove: key")
-        if approve and (after is not None or discard or compose_down or archive_path):
-            raise ValueError("approve is for removal without conditions or cleanup")
+        if restore_nested and removal_worktree_path(decision) is None:
+            raise ValueError("--restore-nested requires a worktree's absolute path in the remove: key")
+        if approve and after is not None:
+            raise ValueError("approve is for removal without conditions")
         if after is not None and not (isinstance(after, str) and PR_MERGED.fullmatch(after.strip())):
             raise ValueError("after must be pr-merged:https://github.com/<owner>/<repo>/pull/<number>")
         if not isinstance(discard, (list, tuple)) or not all(isinstance(path, str) and inside(path) for path in discard):
@@ -106,14 +123,16 @@ class RemovalTerms:
         if not isinstance(compose_down, bool):
             raise ValueError("compose_down must be true or false")
         return cls(after.strip() if isinstance(after, str) else None, tuple(path.strip() for path in discard),
-                   compose_down, tuple(path.strip() for path in archive_path), approve)
+                   compose_down, tuple(path.strip() for path in archive_path), approve,
+                   tuple(path.strip() for path in restore_nested))
 
     @classmethod
     def stored(cls, value: object) -> RemovalTerms | None:
         if not isinstance(value, dict):
             return None
         return cls(value.get("after"), tuple(value.get("discard") or ()), value.get("compose_down") is True,
-                   tuple(value.get("archive_path") or ()), value.get("approve") is True)
+                   tuple(value.get("archive_path") or ()), value.get("approve") is True,
+                   tuple(value.get("restore_nested") or ()))
 
     def pull_request(self) -> PullRequest | None:
         """The PR whose merge `after` waits for."""
@@ -156,7 +175,7 @@ class Decision:
         if self.removal is None:
             del found["removal"]
         else:
-            for key in ("archive_path", "approve"):
+            for key in ("archive_path", "approve", "restore_nested"):
                 if not found["removal"][key]:
                     del found["removal"][key]
         if not self.from_ask:
@@ -299,11 +318,18 @@ def hidden_answers(known: dict[str, list[Decision]], entries: Iterable[Decision]
 
 
 @contextmanager
-def appending(log: Path) -> Generator[Callable[..., None], None, None]:
-    """Serialize decision updates so an explicit decision can supersede automatic answers."""
+def decision_lock(log: Path, *, exclusive: bool = False) -> Generator[None, None, None]:
     log.parent.mkdir(parents=True, exist_ok=True)
     canonical = log.resolve()
     lock_path = canonical.with_name(canonical.name + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+
+
+@contextmanager
+def appending(log: Path) -> Generator[Callable[..., None], None, None]:
+    """Serialize decision updates so an explicit decision can supersede automatic answers."""
 
     def write(*entries: Decision | HandOff) -> None:
         lines = [json.dumps({**entry.view(), "from_ask": entry.from_ask} if isinstance(entry, Decision) else asdict(entry),
@@ -315,8 +341,7 @@ def appending(log: Path) -> Generator[Callable[..., None], None, None]:
                     stream.writelines(lines)
                     stream.flush()
 
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with decision_lock(log, exclusive=True):
         yield write
 
 
@@ -368,7 +393,8 @@ def answer_line(raw: str) -> Decision:
                     decided_at=at, value=answer_value(decision, item.get("value")),
                     removal=RemovalTerms.checked(decision, item.get("after"), item.get("discard", []),
                                                  item.get("compose_down", False),
-                                                 archive_path=item.get("archive_path", []), approve=item.get("approve", False)),
+                                                 archive_path=item.get("archive_path", []), approve=item.get("approve", False),
+                                                 restore_nested=item.get("restore_nested", [])),
                     sender={**inbox_read.answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")})
 
 
@@ -774,12 +800,16 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
                         help="for a remove: key, a path relative to the worktree to archive and verify before removal. "
                              "Repeat for each path.")
     record.add_argument("--approve", action="store_true",
-                        help="approve a remove: key explicitly without conditions or cleanup")
+                        help="approve a remove: key explicitly, with or without cleanup, without --after")
+    record.add_argument("--restore-nested", action="append", default=[], metavar="PATH",
+                        help="for a remove: key, restore tracked changes in a nested repository at this relative path. "
+                             "Repeat for each repository.")
     many = commands.add_parser(
         "record-many", help='append several answers from JSON Lines of {"decision": KEY, "answer": TEXT, '
                             '"decided_at": ISO time with offset (optional), "value": what an asana:<item>: answer '
                             'puts in that item (optional), and for a remove: key "after", "discard": [PATH, ...], '
-                            '"compose_down": true, "archive_path": [PATH, ...], and "approve": true as the matching '
+                            '"compose_down": true, "archive_path": [PATH, ...], "restore_nested": [PATH, ...], '
+                            'and "approve": true as the matching '
                             'record options (optional)}; '
                             '{answered_at} in an answer as with record; a wrong line writes nothing')
     many.add_argument("--file", type=Path, help="UTF-8 JSON Lines file (default: standard input)")
@@ -830,7 +860,8 @@ def main(argv: list[str] | None = None, read_prs: PrStates = github_item_states)
             entry = Decision(id=uuid.uuid4().hex, decision=decision, answer=answer,
                              decided_at=at, value=answer_value(decision, args.value),
                              removal=RemovalTerms.checked(decision, args.after, args.discard, args.compose_down,
-                                                          archive_path=args.archive_path, approve=args.approve),
+                                                          archive_path=args.archive_path, approve=args.approve,
+                                                          restore_nested=args.restore_nested),
                              sender={**inbox_read.answer_sender(), "handle": os.environ.get("ORCA_TERMINAL_HANDLE")})
             warnings = hidden_answers(history(records(log)), [entry])
             append(log, entry)

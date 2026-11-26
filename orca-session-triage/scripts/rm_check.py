@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Collection, Sequence
-from dataclasses import asdict
+from contextlib import AbstractContextManager, nullcontext, suppress
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import filecmp
 from functools import partial
+from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
+from tempfile import mkdtemp, TemporaryFile
 import posixpath
 import re
 import shlex
@@ -20,7 +24,8 @@ import stat
 import subprocess
 import sys
 import time
-from typing import NamedTuple, NotRequired, TypedDict
+from typing import Literal, NamedTuple, NotRequired, TypedDict
+from unicodedata import normalize
 from urllib.parse import urlsplit
 
 import lead_decisions
@@ -114,6 +119,7 @@ ARCHIVE_BLOCK = re.compile(r'(?:data|resource)\s+"archive_file"\s')
 LOG_SUFFIX = ".log"
 # The blocker for nested worktrees --detach-nested can remove.
 NESTED_READY = "worktrees of other repositories remain inside: "
+NESTED_RESTORE = "approved tracked changes to restore in nested repositories: "
 # Records agents keep in a worktree outside git; --archive-scratch moves them aside.
 SCRATCH_DIRS = (".yomiyasu", ".investigate")
 # Records --archive-scratch copies to main. Other ignored files, such as .claude/settings.local.json or .env,
@@ -147,6 +153,7 @@ PROCESS_RECHECK_SECONDS = 2
 # Claude Code's lock on a session's scheduled tasks, {"pid": …, "procStart": <ps lstart in UTC>, …}: it says only
 # that its holder runs, so a lock whose holder ended is regenerable and a live holder is a process using the worktree.
 SCHEDULED_LOCK = ".claude/scheduled_tasks.lock"
+CHECKOUT_ABSENT: Literal["absent"] = "absent"
 # How many uncommitted paths `reasons` names after their count.
 REASON_PATHS = 10
 
@@ -200,22 +207,23 @@ def log_note(rel: str, files: list[Path]) -> str:
         rel, sum(stat.st_size for stat in stats), latest.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
-def working_changes(worktree: str | Path) -> tuple[list[str], list[str]]:
-    """(uncommitted, regenerable): paths `git status` reports, split off the untracked bytecode in them."""
-    uncommitted, regenerable = [], []
+def working_changes(worktree: str | Path, *, all_untracked: bool = False) -> tuple[list[str], list[str], list[str]]:
+    tracked_changes, untracked, regenerable = [], [], []
     # -z gives each path unquoted; a rename's second entry names its source and is skipped.
-    entries = iter(git(worktree, "status", "--porcelain", "-z").stdout.split("\0"))
+    mode = "all" if all_untracked else "normal"
+    entries = iter(git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", f"--untracked-files={mode}")
+                   .stdout.split("\0"))
     for entry in entries:
         if not entry:
             continue
         if set(entry[:2]) & set("RC"):
             next(entries, None)
         rel = entry[3:]
-        if entry.startswith("?? ") and holds_only_bytecode(Path(worktree) / rel):
-            regenerable.append(rel)
+        if entry.startswith("?? "):
+            (regenerable if holds_only_bytecode(Path(worktree) / rel) else untracked).append(rel)
         else:
-            uncommitted.append(rel)
-    return uncommitted, regenerable
+            tracked_changes.append(rel)
+    return tracked_changes, untracked, regenerable
 
 
 def is_regenerable(relpath: str) -> bool:
@@ -645,9 +653,10 @@ class IgnoredPaths(NamedTuple):
     # The paths of `review` split by what they hold: work records --archive-scratch moves aside, and the rest.
     records: list[Record]
     held: list[Held]
+    error: str | None = None
 
 
-def dependency_clones(worktree: Path, rel: str) -> list[Path]:
+def dependency_clones(worktree: Path, rel: str, linked: Sequence[Path] = ()) -> list[Path]:
     """Standalone clones at an untracked/ignored local-deps path containing nothing else."""
     path = PurePosixPath(rel)
     if not path.parts or path.parts[0] != "local-deps" or len(path.parts) > 2:
@@ -655,9 +664,20 @@ def dependency_clones(worktree: Path, rel: str) -> list[Path]:
     source = worktree / rel
     if source.is_symlink() or not source.is_dir():
         return []
-    copies = sorted(source.iterdir()) if len(path.parts) == 1 else [source]
+    copies = sorted(set(source.iterdir()) - set(linked)) if len(path.parts) == 1 else [source]
     return copies if copies and all(not copy.is_symlink() and (copy / ".git").is_dir()
                                    and not (copy / ".git").is_symlink() for copy in copies) else []
+
+
+def nested_dependencies(worktree: Path, rel: str) -> tuple[list[Path], list[Path]]:
+    source = worktree / rel
+    linked = nested_worktrees(source)
+    if linked == [source]:
+        return [], linked
+    clones = dependency_clones(worktree, rel, linked)
+    if linked and set(source.iterdir()) != set(linked + clones):
+        return [], []
+    return clones, linked
 
 
 class CloneResult(NamedTuple):
@@ -665,25 +685,284 @@ class CloneResult(NamedTuple):
     details: list[str]
 
 
-def clone_check(copy: Path, checked: dict[Path, CloneResult]) -> CloneResult:
+@dataclass(frozen=True)
+class NestedRestorePlan:
+    head: str
+    checkout_stamp: list[int]
+    index: Path
+    index_stamp: list[int]
+    files: dict[str, list[int] | None]
+
+    def matches(self, copy: Path) -> bool:
+        try:
+            head = git(copy, "rev-parse", "--verify", "HEAD")
+            return head.returncode == 0 and head.stdout.strip() == self.head and self.files_match(copy)
+        except OSError:
+            return False
+
+    def files_match(self, copy: Path) -> bool:
+        try:
+            return (file_stamp(copy / ".git") == self.checkout_stamp
+                    and file_stamp(self.index) == self.index_stamp
+                    and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
+        except OSError:
+            return False
+
+
+@dataclass
+class NestedRestore:
+    root: Path
+    requested: set[Path]
+    discard: frozenset[Path] = frozenset()
+    since: datetime | None = None
+    already_missing: frozenset[Path] = frozenset()
+    plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
+    found: set[Path] = field(default_factory=set)
+    moved: set[Path] = field(default_factory=set)
+    expected: dict[Path, list[int | str] | Literal["absent"] | None] = field(default_factory=dict)
+    observed: dict[Path, list[int | str]] = field(default_factory=dict)
+    clone_refs: dict[Path, list[tuple[str, str]]] = field(default_factory=dict)
+    detached: frozenset[Path] = frozenset()
+
+    def allows_changes(self, copy: Path, *, allow_bytecode: bool = False) -> bool:
+        if copy not in self.requested or copy.resolve() != copy or git_directories(copy) is None:
+            return False
+        self.found.add(copy)
+        state = checkout_head(copy)
+        if state is None:
+            self.moved.add(copy)
+            return False
+        self.observed[copy] = state
+        expected = self.expected.get(copy)
+        if ((copy in self.expected and state != expected)
+                or (copy not in self.expected and self.since is not None and latest_head_change(copy) > self.since.timestamp())):
+            self.moved.add(copy)
+            return False
+        head = git(copy, "rev-parse", "--verify", "HEAD")
+        status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
+        tracked = git(copy, "ls-tree", "-rz", "HEAD")
+        index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        if head.returncode or status.returncode or tracked.returncode or index.returncode:
+            return False
+        entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
+                   for info, _, rel in (item.partition("\t"),)}
+        tracked_names = {filename_key(name) for name in entries} if allow_bytecode else set()
+        cutoff = self.since.timestamp() * 1e9 if self.since else None
+        changes: dict[str, list[int] | None] = {}
+        listings: dict[Path, dict[str, Path]] = {}
+        for item in filter(None, status.stdout.split("\0")):
+            rel = item[3:]
+            path = copy / rel
+            if item.startswith("?? "):
+                if (allow_bytecode and path.suffix == BYTECODE_SUFFIX and filename_key(rel) not in tracked_names
+                        and path.parent.resolve() == path.parent and holds_only_bytecode(path) and path.is_file()):
+                    continue
+                if self.discard:
+                    try:
+                        if disk_path(copy, Path(rel), listings) in self.discard:
+                            continue
+                    except OSError:
+                        pass
+                return False
+            if (entries.get(rel) not in {"100644", "100755", "120000"}
+                    or (item.startswith("D ") and (path.exists() or path.is_symlink()))
+                    or path.parent.resolve() != path.parent or (path.is_dir() and not path.is_symlink())
+                    or any(parent.exists() and not parent.is_dir()
+                           for parent in path.parents if parent.is_relative_to(copy))):
+                return False
+            try:
+                stamp = optional_stamp(path)
+                last_change = stamp if stamp is not None else file_stamp(next(parent for parent in path.parents if parent.exists()))
+            except OSError:
+                return False
+            if (cutoff is not None and max(last_change[3:]) > cutoff
+                    and not (stamp is None and path in self.already_missing)):
+                return False
+            changes[rel] = stamp
+        if changes:
+            index_path = Path(index.stdout.strip())
+            try:
+                checkout_stamp = file_stamp(copy / ".git")
+                stamp = file_stamp(index_path)
+            except OSError:
+                return False
+            if cutoff is not None and max(stamp[3:]) > cutoff:
+                return False
+            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), checkout_stamp, index_path, stamp, changes)
+        return True
+
+    def display(self) -> dict[str, list[str]]:
+        return {str(copy.relative_to(self.root)): list(plan.files) for copy, plan in self.plans.items()}
+
+
+def matches_checkout_blob(copy: Path, actual: Path, name: Path, blob: str) -> bool:
+    with TemporaryFile() as expected:
+        result = subprocess.run(["git", "-C", str(copy), "-c", "core.precomposeunicode=false", "cat-file", "--filters",
+                                 f"--path={name}", blob], stdout=expected, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode:
+            return False
+        expected.seek(0)
+        with actual.open("rb") as current:
+            return file_digest(current, "sha256").digest() == file_digest(expected, "sha256").digest()
+
+
+def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
+    changes = [entry for entry in status.split("\0") if entry]
+    if not changes or any(not entry.startswith("?? ") for entry in changes):
+        return bool(changes)
+    tracked: dict[str, list[tuple[Path, str, str]]] = {}
+    for entry in index.split("\0"):
+        metadata, _, name = entry.partition("\t")
+        if metadata.startswith(("100644 ", "100755 ", "120000 ")):
+            mode, blob, _ = metadata.split()
+            tracked.setdefault(filename_key(name), []).append((Path(name), mode, blob))
+    listings: dict[Path, dict[str, Path]] = {}
+    for entry in changes:
+        name = entry[3:]
+        aliases = tracked.get(filename_key(name))
+        if not aliases:
+            return True
+        try:
+            actual = disk_path(copy, Path(name), listings)
+            if actual.is_symlink():
+                mode = "120000"
+            elif actual.is_file():
+                mode = "100755" if actual.stat().st_mode & 0o100 else "100644"
+            else:
+                return True
+            expected = [(path, blob) for path, tracked_mode, blob in aliases
+                        if tracked_mode == mode and disk_path(copy, path, listings) == actual]
+            if not expected:
+                return True
+            if mode == "120000":
+                blobs = {blob for _, blob in expected}
+                target = os.readlink(os.fsencode(actual))  # noqa: PTH115 - Git hashes the raw symlink target.
+                hashed_link = subprocess.run(["git", "-C", str(copy), "hash-object", "--stdin"],
+                                             input=target, capture_output=True)
+                if hashed_link.returncode or os.fsdecode(hashed_link.stdout).strip() not in blobs:
+                    return True
+            elif not any(matches_checkout_blob(copy, actual, path, blob) for path, blob in expected):
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+    return False
+
+
+def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
+    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags", "refs/stash")
+    head = git(copy, "rev-parse", "--verify", "HEAD")
+    if local.returncode or head.returncode:
+        return None
+    return [("HEAD", head.stdout.strip()), *((name, oid) for line in local.stdout.splitlines()
+                                             for name, _, oid in (line.partition(" "),))]
+
+
+def excludes_file(copy: Path) -> Path:
+    setting = git(copy, "config", "--path", "--get", "core.excludesFile")
+    if setting.returncode == 0:
+        return copy / setting.stdout.removesuffix("\n")
+    if setting.returncode != 1:
+        raise OSError("Git の core.excludesFile を確認できません")
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "git/ignore"
+
+
+def reference_paths(path: Path) -> set[Path]:
+    path = path.absolute()
+    parts = deque(path.parts[1:])
+    location = Path(path.anchor)
+    links = set()
+    traversed = 0
+    while parts:
+        part = parts.popleft()
+        if part == "..":
+            location = location.parent
+            continue
+        candidate = location / part
+        if not candidate.is_symlink():
+            location = candidate
+            continue
+        traversed += 1
+        if traversed > 40:
+            raise OSError(f"Git の無視ルールが循環しています（{path}）")
+        links.add(candidate)
+        destination = candidate.readlink()
+        if destination.is_absolute():
+            location = Path(destination.anchor)
+        parts.extendleft(reversed(destination.parts[bool(destination.anchor):]))
+    return {location, *links}
+
+
+def ignore_configuration_paths(copy: Path) -> set[Path]:
+    settings = git(copy, "config", "--includes", "--show-origin", "--null", "--get-regexp",
+                   r"^(core\.excludesfile|include\.path|includeif\..*\.path)$")
+    if settings.returncode not in (0, 1):
+        raise OSError("Git の無視ルールに使う設定を確認できません")
+    sources = {excludes_file(copy)}
+    fields = settings.stdout.split("\0")
+    for source, setting in zip(fields[::2], fields[1::2]):
+        if not source.startswith("file:"):
+            continue
+        config = copy / source.removeprefix("file:")
+        sources.add(config)
+        name, _, value = setting.partition("\n")
+        if name != "core.excludesfile" and value:
+            sources.add(config.parent / Path(value).expanduser())
+    return {path for source in sources for path in reference_paths(source)}
+
+
+def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
+    def identity(path: Path) -> tuple[int, int] | None:
+        stamp = optional_stamp(path)
+        return (stamp[0], stamp[1]) if stamp is not None else None
+
+    try:
+        directories = git_directories(copy)
+        if directories is None:
+            raise OSError("Git checkout を確認できません")
+        sources = reference_paths(excludes_file(copy)) | reference_paths(directories[1] / "info/exclude")
+        source_ids = {value for path in sources if (value := identity(path)) is not None}
+        candidates = {name: copy / name for name in plan.files
+                      if (copy / name in sources or identity(copy / name) in source_ids
+                          or Path(name).name.casefold() == ".gitignore")}
+        if not candidates:
+            return None
+        listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+        if listing.returncode:
+            return "依存 clone の無視対象を確認できません"
+        if not listing.stdout:
+            return None
+        rules = subprocess.run(["git", "-C", str(copy), "check-ignore", "--verbose", "-z", "--stdin"],
+                               input=listing.stdout, capture_output=True, text=True, check=True, timeout=30)
+        sources = {path for source in rules.stdout.removesuffix("\0").split("\0")[::4]
+                   for path in reference_paths(copy / source)}
+        source_ids = {value for path in sources if (value := identity(path)) is not None}
+        for name, path in candidates.items():
+            if path in sources or identity(path) in source_ids:
+                return f"{name} は依存 clone 内の無視ルールに使われています"
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return "依存 clone の無視ルールを確認できません"
+    return None
+
+
+def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None) -> CloneResult:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
     copy = copy.resolve()
     if copy in checked:
         return checked[copy]
+    refs = origin_refs(copy, branches_and_tags=True)
     blockers = []
     branch = git(copy, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
     details = [f"branch {branch or '(detached HEAD)'}"]
-    status = git(copy, "status", "--porcelain", "--untracked-files=all")
-    if status.returncode or status.stdout.strip():
-        blockers.append("uncommitted changes or git status failed")
-    else:
-        details.append("uncommitted changes: none")
     stash = git(copy, "stash", "list")
     if stash.returncode or stash.stdout.strip():
         blockers.append("stash remains or could not be checked")
     else:
         details.append("stash: none")
-    ignored = ignored_paths(copy, None, clone_checks=checked)
+    discard = restore.discard if restore and copy in restore.requested else frozenset()
+    ignored = ignored_paths(copy, None, clone_checks=checked, discard=discard)
+    if ignored.error:
+        blockers.append(ignored.error)
     if ignored.review or ignored.nested or ignored.lock_holders:
         blockers.append("ignored paths or live locks to preserve: " + ", ".join(
             [*ignored.review, *(str(path) for path in ignored.nested), *map(str, ignored.lock_holders)]))
@@ -698,25 +977,40 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult]) -> CloneResult:
     modules = copy / ".git/modules"
     if entries.returncode or initialized or (modules.is_dir() and any(modules.iterdir())):
         blockers.append("submodule repositories need preservation: " + ", ".join(initialized or [str(modules)]))
-    refs = origin_refs(copy, branches_and_tags=True)
-    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
-    if local.returncode:
-        blockers.append("local branches and tags could not be checked")
-    tips = [("HEAD", git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()),
-            *(line.split(" ", 1) for line in local.stdout.splitlines())]
-    unsaved = [(name, oid) for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
+    tips = clone_tips(copy)
+    if tips is None:
+        blockers.append("HEAD, local branches and tags could not be checked")
+    unsaved = [(name, oid) for name, oid in tips or [] if not oid or refs is None or not remote_contains(copy, oid, refs)]
     if unsaved:
         blockers.append("local refs are on no verified remote branch or tag: " + ", ".join(name for name, _ in unsaved))
         details.append("local tips: " + ", ".join(f"{name} {oid[:12] or '?'}" for name, oid in unsaved))
     else:
         details.append("commits absent from origin: none")
+    status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
+    approved = restore is not None and restore.allows_changes(copy)
+    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := restore_ignore_change(copy, plan)):
+        blockers.append(ignore_change)
+    if restore and copy in restore.moved:
+        blockers.append("--restore-nested の checkout または HEAD が走査後に変わりました")
+    elif status.returncode or (not approved and clone_has_local_changes(copy, status.stdout, entries.stdout)):
+        blockers.append("uncommitted changes or git status failed")
+    elif restore and copy in restore.plans:
+        details.append("uncommitted changes: approved for restoration")
+    else:
+        details.append("uncommitted changes: none")
+    if tips is not None:
+        if clone_tips(copy) != tips:
+            blockers.append("HEAD, local branches or tags changed during the check")
+        elif restore and copy in restore.requested:
+            restore.clone_refs[copy] = tips
     result = CloneResult(blockers, [*details, *blockers])
     checked[copy] = result
     return result
 
 
 def ignored_paths(worktree: str | Path, main: str | Path | None, *,
-                  clone_checks: dict[Path, CloneResult] | None = None) -> IgnoredPaths:
+                  clone_checks: dict[Path, CloneResult] | None = None,
+                  restore: NestedRestore | None = None, discard: frozenset[Path] = frozenset()) -> IgnoredPaths:
     """(review, regenerable, nested, notes, lock_holders, records, held): ignored paths that hold something and are
     neither caches nor copies of the main checkout, split into those that keep the worktree and those a setup or
     test run writes again, the worktrees of other repositories found at them (such as `local-deps/<repo>`), the
@@ -731,12 +1025,27 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
         clone_checks = {}
     records: list[Record] = []
     held: list[Held] = []
+    root = Path(worktree).resolve()
+    cache_tags: dict[Path, bool] = {}
+    listings: dict[Path, dict[str, Path]] = {}
     # -z gives each path unquoted, so a Japanese or spaced name is read as written.
-    for entry in git(worktree, "status", "--porcelain", "-z", "--ignored=matching").stdout.split("\0"):
+    status = git(worktree, "--no-optional-locks", "status", "--porcelain", "-z", "--ignored=matching", "--untracked-files=normal")
+    if status.returncode:
+        return IgnoredPaths(review, regenerable, nested, notes, holders, records, held,
+                            f"ignored paths could not be checked (Git exit {status.returncode})")
+    for entry in status.stdout.split("\0"):
         if not entry.startswith("!! ") or is_cache(entry[3:]):
             continue
         rel = entry[3:]
         source, copy = Path(worktree) / rel, Path(main) / rel if main is not None else None
+        if discard:
+            try:
+                actual = disk_path(root, Path(rel), listings)
+            except OSError:
+                actual = source
+            if any(path.is_relative_to(actual) for path in discard) and all(
+                    path in discard or holds_nothing(path) for path in files_in(actual)):
+                continue
         if holds_nothing(source) or (copy is not None and same_tree(source, copy)):
             continue
         if rel == SCHEDULED_LOCK and not source.is_symlink() and (holder := lock_holder(source)) is not None:
@@ -745,13 +1054,14 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
             else:
                 regenerable.append(rel)
             continue
-        found = nested_worktrees(source)
-        if found and (found == [source] or {child.name for child in source.iterdir()} == {f.name for f in found}):
+        clones, found = nested_dependencies(Path(worktree), rel)
+        if found:
             nested.extend(found)
-            continue
-        if clones := dependency_clones(Path(worktree), rel):
+            if not clones:
+                continue
+        if clones:
             for clone in clones:
-                examined = clone_check(clone, clone_checks)
+                examined = clone_check(clone, clone_checks, restore)
                 if examined.blockers:
                     review.append("%s (%s)" % (clone, "; ".join(examined.blockers)))
                     content = held_details(clone)
@@ -760,9 +1070,20 @@ def ignored_paths(worktree: str | Path, main: str | Path | None, *,
                                  "decision": "変更と stash を保存し、HEAD が remote にあることを確かめてください"})
                 else:
                     regenerable.append(str(clone.relative_to(worktree)))
-                    notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
+                    if not restore or clone not in restore.plans:
+                        notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
             continue
-        if has_cache_tag(source):
+        ancestors = (root / rel, *(root / rel).parents)
+        tagged = False
+        for directory in ancestors:
+            if directory == root:
+                break
+            if directory not in cache_tags:
+                cache_tags[directory] = has_cache_tag(directory) and directory.resolve() == directory
+            if cache_tags[directory]:
+                tagged = True
+                break
+        if tagged:
             regenerable.append(rel)
             notes.append(f"{rel}: cache (CACHEDIR.TAG)")
             continue
@@ -819,32 +1140,276 @@ def on_remote(worktree: Path, head: str) -> bool:
             or any(oid == head for oid, _ in origin_refs(worktree) or []))
 
 
-def nested_check(copy: Path) -> dict:
+def linked_restore_alias(copy: Path, paths: Collection[str]) -> str | None:
+    config = git(copy, "config", "--bool", "core.precomposeunicode")
+    precompose = sys.platform == "darwin" and config.returncode == 0 and config.stdout.strip() == "true"
+    listings: dict[Path, dict[str, Path]] = {}
+    for relative in paths:
+        if precompose and normalize("NFC", relative) != relative:
+            return relative
+        actual = copy
+        for part in Path(relative).parts:
+            try:
+                actual = disk_entry(actual, part, listings)
+            except FileNotFoundError:
+                break
+            except OSError:
+                return relative
+            observed = normalize("NFC", actual.name) if precompose else actual.name
+            if observed != part:
+                return relative
+    return None
+
+
+def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> None:
+    tracked = git(copy, "ls-files", "--cached", "-z")
+    names = {filename_key(name) for name in tracked.stdout.split("\0")}
+    if tracked.returncode or any(filename_key(name) in names for name in files):
+        raise ValueError("バイトコードが未追跡であることを確認できません")
+    staging = Path(mkdtemp(prefix="rm-check-bytecode-", dir=copy))
+    verified = []
+    try:
+        for number, (name, stamp) in enumerate(files.items()):
+            path = copy / name
+            if path.parent.resolve() != path.parent:
+                raise ValueError(f"{name} の親ディレクトリが変わりました")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                original = os.fstat(stream.fileno())
+                if not stat.S_ISREG(original.st_mode) or stat_stamp(original) != stamp:
+                    raise ValueError(f"{name} が検査後に変わりました")
+                digest = file_digest(stream, "sha256").digest()
+                if stat_stamp(os.fstat(stream.fileno())) != stamp:
+                    raise ValueError(f"{name} が検査後に変わりました")
+                moved = path.rename(staging / str(number))
+            observed = moved.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat_stamp(observed)[:4] != stamp[:4]:
+                raise ValueError(f"{name} が検査後に変わりました。退避先は {moved.relative_to(copy)} です")
+            with moved.open("rb") as stream:
+                if file_digest(stream, "sha256").digest() != digest:
+                    raise ValueError(f"{name} が検査後に変わりました。退避先は {moved.relative_to(copy)} です")
+            verified.append(moved)
+        latest = git(copy, "ls-files", "--cached", "-z")
+        if latest.returncode or latest.stdout != tracked.stdout:
+            raise ValueError(f"Git の追跡対象が変わりました。退避先は {staging.relative_to(copy)} です")
+        for path in verified:
+            path.unlink()
+    finally:
+        with suppress(OSError):
+            staging.rmdir()
+
+
+def worktree_registration_blockers(copy: Path) -> list[str]:
+    directories = git_directories(copy)
+    if directories is None:
+        return ["Git worktree registration could not be checked"]
+    private, common = directories
+    try:
+        backlink = (private / "gitdir").read_text(errors="surrogateescape").strip()
+        if private.parent != common / "worktrees" or (private / backlink).resolve() != copy / ".git":
+            return ["Git worktree registration does not point back to this checkout"]
+        if optional_stamp(private / "BISECT_START") is not None:
+            return ["Git bisect is in progress"]
+    except (OSError, RuntimeError):
+        return ["Git worktree registration could not be checked"]
+    worktrees = git(copy, "worktree", "list", "--porcelain", "-z")
+    records = [record.split("\0") for record in worktrees.stdout.split("\0\0")
+               if record.startswith("worktree ") and Path(record.split("\0", 1)[0][9:]).resolve() == copy]
+    if worktrees.returncode or len(records) != 1:
+        return ["Git worktree registration could not be checked"]
+    if any(field == "locked" or field.startswith("locked ") for field in records[0]):
+        return ["Git worktree is locked"]
+    return []
+
+
+def native_detach_blockers(copy: Path) -> list[str]:
+    blockers = worktree_registration_blockers(copy)
+    modules = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "modules")
+    index = git(copy, "ls-files", "--stage", "-z")
+    if modules.returncode or index.returncode:
+        blockers.append("submodules could not be checked")
+    elif Path(modules.stdout.strip()).is_dir() or any(
+            (copy / entry.partition("\t")[2] / ".git").exists()
+            for entry in index.stdout.split("\0") if entry.startswith("160000 ")):
+        blockers.append("initialized submodule repositories prevent native Git worktree removal")
+    return blockers
+
+
+def nested_ignored_blockers(copy: Path, repository: str | None, discard: frozenset[Path] = frozenset()) -> list[str]:
+    ignored = ignored_paths(copy, repository, discard=discard)
+    blockers = [ignored.error] if ignored.error else []
+    if ignored.review or ignored.nested:
+        blockers.append("ignored paths to open: " + ", ".join([*ignored.review, *map(str, ignored.nested)]))
+    if ignored.lock_holders:
+        blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
+    return blockers
+
+
+def worktree_entry_stamps(copy: Path, *, git_checkouts: set[Path] | None = None) -> dict[Path, list[int]]:
+    stamps = {copy: file_stamp(copy)}
+    pending = [copy]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = directory / entry.name
+                if entry.name == ".git":
+                    if git_checkouts is not None:
+                        git_checkouts.add(directory)
+                        stamps[path] = file_stamp(path)
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                stamps[path] = stat_stamp(info)
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+    return stamps
+
+
+def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
+    try:
+        marker = file_stamp(copy / ".git")
+        directories = git_directories(copy)
+        head = git(copy, "rev-parse", "--verify", "HEAD")
+        if directories is not None and head.returncode == 0 and marker == file_stamp(copy / ".git"):
+            return marker, str(directories[0]), str(directories[1]), head.stdout.strip()
+    except OSError:
+        pass
+    return None
+
+
+def checkout_head(copy: Path) -> list[int | str] | None:
+    if state := linked_checkout_state(copy):
+        marker, private, common, head = state
+        branch = git(copy, "symbolic-ref", "-q", "HEAD")
+        reflog = git(copy, "log", "-g", "-1", "--format=%H%x00%gD%x00%gs", "--date=unix", "HEAD")
+        if branch.returncode in (0, 1) and reflog.returncode == 0:
+            return [*marker[:2], private, common, head, branch.stdout.strip(), reflog.stdout.strip()]
+    return None
+
+
+def snapshot_checkout(copy: Path, cutoff: float | None = None) -> list[int | str] | Literal["absent"] | None:
+    try:
+        initial = copy.lstat()
+    except FileNotFoundError:
+        return CHECKOUT_ABSENT
+    except OSError:
+        return None
+    try:
+        if copy.resolve() == copy and (state := checkout_head(copy)) is not None:
+            if cutoff is not None and (initial.st_ctime_ns > cutoff * 1e9 or latest_head_change(copy) > cutoff):
+                return None
+            if stat_stamp(copy.lstat()) == stat_stamp(initial):
+                return state
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
+def head_storage_paths(private: Path, common: Path) -> list[Path]:
+    head = private / "HEAD"
+    tables = common / "reftable/tables.list"
+    paths = [head, private / "logs/HEAD", private / "reftable/tables.list", tables]
+    pointer = head.read_text().strip()
+    if not tables.is_file() and pointer.startswith("ref: refs/"):
+        branch = pointer.removeprefix("ref: ")
+        paths.extend((common / branch, common / "logs" / branch, common / "packed-refs"))
+    return paths
+
+
+def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
+    return [optional_stamp(path) for path in head_storage_paths(private, common)]
+
+
+def checkout_metadata_stamps(copy: Path, directories: tuple[Path, Path], *,
+                             include_clone_refs: bool = True) -> dict[Path, list[int] | None]:
+    private, common = directories
+    if optional_stamp(private / "BISECT_START") is not None:
+        raise OSError(f"git bisect が進行中です（{copy}）")
+    index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if index.returncode:
+        raise OSError(f"Git index を確認できません（{copy}）")
+    index_path = Path(index.stdout.strip())
+    paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"),
+             *reference_paths(common / "info/exclude"),
+             common / "config", private / "config.worktree", *ignore_configuration_paths(copy),
+             *head_storage_paths(private, common)]
+    stamps: dict[Path, list[int] | None] = {}
+    if private != common:
+        stamps.update(worktree_entry_stamps(private))
+    elif include_clone_refs:
+        for name in ("refs", "logs", "reftable", "worktrees"):
+            storage = common / name
+            if optional_stamp(storage) is None:
+                stamps[storage] = None
+            else:
+                stamps.update(worktree_entry_stamps(storage))
+        paths.extend(common / name for name in ("packed-refs", "modules", "config"))
+    stamps.update({path: optional_stamp(path) for path in paths})
+    return stamps
+
+
+def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] | None]:
+    visible: set[Path] = set()
+    stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root, git_checkouts=visible))
+    required = {root, *dependencies}
+    for copy in sorted(visible | required):
+        if optional_stamp(copy) is None:
+            stamps[copy] = None
+            continue
+        directories = git_directories(copy)
+        if directories is None:
+            if copy in required:
+                raise OSError(f"Git checkout を確認できません（{copy}）")
+            continue
+        stamps.update(checkout_metadata_stamps(copy, directories, include_clone_refs=copy != root))
+    return {str(path): stamp for path, stamp in stamps.items()}
+
+
+def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
-    changes, _ = working_changes(copy)
-    modified = set(git(copy, "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
+    checkout = linked_checkout_state(copy)
+    if checkout is None:
+        blockers.append("Git worktree identity could not be checked")
+    head = checkout[3] if checkout else ""
+    if not head or not on_remote(copy, head):
+        blockers.append("HEAD %s is on no remote branch" % head[:8])
+    elif git(copy, "rev-parse", "HEAD").stdout.strip() != head:
+        blockers.append("HEAD changed during the remote check")
+    blockers.extend(native_detach_blockers(copy))
+    tracked_changes, untracked, bytecode = working_changes(copy, all_untracked=True)
+    cached: dict[str, list[int]] = {}
+    listings: dict[Path, dict[str, Path]] = {}
+    try:
+        for name in bytecode:
+            path = disk_path(copy, Path(name), listings)
+            cached[str(path.relative_to(copy))] = file_stamp(path)
+    except OSError:
+        blockers.append("untracked bytecode could not be checked")
+    changes = [*tracked_changes, *untracked]
+    modified = set(git(copy, "--no-optional-locks", "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
     regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
                    and (copy / rel).with_suffix(".po").is_file()
                    and str(Path(rel).with_suffix(".po")) not in changes]
     changes = [rel for rel in changes if rel not in regenerable]
-    if changes:
+    approved = restore is not None and restore.allows_changes(copy, allow_bytecode=True)
+    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := restore_ignore_change(copy, plan)):
+        blockers.append(ignore_change)
+    if changes and not approved:
         blockers.append("%d uncommitted changes" % len(changes))
-    ignored = ignored_paths(copy, repository)
-    review, deeper = ignored.review, ignored.nested
-    if review or deeper:
-        blockers.append("ignored paths to open: " + ", ".join([*review, *(str(d) for d in deeper)]))
-    if ignored.lock_holders:
-        blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
-    head = git(copy, "rev-parse", "HEAD").stdout.strip()
-    if not head or not on_remote(copy, head):
-        blockers.append("HEAD %s is on no remote branch" % head[:8])
-    return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
-            "regenerable": regenerable,
+    if restore is not None and copy in restore.requested and not approved:
+        blockers.append("--restore-nested の復元条件を満たしません")
+    if restore is not None and (plan := restore.plans.get(copy)) and (alias := linked_restore_alias(copy, plan.files)):
+        blockers.append(f"--restore-nested の Git とディスクのパス表記が異なります（{alias}）")
+    discard = restore.discard if approved and restore else frozenset()
+    blockers.extend(nested_ignored_blockers(copy, repository, discard))
+    return {"path": str(copy), "repository": repository, "head": head[:12], "checkout_state": checkout,
+            "blockers": blockers,
+            "regenerable": regenerable, "untracked_bytecode": cached,
             "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
-            "detach": ["git", "-C", repository, "worktree", "remove", "--force", str(copy)]}
+            "detach": ["git", "-C", repository, "-c", "status.showUntrackedFiles=all", "worktree", "remove", str(copy)]}
 
 
 def patches_in_base(worktree: str | Path, head: str, base: str) -> list[str] | None:
@@ -1158,7 +1723,65 @@ def without_ended(processes: list[dict]) -> list[dict]:
 UNWATCHED_DIRS = {".git", "node_modules", ".venv"}
 
 
-def moved_since(worktree: Path, since: datetime) -> list[str]:
+def stat_stamp(info: os.stat_result) -> list[int]:
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def file_stamp(path: Path) -> list[int]:
+    return stat_stamp(path.lstat())
+
+
+def filename_key(name: str) -> str:
+    return normalize("NFD", normalize("NFD", name).casefold())
+
+
+def disk_entry(directory: Path, name: str, listings: dict[Path, dict[str, Path]]) -> Path:
+    if directory not in listings:
+        listings[directory] = {entry.name: entry for entry in directory.iterdir()}
+    entries = listings[directory]
+    if name in entries:
+        return entries[name]
+    path = directory / name
+    identity = path.lstat()
+    spelling = filename_key(name)
+    for entry in entries.values():
+        if filename_key(entry.name) == spelling and os.path.samestat(entry.lstat(), identity):
+            return entry
+    raise FileNotFoundError(path)
+
+
+def disk_path(root: Path, relative: Path, listings: dict[Path, dict[str, Path]]) -> Path:
+    for part in relative.parts:
+        root = disk_entry(root, part, listings)
+    return root
+
+
+def optional_stamp(path: Path) -> list[int] | None:
+    try:
+        return file_stamp(path)
+    except FileNotFoundError:
+        return None
+
+
+def latest_head_change(worktree: Path) -> float:
+    moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
+    stamp = re.search(r"@\{(\d+)\}", moves)
+    last = float(stamp.group(1)) if stamp else float(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
+    if directories := git_directories(worktree):
+        private, common = directories
+        paths = [private / "HEAD", private / "logs/HEAD", private / "reftable/tables.list"]
+        branch = git(worktree, "symbolic-ref", "-q", "HEAD").stdout.strip()
+        if branch.startswith("refs/"):
+            paths.extend((common / branch, common / "logs" / branch, common / "reftable/tables.list"))
+            if not (common / branch).exists():
+                paths.append(common / "packed-refs")
+        for path in paths:
+            with suppress(OSError):
+                last = max(last, max(file_stamp(path)[3:]) / 1e9)
+    return last
+
+
+def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]], *, inspect_head: bool = True) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
     moved = []
@@ -1166,22 +1789,21 @@ def moved_since(worktree: Path, since: datetime) -> list[str]:
         dirs[:] = [name for name in dirs if name not in UNWATCHED_DIRS]
         for name in files:
             try:
-                if (Path(top) / name).lstat().st_mtime > after:
-                    moved.append(Path(top) / name)
+                path = Path(top) / name
+                stamp = file_stamp(path)
+                latest_ns = max(stamp[3], stamp[4])
+                if latest_ns > after * 1e9 and restored.get(str(path.relative_to(worktree))) != stamp:
+                    moved.append((latest_ns, path))
             except OSError:
                 continue
     blockers = []
     if moved:
-        latest = max(moved, key=lambda path: path.lstat().st_mtime)
+        latest_ns, latest = max(moved)
         blockers.append("走査（%s）の後に作業場のファイルが %d 個変わりました（最新 %s の %s）。別の担当が使っているかもしれません"
                         % (since.isoformat(timespec="seconds"), len(moved),
-                           datetime.fromtimestamp(latest.lstat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                           datetime.fromtimestamp(latest_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
                            latest.relative_to(worktree)))
-    # The reflog dates every move of HEAD (commit, checkout, reset); the commit date stands in without one.
-    moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
-    stamp = re.search(r"@\{(\d+)\}", moves)
-    moved_at = int(stamp.group(1)) if stamp else int(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
-    if moved_at > after:
+    if inspect_head and (moved_at := latest_head_change(worktree)) > after:
         blockers.append("走査（%s）の後に HEAD が動きました（%s）。別の担当が使っているかもしれません"
                         % (since.isoformat(timespec="seconds"),
                            datetime.fromtimestamp(moved_at, timezone.utc).isoformat(timespec="seconds")))
@@ -1189,7 +1811,8 @@ def moved_since(worktree: Path, since: datetime) -> list[str]:
 
 
 def check(worktree: str | Path, main: str | Path, base: str | None, compose_projects: Sequence[ComposeProject], pr: dict | None = None, pr_head: str | None = None, head_ahead_of_pr: int | None = None,
-          *, decided: tuple[str, ...] = (), since: datetime | None = None, scan_file: Path | None = None) -> dict:
+          *, decided: tuple[str, ...] = (), since: datetime | None = None, scan_file: Path | None = None,
+          restore: NestedRestore | None = None, restored: dict[str, list[int]] | None = None) -> dict:
     """Return the removal verdict, including containers and processes using `worktree`.
 
     `decided` are blockers main found before the check: an Orca comment to keep it, an unanswered docker.
@@ -1198,22 +1821,30 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     blockers = list(decided)
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
-    changes, bytecode = working_changes(worktree)
+    elif restore is not None and (Path(worktree) / ".git").is_file():
+        blockers.extend(worktree_registration_blockers(Path(worktree).resolve()))
+    tracked_changes, untracked, bytecode = working_changes(worktree)
     clone_notes = []
     clone_checks: dict[Path, CloneResult] = {}
-    for rel in changes[:]:
-        if clones := dependency_clones(Path(worktree), rel):
+    untracked_nested: list[Path] = []
+    for rel in untracked[:]:
+        if PurePosixPath(rel).parts[:1] != ("local-deps",):
+            continue
+        clones, linked = nested_dependencies(Path(worktree), rel)
+        if clones or linked:
             if tracked(Path(worktree), PurePosixPath(rel)):
                 continue
-            checked = [(clone, clone_check(clone, clone_checks).blockers) for clone in clones]
+            checked = [(clone, clone_check(clone, clone_checks, restore).blockers) for clone in clones]
             for clone, problems in checked:
                 if problems:
                     blockers.append("%s (%s)" % (clone, "; ".join(problems)))
-                else:
+                elif not restore or clone not in restore.plans:
                     clone_notes.append("%s: disposable clone; clean, no stash, HEAD on a verified remote branch or tag" % clone)
             if all(not problems for _, problems in checked):
-                changes.remove(rel)
+                untracked.remove(rel)
                 bytecode.append(rel)
+                untracked_nested.extend(linked)
+    changes = [*tracked_changes, *untracked]
     if changes:
         blockers.append("%d uncommitted changes" % len(changes))
     head = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -1249,10 +1880,13 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
             elif pr.get("headRefOid") != head or pr.get("state") != "MERGED":
                 blockers.append("HEAD %s is not in %s and PR #%s is %s"
                                 % (head[:8], base, pr.get("number"), pr.get("state")))
-    review, regenerable, nested, notes, lock_holders, records, held_files = ignored_paths(worktree, main, clone_checks=clone_checks)
+    review, regenerable, nested, notes, lock_holders, records, held_files, ignore_error = ignored_paths(
+        worktree, main, clone_checks=clone_checks, restore=restore)
+    if ignore_error:
+        blockers.append(ignore_error)
     notes.extend(clone_notes)
     notes.extend(merge_notes)
-    nested = [nested_check(copy) for copy in nested]
+    nested = [nested_check(copy, restore) for copy in dict.fromkeys([*untracked_nested, *nested])]
     ready = [item["path"] for item in nested if not item["blockers"]]
     held = ["%s (%s)" % (item["path"], "; ".join(item["blockers"])) for item in nested if item["blockers"]]
     if ready:
@@ -1282,8 +1916,16 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                             "rm_check をやり直してください: " + "; ".join(closes)
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
+    if restore:
+        missing = restore.requested - restore.found - restore.detached
+        blockers.extend(f"--restore-nested の {copy.relative_to(restore.root)} を入れ子の Git リポジトリとして確認できません"
+                        for copy in sorted(missing)
+                        if ((copy in restore.expected and restore.expected[copy] != CHECKOUT_ABSENT)
+                            or copy.exists() or copy.is_symlink()))
+        blockers.extend(f"削除した子 worktree {copy.relative_to(restore.root)} にファイルが再作成されました"
+                        for copy in sorted(restore.detached) if copy.exists() or copy.is_symlink())
     if since is not None:
-        blockers.extend(moved_since(Path(worktree), since))
+        blockers.extend(moved_since(Path(worktree), since, restored or {}))
     return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
             "records": records, "held": held_files,
             "regenerable": bytecode + regenerable, "merged_by_patch": merged_by_patch, "nested_worktrees": nested,
@@ -1508,23 +2150,30 @@ def untracked_exec_plans(worktree: Path, base: str | None, pr: dict | None) -> t
 
 def named_archive_path(worktree: Path, requested: PurePosixPath) -> Path:
     source = worktree
+    listings: dict[Path, dict[str, Path]] = {}
     for part in requested.parts:
         if source.is_symlink() or (source != worktree and (
                 (source / ".git").exists() or (source / "HEAD").is_file() and (source / "objects").is_dir())):
             raise ValueError("symlink または別の Git リポジトリの内側です")
-        candidate = source / part
-        if not (candidate.exists() or candidate.is_symlink()):
-            raise ValueError("パスがありません")
-        for entry in source.iterdir():
-            if entry.name != part and entry.name.casefold() == part.casefold() and entry.samefile(candidate):
-                candidate = entry
-                break
-        source = candidate
-    rel = source.relative_to(worktree).as_posix()
-    tracked = [git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", rel),
-               git(worktree, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", rel)]
-    if any(item.returncode or item.stdout for item in tracked):
+        try:
+            source = disk_entry(source, part, listings)
+        except FileNotFoundError as error:
+            raise ValueError("パスがありません") from error
+    rel = source.relative_to(worktree)
+    tracked = [git(worktree, "ls-files", "--cached", "-z"), git(worktree, "ls-tree", "-rz", "--name-only", "HEAD")]
+    if any(item.returncode for item in tracked):
         raise ValueError("追跡済みのファイルがあるか、確認できません")
+    stamp = source.lstat()
+    key = filename_key(str(rel))
+    for item in tracked:
+        for name in filter(None, item.stdout.split("\0")):
+            prefix = Path(*Path(name).parts[:len(rel.parts)])
+            if prefix == rel:
+                raise ValueError("追跡済みのファイルがあるか、確認できません")
+            if filename_key(str(prefix)) == key:
+                with suppress(FileNotFoundError):
+                    if os.path.samestat((worktree / prefix).lstat(), stamp):
+                        raise ValueError("追跡済みのファイルがあるか、確認できません")
     if source.is_dir() and not source.is_symlink():
         for folder, children, files in os.walk(source):
             if ".git" in {name.casefold() for name in (*children, *files)} or (
@@ -1548,7 +2197,11 @@ def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
     # Only what is on disk moves: a deleted tracked file named here keeps the worktree as a change.
     present = [named for named in movable if (worktree / named).exists() or (worktree / named).is_symlink()]
     movers = set(explicit).intersection(present)
+    listings: dict[Path, dict[str, Path]] = {}
     for rel in paths:
+        if explicit:
+            with suppress(OSError):
+                rel = disk_path(worktree, Path(rel), listings).relative_to(worktree).as_posix()
         found = {named for named in present if within(rel, named)}
         holder = worktree / rel
         if not found and holder.is_dir() and not holder.is_symlink() and all(
@@ -1649,7 +2302,8 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def archive(source: Path, target: Path, worktree: Path) -> dict:
+def archive(source: Path, target: Path, worktree: Path, *, restore_approval: str | None = None,
+            recorded_paths: dict[str, Path] | None = None) -> dict:
     """Copy `source` to `target`, compare every file, record the move in the archive's manifest, then delete
     `source`. A copy that fails or differs is deleted and `source` stays, so nothing is lost on the way."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1667,6 +2321,10 @@ def archive(source: Path, target: Path, worktree: Path) -> dict:
         return moved
     entry = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "worktree": str(worktree), **moved,
              "files": len(files_in(source))}
+    if restore_approval:
+        entry["restore_approval"] = restore_approval
+        entry["recorded_paths"] = {name: str(path.relative_to(source)) for name, path in (recorded_paths or {}).items()
+                                   if path.is_relative_to(source)}
     with (target.parent / ARCHIVE_MANIFEST).open("a", encoding="utf-8") as manifest:
         manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
     remove_path(source)
@@ -1883,7 +2541,18 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--detach-nested", action="store_true",
                         help="when nested worktrees are all that block the removal and each has no changes beyond "
                              "recompiled catalogs, nothing ignored to open, and HEAD on a remote, restore those "
-                             "catalogs and remove the copies with git worktree remove --force, then check again")
+                             "catalogs and remove the copies with git worktree remove, then check again")
+    parser.add_argument("--restore-nested", action="append", default=[], metavar="PATH",
+                        help="plan restoration of tracked changes in a nested Git repository named by a relative path")
+    parser.add_argument("--apply-restore-nested", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--require-ignored-clones", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--discard-before-restore", action="append", default=[], metavar="PATH",
+                        help="when planning --restore-nested, a file the batch will discard first")
+    parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
+    parser.add_argument("--missing-restore-file", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--detached-restore-repo", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--restored-file-stamps", type=json.loads, default={}, help=argparse.SUPPRESS)
+    parser.add_argument("--removal-stamps", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
                              "records under .claude/reviews/) to the same place in main, confirmed with cmp; then "
@@ -1931,6 +2600,35 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if any(path.is_absolute() or not path.parts or ".." in path.parts
            or any(part.casefold() == ".git" for part in path.parts) for path in named):
         parser.error("--archive-path takes a path inside the worktree, relative to it")
+    restore_paths = [PurePosixPath(rel) for rel in args.restore_nested]
+    discard_paths = [PurePosixPath(rel) for rel in args.discard_before_restore]
+    missing_paths = [PurePosixPath(rel) for rel in args.missing_restore_file]
+    detached_paths = {PurePosixPath(rel) for rel in args.detached_restore_repo}
+    if any(path.is_absolute() or not path.parts or ".." in path.parts
+           or any(part.casefold() == ".git" for part in path.parts) for path in (*restore_paths, *discard_paths, *missing_paths)):
+        parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
+    if args.apply_restore_nested and (not restore_paths or not args.restore_approval):
+        parser.error("--apply-restore-nested needs saved restoration approval; use rm-check-batch --from SCAN_JSON --remove-ok")
+    if args.require_ignored_clones and not args.apply_restore_nested:
+        parser.error("--require-ignored-clones requires --apply-restore-nested")
+    if args.removal_stamps and (not restore_paths or not args.from_file
+                                or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
+        parser.error("--removal-stamps requires a read-only check of recorded restoration")
+    if args.restore_approval and (not args.apply_restore_nested or not args.from_file
+                                  or not re.fullmatch(r"[0-9a-f]{64}", args.restore_approval)):
+        parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
+    if missing_paths and not args.restore_approval:
+        parser.error("--missing-restore-file needs --restore-approval")
+    if detached_paths and (not args.from_file or not detached_paths.issubset(restore_paths)
+                           or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
+        parser.error("--detached-restore-repo is only for rechecking approved repositories detached by the batch")
+    if discard_paths and (not restore_paths or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
+        parser.error("--discard-before-restore can only be used to plan --restore-nested")
+    restored = args.restored_file_stamps
+    if not isinstance(restored, dict) or not all(isinstance(stamp, list) and len(stamp) == 5
+                                                 and all(isinstance(value, int) for value in stamp)
+                                                 for stamp in restored.values()):
+        parser.error("invalid restored file stamps")
     references = [ref for ref in (args.pr_number, args.pr) if ref not in (None, "-")]
     if len(set(references)) > 1:
         parser.error("positional PR and --pr must agree")
@@ -1954,12 +2652,32 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         print_check({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers}, args.summary)
         return 2
     since = args.since
-    if since is None and args.from_file:
-        rows = json.loads(args.from_file.read_text(encoding="utf-8"))
-        scanned = [row["scanned_at"] for row in rows if row.get("scanned_at")]
-        since = datetime.fromisoformat(scanned[0]) if scanned else None
     if since is not None and since.tzinfo is None:
         since = since.astimezone()
+    scanned_at = None
+    scan_time_invalid = False
+    saved_heads = {}
+    if args.from_file:
+        rows = json.loads(args.from_file.read_text(encoding="utf-8"))
+        local_row = next((row for row in rows if row.get("path") == worktree and not row.get("environment")), {})
+        time_row = local_row
+        if "scanned_at" not in time_row and not restore_paths:
+            time_row = next((row for row in rows if "scanned_at" in row), {})
+        if "scanned_at" in time_row:
+            try:
+                scanned_at = datetime.fromisoformat(time_row["scanned_at"])
+                if scanned_at.tzinfo is None:
+                    scanned_at = scanned_at.astimezone()
+            except (TypeError, ValueError):
+                scanned_at = None
+                scan_time_invalid = True
+        if scanned_at is not None:
+            if since is None:
+                since = scanned_at
+            elif restore_paths:
+                since = min(since, scanned_at)
+        saved_heads = {str(PurePosixPath(name)): state for name, state in
+                       (local_row.get("restore_checkout_heads") or {}).items()}
     checkout = args.main or main_checkout(worktree)
     if checkout is None:
         parser.error("could not locate the main checkout; pass --main")
@@ -2017,7 +2735,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     remote_default = default_base(worktree)
     local_default = None if remote_default else local_base(worktree)
     fallback = remote_default or local_default
-    fetch_note = fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
+    fetch_note = None if args.removal_stamps else fetch_when_stale(worktree, args.base or start_base(worktree) or fallback)
     if fetch_note:
         notes.append(fetch_note)
     if not pr and not args.pr and not args.pr_head and not head_in(worktree, args.base or start_base(worktree) or fallback):
@@ -2041,6 +2759,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    if scan_time_invalid:
+        decided.append("保存した走査時刻が不正です。新しい走査を保存して再試行してください")
+    elif restore_paths and args.from_file and scanned_at is None:
+        decided.append("--restore-nested の走査時刻を確認できません。新しい走査を保存して再試行してください")
+    if args.from_file and (unobserved := {str(path) for path in restore_paths if saved_heads.get(str(path)) is None}):
+        decided.append(f"--restore-nested の checkout 情報が走査にありません（{', '.join(sorted(unobserved))}）。"
+                       "新しい走査を保存して再試行してください")
     if args.topic_check or args.from_file:
         try:
             drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check
@@ -2082,9 +2807,32 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             notes.append(f"{detail}。作業場に compose の定義はありません。")
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
-                      decided=tuple(decided), since=since,
+                      decided=tuple(decided), since=since, restored=restored,
                       scan_file=args.from_file.expanduser().absolute() if args.from_file else None)
-    result = recheck()
+    restore = (NestedRestore(root, {root / path for path in restore_paths},
+                             frozenset(root / path for path in discard_paths), since,
+                             frozenset(root / path for path in missing_paths),
+                             expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads},
+                             detached=frozenset(root / path for path in detached_paths))
+               if restore_paths else None)
+    parent_stamps: dict[Path, list[int] | None] = {}
+    checked_stamps = None
+    if restore is not None:
+        try:
+            if args.removal_stamps:
+                checked_stamps = removal_stamps(root, restore.requested)
+            elif args.apply_restore_nested and (root / ".git").is_file():
+                if (parent := git_directories(root)) is None:
+                    raise OSError("親 worktree の登録を確認できません")
+                parent_stamps = checkout_metadata_stamps(root, parent, include_clone_refs=False)
+                ignore_files = {folder / ".gitignore" for copy in restore.requested for folder in copy.parents
+                                if folder.is_relative_to(root)}
+                parent_stamps.update({path: optional_stamp(path) for ignore_file in ignore_files
+                                      for path in reference_paths(ignore_file)})
+        except (OSError, RuntimeError) as error:
+            decided.append(f"削除前の作業場の状態を記録できません（{error}）")
+            recheck = partial(recheck, decided=tuple(decided))
+    result = recheck(restore=restore)
 
     def movable_now(result: dict) -> tuple[str, ...]:
         """The scratch folders and named paths, and with --archive-scratch the work records this check found."""
@@ -2092,13 +2840,167 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         plans = untracked_exec_plans(Path(worktree), base, pr) if args.archive_scratch else ()
         return (*movable, *found, *plans)
 
+    def may_detach(nested: list[dict]) -> bool:
+        if restore is None:
+            return args.detach_nested
+        return bool(args.apply_restore_nested and nested
+                    and all(Path(item["path"]) in restore.requested for item in nested))
+
+    approved_archives: list[str] = []
+
+    def restore_approval_error() -> str | None:
+        nonlocal approved_archives
+        if not args.restore_approval:
+            return None
+        command = [sys.executable, str(Path(__file__).with_name("scan_sessions.py")),
+                   "--from", str(args.from_file.expanduser()), "--decisions-file", str(args.decisions_file.expanduser())]
+        try:
+            replay = subprocess.run(command, capture_output=True, text=True, check=True, timeout=60)
+            rows = [row for row in json.loads(replay.stdout) if row.get("path") == worktree and not row.get("environment")]
+            if len(rows) == 1:
+                row = rows[0]
+                decision = row.get("removal_decision") or {}
+                digest = sha256(json.dumps(decision, sort_keys=True).encode()).hexdigest()
+                recorded_paths = {PurePosixPath(name) for name in decision.get("restore_nested") or []}
+                if (decision.get("allows_removal") is True and decision.get("record_id") and digest == args.restore_approval
+                        and recorded_paths == set(restore_paths)
+                        and not any(row.get(key) for key in ("cleanup_blockers", "automation_blocker", "pending_handoffs"))):
+                    approved_archives = decision.get("archive_path") or []
+                    return None
+        except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
+            return "--restore-nested の削除承認を復元直前に確認できません"
+        return "--restore-nested の削除承認が変わりました。再検査してください"
+
+    def restoration_lock() -> AbstractContextManager[None]:
+        if args.restore_approval:
+            return lead_decisions.decision_lock(args.decisions_file.expanduser())
+        return nullcontext()
+
+    def parent_unchanged() -> bool:
+        try:
+            return all(optional_stamp(path) == stamp for path, stamp in parent_stamps.items())
+        except OSError:
+            return False
+
+    def changed_checkouts(restore: NestedRestore) -> set[Path]:
+        changed = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
+        changed.update(copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs)
+        return changed
+
+    def changed_absent_checkouts(restore: NestedRestore) -> set[Path]:
+        changed = set()
+        for copy, state in restore.expected.items():
+            if state != CHECKOUT_ABSENT:
+                continue
+            try:
+                copy.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            changed.add(copy)
+        return changed
+
+    restored_nested: dict[str, list[str]] = {}
+    if restore and restore.plans:
+        detach = may_detach(result["nested_worktrees"])
+        bypassed = [blocker for blocker in result["blockers"] if detach and blocker.startswith(NESTED_READY)]
+        other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
+        archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
+        if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
+            linked = {Path(item["path"]) for item in result["nested_worktrees"]}
+            parent_linked = (root / ".git").is_file()
+
+            def restore_matches(copy: Path, plan: NestedRestorePlan | None) -> bool:
+                if ((plan is not None and not plan.matches(copy)) or (parent_linked and worktree_registration_blockers(root))
+                        or (copy in linked and native_detach_blockers(copy))):
+                    return False
+                fresh = NestedRestore(root, {copy}, since=since, already_missing=restore.already_missing,
+                                      expected=restore.expected)
+                if copy in linked:
+                    blockers = nested_check(copy, fresh)["blockers"]
+                else:
+                    blockers = clone_check(copy, {}, fresh).blockers
+                    if (args.require_ignored_clones
+                            and git(root, "check-ignore", "--", copy.relative_to(root).as_posix()).returncode):
+                        return False
+                return not blockers and fresh.plans.get(copy) == plan and (plan is None or plan.matches(copy))
+
+            with restoration_lock():
+                approval_error = restore_approval_error()
+                if approval_error:
+                    decided.append(approval_error)
+                changed = changed_checkouts(restore)
+                pending: dict[Path, dict[Path, list[int] | None]] = {}
+                if not changed and not approval_error:
+                    for copy in restore.observed:
+                        try:
+                            if (directories := git_directories(copy)) is None:
+                                raise OSError("Git checkout を確認できません")
+                            pending[copy] = {**worktree_entry_stamps(copy), **checkout_metadata_stamps(copy, directories)}
+                        except OSError:
+                            changed.add(copy)
+                if not changed and not approval_error:
+                    changed = {copy for copy in restore.observed if not restore_matches(copy, restore.plans.get(copy))}
+                changed.update(changed_absent_checkouts(restore))
+                for copy in sorted(changed):
+                    decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
+                for copy, approved in (() if changed or approval_error else restore.plans.items()):
+                    try:
+                        ready = (restore_matches(copy, approved) and not changed_checkouts(restore) and approved.files_match(copy)
+                                 and all(optional_stamp(path) == stamp for sibling, entries in pending.items()
+                                         if sibling != copy for path, stamp in entries.items())
+                                 and not changed_absent_checkouts(restore)
+                                 and parent_unchanged()
+                                 and all(optional_stamp(path) == stamp for path, stamp in pending[copy].items()))
+                    except OSError:
+                        ready = False
+                    if not ready:
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
+                        break
+                    paths = list(approved.files)
+                    done = git(copy, "-c", "core.precomposeunicode=false", "--literal-pathspecs", "restore",
+                               f"--source={approved.head}", "--staged", "--worktree", "--", *paths)
+                    if done.returncode:
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} を復元できません: {done.stderr.strip()}")
+                        break
+                    try:
+                        listings: dict[Path, dict[str, Path]] = {}
+                        for rel in paths:
+                            path = disk_path(copy, Path(rel), listings)
+                            restored[str(path.relative_to(root))] = file_stamp(path)
+                    except OSError as error:
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")
+                        break
+                    restored_nested[str(copy.relative_to(root))] = paths
+                    pending.pop(copy)
+                    notes.append(f"後始末: {copy.relative_to(root)} の追跡済みファイル {len(paths)} 件を復元")
+                if restored_nested:
+                    for copy in sorted(changed_checkouts(restore) | changed_absent_checkouts(restore)):
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} が復元後に変わりました")
+            recheck = partial(recheck, decided=tuple(decided))
+            result = recheck()
+        else:
+            result["blockers"].append(NESTED_RESTORE + ", ".join(restore.display()))
+            result["ok"] = False
+            result["restore_nested"] = restore.display()
+            result["restore_missing_files"] = [str((copy / rel).relative_to(root))
+                                               for copy, plan in restore.plans.items()
+                                               for rel, stamp in plan.files.items() if stamp is None]
+
     copied = []
     # Nothing is written to main while anything else keeps the worktree.
     if args.archive_scratch and holds_only_records(result, movable):
-        copied = copy_to_main(Path(worktree), Path(main), result["review"])
-        if copied:
-            result = recheck()
-    if args.detach_nested:
+        with restoration_lock():
+            if approval_error := restore_approval_error():
+                decided.append(approval_error)
+                recheck = partial(recheck, decided=tuple(decided))
+                result = recheck(restore=restore)
+            else:
+                copied = copy_to_main(Path(worktree), Path(main), result["review"])
+                if copied:
+                    result = recheck()
+    if may_detach(result["nested_worktrees"]):
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
         # Records --archive-scratch and --archive-path move next do not keep it.
@@ -2107,11 +3009,77 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         scratch_next = bool(archive_movers(Path(worktree), result, movable_now(result), besides_nested=True))
         removable = (nested and (scratch_next or (not others and not result["review"]))
                      and not any(item["blockers"] for item in nested))
-        detached = [item["path"] for item in nested if removable
-                    and (not item["restore"]
-                         or subprocess.run(item["restore"], capture_output=True, text=True).returncode == 0)
-                    and subprocess.run(item["detach"], capture_output=True, text=True).returncode == 0]
-        if detached:
+        with restoration_lock() if removable else nullcontext():
+            if removable and (approval_error := restore_approval_error()):
+                result["blockers"].append(approval_error)
+                result["ok"] = False
+                removable = False
+            if removable and restore:
+                fresh_nested = [nested_check(Path(item["path"])) for item in nested]
+                movement = moved_since(root, since, restored) if since else []
+                if fresh_nested != nested or movement:
+                    result["blockers"].extend(["子 worktree が削除直前に変わりました", *movement])
+                    result["ok"] = False
+                    removable = False
+            detached = []
+            detach_error = ""
+            for item in nested if removable else ():
+                copy = Path(item["path"])
+                current = nested_check(copy)
+                prefix = f"{copy.relative_to(root)}/"
+                written = {name.removeprefix(prefix): stamp for name, stamp in restored.items() if name.startswith(prefix)}
+                movement = moved_since(copy, since, written, inspect_head=copy not in restore.expected) if since and restore else []
+                if current != item or movement or not parent_unchanged():
+                    detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
+                    if movement:
+                        decided.extend(movement)
+                    break
+                if item["restore"]:
+                    applied = subprocess.run(item["restore"], capture_output=True, text=True)
+                    if applied.returncode or nested_check(copy)["blockers"]:
+                        detach_error = f"子 worktree {copy.relative_to(root)} の生成ファイル復元後に削除を確認できません"
+                        break
+                if item["untracked_bytecode"]:
+                    try:
+                        clean_nested_bytecode(copy, item["untracked_bytecode"])
+                    except (OSError, ValueError) as error:
+                        detach_error = f"子 worktree {copy.relative_to(root)} のバイトコードを削除できません（{error}）"
+                        break
+                marker, private, common, _ = item["checkout_state"]
+                try:
+                    entries = worktree_entry_stamps(copy)
+                    metadata = head_storage_stamps(Path(private), Path(common))
+                    if (linked_checkout_state(copy) != item["checkout_state"]
+                            or (restore and copy in restore.observed and checkout_head(copy) != restore.observed[copy])):
+                        raise ValueError("登録または HEAD が変わりました")
+                except (OSError, ValueError) as error:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
+                    break
+                if ignored_blockers := nested_ignored_blockers(copy, item["repository"]):
+                    detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
+                    decided.extend(ignored_blockers)
+                    break
+                try:
+                    if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
+                        raise ValueError("登録または HEAD が変わりました")
+                    if any(file_stamp(path) != stamp for path, stamp in entries.items()):
+                        raise ValueError("子 worktree のファイルが変わりました")
+                    if optional_stamp(Path(private) / "BISECT_START") is not None:
+                        raise ValueError("子 worktree で git bisect が進行中です")
+                    if not parent_unchanged():
+                        raise ValueError("親 worktree の登録が変わりました")
+                except (OSError, ValueError) as error:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
+                    break
+                removed = subprocess.run(item["detach"], capture_output=True, text=True)
+                if removed.returncode:
+                    detach_error = f"子 worktree {copy.relative_to(root)} を削除できません: {removed.stderr.strip()}"
+                    break
+                detached.append(item["path"])
+        if detach_error:
+            decided.append(detach_error)
+            recheck = partial(recheck, decided=tuple(decided))
+        if detached or detach_error:
             result = recheck()
         elif nested:
             notes.append("--detach-nested removed nothing: the worktree is kept while it has other blockers, "
@@ -2119,8 +3087,23 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["detached"] = detached
     if movable:
         day = datetime.now().strftime("%Y%m%d")
-        archived = [archive(source, archive_target(args.archive_dir, Path(worktree), source, day), Path(worktree))
-                    for source in archive_movers(root, result, movable_now(result), explicit=explicit)]
+        moves = archive_movers(root, result, movable_now(result), explicit=explicit)
+        archived: list[dict] = []
+        if moves:
+            with restoration_lock():
+                if approval_error := restore_approval_error():
+                    decided.append(approval_error)
+                    recheck = partial(recheck, decided=tuple(decided))
+                    result = recheck()
+                else:
+                    recorded_paths = {}
+                    for name in approved_archives:
+                        path = PurePosixPath(name)
+                        with suppress(OSError, ValueError):
+                            recorded_paths[str(path)] = named_archive_path(root, path)
+                    archived = [archive(source, archive_target(args.archive_dir, root, source, day), root,
+                                        restore_approval=args.restore_approval, recorded_paths=recorded_paths)
+                                for source in moves]
         if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}
@@ -2180,8 +3163,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if not args.base and not by_pr and pr_base_name:
         notes.append("PR #%s base origin/%s is not fetched: fetch it or pass --base"
                      % ((pr or {}).get("number"), pr_base_name))
+    if restored_nested:
+        result["restored_nested"] = restored_nested
+    if restored:
+        result["restored_file_stamps"] = {rel: stamp for rel, stamp in restored.items() if (root / rel).exists()
+                                         or (root / rel).is_symlink()}
     if notes:
         result["notes"] = notes
+    if checked_stamps is not None and result["ok"]:
+        result["removal_stamps"] = checked_stamps
     if automation_blockers:
         result["automation_blocker"] = "; ".join(automation_blockers)
     print_check({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),

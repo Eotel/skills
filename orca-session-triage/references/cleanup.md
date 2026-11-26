@@ -57,18 +57,29 @@ shell's environment, so `rm_check.py` names no `tab` for an empty one: as many s
 removal. A live tab left without one keeps the row.
 Record a removal answer's condition and cleanup as values, not only in its words. `lead_decisions.py record --decision
 remove:… --after pr-merged:<PR URL>` approves the row once the scan reads that PR as merged, whatever conditions the
-words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH` or `--archive-path PATH`
-(both repeatable, relative to the worktree) or `--compose-down`, the scan approves the row whatever the
+words give (`removal_decision` shows `after` and `after_state`). With `--discard PATH`, `--archive-path PATH`, or
+`--restore-nested PATH` (repeatable, relative to the worktree) or `--compose-down`, the scan approves the row whatever the
 words give. `rm-check-batch --from SCAN_JSON --remove-ok` closes the scanned tabs, runs the recorded cleanup,
 verifies any requested archives, and checks again before removal. A named path is archived even if the removal
 check already passes without it. Tracked files and paths inside a symlinked directory are kept. Run that cleanup
 on the worktree's Mac.
-Use `--approve` for an explicit approval without conditions or cleanup. If an answer has no structured values,
+Use `--approve` for an explicit approval without a PR condition. It can accompany cleanup options.
+Name each nested repository separately with `--restore-nested`, for example `--restore-nested local-deps/library`.
+Record the approval against the worktree's absolute path, as in `--decision remove:/path/to/worktree`.
+For batch removal, standalone clones must be directly under `local-deps/` and ignored by the parent repository.
+The batch checks this in both the preview and the restoration that precedes removal.
+It restores index and working-tree changes to files in that repository's HEAD. Use `--discard PATH` for individual
+untracked files the answer authorizes. A remaining untracked file, stash, or unpublished commit can still block cleanup.
+Use the same decision log for the scan and the batch. If the log lacks the current restoration approval or a repository
+recorded by the scan disappears or changes checkout, resolve the discrepancy and save a fresh scan. Save a fresh scan
+before applying a restoration approval if an older scan lacks the checkout information for any named repository.
+For recorded restoration, a later `--since` value cannot override the saved scan's cutoff.
+If an answer has no structured values,
 the scan reads its text. For a short closure instruction such as `閉じる。` or `close it`, it prints a command to
 record an explicit approval. A live summary asks for a saved scan before displaying a removal command.
 
 When the latest answers under different removal keys share a timestamp, keep the worktree
-unless every answer approves removal and specifies the same archive, discard, and Compose cleanup.
+unless every answer approves removal and specifies the same archive, discard, Compose, and nested restoration cleanup.
 
 Every other worktree waits for the user's choice. A row with `main: true` is a
 repository's own checkout: its tabs close and the checkout stays (`rm_check.py`

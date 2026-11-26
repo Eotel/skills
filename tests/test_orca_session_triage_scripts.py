@@ -3224,6 +3224,20 @@ class ScanCommandTests(unittest.TestCase):
         self.assertNotIn(scan.REMOTE_CHECK_RELEASE, out.getvalue())
         self.assertNotIn("rm-check-batch", out.getvalue())
 
+    def test_finished_row_with_restore_approval_uses_batch_preview(self) -> None:
+        row = {"path": "/w/app/finished", "repo": "app", "class": "finished",
+               "removal_decision": {"approve": True, "restore_nested": ["local-deps/library"]}}
+        saved = self.dir / "scan.json"
+        with patch.object(scan, "batch_help", return_value="--preview --decisions-file LOG recorded restore_nested"):
+            command = shlex.split(scan.rm_check_command(row, saved))
+            removal = shlex.split(scan.rm_check_command(row, saved, remove_ok=True))
+        self.assertEqual(Path(command[0]).name, "rm-check-batch")
+        self.assertIn("--preview", command)
+        self.assertNotIn("--remove-ok", command)
+        self.assertIn("--remove-ok", removal)
+        self.assertNotIn("--detach-nested", command)
+        self.assertNotIn("--detach-nested", removal)
+
     def test_remote_cleanup_hides_commands_for_keep_and_pending_handoff(self) -> None:
         saved = self.dir / "scan.json"
         base = {"path": "/w/app/remote", "repo": "app", "class": "finished", "terminals": [],
@@ -5641,6 +5655,62 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((Path(moved["to"]) / "917.md").read_text(), "PR 本文の写し\n")
         self.assertFalse(named.exists())
 
+    def test_nested_restore_archive_retains_a_file_when_approval_is_stale(self) -> None:
+        import lead_decisions
+
+        root = self.wt.resolve()
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(root / "local-deps/library"))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        note = root / "work notes.txt"
+        note.write_text("keep this record\n")
+        fixture = Path(self.tmp.name)
+        decisions, saved = fixture / "decisions.jsonl", fixture / "scan.json"
+        row = {"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat(),
+               "agent_ownership_observed": True,
+               "restore_checkout_heads": {"local-deps/library": rmcheck.checkout_head(root / "local-deps/library")}}
+        key = f"remove:{root}"
+        terms = lead_decisions.RemovalTerms(approve=True, restore_nested=("local-deps/library",), archive_path=(note.name,))
+        agreed = "2026-01-01T00:00:00Z"
+        lead_decisions.append(decisions, lead_decisions.Decision("approved", key, "削除してよい", agreed, removal=terms))
+        unchanged = fixture / "unchanged.jsonl"
+        unchanged.write_bytes(decisions.read_bytes())
+        [approved] = scan.with_cleanup_constraints([dict(row)], fixture / "state.json", decisions)
+        digest = hashlib.sha256(json.dumps(approved["removal_decision"], sort_keys=True).encode()).hexdigest()
+        saved.write_text(json.dumps([approved]))
+        replacements = (
+            lead_decisions.Decision("different-id", key, "削除してよい", agreed, removal=terms),
+            lead_decisions.Decision("revoked", key, "残してください", "2026-01-02T00:00:00Z"),
+        )
+        empty = fixture / "wrong-log.jsonl"
+        empty.touch()
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved), "--decisions-file", str(empty),
+                                         "--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--restore-approval", digest, "--archive-path", note.name,
+                                         "--archive-dir", str(fixture / "archive"))
+        self.assertEqual((code, result.get("archived")), (1, []), result)
+        self.assertEqual(note.read_text(), "keep this record\n")
+        for replacement in replacements:
+            with (self.subTest(replacement=replacement.id), patch.object(rmcheck, "processes_in", return_value=[])):
+                lead_decisions.append(decisions, replacement)
+                code, result = self.run_main("--from", str(saved), "--decisions-file", str(decisions),
+                                             "--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                             "--restore-approval", digest, "--archive-path", note.name,
+                                             "--archive-dir", str(fixture / "archive"))
+                self.assertEqual((code, result.get("archived")), (1, []), result)
+                self.assertEqual(note.read_text(), "keep this record\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved), "--decisions-file", str(unchanged),
+                                         "--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--restore-approval", digest, "--archive-path", note.name,
+                                         "--archive-dir", str(fixture / "archive"))
+        self.assertEqual(code, 0, result)
+        [archived] = result["archived"]
+        self.assertEqual(Path(archived["to"]).read_text(), "keep this record\n")
+
     def test_named_archive_explains_scratch_without_moving_it_implicitly(self) -> None:
         (self.main / ".git/info/exclude").write_text(".tmp/\n.yomiyasu/\n")
         for rel in (".tmp/body.md", ".yomiyasu/inputs/draft.md"):
@@ -5689,6 +5759,25 @@ class RmCheckTests(unittest.TestCase):
             code, result = self.run_main("--archive-path", "APP.TXT", "--archive-dir", str(self.wt.parent / "archive"))
             self.assertEqual((code, result["archived"]), (1, []))
             self.assertTrue(tracked.is_file())
+
+    def test_explicit_archive_preserves_a_tracked_file_with_normalized_disk_spelling(self) -> None:
+        tracked = self.wt / "caf\u00e9.txt"
+        on_disk = self.wt / "cafe\u0301.txt"
+        git(self.main, "config", "core.precomposeunicode", "false")
+        tracked.write_text("tracked file\n")
+        git(self.wt, "add", tracked.name)
+        git(self.wt, "commit", "-qm", "track composed file name")
+        git(self.main, "merge", "-q", "feature")
+        tracked.rename(on_disk)
+        if not tracked.exists():
+            self.skipTest("requires normalization-insensitive file lookup")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--archive-path", tracked.name, "--archive-dir", str(self.wt.parent / "archive"))
+
+        self.assertEqual((code, result["archived"]), (1, []), result)
+        self.assertEqual(on_disk.read_text(), "tracked file\n")
+        self.assertTrue(any("追跡済みのファイル" in reason for reason in result["reasons"]), result)
 
     def test_archive_paths_that_overlap_move_once_with_their_parent(self) -> None:
         (self.main / ".git/info/exclude").write_text("notes/child/\n")
@@ -5740,6 +5829,45 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual(result["copied_to_main"], [])
         self.assertFalse((self.main / ".claude/reviews/new.md").exists())
+
+    def test_record_copy_keeps_main_unchanged_when_restore_approval_is_revoked(self) -> None:
+        import lead_decisions
+
+        self.ignore_review_records()
+        root = self.wt.resolve()
+        name = "local-deps/library"
+        fixture = Path(self.tmp.name)
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(fixture / "deps.git"))
+        git(self.main, "clone", "-q", str(fixture / "deps.git"), str(root / name))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        log, saved = fixture / "decisions.jsonl", fixture / "scan.json"
+        key = f"remove:{root}"
+        lead_decisions.append(log, lead_decisions.Decision(
+            "approved", key, "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
+        [row] = scan.with_cleanup_constraints(
+            [{"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat(),
+              "agent_ownership_observed": True, "restore_checkout_heads": {name: rmcheck.checkout_head(root / name)}}],
+            fixture / "state.json", log)
+        saved.write_text(json.dumps([row]))
+        digest = hashlib.sha256(json.dumps(row["removal_decision"], sort_keys=True).encode()).hexdigest()
+        revoked = False
+
+        def revoke_during_check(*args: object) -> list:
+            nonlocal revoked
+            if not revoked:
+                lead_decisions.append(log, lead_decisions.Decision("revoked", key, "残してください", "2026-01-02T00:00:00Z"))
+                revoked = True
+            return []
+
+        with patch.object(rmcheck, "processes_in", side_effect=revoke_during_check):
+            code, result = self.run_main("--from", str(saved), "--decisions-file", str(log), "--restore-approval", digest,
+                                         "--restore-nested", name, "--apply-restore-nested", "--archive-scratch")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result.get("copied_to_main"), [])
+        self.assertFalse((self.main / ".claude/reviews/new.md").exists())
+        self.assertTrue((self.wt / ".claude/reviews/new.md").is_file())
 
     def ignore_review_records(self) -> None:
         """Main ignores .claude/ and keeps an older review; the worktree has a new one main lacks."""
@@ -5969,6 +6097,22 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["regenerable"]), (1, [".uv-cache/"]))
         self.assertEqual([item["path"] for item in result["held"]], ["other-cache/"])
         self.assertTrue(any(".uv-cache/" in note and "CACHEDIR.TAG" in note for note in result["notes"]))
+
+    def test_uv_cache_children_inherit_the_cache_tag(self) -> None:
+        for name in (".uv-cache", "data"):
+            folder = self.wt / name
+            (folder / "sdists-v9").mkdir(parents=True)
+            (folder / ".gitignore").write_text("*\n")
+            (folder / "sdists-v9/.git").write_text("fixture\n")
+            (folder / "CACHEDIR.TAG").write_bytes(
+                b"Signature: 8a477f597d28d172789f06886806bc55\n" if name == ".uv-cache" else b"invalid\n")
+
+        code, result = self.run_main()
+
+        self.assertEqual(code, 1, result)
+        self.assertTrue({".uv-cache/.gitignore", ".uv-cache/CACHEDIR.TAG", ".uv-cache/sdists-v9/"}
+                        <= set(result["regenerable"]), result)
+        self.assertEqual({Path(item["path"]).parts[0] for item in result["held"]}, {"data"}, result)
 
     def test_same_run_topic_drift_holds_the_named_worktree_until_the_next_clean_scan(self) -> None:
         folder = self.wt.parent / "hourly"
@@ -6328,6 +6472,961 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
 
+    def test_local_dependency_clone_keeps_a_commit_created_during_status_check(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt.resolve() / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (copy / "app.txt").write_text("new unpublished work\n")
+        git(copy, "add", "app.txt")
+        actual_git = rmcheck.git
+        committed = False
+
+        def commit_before_status(cwd: str | Path, *args: str,
+                                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal committed
+            if Path(cwd) == copy and "status" in args and "--no-renames" in args and not committed:
+                git(copy, "commit", "-qm", "new unpublished commit")
+                committed = True
+            return actual_git(cwd, *args, env=env)
+
+        with (patch.object(rmcheck, "git", side_effect=commit_before_status),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main()
+
+        self.assertEqual((committed, code, result["ok"]), (True, 1, False), result)
+        self.assertEqual(git(copy, "log", "-1", "--format=%s"), "new unpublished commit")
+
+    def test_local_dependency_clone_keeps_a_stash_created_during_status_check(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt.resolve() / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        (copy / "notes.txt").write_text("untracked draft\n")
+        actual_git = rmcheck.git
+        saved = False
+
+        def stash_before_status(cwd: str | Path, *args: str,
+                                env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal saved
+            if Path(cwd) == copy and "status" in args and "--no-renames" in args and not saved:
+                git(copy, "stash", "push", "-qu")
+                saved = True
+            return actual_git(cwd, *args, env=env)
+
+        with patch.object(rmcheck, "git", side_effect=stash_before_status):
+            result = rmcheck.clone_check(copy, {})
+
+        self.assertTrue(result.blockers, result)
+        self.assertEqual(git(copy, "show", "stash@{0}^3:notes.txt"), "untracked draft")
+
+    def test_nested_restore_only_applies_to_the_approved_clone_after_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        original = filename.read_text()
+        filename.write_text("staged change\n")
+        git(copy, "add", "app.txt")
+        filename.write_text("unstaged change\n")
+        options = ("--restore-nested", "local-deps/library")
+
+        code, preview = self.run_main(*options)
+        self.assertEqual((code, preview["restore_nested"]), (1, {"local-deps/library": ["app.txt"]}), preview)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+
+        unpublished = copy / "keep.txt"
+        unpublished.write_text("untracked data\n")
+        code, blocked = self.run_main(*options, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        self.assertEqual(unpublished.read_text(), "untracked data\n")
+        unpublished.unlink()
+
+        git(copy, "rm", "--cached", "-f", "app.txt")
+        code, blocked = self.run_main(*options, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        git(copy, "add", "app.txt")
+
+        before = datetime.now(timezone.utc).isoformat()
+        code, result = self.run_main(*options, "--apply-restore-nested", "--since", before)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(filename.read_text(), original)
+        self.assertFalse(git(copy, "status", "--porcelain"))
+
+    def test_restore_rejects_missing_approval_and_a_different_approved_path(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        approved, other = "local-deps/approved", "local-deps/other"
+        for name in (approved, other):
+            git(self.main, "clone", "-q", str(remote), str(self.wt / name))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = self.wt / other / "app.txt"
+        changed.write_text("keep staged\n")
+        git(changed.parent, "add", changed.name)
+        changed.write_text("keep working file\n")
+        options = self.recorded_restore(("--restore-nested", approved, "--apply-restore-nested"))
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        row["restore_checkout_heads"][other] = rmcheck.checkout_head(changed.parent.resolve())
+        saved.write_text(json.dumps([row]))
+        wrong_target = ("--restore-nested", other, *options[2:])
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as unapproved:
+            self.run_main("--restore-nested", other, "--apply-restore-nested", record_approval=False)
+        self.assertEqual(unapproved.exception.code, 2)
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*wrong_target, record_approval=False)
+        self.assertIn("削除承認が変わりました", " ".join(result["reasons"]))
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(changed.parent, "show", ":app.txt"), "keep staged")
+        self.assertEqual(changed.read_text(), "keep working file\n")
+
+    def test_later_since_cannot_approve_edits_after_the_saved_scan(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/library", "--apply-restore-nested"))
+        changed = copy / "app.txt"
+        changed.write_text("new staged work\n")
+        git(copy, "add", "--", "app.txt")
+        changed.write_text("new unstaged work\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*options, "--since", datetime.now(timezone.utc).isoformat())
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "show", ":app.txt"), "new staged work")
+        self.assertEqual(changed.read_text(), "new unstaged work\n")
+
+    def test_saved_scan_with_an_invalid_time_blocks_ordinary_removal(self) -> None:
+        saved = Path(self.tmp.name) / "scan.json"
+        changed = self.wt / "app.txt"
+        changed.touch()
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "")
+
+        for value in ("bad timestamp", "", None):
+            saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": value}]))
+            for extra in ((), ("--since", datetime.now(timezone.utc).isoformat())):
+                with self.subTest(value=value, extra=extra):
+                    with patch.object(rmcheck, "processes_in", return_value=[]):
+                        code, result = self.run_main("--from", str(saved), *extra)
+
+                    self.assertEqual(code, 1, result)
+                    self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+
+    def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = (self.wt / "local-deps/library").resolve()
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        actual_git = rmcheck.git
+        for stage in (False, True):
+            with self.subTest(stage=stage):
+                filename.write_text("before the scan\n")
+                since = datetime.now(timezone.utc).isoformat()
+                calls = 0
+
+                def edit_during_recheck(cwd: str | Path, *args: str,
+                                        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    nonlocal calls
+                    if Path(cwd) == copy and "--no-renames" in args:
+                        calls += 1
+                        if calls == 2:
+                            if stage:
+                                git(copy, "add", "app.txt")
+                            else:
+                                filename.write_text("after the scan\n")
+                    return actual_git(cwd, *args, env=env)
+
+                with patch.object(rmcheck, "git", side_effect=edit_during_recheck):
+                    code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                                 "--since", since)
+                self.assertEqual((calls, code), (2, 1), result)
+                if stage:
+                    self.assertEqual(git(copy, "show", ":app.txt").strip(), "before the scan")
+                else:
+                    self.assertEqual(filename.read_text(), "after the scan\n")
+
+    def test_nested_restore_preserves_changes_when_head_moves_after_preflight(self) -> None:
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        filename.write_text("staged change\n")
+        git(copy, "add", "app.txt")
+        filename.write_text("unstaged change\n")
+        matches = rmcheck.NestedRestorePlan.matches
+        calls = 0
+
+        def move_head(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                git(path, "reset", "--soft", "HEAD^")
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", move_head),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(result.get("restored_nested", {}), {})
+        self.assertEqual(filename.read_text(), "unstaged change\n")
+        self.assertEqual(git(copy, "show", ":app.txt"), "staged change")
+
+    def test_nested_clone_restore_keeps_edits_after_scan_without_reflog(self) -> None:
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        git(copy, "config", "core.logallrefupdates", "false")
+        for log in (copy / ".git/logs").rglob("*"):
+            if log.is_file():
+                log.unlink()
+        changed = copy / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(copy, "add", "app.txt")
+        changed.write_text("keep unstaged work\n")
+        since = datetime.now(timezone.utc)
+        git(copy, "reset", "--soft", "HEAD^")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--since", since.isoformat())
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_saved_scan_distinguishes_packing_refs_from_moving_a_clone_head(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        name = "local-deps/library"
+        copy = self.wt / name
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = copy / "app.txt"
+        original = changed.read_text()
+        changed.write_text("approved edit\n")
+        snapshot = Path(self.tmp.name) / "scan.json"
+
+        def save_scan() -> None:
+            snapshot.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                             "restore_checkout_heads": {"./" + name: rmcheck.checkout_head(copy.resolve())}}]))
+
+        save_scan()
+        git(copy, "branch", "-m", "resumed-work")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(snapshot), "--restore-nested", name, "--apply-restore-nested")
+        self.assertEqual(code, 1, result)
+        self.assertEqual(changed.read_text(), "approved edit\n")
+
+        save_scan()
+        git(copy, "pack-refs", "--all")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(snapshot), "--restore-nested", name, "--apply-restore-nested")
+
+        self.assertEqual(code, 0, result)
+        self.assertEqual(changed.read_text(), original)
+
+    def test_restoration_keeps_edits_when_another_approved_clone_moved_since_the_scan(self) -> None:
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        names = ("local-deps/first", "local-deps/second")
+        for name in names:
+            git(self.main, "clone", "-q", str(remote), str(self.wt / name))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = self.wt / names[0] / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(self.wt / names[0], "add", "app.txt")
+        changed.write_text("keep unstaged work\n")
+        since = datetime.now(timezone.utc)
+        git(self.wt / names[1], "reset", "--soft", "HEAD^")
+        self.assertEqual(git(self.wt / names[1], "status", "--porcelain"), "")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", names[0], "--restore-nested", names[1],
+                                         "--apply-restore-nested", "--since", since.isoformat())
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(self.wt / names[0], "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_restoration_keeps_edits_when_a_saved_clean_clone_disappears(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        first, second = (root / "local-deps" / name for name in ("first", "second"))
+        for copy in (first, second):
+            git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = first / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(first, "add", changed.name)
+        changed.write_text("keep unstaged work\n")
+        names = [str(copy.relative_to(root)) for copy in (first, second)]
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(root), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                     "restore_checkout_heads": dict(zip(names, map(rmcheck.checkout_head, (first, second))))}]))
+        second.rename(Path(self.tmp.name) / "moved-clone")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved), "--restore-nested", names[0], "--restore-nested", names[1],
+                                         "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_recorded_restore_rejects_a_clone_moved_into_an_unobserved_path(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        source = Path(self.tmp.name) / "off-worktree"
+        git(self.main, "clone", "-q", str(remote), str(source))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (source / "app.txt").write_text("keep staged work\n")
+        git(source, "add", "app.txt")
+        (source / "app.txt").write_text("keep unstaged work\n")
+        name = "local-deps/target"
+        options = self.recorded_restore(("--restore-nested", name, "--apply-restore-nested"))
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        self.assertEqual(row["restore_checkout_heads"], {name: rmcheck.CHECKOUT_ABSENT})
+        target = self.wt / name
+        target.parent.mkdir()
+        source.rename(target)
+
+        for heads in ({name: rmcheck.CHECKOUT_ABSENT}, {name: None}, {}):
+            with self.subTest(heads=heads), patch.object(rmcheck, "processes_in", return_value=[]):
+                saved.write_text(json.dumps([{**row, "restore_checkout_heads": heads}]))
+                code, result = self.run_main(*options, record_approval=False)
+                self.assertEqual(code, 1, result)
+                self.assertEqual(git(target, "show", ":app.txt"), "keep staged work")
+                self.assertEqual((target / "app.txt").read_text(), "keep unstaged work\n")
+
+    def test_a_clone_arriving_during_preflight_keeps_the_other_approved_edits(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        first, second = (root / "local-deps" / name for name in ("first", "second"))
+        outside = Path(self.tmp.name) / "outside"
+        for clone in (first, outside):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = first / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(first, "add", "--", "app.txt")
+        changed.write_text("keep unstaged work\n")
+        matching = rmcheck.NestedRestorePlan.files_match
+        checks = 0
+
+        def move_clone_during_file_recheck(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal checks
+            checks += 1
+            if checks == 5:
+                outside.rename(second)
+            return matching(plan, copy)
+
+        options = self.recorded_restore(("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested"))
+        with (patch.object(rmcheck.NestedRestorePlan, "files_match", move_clone_during_file_recheck),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertTrue(second.is_dir())
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+        second.rename(outside)
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        row["restore_checkout_heads"]["local-deps/second"] = None
+        saved.write_text(json.dumps([row]))
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*options)
+        self.assertEqual(code, 1, result)
+        self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+        self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_restoration_keeps_first_edit_if_a_clean_sibling_is_edited_during_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        first, second = (root / "local-deps" / name for name in ("first", "second"))
+        for clone in (first, second):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (first / "app.txt").write_text("first staged work\n")
+        git(first, "add", "--", "app.txt")
+        (first / "app.txt").write_text("first unstaged work\n")
+        matching = rmcheck.NestedRestorePlan.matches
+        checks = 0
+
+        def edit_sibling_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal checks
+            if copy == first:
+                checks += 1
+                if checks == 3:
+                    (second / "app.txt").write_text("second staged work\n")
+                    git(second, "add", "--", "app.txt")
+                    (second / "app.txt").write_text("second unstaged work\n")
+            return matching(plan, copy)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", edit_sibling_during_preflight),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        for copy in (first, second):
+            self.assertEqual(git(copy, "show", ":app.txt"), f"{copy.name} staged work")
+            self.assertEqual((copy / "app.txt").read_text(), f"{copy.name} unstaged work\n")
+
+    def test_unreadable_checkout_is_not_recorded_as_absent(self) -> None:
+        copy = self.nested_catalog().resolve()
+        self.assertIsInstance(rmcheck.snapshot_checkout(copy), list)
+        self.assertEqual(rmcheck.snapshot_checkout(copy.with_name("absent")), rmcheck.CHECKOUT_ABSENT)
+        with patch.object(Path, "lstat", side_effect=PermissionError("fixture denied")):
+            self.assertIsNone(rmcheck.snapshot_checkout(copy))
+        loop = copy.with_name("loop")
+        loop.symlink_to(loop.name)
+        self.assertIsNone(rmcheck.snapshot_checkout(loop))
+
+    def test_live_scan_does_not_accept_a_clone_moved_into_place(self) -> None:
+        import lead_decisions
+
+        fixture = Path(self.tmp.name)
+        root = self.wt.resolve()
+        name = "local-deps/library"
+        copy = root / name
+        copy.parent.mkdir()
+        moved, remote = fixture / "outside", fixture / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(moved))
+        (moved / "app.txt").write_text("retain this edit\n")
+        ps, terms, decisions = (fixture / filename for filename in ("ps.json", "terms.json", "decisions.jsonl"))
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree(str(root))]}}))
+        terms.write_text(json.dumps({"result": {"terminals": []}}))
+        lead_decisions.append(decisions, lead_decisions.Decision(
+            "approved", f"remove:{root}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
+        collect = scan.collect_worktrees_and_terminals
+        snapshot = rmcheck.snapshot_checkout
+
+        def move_during_inventory(*args: str | None) -> tuple[list[dict], list[dict]]:
+            moved.rename(copy)
+            return collect(*args)
+
+        output = io.StringIO()
+        with (patch.object(scan, "collect_worktrees_and_terminals", side_effect=move_during_inventory),
+              patch.object(rmcheck, "snapshot_checkout", side_effect=lambda path, cutoff=None: snapshot(path)),
+              patch.object(scan, "read_mail", return_value={}), patch.object(scan, "jev_key", return_value=None),
+              redirect_stdout(output), redirect_stderr(io.StringIO())):
+            self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--decisions-file", str(decisions),
+                                        "--claude-projects", str(fixture / "no-claude"), "--codex-sessions", str(fixture / "no-codex"),
+                                        "--inbox", str(fixture / "no-inbox"), "--ask-answers", str(fixture / "no-answers"),
+                                        "--state-file", str(fixture / "no-state")]), 0)
+        [row] = json.loads(output.getvalue())
+        self.assertTrue(row["removal_decision"]["allows_removal"], row)
+        self.assertEqual(row["restore_checkout_heads"], {name: None})
+        self.assertEqual((copy / "app.txt").read_text(), "retain this edit\n")
+
+    def test_legacy_short_restore_approval_is_held_before_cleanup(self) -> None:
+        import lead_decisions
+
+        fixture = Path(self.tmp.name)
+        root = self.wt.resolve()
+        decisions = fixture / "decisions.jsonl"
+        row = {"path": str(root), "repo": "fixture", "class": "stalled", "closable": ["term_1"]}
+        lead_decisions.append(decisions, lead_decisions.Decision(
+            "approved", f"remove:fixture/{root.name}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=("local-deps/library",))))
+
+        [checked] = scan.with_cleanup_constraints([row], fixture / "state.json", decisions)
+
+        self.assertFalse(checked["removal_decision"]["allows_removal"])
+        self.assertIn("作業場の絶対パス", " ".join(checked["cleanup_blockers"]))
+        self.assertEqual(checked["closable"], [])
+
+    def test_restoration_keeps_target_edits_written_while_checking_a_sibling(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        first, second = (self.wt.resolve() / "local-deps" / name for name in ("first", "second"))
+        for clone in (first, second):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        target = first / "app.txt"
+        target.write_text("approved edit\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/first", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested"))
+        actual = rmcheck.file_stamp
+        actual_matches = rmcheck.NestedRestorePlan.files_match
+        matches = 0
+        saved = False
+
+        def count_target_checks(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal matches
+            if copy == first:
+                matches += 1
+            return actual_matches(plan, copy)
+
+        def edit_target_while_checking_sibling(path: Path) -> list[int]:
+            nonlocal saved
+            if path == second / "app.txt" and matches >= 5 and not saved:
+                target.write_text("new staged edit\n")
+                git(first, "add", "app.txt")
+                target.write_text("new unstaged edit\n")
+                saved = True
+            return actual(path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "files_match", count_target_checks),
+              patch.object(rmcheck, "file_stamp", edit_target_while_checking_sibling),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertTrue(saved)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(first, "show", ":app.txt"), "new staged edit")
+        self.assertEqual(target.read_text(), "new unstaged edit\n")
+
+    def test_restoration_keeps_target_edits_if_a_sibling_is_locked_during_preflight(self) -> None:
+        first = self.nested_catalog().resolve()
+        second = first.with_name("second")
+        repository = Path(self.tmp.name) / "deps"
+        git(repository, "worktree", "add", "-q", "--detach", str(second), "main")
+        relative = "locale/de/LC_MESSAGES/django.po"
+        target = first / relative
+        target.write_text("keep staged edit\n")
+        git(first, "add", relative)
+        target.write_text("keep unstaged edit\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/pushed", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested"))
+        actual = rmcheck.NestedRestorePlan.matches
+        matches = 0
+
+        def lock_sibling_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal matches
+            if copy == first:
+                matches += 1
+                if matches == 3:
+                    git(repository, "worktree", "lock", str(second))
+            return actual(plan, copy)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", lock_sibling_during_preflight),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("locked", git(repository, "worktree", "list", "--porcelain"))
+        self.assertEqual(git(first, "show", f":{relative}"), "keep staged edit")
+        self.assertEqual(target.read_text(), "keep unstaged edit\n")
+
+    def test_live_scan_does_not_accept_a_clone_head_that_moves_during_the_scan(self) -> None:
+        import lead_decisions
+
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        fixture = Path(self.tmp.name)
+        remote = fixture / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        name = "local-deps/library"
+        copy = root / name
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = copy / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(copy, "add", changed.name)
+        changed.write_text("keep unstaged work\n")
+        ps, terms, decisions, saved = (fixture / filename for filename in ("ps.json", "terms.json", "decisions.jsonl", "scan.json"))
+        ps.write_text(json.dumps({"result": {"worktrees": [worktree(str(root))]}}))
+        terms.write_text(json.dumps({"result": {"terminals": []}}))
+        lead_decisions.append(decisions, lead_decisions.Decision(
+            "approved", f"remove:{root}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
+        collect = scan.collect_worktrees_and_terminals
+        snapshot = rmcheck.snapshot_checkout
+
+        def reset_during_scan(*args: str | None) -> tuple[list[dict], list[dict]]:
+            git(copy, "reset", "--soft", "HEAD^")
+            return collect(*args)
+
+        output = io.StringIO()
+        with (patch.object(scan, "collect_worktrees_and_terminals", side_effect=reset_during_scan),
+              patch.object(rmcheck, "snapshot_checkout", side_effect=lambda path, cutoff=None: snapshot(path)),
+              patch.object(scan, "read_mail", return_value={}), patch.object(scan, "jev_key", return_value=None),
+              redirect_stdout(output), redirect_stderr(io.StringIO())):
+            self.assertEqual(scan.main(["--ps-json", str(ps), "--terminals-json", str(terms), "--decisions-file", str(decisions),
+                                        "--claude-projects", str(fixture / "no-claude"), "--codex-sessions", str(fixture / "no-codex"),
+                                        "--inbox", str(fixture / "no-inbox"), "--ask-answers", str(fixture / "no-answers"),
+                                        "--state-file", str(fixture / "no-state")]), 0)
+        [row] = json.loads(output.getvalue())
+        self.assertEqual(row["restore_checkout_heads"], {name: None})
+        saved.write_text(output.getvalue())
+        digest = hashlib.sha256(json.dumps(row["removal_decision"], sort_keys=True).encode()).hexdigest()
+        self.assertTrue(row["removal_decision"]["allows_removal"], row)
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved), "--decisions-file", str(decisions), "--restore-approval", digest,
+                                         "--restore-nested", name, "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_nested_restore_allows_clones_and_linked_worktrees_in_one_directory(self) -> None:
+        linked = self.nested_catalog()
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "-b", "main", str(remote), str(clone))
+        repo_file = Path("locale/de/LC_MESSAGES/django.po")
+        for copy in (linked, clone):
+            (copy / repo_file).write_text("changed\n")
+        options = ("--restore-nested", "local-deps/library", "--restore-nested", "local-deps/pushed")
+        exclude = self.main / ".git/info/exclude"
+        exclude.write_text("")
+        _, preview = self.run_main(*options)
+        self.assertEqual(set(preview["restore_nested"]), {"local-deps/library", "local-deps/pushed"}, preview)
+
+        exclude.write_text("local-deps/\n")
+        code, result = self.run_main(*options, "--apply-restore-nested", "--detach-nested")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(set(result["restored_nested"]), {"local-deps/library", "local-deps/pushed"})
+        self.assertFalse(linked.exists())
+        self.assertFalse(git(clone, "status", "--porcelain"))
+
+    def test_direct_restoration_accepts_an_untracked_dependency_clone(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        target = clone / "app.txt"
+        target.write_text("approved edit\n")
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "?? local-deps/")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), "v1\n")
+        self.assertTrue(self.wt.is_dir())
+
+    def test_restore_keeps_the_case_alias_of_an_active_gitignore(self) -> None:
+        if not (self.main / ".GITIGNORE").exists():
+            self.skipTest("requires a case-insensitive filesystem")
+        git(self.main, "mv", ".gitignore", "ignore-fixture")
+        git(self.main, "mv", "ignore-fixture", ".GITIGNORE")
+        git(self.main, "commit", "-qm", "track uppercase ignore filename")
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("/local-deps/\n")
+        ignore = clone / ".GITIGNORE"
+        ignore.write_text("/scratch_cache/\n")
+        git(clone, "add", ignore.name)
+        target = clone / "app.txt"
+        target.write_text("approved edit\n")
+        cache = clone / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+        self.assertIn(".gitignore", git(clone, "check-ignore", "-v", "scratch_cache/cache.tmp").lower())
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(clone, "show", ":.GITIGNORE"), "/scratch_cache/")
+        self.assertEqual(target.read_text(), "approved edit\n")
+
+    def test_restore_keeps_a_tracked_ignore_file_linked_from_git_info(self) -> None:
+        (self.main / "Rules").write_text("/old-cache/\n")
+        git(self.main, "add", "Rules")
+        git(self.main, "commit", "-qm", "track exclude rules")
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("/local-deps/\n")
+        exclude = clone / ".git/info/exclude"
+        exclude.unlink()
+        exclude.symlink_to(clone.resolve() / "Rules")
+        (clone / "Rules").write_text("/scratch_cache/\n")
+        git(clone, "add", "Rules")
+        cache = clone / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+        self.assertIn("info/exclude", git(clone, "check-ignore", "-v", "scratch_cache/cache.tmp"))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(clone, "show", ":Rules"), "/scratch_cache/")
+
+    def test_restore_keeps_edits_if_parent_ignore_changes_after_the_last_match(self) -> None:
+        (self.main / ".gitignore").write_text("/local-deps/\n")
+        git(self.main, "commit", "-qam", "ignore the dependency")
+        git(self.wt, "merge", "--ff-only", "main")
+        root = self.wt.resolve()
+        remote = root.parent / "deps.git"
+        copy = root / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        target = copy / "app.txt"
+        target.write_text("keep staged edit\n")
+        git(copy, "add", "app.txt")
+        target.write_text("keep unstaged edit\n")
+        actual = rmcheck.git
+        checks = 0
+
+        def change_ignore_after_matching(cwd: str | Path, *args: str,
+                                         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal checks
+            found = actual(cwd, *args, env=env)
+            if Path(cwd) == root and args[0] == "check-ignore":
+                checks += 1
+                if checks == 2:
+                    (root / ".gitignore").write_text("")
+            return found
+
+        with (patch.object(rmcheck, "git", side_effect=change_ignore_after_matching),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--require-ignored-clones")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual((root / ".gitignore").read_text(), "")
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged edit")
+        self.assertEqual(target.read_text(), "keep unstaged edit\n")
+
+    def test_nested_restore_revalidates_every_repository_before_the_first_write(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copies = [(self.wt / "local-deps" / name).resolve() for name in ("first", "second")]
+        for copy in copies:
+            git(self.main, "clone", "-q", str(remote), str(copy))
+            (copy / "app.txt").write_text("before scan\n")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        since = datetime.now(timezone.utc).isoformat()
+        actual_git = rmcheck.git
+        index_calls = 0
+
+        def save_during_index_lookup(cwd: str | Path, *args: str,
+                                     env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal index_calls
+            if Path(cwd) == copies[1] and args[-2:] == ("--git-path", "index"):
+                index_calls += 1
+                if index_calls == 2:
+                    (copies[1] / "app.txt").write_text("saved during preflight\n")
+            return actual_git(cwd, *args, env=env)
+
+        with patch.object(rmcheck, "git", side_effect=save_during_index_lookup):
+            code, result = self.run_main("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested", "--since", since)
+        self.assertEqual((code, index_calls), (1, 2), result)
+        self.assertEqual((copies[0] / "app.txt").read_text(), "before scan\n")
+        self.assertEqual((copies[1] / "app.txt").read_text(), "saved during preflight\n")
+
+    def test_nested_restore_records_actual_directory_spelling(self) -> None:
+        spellings = (("folder", "Folder"), ("Μαΐου", "ΜΑΪ́ΟΥ"))
+        generated = self.main / "__generated__"
+        ignore = self.main / ".gitignore"
+        ignore.write_text(ignore.read_text() + "__generated__/\n")
+        git(self.main, "add", ".gitignore")
+        for original, _ in spellings:
+            folder = generated / original
+            folder.mkdir(parents=True)
+            (folder / "app.txt").write_text("tracked\n")
+            git(self.main, "add", "-f", f"__generated__/{original}/app.txt")
+        git(self.main, "commit", "-qm", "track nested fixture file")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        generated = copy / "__generated__"
+        for original, on_disk in spellings:
+            (generated / original).rename(generated / on_disk)
+            if not (generated / original).exists():
+                self.skipTest("requires a case-insensitive filesystem with normalized lookup")
+            (generated / on_disk / "app.txt").write_text("changed\n")
+        since = datetime.now(timezone.utc).isoformat()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 0, result)
+        disk_names = {str((child / "app.txt").relative_to(self.wt.resolve())) for child in generated.resolve().iterdir()}
+        self.assertEqual(set(result["restored_file_stamps"]), disk_names)
+        for _, on_disk in spellings:
+            self.assertEqual((generated / on_disk / "app.txt").read_text(), "tracked\n")
+
+    def test_nested_restore_plans_discard_using_the_actual_untracked_filename(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = self.wt / rel
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = "cafe\u0301.tmp"
+        disposable = copy / filename
+        disposable.write_text("explicitly approved\n")
+        (copy / "app.txt").write_text("edit to restore\n")
+        if not (copy / "caf\u00e9.tmp").exists():
+            self.skipTest("requires normalization-insensitive file lookup")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--discard-before-restore", f"{rel}/{filename}")
+
+        self.assertEqual((code, result.get("restore_nested")), (1, {rel: ["app.txt"]}), result)
+        self.assertEqual(disposable.read_text(), "explicitly approved\n")
+
+        directory = copy / "cafe\u0301"
+        directory.mkdir()
+        ignored = directory / "report.tmp"
+        ignored.write_text("approved ignored file\n")
+        (copy / ".git/info/exclude").write_text("/ca*/\n")
+        self.assertIn("!! caf\u00e9/", git(copy, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored=matching"))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--discard-before-restore", f"{rel}/{filename}",
+                                         "--discard-before-restore", f"{rel}/{directory.name}/report.tmp")
+
+        self.assertEqual((code, result.get("restore_nested")), (1, {rel: ["app.txt"]}), result)
+        self.assertEqual(ignored.read_text(), "approved ignored file\n")
+        self.assertFalse(result["review"], result)
+
+    def test_nested_clone_accepts_the_restored_tracked_file_under_its_disk_alias(self) -> None:
+        original, alias = "Μαΐου", "ΜΑΪ́ΟΥ"
+        versioned = self.main / original / "inside/app.txt"
+        versioned.parent.mkdir(parents=True)
+        versioned.write_text("tracked\n")
+        versioned.with_name("link").symlink_to("app.txt")
+        (self.main / ".gitattributes").write_text("**/app.txt text eol=crlf\n")
+        git(self.main, "add", ".gitattributes", str(versioned.parent.relative_to(self.main)))
+        git(self.main, "commit", "-qm", "track Unicode file")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = self.wt / rel
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (copy / original).rename(copy / alias)
+        if not (copy / original).is_dir():
+            self.skipTest("requires a case-insensitive filesystem with normalized lookup")
+        file = copy / alias / "inside/app.txt"
+        file.unlink()
+        link = file.with_name("link")
+        link.unlink()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+
+        self.assertEqual((code, result["ok"]), (0, True), result)
+        self.assertEqual(file.read_bytes(), b"tracked\r\n")
+        self.assertEqual(link.readlink(), Path("app.txt"))
+        (self.main / ".git/info/exclude").write_text("")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, retry = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+        self.assertEqual((code, retry["ok"]), (0, True), retry)
+
+        git(copy, "update-index", "--assume-unchanged", f"{original}/inside/app.txt")
+        file.write_bytes(b"tracked\n")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, blocked = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(file.read_bytes(), b"tracked\n")
+        file.write_bytes(b"tracked\r\n")
+
+        unknown = file.with_name("unapproved.txt")
+        unknown.write_text("keep this file\n")
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, blocked = self.run_main("--restore-nested", rel, "--apply-restore-nested")
+        self.assertEqual(code, 1, blocked)
+        self.assertEqual(unknown.read_text(), "keep this file\n")
+
+    def test_clone_cleanup_rechecks_files_after_the_remote_lookup(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        rel = "local-deps/library"
+        copy = (self.wt / rel).resolve()
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        saved = (copy / "app.txt").stat()
+        since = datetime.now(timezone.utc).isoformat()
+        created = copy / "private.sqlite3"
+        lookup = rmcheck.origin_refs
+
+        def copy_during_lookup(path: Path, *, branches_and_tags: bool = False) -> list[tuple[str, str]] | None:
+            refs = lookup(path, branches_and_tags=branches_and_tags)
+            if path == copy:
+                created.write_bytes(b"data copied while checking the remote")
+                os.utime(created, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+            return refs
+
+        with (patch.object(rmcheck, "origin_refs", side_effect=copy_during_lookup),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", rel, "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 1, result)
+        self.assertNotIn(rel, result["regenerable"])
+        self.assertEqual(created.read_bytes(), b"data copied while checking the remote")
+
+    def test_nested_restore_preserves_an_edit_with_mtime_retained_after_the_scan(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        filename = copy / "app.txt"
+        filename.write_text("before scan\n")
+        stamp = filename.stat()
+        since = datetime.now(timezone.utc).isoformat()
+        filename.write_text("copied after scan\n")
+        os.utime(filename, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested", "--since", since)
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(filename.read_text(), "copied after scan\n")
+
+        before_deletion = datetime.now(timezone.utc) + timedelta(seconds=1)
+        filename.unlink()
+        after_deletion = (before_deletion + timedelta(seconds=1)).timestamp()
+        os.utime(filename.parent, (after_deletion, after_deletion))
+        code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                     "--since", before_deletion.isoformat())
+        self.assertEqual(code, 1, result)
+        self.assertFalse(filename.exists())
+
     def test_local_dependency_clones_keep_commits_on_other_local_branches_and_tags(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6459,12 +7558,12 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["detached"]), (1, []))
         self.assertTrue(pushed.exists())
 
-    def nested_catalog(self) -> Path:
+    def nested_catalog(self, *, ref_format: str | None = None) -> Path:
         remote = Path(self.tmp.name) / "deps.git"
         git(Path(self.tmp.name), "init", "--bare", "-q", str(remote))
         deps = Path(self.tmp.name) / "deps"
         deps.mkdir()
-        git(deps, "init", "-q", "-b", "main")
+        git(deps, "init", "-q", "-b", "main", *([f"--ref-format={ref_format}"] if ref_format else []))
         git(deps, "config", "user.email", "t@example.com")
         git(deps, "config", "user.name", "t")
         locale = deps / "locale/de/LC_MESSAGES"
@@ -6514,6 +7613,54 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"], result["detached"]), (0, True, [str(copy.resolve())]))
         self.assertFalse(copy.exists())
 
+    def test_nested_detach_cleans_untracked_bytecode_without_forcing_git(self) -> None:
+        copy = self.nested_catalog()
+        bytecode = copy / "stale.pyc"
+        bytecode.write_bytes(b"fixture bytecode")
+        unknown = copy / "keep.txt"
+        unknown.write_text("keep this file\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, blocked = self.run_main("--detach-nested")
+            self.assertEqual((code, blocked["detached"]), (1, []), blocked)
+            self.assertTrue(bytecode.exists())
+            unknown.unlink()
+            code, removed = self.run_main("--detach-nested")
+
+        self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
+        self.assertFalse(copy.exists())
+
+    def test_nested_bytecode_cleanup_preserves_a_directory_created_at_the_same_path(self) -> None:
+        copy = self.nested_catalog().resolve()
+        bytecode = copy / "stale.pyc"
+        bytecode.write_bytes(b"fixture bytecode")
+        actual_git = rmcheck.git
+        rename = Path.rename
+
+        def replace_bytecode() -> None:
+            bytecode.unlink()
+            bytecode.mkdir()
+            (bytecode / "keep.txt").write_text("keep these new contents\n")
+
+        def replace_before_clean(cwd: str | Path, *args: str,
+                                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == copy and "clean" in args:
+                replace_bytecode()
+            return actual_git(cwd, *args, env=env)
+
+        def replace_before_rename(source: Path, destination: Path) -> Path:
+            if source == bytecode:
+                replace_bytecode()
+            return rename(source, destination)
+
+        with (patch.object(rmcheck, "git", side_effect=replace_before_clean),
+              patch.object(Path, "rename", replace_before_rename),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual([item.read_text() for item in copy.rglob("keep.txt")], ["keep these new contents\n"])
+
     def test_nested_catalog_with_changed_source_blocks_detach(self) -> None:
         copy = self.nested_catalog()
         (copy / "locale/de/LC_MESSAGES/django.po").write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
@@ -6522,6 +7669,672 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"], result["detached"]), (1, False, []))
         self.assertEqual(result["nested_worktrees"][0]["blockers"], ["2 uncommitted changes"])
         self.assertTrue(copy.exists())
+
+    def test_nested_detach_keeps_ignored_data_created_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog()
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("private.sqlite3\n")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        database = copy / "private.sqlite3"
+        clean = rmcheck.clean_nested_bytecode
+
+        def finish_cleanup(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            database.write_bytes(b"keep this database")
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", finish_cleanup),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(database.read_bytes(), b"keep this database")
+
+    def test_nested_detach_keeps_ignored_data_created_during_the_last_ref_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        (deps / ".git/info/exclude").write_text("private.sqlite3\n")
+        created = copy / "locale/de/LC_MESSAGES/private.sqlite3"
+        read_stamps = rmcheck.head_storage_stamps
+        calls = 0
+
+        def create_during_recheck(private: Path, common: Path) -> list[list[int] | None]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                created.write_bytes(b"private data")
+            return read_stamps(private, common)
+
+        for previously_empty in (False, True):
+            with self.subTest(previously_empty=previously_empty):
+                if previously_empty:
+                    created.write_bytes(b"")
+                calls = 0
+                with (patch.object(rmcheck, "head_storage_stamps", side_effect=create_during_recheck),
+                      patch.object(rmcheck, "processes_in", return_value=[])):
+                    code, result = self.run_main("--detach-nested")
+
+                self.assertEqual((code, result["detached"]), (1, []), result)
+                self.assertEqual(created.read_bytes(), b"private data")
+
+    def test_nested_detach_keeps_a_detached_commit_created_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog()
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        clean = rmcheck.clean_nested_bytecode
+
+        def commit_before_removal(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            changed.write_text("preserve unpublished commit\n")
+            git(copy, "add", str(changed))
+            git(copy, "commit", "-qm", "new unpublished commit")
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", commit_before_removal),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "log", "-1", "--format=%s"), "new unpublished commit")
+
+    def test_nested_detach_keeps_a_replacement_moved_in_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        replacement = Path(self.tmp.name) / "replacement"
+        parked = Path(self.tmp.name) / "parked"
+        git(deps, "worktree", "add", "-q", "--detach", str(replacement), "main")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        marker = (replacement / ".git").read_text().split(": ", 1)[1].strip()
+        clean = rmcheck.clean_nested_bytecode
+
+        def replace_before_removal(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            git(deps, "worktree", "move", str(copy), str(parked))
+            git(deps, "worktree", "move", str(replacement), str(copy))
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", replace_before_removal),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "rev-parse", "--absolute-git-dir"), str(Path(marker).resolve()))
+
+    def test_approved_tracked_changes_in_a_nested_worktree_are_restored_before_detaching(self) -> None:
+        copy = self.nested_catalog().resolve()
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (copy / rel).write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
+        name = "local-deps/pushed"
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                     "restore_checkout_heads": {name: rmcheck.checkout_head(copy)}}]))
+        options = ("--from", str(saved), "--restore-nested", name)
+
+        code, result = self.run_main(*options, "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (0, [str(copy)]), result)
+        self.assertIn(rel, result["restored_nested"][name])
+        self.assertFalse(copy.exists())
+        blocked, _ = self.run_main(*options)
+        self.assertEqual(blocked, 1)
+        clear, final = self.run_main(*options, "--detached-restore-repo", name)
+        self.assertEqual(clear, 0, final)
+        copy.mkdir()
+        blocked, recreated = self.run_main(*options, "--detached-restore-repo", name)
+        self.assertEqual(blocked, 1, recreated)
+
+    def test_nested_restore_respects_decomposed_paths_recorded_in_git(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("requires Git's macOS Unicode path normalization")
+        copy = self.nested_catalog()
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(copy, "config", "core.precomposeunicode", "false")
+        rel = "cafe\u0301/inside/gone.txt"
+        path = copy / rel
+        path.parent.mkdir(parents=True)
+        path.write_text("tracked\n")
+        git(copy, "add", rel)
+        git(copy, "commit", "-qm", "store a decomposed path")
+        git(copy, "push", "-q", "origin", "HEAD:main")
+        if not (copy / "caf\u00e9").is_dir():
+            self.skipTest("requires normalization-insensitive file lookup")
+        git(copy, "config", "core.precomposeunicode", "true")
+        path.unlink()
+        path.parent.rmdir()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("Git とディスクのパス表記が異なります", " ".join(result["reasons"]))
+        self.assertFalse(path.exists())
+
+        deps = Path(self.tmp.name) / "deps"
+        git(deps, "worktree", "remove", "--force", str(copy))
+        git(deps, "clone", "-q", "-b", "main", str(Path(self.tmp.name) / "deps.git"), str(copy))
+        git(copy, "config", "core.precomposeunicode", "true")
+        path.unlink()
+        path.parent.rmdir()
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, clone = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, clone["ok"]), (0, True), clone)
+        self.assertEqual(path.read_text(), "tracked\n")
+
+    def test_locked_nested_worktree_refuses_before_restoring_its_files(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        git(deps, "worktree", "lock", str(copy))
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_nested_restore_retains_edits_when_a_lock_appears_before_the_write(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+        matches = rmcheck.NestedRestorePlan.matches
+        calls = 0
+
+        def lock_before_restore(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                git(deps, "worktree", "lock", str(path))
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", lock_before_restore),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_nested_restore_retains_an_edit_made_during_the_final_head_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("approved edit\n")
+        matches = rmcheck.NestedRestorePlan.matches
+        actual_git = rmcheck.git
+        calls = 0
+
+        def save_during_head_check(cwd: str | Path, *args: str,
+                                   env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            result = actual_git(cwd, *args, env=env)
+            if Path(cwd) == copy and args == ("rev-parse", "--verify", "HEAD"):
+                changed.write_text("keep the newer edit\n")
+            return result
+
+        def check_before_restore(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                with patch.object(rmcheck, "git", side_effect=save_during_head_check):
+                    return matches(plan, path)
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", check_before_restore),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep the newer edit\n")
+
+    def test_nested_restore_retains_edits_after_a_soft_reset_during_registration_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (deps / rel).write_text("different committed contents\n")
+        git(deps, "commit", "-qam", "a newer revision")
+        git(deps, "push", "-q", "origin", "main")
+        changed = copy / rel
+        changed.write_text("staged edit\n")
+        git(copy, "add", rel)
+        changed.write_text("unstaged edit\n")
+        check = rmcheck.native_detach_blockers
+        calls = 0
+
+        def reset_while_checking(path: Path) -> list[str]:
+            nonlocal calls
+            blockers = check(path)
+            if path == copy:
+                calls += 1
+                if calls == 3:
+                    git(copy, "reset", "--soft", "origin/main")
+            return blockers
+
+        with (patch.object(rmcheck, "native_detach_blockers", reset_while_checking),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
+        self.assertEqual(changed.read_text(), "unstaged edit\n")
+
+    def test_nested_restore_retains_edits_after_a_soft_reset_since_the_scan(self) -> None:
+        self.check_nested_soft_reset_after_scan()
+
+    def test_nested_reftable_restore_retains_edits_after_a_soft_reset_since_the_scan(self) -> None:
+        help_text = subprocess.run(["git", "init", "-h"], capture_output=True, text=True)
+        if "--ref-format" not in help_text.stdout + help_text.stderr:
+            self.skipTest("Git does not support reftable repositories")
+        self.check_nested_soft_reset_after_scan(ref_format="reftable")
+
+    def check_nested_soft_reset_after_scan(self, *, ref_format: str | None = None) -> None:
+        copy = self.nested_catalog(ref_format=ref_format)
+        deps = Path(self.tmp.name) / "deps"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (deps / rel).write_text("different committed contents\n")
+        git(deps, "commit", "-qam", "a newer revision")
+        git(deps, "push", "-q", "origin", "main")
+        changed = copy / rel
+        changed.write_text("staged edit\n")
+        git(copy, "add", rel)
+        changed.write_text("unstaged edit\n")
+        since = datetime.now(timezone.utc)
+        git(copy, "reset", "--soft", "origin/main")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested",
+                                         "--since", since.isoformat())
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
+        self.assertEqual(changed.read_text(), "unstaged edit\n")
+
+    def test_nested_restore_keeps_an_ignored_file_created_during_registration_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        (deps / ".git/info/exclude").write_text(".env\n")
+        rel = "locale/de/LC_MESSAGES/django.po"
+        changed = copy / rel
+        changed.write_text("keep staged work\n")
+        git(copy, "add", rel)
+        changed.write_text("keep unstaged work\n")
+        check = rmcheck.native_detach_blockers
+        calls = 0
+
+        def save_ignored_file(path: Path) -> list[str]:
+            nonlocal calls
+            blockers = check(path)
+            if path == copy:
+                calls += 1
+                if calls == 3:
+                    (copy / ".env").write_text("KEEP=1\n")
+            return blockers
+
+        with (patch.object(rmcheck, "native_detach_blockers", save_ignored_file),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+        self.assertEqual((copy / ".env").read_text(), "KEEP=1\n")
+
+    def test_nested_restore_refuses_a_replacement_with_mismatched_worktree_registration(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        replacement = Path(self.tmp.name) / "replacement"
+        git(deps, "worktree", "add", "-q", "--detach", str(replacement), "main")
+        copy.rename(Path(self.tmp.name) / "original")
+        replacement.rename(copy)
+        rel = "locale/de/LC_MESSAGES/django.po"
+        changed = copy / rel
+        changed.write_text("staged edit\n")
+        git(copy, "add", rel)
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+        self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
+
+    def test_nested_restore_retains_a_correctly_registered_replacement(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        parked = Path(self.tmp.name) / "parked"
+        replacement = Path(self.tmp.name) / "replacement"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(deps, "worktree", "add", "-q", "--detach", str(replacement), "main")
+        (copy / rel).unlink()
+        (replacement / rel).write_text("keep this staged edit\n")
+        git(replacement, "add", rel)
+        (replacement / rel).unlink()
+        matches = rmcheck.NestedRestorePlan.matches
+        calls = 0
+
+        def replace_before_write(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                git(deps, "worktree", "move", str(copy), str(parked))
+                git(deps, "worktree", "move", str(replacement), str(copy))
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", replace_before_write),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "keep this staged edit")
+        self.assertFalse((copy / rel).exists())
+
+    def test_nested_restore_allows_previously_supported_untracked_bytecode(self) -> None:
+        copy = self.nested_catalog()
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (copy / rel).write_text("approved tracked edit\n")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, preview = self.run_main("--restore-nested", "local-deps/pushed")
+            self.assertEqual(code, 1, preview)
+            self.assertIn(rel, preview["restore_nested"]["local-deps/pushed"])
+            code, removed = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
+        self.assertFalse(copy.exists())
+
+    def test_nested_restore_keeps_a_linked_checkout_with_active_ignore_changes(self) -> None:
+        copy = self.nested_catalog()
+        dependency = Path(self.tmp.name) / "deps"
+        rule = dependency / ".gitignore"
+        rule.write_text("/old-cache/\n")
+        git(dependency, "add", ".gitignore")
+        git(dependency, "commit", "-qm", "track ignore rule")
+        git(dependency, "push", "-q", "origin", "main")
+        git(copy, "restore", ".")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        (copy / ".gitignore").write_text("/scratch_cache/\n")
+        git(copy, "add", ".gitignore")
+        cache = copy / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(copy, "show", ":.gitignore"), "/scratch_cache/")
+
+    def test_locked_parent_worktree_refuses_before_restoring_a_child(self) -> None:
+        copy = self.nested_catalog()
+        git(self.main, "worktree", "lock", str(self.wt))
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_recorded_detach_keeps_a_clean_child_worktree_during_bisect(self) -> None:
+        copy = self.nested_catalog()
+        dependency = Path(self.tmp.name) / "deps"
+        for message in ("bisect middle", "bisect tip"):
+            git(dependency, "commit", "-q", "--allow-empty", "-m", message)
+        git(dependency, "push", "-q", "origin", "main")
+        git(copy, "restore", ".")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        git(copy, "bisect", "start", "--no-checkout", "HEAD", "HEAD~2")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("Git bisect is in progress", " ".join(result["reasons"]))
+        self.assertTrue(copy.is_dir())
+        self.assertIn("refs/bisect/bad", git(copy, "for-each-ref", "--format=%(refname)", "refs/bisect"))
+
+    def test_new_parent_lock_keeps_child_edits_during_the_remote_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        relative = "locale/de/LC_MESSAGES/django.po"
+        changed = copy / relative
+        changed.write_text("keep staged work\n")
+        git(copy, "add", relative)
+        changed.write_text("keep unstaged work\n")
+        probe = rmcheck.on_remote
+        checks = 0
+
+        def lock_parent_during_remote_check(repo: Path, head: str) -> bool:
+            nonlocal checks
+            if repo == copy:
+                checks += 1
+                if checks == 3:
+                    git(self.main, "worktree", "lock", str(self.wt))
+            return probe(repo, head)
+
+        with (patch.object(rmcheck, "on_remote", side_effect=lock_parent_during_remote_check),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("locked", git(self.main, "worktree", "list", "--porcelain"))
+        self.assertEqual(git(copy, "show", f":{relative}"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_new_local_branch_keeps_edits_after_the_last_ref_listing(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        copy = self.wt.resolve() / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        original = git(copy, "rev-parse", "HEAD")
+        git(copy, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-qm", "unpublished")
+        unpublished = git(copy, "rev-parse", "HEAD")
+        git(copy, "reset", "--hard", original)
+        path = copy / "app.txt"
+        path.write_text("keep staged work\n")
+        git(copy, "add", "app.txt")
+        path.write_text("keep unstaged work\n")
+        actual = rmcheck.git
+        listings = 0
+
+        def save_branch_after_last_listing(cwd: str | Path, *args: str,
+                                           env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal listings
+            found = actual(cwd, *args, env=env)
+            if Path(cwd) == copy and args[0] == "for-each-ref":
+                listings += 1
+                if listings == 8:
+                    git(copy, "branch", "rescue", unpublished)
+            return found
+
+        with (patch.object(rmcheck, "git", side_effect=save_branch_after_last_listing),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(copy, "rev-parse", "rescue"), unpublished)
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(path.read_text(), "keep unstaged work\n")
+
+    def test_initialized_nested_submodule_refuses_before_restoring_its_files(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        remote = Path(self.tmp.name) / "submodule.git"
+        git(self.main, "clone", "--bare", "-q", str(self.main), str(remote))
+        git(deps, "-c", "protocol.file.allow=always", "submodule", "add", "-q", "-b", "main", str(remote), "vendor/lib")
+        git(deps, "commit", "-qm", "add tracked submodule")
+        git(deps, "push", "-q", "origin", "main")
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        git(copy, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_restore_approval_preserves_other_nested_worktrees_even_with_the_batch_flag(self) -> None:
+        copy = self.nested_catalog()
+        other = self.wt / "local-deps/other"
+        git(copy, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+        filename = copy / "locale/de/LC_MESSAGES/django.po"
+        filename.write_text("modified catalog\n")
+
+        code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested", "--detach-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertTrue(other.exists())
+        self.assertEqual(filename.read_text(), "modified catalog\n")
+
+    def test_nested_worktree_is_rechecked_after_the_approved_restore(self) -> None:
+        copy = self.nested_catalog()
+        filename = copy / "locale/de/LC_MESSAGES/django.po"
+        filename.write_text("approved change\n")
+        examine = rmcheck.nested_check
+        calls = 0
+
+        def edit_before_detach(path: Path, restore: rmcheck.NestedRestore | None = None) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                filename.write_text("new edit before detach\n")
+            return examine(path, restore)
+
+        with patch.object(rmcheck, "nested_check", side_effect=edit_before_detach):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(filename.read_text(), "new edit before detach\n")
+
+    def test_nested_worktree_is_retained_when_its_head_moves_after_the_restore(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        git(deps, "commit", "-q", "--allow-empty", "-m", "publish same tree")
+        git(deps, "push", "-q", "origin", "main")
+        (copy / "locale/de/LC_MESSAGES/django.po").write_text("approved change\n")
+        name = "local-deps/pushed"
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                     "restore_checkout_heads": {name: rmcheck.checkout_head(copy)}}]))
+        actual_git = rmcheck.git
+        moved = False
+
+        def reset_after_restore(path: str | Path, *args: str,
+                                env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal moved
+            result = actual_git(path, *args, env=env)
+            if Path(path) == copy and "restore" in args and "--staged" in args and not result.returncode:
+                git(copy, "reset", "--soft", "origin/main")
+                moved = True
+            return result
+
+        with (patch.object(rmcheck, "git", side_effect=reset_after_restore),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--from", str(saved), "--restore-nested", name, "--apply-restore-nested")
+
+        self.assertTrue(moved)
+        self.assertEqual(code, 1, result)
+        self.assertTrue(copy.exists())
+
+    def test_nested_detach_preserves_new_files_in_later_worktrees(self) -> None:
+        first = self.nested_catalog().resolve()
+        later = first.with_name("second")
+        git(first, "worktree", "add", "-q", "--detach", str(later), "HEAD")
+        created = later / "new.txt"
+        run = subprocess.run
+
+        def create_after_first(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+            result = run(cmd, **kwargs)
+            if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd and cmd[-1] == str(first) and result.returncode == 0:
+                created.write_text("keep this file\n")
+            return result
+
+        with (patch.object(rmcheck.subprocess, "run", side_effect=create_after_first),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, [str(first)]), result)
+        self.assertIn("local-deps/second", " ".join(result["blockers"]))
+        self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_nested_detach_checks_untracked_files_even_when_git_config_hides_them(self) -> None:
+        copy = self.nested_catalog()
+        git(copy, "config", "status.showUntrackedFiles", "no")
+        created = copy / "private.txt"
+        created.write_text("keep this file\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(created.read_text(), "keep this file\n")
+
+        ignored = copy / "private.sqlite3"
+        created.rename(ignored)
+        (Path(self.tmp.name) / "deps/.git/info/exclude").write_text("private.sqlite3\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(ignored.read_text(), "keep this file\n")
+
+    def test_native_nested_removal_refuses_untracked_files_created_after_the_last_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        git(copy, "config", "status.showUntrackedFiles", "no")
+        created = copy / "private.txt"
+        run = subprocess.run
+
+        def create_before_remove(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git" and "worktree" in cmd and "remove" in cmd and cmd[-1] == str(copy):
+                created.write_text("keep this file\n")
+            return run(cmd, **kwargs)
+
+        with (patch.object(rmcheck.subprocess, "run", side_effect=create_before_remove),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(created.read_text(), "keep this file\n")
+
+    def test_ignored_inventory_failure_stops_approved_detach(self) -> None:
+        copy = self.nested_catalog().resolve()
+        actual_git = rmcheck.git
+
+        def fail_inventory(cwd: str | Path, *args: str,
+                           env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == copy and "--ignored=matching" in args:
+                return subprocess.CompletedProcess(args, 128, "", "cannot read ignored files")
+            return actual_git(cwd, *args, env=env)
+
+        with (patch.object(rmcheck, "git", side_effect=fail_inventory),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("ignored paths could not be checked", " ".join(result["reasons"]))
+        self.assertTrue(copy.exists())
+
+    def test_nested_catalog_written_after_the_scan_stops_approved_detach(self) -> None:
+        copy = self.nested_catalog()
+        catalog = copy / "locale/de/LC_MESSAGES/django.mo"
+        stamp = catalog.stat()
+        since = datetime.now(timezone.utc)
+        catalog.write_bytes(b"updated since the scan")
+        os.utime(catalog, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested",
+                                         "--since", since.isoformat())
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(catalog.read_bytes(), b"updated since the scan")
 
     def test_a_failed_pr_lookup_blocks_with_a_reason(self) -> None:
         real_run = subprocess.run
@@ -6677,8 +8490,36 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("--pr-head", " ".join(with_pr["notes"]))
         self.assertNotIn("origin の参照は", " ".join(fresh.get("notes", [])))
 
+    def recorded_restore(self, argv: tuple[str, ...]) -> tuple[str, ...]:
+        import lead_decisions
+
+        workspace = str(self.wt.resolve())
+        fixture = Path(tempfile.mkdtemp(prefix="recorded-restore-", dir=self.tmp.name))
+        log, saved = fixture / "decisions.jsonl", fixture / "scan.json"
+        names = tuple(argv[index + 1] for index, option in enumerate(argv) if option == "--restore-nested")
+        row = {"path": workspace, "class": "stalled", "agent_ownership_observed": True,
+               "scanned_at": datetime.now(timezone.utc).isoformat()}
+        if "--from" in argv:
+            index = argv.index("--from")
+            rows = json.loads(Path(argv[index + 1]).read_text())
+            row.update(next((saved_row for saved_row in rows if saved_row.get("path") == workspace), {}))
+            argv = (*argv[:index], *argv[index + 2:])
+        if "restore_checkout_heads" not in row:
+            since = argv[argv.index("--since") + 1] if "--since" in argv else row.get("scanned_at")
+            cutoff = datetime.fromisoformat(str(since)).timestamp() if since else None
+            row["restore_checkout_heads"] = {name: rmcheck.snapshot_checkout(self.wt.resolve() / name, cutoff) for name in names}
+        lead_decisions.append(log, lead_decisions.Decision(
+            "approved", f"remove:{workspace}", "削除してよい", "2026-01-01T00:00:00Z",
+            removal=lead_decisions.RemovalTerms(approve=True, restore_nested=names)))
+        [approved] = scan.with_cleanup_constraints([row], fixture / "state.json", log)
+        saved.write_text(json.dumps([approved]))
+        digest = hashlib.sha256(json.dumps(approved["removal_decision"], sort_keys=True).encode()).hexdigest()
+        return (*argv, "--from", str(saved), "--decisions-file", str(log), "--restore-approval", digest)
+
     def run_main(self, *argv: str, notes: FakeWorktreeNotes | None = None,
-                 docker: bool = False) -> tuple[int, dict]:
+                 docker: bool = False, record_approval: bool = True) -> tuple[int, dict]:
+        if record_approval and "--apply-restore-nested" in argv and "--restore-approval" not in argv:
+            argv = self.recorded_restore(argv)
         out = io.StringIO()
         with redirect_stdout(out):
             code = rmcheck.main(["--worktree", str(self.wt), "--base", "main",
@@ -6837,6 +8678,26 @@ class RmCheckTests(unittest.TestCase):
         code, result = self.run_main_without_base()
 
         self.assertEqual((code, result["blockers"]), (0, []))
+
+    def test_final_removal_snapshot_keeps_existing_remote_refs(self) -> None:
+        bare = Path(self.tmp.name) / "remote.git"
+        git(self.main, "clone", "--bare", "-q", str(self.main), str(bare))
+        git(self.main, "remote", "add", "origin", str(bare))
+        original = git(self.main, "rev-parse", "main")
+        git(self.main, "commit", "--allow-empty", "-qm", "new remote tip")
+        git(self.main, "push", "-q", str(bare), "main")
+        git(self.main, "update-ref", "refs/remotes/origin/main", original)
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                     "restore_checkout_heads": {"local-deps/absent": "absent"}}]))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--base", "origin/main", "--from", str(saved),
+                                         "--restore-nested", "local-deps/absent", "--removal-stamps")
+
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["removal_stamps"])
+        self.assertEqual(git(self.wt, "rev-parse", "origin/main"), original)
 
     def test_the_remote_the_branch_started_from_is_fetched_before_judging(self) -> None:
         bare = Path(self.tmp.name) / "upstream.git"

@@ -3227,6 +3227,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                         **({"archive_path": list(answer.removal.archive_path)}
                            if answer.removal and answer.removal.archive_path else {}),
                         **({"approve": True} if answer.removal and answer.removal.approve else {}),
+                        **({"restore_nested": list(answer.removal.restore_nested)}
+                           if answer.removal and answer.removal.restore_nested else {}),
                 }
         removal_at = EPOCH
         if by_key:
@@ -3273,11 +3275,23 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
         if len(candidates) > 1 and selected["allows_removal"]:
             cleanup_terms = {(frozenset(map(PurePosixPath, removal.get("discard") or ())),
                               frozenset(map(PurePosixPath, removal.get("archive_path") or ())),
+                              frozenset(map(PurePosixPath, removal.get("restore_nested") or ())),
                               removal.get("compose_down") is True)
                              for removal in candidates}
             if len(cleanup_terms) > 1:
                 selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
-        row["removal_decision"] = {key: value for key, value in selected.items() if key != "record_id"}
+        if selected["allows_removal"] and selected.get("restore_nested"):
+            key = selected.get("decision")
+            if not isinstance(key, str) or lead_decisions.removal_worktree_path(key) is None:
+                row["cleanup_blockers"].append("--restore-nested の承認は作業場の絶対パスで記録してください")
+                row["closable"] = []
+                selected = {**selected, "allows_removal": False}
+            elif any((answer := decisions.get(removal.get("decision") or "")) is None
+                   or answer.id != removal.get("record_id") for removal in candidates):
+                row["cleanup_blockers"].append("承認ログに現在有効な --restore-nested の承認がありません")
+                selected = {**selected, "allows_removal": False}
+        row["removal_decision"] = {key: value for key, value in selected.items()
+                                   if key != "record_id" or selected.get("restore_nested")}
         if len(candidates) > 1:
             row["removal_candidates"] = candidates
         else:
@@ -3302,7 +3316,8 @@ def removal_answer_approves(decision: Mapping) -> bool:
         return False
     if decision.get("after"):
         return decision.get("after_state") == "MERGED"
-    if decision.get("approve") is True or decision.get("discard") or decision.get("compose_down") or decision.get("archive_path"):
+    if (decision.get("approve") is True or decision.get("discard") or decision.get("compose_down")
+            or decision.get("archive_path") or decision.get("restore_nested")):
         return True
     text = str(decision.get("answer") or "")
     # The preflight itself proves these conditions. Other future conditions still need a new answer.
@@ -4278,6 +4293,8 @@ def batch_has_preview() -> bool:
 def batch_requirement(row: dict) -> str | None:
     if (row.get("removal_decision") or {}).get("archive_path") and "recorded archive_path" not in batch_help():
         return f"{row['path']}: 記録済みの --archive-path に対応した Harness が必要です"
+    if (row.get("removal_decision") or {}).get("restore_nested") and "recorded restore_nested" not in batch_help():
+        return f"{row['path']}: 記録済みの --restore-nested に対応した Harness が必要です"
     if any(char.isspace() for char in row["path"]) and not batch_has_preview():
         return f"{row['path']}: batch checks for paths containing spaces require the harness release with --preview"
     return None
@@ -4305,7 +4322,10 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     environment = row.get("environment")
     from_scan = ["--from", str(scan_file)] if scan_file else []
     options = [*from_scan, "--summary"]
-    plan_cleanup = bool(row.get("open_pr_cleanup") and scan_file and batch_has_preview())
+    restore = (row.get("removal_decision") or {}).get("restore_nested")
+    if restore and (requirement := batch_requirement(row)):
+        return requirement
+    plan_cleanup = bool((row.get("open_pr_cleanup") or restore) and scan_file and batch_has_preview())
     if not remove_ok and not plan_cleanup and not environment:
         return shlex.join([str(RM_CHECK), *options, *decision_options(decisions_file),
                            row["path"], pr_spec(row)])
@@ -4316,9 +4336,11 @@ def rm_check_command(row: dict, scan_file: Path | None = None, *, remove_ok: boo
     if remove_ok:
         if not scan_file:
             return "削除前に承認ログを再検査するため、走査を保存し、--from で指定してください"
-        options.extend(("--detach-nested", "--archive-scratch", "--remove-ok"))
+        options.extend(("--archive-scratch", "--remove-ok"))
     elif plan_cleanup:
-        options.extend(("--preview", "--detach-nested"))
+        options.append("--preview")
+    if (remove_ok or plan_cleanup) and not restore:
+        options.append("--detach-nested")
     try:
         log_options = batch_decision_options(decisions_file, required=remove_ok) if scan_file else []
     except ValueError as error:
@@ -4437,6 +4459,29 @@ def print_row(args: argparse.Namespace, rows: list[dict], key: str) -> int:
     return 0
 
 
+def recorded_restore_checkouts(decisions_file: Path) -> dict[Path, list[int | str] | Literal["absent"] | None]:
+    import lead_decisions
+
+    decisions = lead_decisions.latest(lead_decisions.records(decisions_file))
+    observed: dict[Path, list[int | str] | Literal["absent"] | None] = {}
+    for key, decision in decisions.items():
+        if not key.startswith("remove:") or not decision.removal or not decision.removal.restore_nested:
+            continue
+        root = Path(key.removeprefix("remove:").removeprefix("local::"))
+        if not root.is_absolute():
+            continue
+        try:
+            root = root.resolve()
+        except (OSError, RuntimeError):
+            continue
+        for name in decision.removal.restore_nested:
+            relative = PurePosixPath(name)
+            if relative.parts and not relative.is_absolute() and ".." not in relative.parts:
+                copy = root / relative
+                observed[copy] = rm_check.snapshot_checkout(copy)
+    return observed
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     def constrain(rows: list[dict], known_tabs: Collection[tuple[str | None, str]]) -> list[dict]:
@@ -4486,7 +4531,9 @@ def main(argv: list[str] | None = None) -> int:
         rows = constrain(with_verdicts(rows, verdicts, reload_holds=True), known_tabs)
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
-    scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    scan_started = datetime.now(timezone.utc)
+    scanned_at = scan_started.isoformat(timespec="seconds")
+    original_checkouts = recorded_restore_checkouts(args.decisions_file.expanduser())
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     known_tabs = {(term.get("_environment"), term["handle"]) for term in terminals
                   if term.get("handle") and (term.get("connected") or not term.get("orphaned"))}
@@ -4575,6 +4622,21 @@ def main(argv: list[str] | None = None) -> int:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
     rows = constrain(rows, known_tabs)
+    for row in rows:
+        decision = row.get("removal_decision") or {}
+        if row.get("environment") or not decision.get("allows_removal") or not decision.get("restore_nested"):
+            continue
+        root = Path(row["path"]).resolve()
+        heads = {}
+        for name in decision["restore_nested"]:
+            relative = PurePosixPath(name)
+            copy = root / relative
+            current = (rm_check.snapshot_checkout(copy, scan_started.timestamp())
+                       if relative.parts and not relative.is_absolute() and ".." not in relative.parts else None)
+            if original_checkouts.get(copy) != current:
+                current = None
+            heads[str(relative)] = current
+        row["restore_checkout_heads"] = heads
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)

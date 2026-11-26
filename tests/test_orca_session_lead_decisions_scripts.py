@@ -37,6 +37,11 @@ class LeadDecisionsTests(unittest.TestCase):
         result = self.run_tool("record", "--decision", "remove:/w/clean", "--answer-file", str(answer), "--approve")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIs(json.loads(result.stdout)["removal"]["approve"], True)
+        combined = self.run_tool("record", "--decision", "remove:/w/cleanup", "--answer-file", str(answer),
+                                 "--approve", "--archive-path", ".notes", "--discard", ".env")
+        self.assertEqual(combined.returncode, 0, combined.stderr)
+        terms = json.loads(combined.stdout)["removal"]
+        self.assertEqual((terms["approve"], terms["archive_path"], terms["discard"]), (True, [".notes"], [".env"]))
         archives = {"decision": "remove:/w/notes", "answer": "記録を保管", "archive_path": [".notes", "logs/data"]}
         result = self.run_tool("record-many", stdin=json.dumps(archives) + "\n")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -44,6 +49,20 @@ class LeadDecisionsTests(unittest.TestCase):
         for path in ("../outside", ".git/index", "vendor/clone/.GIT/index"):
             rejected = self.run_tool("record-many", stdin=json.dumps({**archives, "archive_path": [path]}) + "\n")
             self.assertNotEqual(rejected.returncode, 0)
+
+    def test_nested_restore_is_recorded_as_removal_cleanup(self) -> None:
+        answer = self.root / "answer.txt"
+        answer.write_text("閉じる。", encoding="utf-8")
+        command = ("record", "--decision", "remove:/w/cleanup", "--answer-file", str(answer), "--restore-nested")
+        result = self.run_tool(*command, "local-deps/library")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.run_tool("show").stdout)[0]["removal"]["restore_nested"], ["local-deps/library"])
+        for path in ("../outside", "/w/other", "local-deps/library/.git"):
+            self.assertNotEqual(self.run_tool(*command, path).returncode, 0)
+        result = self.run_tool("record", "--decision", "remove:app/cleanup", "--answer-file", str(answer),
+                               "--restore-nested", "local-deps/library")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute path", result.stderr)
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
