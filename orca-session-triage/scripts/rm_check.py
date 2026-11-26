@@ -1152,16 +1152,19 @@ def nested_ignored_blockers(copy: Path, repository: str | None, discard: frozens
     return blockers
 
 
-def worktree_entry_stamps(copy: Path) -> dict[Path, list[int]]:
+def worktree_entry_stamps(copy: Path, *, git_checkouts: set[Path] | None = None) -> dict[Path, list[int]]:
     stamps = {copy: file_stamp(copy)}
     pending = [copy]
     while pending:
         directory = pending.pop()
         with os.scandir(directory) as entries:
             for entry in entries:
-                if entry.name == ".git":
-                    continue
                 path = directory / entry.name
+                if entry.name == ".git":
+                    if git_checkouts is not None:
+                        git_checkouts.add(directory)
+                        stamps[path] = file_stamp(path)
+                    continue
                 info = entry.stat(follow_symlinks=False)
                 stamps[path] = stat_stamp(info)
                 if stat.S_ISDIR(info.st_mode):
@@ -1236,14 +1239,18 @@ def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
 
 
 def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] | None]:
-    stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root))
-    for copy in (root, *sorted(dependencies)):
+    visible: set[Path] = set()
+    stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root, git_checkouts=visible))
+    required = {root, *dependencies}
+    for copy in sorted(visible | required):
         if optional_stamp(copy) is None:
             stamps[copy] = None
             continue
         directories = git_directories(copy)
         if directories is None:
-            raise OSError(f"Git checkout を確認できません（{copy}）")
+            if copy in required:
+                raise OSError(f"Git checkout を確認できません（{copy}）")
+            continue
         private, common = directories
         index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
         if index.returncode:
