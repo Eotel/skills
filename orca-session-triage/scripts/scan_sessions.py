@@ -4587,6 +4587,16 @@ def main(argv: list[str] | None = None) -> int:
         rows = with_automation_workspaces(rows, args.orca)
     rows = with_verdicts(rows, verdicts)
     rows = constrain(rows, known_tabs)
+    for row in rows:
+        decision = row.get("removal_decision") or {}
+        if row.get("environment") or not decision.get("allows_removal") or not decision.get("restore_nested"):
+            continue
+        root = Path(row["path"]).resolve()
+        row["restore_checkout_heads"] = {
+            name: state for name in decision["restore_nested"]
+            if (copy := root / name).is_relative_to(root) and copy.resolve() == copy
+            and (state := rm_check.checkout_head(copy)) is not None
+        }
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)

@@ -712,12 +712,21 @@ class NestedRestore:
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
     moved: set[Path] = field(default_factory=set)
+    expected: dict[Path, list[int | str]] = field(default_factory=dict)
+    observed: dict[Path, list[int | str]] = field(default_factory=dict)
 
     def allows_changes(self, copy: Path, *, allow_bytecode: bool = False) -> bool:
         if copy not in self.requested or copy.resolve() != copy or git_directories(copy) is None:
             return False
         self.found.add(copy)
-        if self.since is not None and latest_head_change(copy) > self.since.timestamp():
+        state = checkout_head(copy)
+        if state is None:
+            self.moved.add(copy)
+            return False
+        self.observed[copy] = state
+        expected = self.expected.get(copy)
+        if ((expected is not None and state != expected)
+                or (expected is None and self.since is not None and latest_head_change(copy) > self.since.timestamp())):
             self.moved.add(copy)
             return False
         head = git(copy, "rev-parse", "--verify", "HEAD")
@@ -883,7 +892,7 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
     status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
     approved = restore is not None and restore.allows_changes(copy)
     if restore and copy in restore.moved:
-        blockers.append("--restore-nested の HEAD が走査後に変わりました")
+        blockers.append("--restore-nested の checkout または HEAD が走査後に変わりました")
     elif status.returncode or (not approved and clone_has_local_changes(copy, status.stdout, entries.stdout)):
         blockers.append("uncommitted changes or git status failed")
     elif restore and copy in restore.plans:
@@ -1141,6 +1150,13 @@ def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
             return marker, str(directories[0]), str(directories[1]), head.stdout.strip()
     except OSError:
         pass
+    return None
+
+
+def checkout_head(copy: Path) -> list[int | str] | None:
+    if state := linked_checkout_state(copy):
+        marker, private, common, head = state
+        return [*marker[:2], private, common, head]
     return None
 
 
@@ -1558,7 +1574,7 @@ def latest_head_change(worktree: Path) -> float:
     return last
 
 
-def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]]) -> list[str]:
+def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]], *, inspect_head: bool = True) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
     moved = []
@@ -1580,8 +1596,7 @@ def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]])
                         % (since.isoformat(timespec="seconds"), len(moved),
                            datetime.fromtimestamp(latest_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
                            latest.relative_to(worktree)))
-    moved_at = latest_head_change(worktree)
-    if moved_at > after:
+    if inspect_head and (moved_at := latest_head_change(worktree)) > after:
         blockers.append("走査（%s）の後に HEAD が動きました（%s）。別の担当が使っているかもしれません"
                         % (since.isoformat(timespec="seconds"),
                            datetime.fromtimestamp(moved_at, timezone.utc).isoformat(timespec="seconds")))
@@ -2415,10 +2430,14 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         print_check({"worktree": worktree, "ok": False, "reasons": blockers, "blockers": blockers}, args.summary)
         return 2
     since = args.since
-    if since is None and args.from_file:
+    saved_heads = {}
+    if args.from_file and (since is None or restore_paths):
         rows = json.loads(args.from_file.read_text(encoding="utf-8"))
-        scanned = [row["scanned_at"] for row in rows if row.get("scanned_at")]
-        since = datetime.fromisoformat(scanned[0]) if scanned else None
+        local_row = next((row for row in rows if row.get("path") == worktree and not row.get("environment")), {})
+        if since is None:
+            scanned = local_row.get("scanned_at") or next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
+            since = datetime.fromisoformat(scanned) if scanned else None
+        saved_heads = local_row.get("restore_checkout_heads") or {}
     if since is not None and since.tzinfo is None:
         since = since.astimezone()
     checkout = args.main or main_checkout(worktree)
@@ -2547,7 +2566,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                       scan_file=args.from_file.expanduser().absolute() if args.from_file else None)
     restore = (NestedRestore(root, {root / path for path in restore_paths},
                              frozenset(root / path for path in discard_paths), since,
-                             frozenset(root / path for path in missing_paths))
+                             frozenset(root / path for path in missing_paths),
+                             expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads})
                if restore_paths else None)
     result = recheck(restore=restore)
 
@@ -2598,26 +2618,35 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
-            linked = {Path(item["path"]): item["repository"] for item in result["nested_worktrees"]}
+            linked = {Path(item["path"]) for item in result["nested_worktrees"]}
             parent_linked = (root / ".git").is_file()
 
             def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
                 if (not plan.matches(copy) or (parent_linked and worktree_registration_blockers(root))
                         or (copy in linked and native_detach_blockers(copy))):
                     return False
-                fresh = NestedRestore(root, {copy}, since=since, already_missing=restore.already_missing)
-                return (fresh.allows_changes(copy, allow_bytecode=copy in linked) and fresh.plans.get(copy) == plan
-                        and not nested_ignored_blockers(copy, linked.get(copy)) and plan.matches(copy))
+                fresh = NestedRestore(root, {copy}, since=since, already_missing=restore.already_missing,
+                                      expected=restore.expected)
+                if copy in linked:
+                    blockers = nested_check(copy, fresh)["blockers"]
+                else:
+                    blockers = clone_check(copy, {}, fresh).blockers
+                return not blockers and fresh.plans.get(copy) == plan and plan.matches(copy)
+
+            def changed_checkouts() -> set[Path]:
+                return {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
 
             with restoration_lock():
                 approval_error = restore_approval_error()
                 if approval_error:
                     decided.append(approval_error)
-                changed = [copy for copy, plan in restore.plans.items() if not restore_matches(copy, plan)]
-                for copy in changed:
+                changed = changed_checkouts()
+                if not changed and not approval_error:
+                    changed = {copy for copy, plan in restore.plans.items() if not restore_matches(copy, plan)}
+                for copy in sorted(changed):
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                    if not restore_matches(copy, approved):
+                    if not restore_matches(copy, approved) or changed_checkouts():
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
@@ -2680,7 +2709,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 current = nested_check(copy)
                 prefix = f"{copy.relative_to(root)}/"
                 written = {name.removeprefix(prefix): stamp for name, stamp in restored.items() if name.startswith(prefix)}
-                movement = moved_since(copy, since, written) if since and restore else []
+                movement = moved_since(copy, since, written, inspect_head=copy not in restore.expected) if since and restore else []
                 if current != item or movement:
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     if movement:
@@ -2697,12 +2726,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     except (OSError, ValueError) as error:
                         detach_error = f"子 worktree {copy.relative_to(root)} のバイトコードを削除できません（{error}）"
                         break
+                if linked_checkout_state(copy) != item["checkout_state"]:
+                    detach_error = f"子 worktree {copy.relative_to(root)} の登録または HEAD が削除直前に変わりました"
+                    break
                 if ignored_blockers := nested_ignored_blockers(copy, item["repository"]):
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     decided.extend(ignored_blockers)
-                    break
-                if linked_checkout_state(copy) != item["checkout_state"]:
-                    detach_error = f"子 worktree {copy.relative_to(root)} の登録または HEAD が削除直前に変わりました"
                     break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:

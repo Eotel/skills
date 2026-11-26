@@ -5667,11 +5667,14 @@ class RmCheckTests(unittest.TestCase):
         note.write_text("keep this record\n")
         fixture = Path(self.tmp.name)
         decisions, saved = fixture / "decisions.jsonl", fixture / "scan.json"
-        row = {"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat()}
+        row = {"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat(),
+               "agent_ownership_observed": True}
         key = f"remove:{root}"
         terms = lead_decisions.RemovalTerms(approve=True, restore_nested=("local-deps/library",), archive_path=(note.name,))
         agreed = "2026-01-01T00:00:00Z"
         lead_decisions.append(decisions, lead_decisions.Decision("approved", key, "削除してよい", agreed, removal=terms))
+        unchanged = fixture / "unchanged.jsonl"
+        unchanged.write_bytes(decisions.read_bytes())
         [approved] = scan.with_cleanup_constraints([dict(row)], fixture / "state.json", decisions)
         digest = hashlib.sha256(json.dumps(approved["removal_decision"], sort_keys=True).encode()).hexdigest()
         saved.write_text(json.dumps([approved]))
@@ -5688,6 +5691,15 @@ class RmCheckTests(unittest.TestCase):
                                              "--archive-dir", str(fixture / "archive"))
                 self.assertEqual((code, result.get("archived")), (1, []), result)
                 self.assertEqual(note.read_text(), "keep this record\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved), "--decisions-file", str(unchanged),
+                                         "--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--restore-approval", digest, "--archive-path", note.name,
+                                         "--archive-dir", str(fixture / "archive"))
+        self.assertEqual(code, 0, result)
+        [archived] = result["archived"]
+        self.assertEqual(Path(archived["to"]).read_text(), "keep this record\n")
 
     def test_named_archive_explains_scratch_without_moving_it_implicitly(self) -> None:
         (self.main / ".git/info/exclude").write_text(".tmp/\n.yomiyasu/\n")
@@ -6591,6 +6603,27 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
         self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_saved_scan_distinguishes_packing_refs_from_moving_a_clone_head(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        name = "local-deps/library"
+        copy = self.wt / name
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = copy / "app.txt"
+        original = changed.read_text()
+        changed.write_text("approved edit\n")
+        snapshot = Path(self.tmp.name) / "scan.json"
+        snapshot.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": datetime.now(timezone.utc).isoformat(),
+                                         "restore_checkout_heads": {name: rmcheck.checkout_head(copy.resolve())}}]))
+        git(copy, "pack-refs", "--all")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(snapshot), "--restore-nested", name, "--apply-restore-nested")
+
+        self.assertEqual(code, 0, result)
+        self.assertEqual(changed.read_text(), original)
 
     def test_restoration_keeps_edits_when_another_approved_clone_moved_since_the_scan(self) -> None:
         git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
