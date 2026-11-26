@@ -1231,6 +1231,10 @@ def head_storage_paths(private: Path, common: Path) -> list[Path]:
     return paths
 
 
+def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
+    return [optional_stamp(path) for path in head_storage_paths(private, common)]
+
+
 def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] | None]:
     stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root))
     for copy in (root, *sorted(dependencies)):
@@ -2908,7 +2912,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 marker, private, common, _ = item["checkout_state"]
                 try:
                     entries = worktree_entry_stamps(copy)
-                    metadata = {path: optional_stamp(path) for path in head_storage_paths(Path(private), Path(common))}
+                    metadata = head_storage_stamps(Path(private), Path(common))
                     if (linked_checkout_state(copy) != item["checkout_state"]
                             or (restore and copy in restore.observed and checkout_head(copy) != restore.observed[copy])):
                         raise ValueError("登録または HEAD が変わりました")
@@ -2920,7 +2924,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     decided.extend(ignored_blockers)
                     break
                 try:
-                    if file_stamp(copy / ".git") != marker or any(optional_stamp(path) != stamp for path, stamp in metadata.items()):
+                    if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
                         raise ValueError("登録または HEAD が変わりました")
                     if any(file_stamp(path) != stamp for path, stamp in entries.items()):
                         raise ValueError("子 worktree のファイルが変わりました")
