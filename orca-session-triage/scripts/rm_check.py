@@ -917,7 +917,10 @@ def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
         return (stamp[0], stamp[1]) if stamp is not None else None
 
     try:
-        sources = reference_paths(excludes_file(copy))
+        directories = git_directories(copy)
+        if directories is None:
+            raise OSError("Git checkout を確認できません")
+        sources = reference_paths(excludes_file(copy)) | reference_paths(directories[1] / "info/exclude")
         source_ids = {value for path in sources if (value := identity(path)) is not None}
         candidates = {name: copy / name for name in plan.files
                       if (copy / name in sources or identity(copy / name) in source_ids
@@ -1205,6 +1208,8 @@ def worktree_registration_blockers(copy: Path) -> list[str]:
         backlink = (private / "gitdir").read_text(errors="surrogateescape").strip()
         if private.parent != common / "worktrees" or (private / backlink).resolve() != copy / ".git":
             return ["Git worktree registration does not point back to this checkout"]
+        if optional_stamp(private / "BISECT_START") is not None:
+            return ["Git bisect is in progress"]
     except (OSError, RuntimeError):
         return ["Git worktree registration could not be checked"]
     worktrees = git(copy, "worktree", "list", "--porcelain", "-z")
@@ -1324,7 +1329,8 @@ def checkout_metadata_stamps(copy: Path, directories: tuple[Path, Path], *,
     if index.returncode:
         raise OSError(f"Git index を確認できません（{copy}）")
     index_path = Path(index.stdout.strip())
-    paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
+    paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"),
+             *reference_paths(common / "info/exclude"),
              common / "config", private / "config.worktree", *ignore_configuration_paths(copy),
              *head_storage_paths(private, common)]
     stamps: dict[Path, list[int] | None] = {}
@@ -2819,6 +2825,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 if (parent := git_directories(root)) is None:
                     raise OSError("親 worktree の登録を確認できません")
                 parent_stamps = checkout_metadata_stamps(root, parent, include_clone_refs=False)
+                ignore_files = {folder / ".gitignore" for copy in restore.requested for folder in copy.parents
+                                if folder.is_relative_to(root)}
+                parent_stamps.update({path: optional_stamp(path) for ignore_file in ignore_files
+                                      for path in reference_paths(ignore_file)})
         except (OSError, RuntimeError) as error:
             decided.append(f"削除前の作業場の状態を記録できません（{error}）")
             recheck = partial(recheck, decided=tuple(decided))
@@ -3054,6 +3064,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         raise ValueError("登録または HEAD が変わりました")
                     if any(file_stamp(path) != stamp for path, stamp in entries.items()):
                         raise ValueError("子 worktree のファイルが変わりました")
+                    if optional_stamp(Path(private) / "BISECT_START") is not None:
+                        raise ValueError("子 worktree で git bisect が進行中です")
                     if not parent_unchanged():
                         raise ValueError("親 worktree の登録が変わりました")
                 except (OSError, ValueError) as error:

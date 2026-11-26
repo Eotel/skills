@@ -7162,6 +7162,69 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(clone, "show", ":.GITIGNORE"), "/scratch_cache/")
         self.assertEqual(target.read_text(), "approved edit\n")
 
+    def test_restore_keeps_a_tracked_ignore_file_linked_from_git_info(self) -> None:
+        (self.main / "Rules").write_text("/old-cache/\n")
+        git(self.main, "add", "Rules")
+        git(self.main, "commit", "-qm", "track exclude rules")
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("/local-deps/\n")
+        exclude = clone / ".git/info/exclude"
+        exclude.unlink()
+        exclude.symlink_to(clone.resolve() / "Rules")
+        (clone / "Rules").write_text("/scratch_cache/\n")
+        git(clone, "add", "Rules")
+        cache = clone / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+        self.assertIn("info/exclude", git(clone, "check-ignore", "-v", "scratch_cache/cache.tmp"))
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(clone, "show", ":Rules"), "/scratch_cache/")
+
+    def test_restore_keeps_edits_if_parent_ignore_changes_after_the_last_match(self) -> None:
+        (self.main / ".gitignore").write_text("/local-deps/\n")
+        git(self.main, "commit", "-qam", "ignore the dependency")
+        git(self.wt, "merge", "--ff-only", "main")
+        root = self.wt.resolve()
+        remote = root.parent / "deps.git"
+        copy = root / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        target = copy / "app.txt"
+        target.write_text("keep staged edit\n")
+        git(copy, "add", "app.txt")
+        target.write_text("keep unstaged edit\n")
+        actual = rmcheck.git
+        checks = 0
+
+        def change_ignore_after_matching(cwd: str | Path, *args: str,
+                                         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal checks
+            found = actual(cwd, *args, env=env)
+            if Path(cwd) == root and args[0] == "check-ignore":
+                checks += 1
+                if checks == 2:
+                    (root / ".gitignore").write_text("")
+            return found
+
+        with (patch.object(rmcheck, "git", side_effect=change_ignore_after_matching),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested",
+                                         "--require-ignored-clones")
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual((root / ".gitignore").read_text(), "")
+        self.assertEqual(git(copy, "show", ":app.txt"), "keep staged edit")
+        self.assertEqual(target.read_text(), "keep unstaged edit\n")
+
     def test_nested_restore_revalidates_every_repository_before_the_first_write(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -8013,6 +8076,24 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_recorded_detach_keeps_a_clean_child_worktree_during_bisect(self) -> None:
+        copy = self.nested_catalog()
+        dependency = Path(self.tmp.name) / "deps"
+        for message in ("bisect middle", "bisect tip"):
+            git(dependency, "commit", "-q", "--allow-empty", "-m", message)
+        git(dependency, "push", "-q", "origin", "main")
+        git(copy, "restore", ".")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        git(copy, "bisect", "start", "--no-checkout", "HEAD", "HEAD~2")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("Git bisect is in progress", " ".join(result["reasons"]))
+        self.assertTrue(copy.is_dir())
+        self.assertIn("refs/bisect/bad", git(copy, "for-each-ref", "--format=%(refname)", "refs/bisect"))
 
     def test_new_parent_lock_keeps_child_edits_during_the_remote_check(self) -> None:
         copy = self.nested_catalog().resolve()
