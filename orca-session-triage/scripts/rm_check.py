@@ -2557,6 +2557,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if since is not None and since.tzinfo is None:
         since = since.astimezone()
     scanned_at = None
+    scan_time_invalid = False
     saved_heads = {}
     if args.from_file and (since is None or restore_paths):
         rows = json.loads(args.from_file.read_text(encoding="utf-8"))
@@ -2565,10 +2566,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         if not scanned and not restore_paths:
             scanned = next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
         if scanned:
-            with suppress(TypeError, ValueError):
+            try:
                 scanned_at = datetime.fromisoformat(scanned)
                 if scanned_at.tzinfo is None:
                     scanned_at = scanned_at.astimezone()
+            except (TypeError, ValueError):
+                scanned_at = None
+                scan_time_invalid = True
         if scanned_at is not None:
             since = scanned_at if since is None else min(since, scanned_at)
         saved_heads = {str(PurePosixPath(name)): state for name, state in
@@ -2654,7 +2658,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
-    if restore_paths and args.from_file and scanned_at is None:
+    if scan_time_invalid:
+        decided.append("保存した走査時刻が不正です。新しい走査を保存して再試行してください")
+    elif restore_paths and args.from_file and scanned_at is None:
         decided.append("--restore-nested の走査時刻を確認できません。新しい走査を保存して再試行してください")
     if args.from_file and (unobserved := {str(path) for path in restore_paths if saved_heads.get(str(path)) is None}):
         decided.append(f"--restore-nested の checkout 情報が走査にありません（{', '.join(sorted(unobserved))}）。"

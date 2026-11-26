@@ -6609,6 +6609,19 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(copy, "show", ":app.txt"), "new staged work")
         self.assertEqual(changed.read_text(), "new unstaged work\n")
 
+    def test_saved_scan_with_an_invalid_time_blocks_ordinary_removal(self) -> None:
+        saved = Path(self.tmp.name) / "scan.json"
+        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": "bad timestamp"}]))
+        changed = self.wt / "app.txt"
+        changed.touch()
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--from", str(saved))
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+
     def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
