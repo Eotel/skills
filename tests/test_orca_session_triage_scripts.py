@@ -6859,6 +6859,23 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"], result["detached"]), (0, True, [str(copy.resolve())]))
         self.assertFalse(copy.exists())
 
+    def test_nested_detach_cleans_untracked_bytecode_without_forcing_git(self) -> None:
+        copy = self.nested_catalog()
+        bytecode = copy / "stale.pyc"
+        bytecode.write_bytes(b"fixture bytecode")
+        unknown = copy / "keep.txt"
+        unknown.write_text("keep this file\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, blocked = self.run_main("--detach-nested")
+            self.assertEqual((code, blocked["detached"]), (1, []), blocked)
+            self.assertTrue(bytecode.exists())
+            unknown.unlink()
+            code, removed = self.run_main("--detach-nested")
+
+        self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
+        self.assertFalse(copy.exists())
+
     def test_nested_catalog_with_changed_source_blocks_detach(self) -> None:
         copy = self.nested_catalog()
         (copy / "locale/de/LC_MESSAGES/django.po").write_text('msgid "hello"\nmsgstr "Guten Tag"\n')

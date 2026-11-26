@@ -1032,6 +1032,22 @@ def linked_restore_alias(copy: Path, paths: Collection[str]) -> str | None:
     return None
 
 
+def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> bool:
+    tracked = git(copy, "ls-files", "--cached", "-z")
+    names = {filename_key(name) for name in tracked.stdout.split("\0")}
+    if tracked.returncode or any(filename_key(name) in names for name in files):
+        return False
+    try:
+        for name, stamp in files.items():
+            path = copy / name
+            if path.parent.resolve() != path.parent or not holds_only_bytecode(path) or file_stamp(path) != stamp:
+                return False
+        return git(copy, "-c", "core.precomposeunicode=false", "--literal-pathspecs", "clean", "-f", "--",
+                   *files).returncode == 0
+    except OSError:
+        return False
+
+
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
@@ -1042,7 +1058,15 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
         blockers.append("HEAD %s is on no remote branch" % head[:8])
     elif git(copy, "rev-parse", "HEAD").stdout.strip() != head:
         blockers.append("HEAD changed during the remote check")
-    tracked_changes, untracked, _ = working_changes(copy, all_untracked=True)
+    tracked_changes, untracked, bytecode = working_changes(copy, all_untracked=True)
+    cached: dict[str, list[int]] = {}
+    listings: dict[Path, dict[str, Path]] = {}
+    try:
+        for name in bytecode:
+            path = disk_path(copy, Path(name), listings)
+            cached[str(path.relative_to(copy))] = file_stamp(path)
+    except OSError:
+        blockers.append("untracked bytecode could not be checked")
     changes = [*tracked_changes, *untracked]
     modified = set(git(copy, "--no-optional-locks", "diff", "HEAD", "--name-only", "--diff-filter=M", "-z").stdout.split("\0"))
     regenerable = [rel for rel in changes if rel.endswith(".mo") and rel in modified
@@ -1066,7 +1090,7 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     if ignored.lock_holders:
         blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
     return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
-            "regenerable": regenerable,
+            "regenerable": regenerable, "untracked_bytecode": cached,
             "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
             "detach": ["git", "-C", repository, "-c", "status.showUntrackedFiles=all", "worktree", "remove", str(copy)]}
 
@@ -2523,6 +2547,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     if applied.returncode or nested_check(copy)["blockers"]:
                         detach_error = f"子 worktree {copy.relative_to(root)} の生成ファイル復元後に削除を確認できません"
                         break
+                if item["untracked_bytecode"] and not clean_nested_bytecode(copy, item["untracked_bytecode"]):
+                    detach_error = f"子 worktree {copy.relative_to(root)} の未追跡バイトコードを確認できません"
+                    break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除できません: {removed.stderr.strip()}"
