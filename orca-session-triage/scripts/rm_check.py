@@ -711,11 +711,15 @@ class NestedRestore:
     already_missing: frozenset[Path] = frozenset()
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
+    moved: set[Path] = field(default_factory=set)
 
     def allows_changes(self, copy: Path, *, allow_bytecode: bool = False) -> bool:
         if copy not in self.requested or copy.resolve() != copy or git_directories(copy) is None:
             return False
         self.found.add(copy)
+        if self.since is not None and latest_head_change(copy) > self.since.timestamp():
+            self.moved.add(copy)
+            return False
         head = git(copy, "rev-parse", "--verify", "HEAD")
         status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
         tracked = git(copy, "ls-tree", "-rz", "HEAD")
@@ -759,8 +763,6 @@ class NestedRestore:
             changes[rel] = stamp
         if changes:
             index_path = Path(index.stdout.strip())
-            if self.since is not None and latest_head_change(copy) > self.since.timestamp():
-                return False
             try:
                 checkout_stamp = file_stamp(copy / ".git")
                 stamp = file_stamp(index_path)
@@ -880,7 +882,9 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("commits absent from origin: none")
     status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
     approved = restore is not None and restore.allows_changes(copy)
-    if status.returncode or (not approved and clone_has_local_changes(copy, status.stdout, entries.stdout)):
+    if restore and copy in restore.moved:
+        blockers.append("--restore-nested の HEAD が走査後に変わりました")
+    elif status.returncode or (not approved and clone_has_local_changes(copy, status.stdout, entries.stdout)):
         blockers.append("uncommitted changes or git status failed")
     elif restore and copy in restore.plans:
         details.append("uncommitted changes: approved for restoration")

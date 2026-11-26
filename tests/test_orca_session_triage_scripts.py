@@ -6571,6 +6571,30 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(copy, "show", ":app.txt"), "keep staged work")
         self.assertEqual(changed.read_text(), "keep unstaged work\n")
 
+    def test_restoration_keeps_edits_when_another_approved_clone_moved_since_the_scan(self) -> None:
+        git(self.main, "commit", "-q", "--allow-empty", "-m", "published baseline")
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        names = ("local-deps/first", "local-deps/second")
+        for name in names:
+            git(self.main, "clone", "-q", str(remote), str(self.wt / name))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        changed = self.wt / names[0] / "app.txt"
+        changed.write_text("keep staged work\n")
+        git(self.wt / names[0], "add", "app.txt")
+        changed.write_text("keep unstaged work\n")
+        since = datetime.now(timezone.utc)
+        git(self.wt / names[1], "reset", "--soft", "HEAD^")
+        self.assertEqual(git(self.wt / names[1], "status", "--porcelain"), "")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", names[0], "--restore-nested", names[1],
+                                         "--apply-restore-nested", "--since", since.isoformat())
+
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(self.wt / names[0], "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
     def test_nested_restore_allows_clones_and_linked_worktrees_in_one_directory(self) -> None:
         linked = self.nested_catalog()
         remote = Path(self.tmp.name) / "deps.git"
