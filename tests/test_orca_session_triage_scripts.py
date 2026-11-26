@@ -6894,6 +6894,82 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(rmcheck.snapshot_checkout(copy.with_name("absent")), rmcheck.CHECKOUT_ABSENT)
         with patch.object(Path, "lstat", side_effect=PermissionError("fixture denied")):
             self.assertIsNone(rmcheck.snapshot_checkout(copy))
+        loop = copy.with_name("loop")
+        loop.symlink_to(loop.name)
+        self.assertIsNone(rmcheck.snapshot_checkout(loop))
+
+    def test_restoration_keeps_target_edits_written_while_checking_a_sibling(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        first, second = (self.wt.resolve() / "local-deps" / name for name in ("first", "second"))
+        for clone in (first, second):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        target = first / "app.txt"
+        target.write_text("approved edit\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/first", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested"))
+        actual = rmcheck.file_stamp
+        actual_matches = rmcheck.NestedRestorePlan.files_match
+        matches = 0
+        saved = False
+
+        def count_target_checks(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal matches
+            if copy == first:
+                matches += 1
+            return actual_matches(plan, copy)
+
+        def edit_target_while_checking_sibling(path: Path) -> list[int]:
+            nonlocal saved
+            if path == second / "app.txt" and matches >= 5 and not saved:
+                target.write_text("new staged edit\n")
+                git(first, "add", "app.txt")
+                target.write_text("new unstaged edit\n")
+                saved = True
+            return actual(path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "files_match", count_target_checks),
+              patch.object(rmcheck, "file_stamp", edit_target_while_checking_sibling),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertTrue(saved)
+        self.assertEqual(code, 1, result)
+        self.assertEqual(git(first, "show", ":app.txt"), "new staged edit")
+        self.assertEqual(target.read_text(), "new unstaged edit\n")
+
+    def test_restoration_keeps_target_edits_if_a_sibling_is_locked_during_preflight(self) -> None:
+        first = self.nested_catalog().resolve()
+        second = first.with_name("second")
+        repository = Path(self.tmp.name) / "deps"
+        git(repository, "worktree", "add", "-q", "--detach", str(second), "main")
+        relative = "locale/de/LC_MESSAGES/django.po"
+        target = first / relative
+        target.write_text("keep staged edit\n")
+        git(first, "add", relative)
+        target.write_text("keep unstaged edit\n")
+        options = self.recorded_restore(("--restore-nested", "local-deps/pushed", "--restore-nested",
+                                         "local-deps/second", "--apply-restore-nested"))
+        actual = rmcheck.NestedRestorePlan.matches
+        matches = 0
+
+        def lock_sibling_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal matches
+            if copy == first:
+                matches += 1
+                if matches == 3:
+                    git(repository, "worktree", "lock", str(second))
+            return actual(plan, copy)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", lock_sibling_during_preflight),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main(*options)
+
+        self.assertEqual(code, 1, result)
+        self.assertIn("locked", git(repository, "worktree", "list", "--porcelain"))
+        self.assertEqual(git(first, "show", f":{relative}"), "keep staged edit")
+        self.assertEqual(target.read_text(), "keep unstaged edit\n")
 
     def test_live_scan_does_not_accept_a_clone_head_that_moves_during_the_scan(self) -> None:
         import lead_decisions

@@ -1169,14 +1169,17 @@ def worktree_entry_stamps(copy: Path) -> dict[Path, list[int]]:
     return stamps
 
 
-def restore_entry_stamps(copy: Path) -> dict[Path, list[int]]:
+def restore_entry_stamps(copy: Path, *, linked: bool = False) -> dict[Path, list[int] | None]:
     stamps = worktree_entry_stamps(copy)
     index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
     if index.returncode:
         raise OSError("Git index を確認できません")
     path = Path(index.stdout.strip())
-    stamps[path] = file_stamp(path)
-    return stamps
+    checkout: dict[Path, list[int] | None] = {**stamps, path: file_stamp(path)}
+    if linked:
+        checkout.update({path.with_name(name): optional_stamp(path.with_name(name))
+                         for name in ("locked", "gitdir", "modules")})
+    return checkout
 
 
 def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
@@ -1212,12 +1215,12 @@ def snapshot_checkout(copy: Path, cutoff: float | None = None) -> list[int | str
         if copy.resolve() == copy and (state := checkout_head(copy)) is not None:
             if cutoff is None or latest_head_change(copy) <= cutoff:
                 return state
-    except OSError:
+    except (OSError, RuntimeError):
         pass
     return None
 
 
-def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
+def head_storage_paths(private: Path, common: Path) -> list[Path]:
     head = private / "HEAD"
     tables = common / "reftable/tables.list"
     paths = [head, private / "logs/HEAD", private / "reftable/tables.list", tables]
@@ -1225,7 +1228,37 @@ def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
     if not tables.is_file() and pointer.startswith("ref: refs/"):
         branch = pointer.removeprefix("ref: ")
         paths.extend((common / branch, common / "logs" / branch, common / "packed-refs"))
-    return [optional_stamp(path) for path in paths]
+    return paths
+
+
+def removal_stamps(root: Path, dependencies: set[Path]) -> dict[str, list[int] | None]:
+    stamps: dict[Path, list[int] | None] = dict(worktree_entry_stamps(root))
+    for copy in (root, *sorted(dependencies)):
+        if optional_stamp(copy) is None:
+            stamps[copy] = None
+            continue
+        directories = git_directories(copy)
+        if directories is None:
+            raise OSError(f"Git checkout を確認できません（{copy}）")
+        private, common = directories
+        index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        if index.returncode:
+            raise OSError(f"Git index を確認できません（{copy}）")
+        index_path = Path(index.stdout.strip())
+        paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
+                 *head_storage_paths(private, common)]
+        if private != common:
+            paths.extend(private / name for name in ("locked", "gitdir", "modules"))
+        elif copy != root:
+            for name in ("refs", "logs", "reftable", "worktrees"):
+                storage = common / name
+                if optional_stamp(storage) is None:
+                    stamps[storage] = None
+                else:
+                    stamps.update(worktree_entry_stamps(storage))
+            paths.extend(common / name for name in ("packed-refs", "modules", "config"))
+        stamps.update({path: optional_stamp(path) for path in paths})
+    return {str(path): stamp for path, stamp in stamps.items()}
 
 
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
@@ -2412,6 +2445,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--missing-restore-file", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--detached-restore-repo", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--restored-file-stamps", type=json.loads, default={}, help=argparse.SUPPRESS)
+    parser.add_argument("--removal-stamps", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
                              "records under .claude/reviews/) to the same place in main, confirmed with cmp; then "
@@ -2468,6 +2502,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
     if args.apply_restore_nested and (not restore_paths or not args.restore_approval):
         parser.error("--apply-restore-nested needs saved restoration approval; use rm-check-batch --from SCAN_JSON --remove-ok")
+    if args.removal_stamps and (not restore_paths or not args.from_file
+                                or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
+        parser.error("--removal-stamps requires a read-only check of recorded restoration")
     if args.restore_approval and (not args.apply_restore_nested or not args.from_file
                                   or not re.fullmatch(r"[0-9a-f]{64}", args.restore_approval)):
         parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
@@ -2660,6 +2697,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads},
                              detached=frozenset(root / path for path in detached_paths))
                if restore_paths else None)
+    checked_stamps = None
+    if args.removal_stamps and restore is not None:
+        try:
+            checked_stamps = removal_stamps(root, restore.requested)
+        except (OSError, RuntimeError) as error:
+            decided.append(f"削除前の作業場の状態を記録できません（{error}）")
+            recheck = partial(recheck, decided=tuple(decided))
     result = recheck(restore=restore)
 
     def movable_now(result: dict) -> tuple[str, ...]:
@@ -2750,11 +2794,11 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 if approval_error:
                     decided.append(approval_error)
                 changed = changed_checkouts(restore)
-                pending: dict[Path, dict[Path, list[int]]] = {}
+                pending: dict[Path, dict[Path, list[int] | None]] = {}
                 if not changed and not approval_error:
                     for copy in restore.observed:
                         try:
-                            pending[copy] = restore_entry_stamps(copy)
+                            pending[copy] = restore_entry_stamps(copy, linked=copy in linked)
                         except OSError:
                             changed.add(copy)
                 if not changed and not approval_error:
@@ -2765,8 +2809,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
                     try:
                         ready = (restore_matches(copy, approved) and not changed_checkouts(restore) and approved.files_match(copy)
-                                 and all(file_stamp(path) == stamp for entries in pending.values() for path, stamp in entries.items())
-                                 and not changed_absent_checkouts(restore))
+                                 and all(optional_stamp(path) == stamp for sibling, entries in pending.items()
+                                         if sibling != copy for path, stamp in entries.items())
+                                 and not changed_absent_checkouts(restore)
+                                 and all(optional_stamp(path) == stamp for path, stamp in pending[copy].items()))
                     except OSError:
                         ready = False
                     if not ready:
@@ -2862,7 +2908,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 marker, private, common, _ = item["checkout_state"]
                 try:
                     entries = worktree_entry_stamps(copy)
-                    metadata = head_storage_stamps(Path(private), Path(common))
+                    metadata = {path: optional_stamp(path) for path in head_storage_paths(Path(private), Path(common))}
                     if (linked_checkout_state(copy) != item["checkout_state"]
                             or (restore and copy in restore.observed and checkout_head(copy) != restore.observed[copy])):
                         raise ValueError("登録または HEAD が変わりました")
@@ -2874,7 +2920,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     decided.extend(ignored_blockers)
                     break
                 try:
-                    if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
+                    if file_stamp(copy / ".git") != marker or any(optional_stamp(path) != stamp for path, stamp in metadata.items()):
                         raise ValueError("登録または HEAD が変わりました")
                     if any(file_stamp(path) != stamp for path, stamp in entries.items()):
                         raise ValueError("子 worktree のファイルが変わりました")
@@ -2980,6 +3026,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                                          or (root / rel).is_symlink()}
     if notes:
         result["notes"] = notes
+    if checked_stamps is not None and result["ok"]:
+        result["removal_stamps"] = checked_stamps
     if automation_blockers:
         result["automation_blocker"] = "; ".join(automation_blockers)
     print_check({"worktree": worktree, "main": main, "base": base, "ok": result["ok"], "reasons": reasons(result),
