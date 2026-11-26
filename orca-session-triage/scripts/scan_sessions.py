@@ -3280,6 +3280,11 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                              for removal in candidates}
             if len(cleanup_terms) > 1:
                 selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
+        if selected["allows_removal"] and selected.get("restore_nested"):
+            if any((answer := decisions.get(removal.get("decision") or "")) is None
+                   or answer.id != removal.get("record_id") for removal in candidates):
+                row["cleanup_blockers"].append("承認ログに現在有効な --restore-nested の承認がありません")
+                selected = {**selected, "allows_removal": False}
         row["removal_decision"] = {key: value for key, value in selected.items()
                                    if key != "record_id" or selected.get("restore_nested")}
         if len(candidates) > 1:
@@ -4498,7 +4503,8 @@ def main(argv: list[str] | None = None) -> int:
         rows = constrain(with_verdicts(rows, verdicts, reload_holds=True), known_tabs)
         return print_rows(args, rows, verdicts)
     # close_tabs.py keeps a tab whose worktree moved after this moment.
-    scanned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    scan_started = datetime.now(timezone.utc)
+    scanned_at = scan_started.isoformat(timespec="seconds")
     worktrees, terminals = collect_worktrees_and_terminals(args.orca, args.ps_json, args.terminals_json)
     known_tabs = {(term.get("_environment"), term["handle"]) for term in terminals
                   if term.get("handle") and (term.get("connected") or not term.get("orphaned"))}
@@ -4592,11 +4598,16 @@ def main(argv: list[str] | None = None) -> int:
         if row.get("environment") or not decision.get("allows_removal") or not decision.get("restore_nested"):
             continue
         root = Path(row["path"]).resolve()
-        row["restore_checkout_heads"] = {
-            str(PurePosixPath(name)): state for name in decision["restore_nested"]
-            if (copy := root / name).is_relative_to(root) and copy.resolve() == copy
-            and (state := rm_check.checkout_head(copy)) is not None
-        }
+        heads = {}
+        for name in decision["restore_nested"]:
+            copy = root / name
+            if not copy.is_relative_to(root) or copy.resolve() != copy or not copy.exists():
+                continue
+            state = rm_check.checkout_head(copy)
+            if state is not None and rm_check.latest_head_change(copy) > scan_started.timestamp():
+                state = None
+            heads[str(PurePosixPath(name))] = state
+        row["restore_checkout_heads"] = heads
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
     return print_rows(args, rows, verdicts)

@@ -717,8 +717,10 @@ class NestedRestore:
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
     moved: set[Path] = field(default_factory=set)
-    expected: dict[Path, list[int | str]] = field(default_factory=dict)
+    expected: dict[Path, list[int | str] | None] = field(default_factory=dict)
     observed: dict[Path, list[int | str]] = field(default_factory=dict)
+    clone_refs: dict[Path, list[tuple[str, str]]] = field(default_factory=dict)
+    detached: frozenset[Path] = frozenset()
 
     def allows_changes(self, copy: Path, *, allow_bytecode: bool = False) -> bool:
         if copy not in self.requested or copy.resolve() != copy or git_directories(copy) is None:
@@ -730,8 +732,8 @@ class NestedRestore:
             return False
         self.observed[copy] = state
         expected = self.expected.get(copy)
-        if ((expected is not None and state != expected)
-                or (expected is None and self.since is not None and latest_head_change(copy) > self.since.timestamp())):
+        if ((copy in self.expected and state != expected)
+                or (copy not in self.expected and self.since is not None and latest_head_change(copy) > self.since.timestamp())):
             self.moved.add(copy)
             return False
         head = git(copy, "rev-parse", "--verify", "HEAD")
@@ -904,8 +906,11 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("uncommitted changes: approved for restoration")
     else:
         details.append("uncommitted changes: none")
-    if tips is not None and clone_tips(copy) != tips:
-        blockers.append("HEAD, local branches or tags changed during the check")
+    if tips is not None:
+        if clone_tips(copy) != tips:
+            blockers.append("HEAD, local branches or tags changed during the check")
+        elif restore and copy in restore.requested:
+            restore.clone_refs[copy] = tips
     result = CloneResult(blockers, [*details, *blockers])
     checked[copy] = result
     return result
@@ -1144,6 +1149,18 @@ def nested_ignored_blockers(copy: Path, repository: str | None, discard: frozens
     if ignored.lock_holders:
         blockers.append("%s is held by running PID %s" % (SCHEDULED_LOCK, ", ".join(map(str, ignored.lock_holders))))
     return blockers
+
+
+def worktree_directory_stamps(copy: Path) -> dict[Path, list[int]]:
+    stamps = {}
+    pending = [copy]
+    while pending:
+        directory = pending.pop()
+        stamps[directory] = file_stamp(directory)
+        with os.scandir(directory) as entries:
+            pending.extend(directory / entry.name for entry in entries
+                           if entry.name != ".git" and entry.is_dir(follow_symlinks=False))
+    return stamps
 
 
 def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
@@ -1729,9 +1746,11 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
                             + ("。handle を読めないタブの PID %s は orca terminal list --worktree path:%s --json "
                                "で探してください" % (", ".join(unknown), worktree) if unknown else ""))
     if restore:
-        missing = restore.requested - restore.found
+        missing = restore.requested - restore.found - restore.detached
         blockers.extend(f"--restore-nested の {copy.relative_to(restore.root)} を入れ子の Git リポジトリとして確認できません"
-                        for copy in sorted(missing) if copy.exists() or copy.is_symlink())
+                        for copy in sorted(missing) if copy in restore.expected or copy.exists() or copy.is_symlink())
+        blockers.extend(f"削除した子 worktree {copy.relative_to(restore.root)} にファイルが再作成されました"
+                        for copy in sorted(restore.detached) if copy.exists() or copy.is_symlink())
     if since is not None:
         blockers.extend(moved_since(Path(worktree), since, restored or {}))
     return {"ok": not blockers and not review, "blockers": blockers, "uncommitted": changes, "review": review,
@@ -2358,6 +2377,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         help="when planning --restore-nested, a file the batch will discard first")
     parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
     parser.add_argument("--missing-restore-file", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--detached-restore-repo", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument("--restored-file-stamps", type=json.loads, default={}, help=argparse.SUPPRESS)
     parser.add_argument("--archive-scratch", action="store_true",
                         help="first copy each file to review that the main checkout also ignores and lacks (new "
@@ -2409,6 +2429,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     restore_paths = [PurePosixPath(rel) for rel in args.restore_nested]
     discard_paths = [PurePosixPath(rel) for rel in args.discard_before_restore]
     missing_paths = [PurePosixPath(rel) for rel in args.missing_restore_file]
+    detached_paths = {PurePosixPath(rel) for rel in args.detached_restore_repo}
     if any(path.is_absolute() or not path.parts or ".." in path.parts
            or any(part.casefold() == ".git" for part in path.parts) for path in (*restore_paths, *discard_paths, *missing_paths)):
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
@@ -2419,6 +2440,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
     if missing_paths and not args.restore_approval:
         parser.error("--missing-restore-file needs --restore-approval")
+    if detached_paths and (not args.from_file or not detached_paths.issubset(restore_paths)
+                           or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
+        parser.error("--detached-restore-repo is only for rechecking approved repositories detached by the batch")
     if discard_paths and (not restore_paths or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
         parser.error("--discard-before-restore can only be used to plan --restore-nested")
     restored = args.restored_file_stamps
@@ -2587,7 +2611,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     restore = (NestedRestore(root, {root / path for path in restore_paths},
                              frozenset(root / path for path in discard_paths), since,
                              frozenset(root / path for path in missing_paths),
-                             expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads})
+                             expected={root / path: saved_heads[str(path)] for path in restore_paths if str(path) in saved_heads},
+                             detached=frozenset(root / path for path in detached_paths))
                if restore_paths else None)
     result = recheck(restore=restore)
 
@@ -2631,6 +2656,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
             return lead_decisions.decision_lock(args.decisions_file.expanduser())
         return nullcontext()
 
+    def changed_checkouts(restore: NestedRestore) -> set[Path]:
+        checkout_changes = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
+        return checkout_changes | {copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs}
+
     restored_nested: dict[str, list[str]] = {}
     if restore and restore.plans:
         detach = may_detach(result["nested_worktrees"])
@@ -2653,20 +2682,17 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     blockers = clone_check(copy, {}, fresh).blockers
                 return not blockers and fresh.plans.get(copy) == plan and (plan is None or plan.matches(copy))
 
-            def changed_checkouts() -> set[Path]:
-                return {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
-
             with restoration_lock():
                 approval_error = restore_approval_error()
                 if approval_error:
                     decided.append(approval_error)
-                changed = changed_checkouts()
+                changed = changed_checkouts(restore)
                 if not changed and not approval_error:
                     changed = {copy for copy in restore.observed if not restore_matches(copy, restore.plans.get(copy))}
                 for copy in sorted(changed):
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                    if not restore_matches(copy, approved) or changed_checkouts() or not approved.files_match(copy):
+                    if not restore_matches(copy, approved) or changed_checkouts(restore) or not approved.files_match(copy):
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
@@ -2685,6 +2711,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         break
                     restored_nested[str(copy.relative_to(root))] = paths
                     notes.append(f"後始末: {copy.relative_to(root)} の追跡済みファイル {len(paths)} 件を復元")
+                if restored_nested:
+                    for copy in sorted(changed_checkouts(restore)):
+                        decided.append(f"--restore-nested の {copy.relative_to(root)} が復元後に変わりました")
             recheck = partial(recheck, decided=tuple(decided))
             result = recheck()
         else:
@@ -2698,9 +2727,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     copied = []
     # Nothing is written to main while anything else keeps the worktree.
     if args.archive_scratch and holds_only_records(result, movable):
-        copied = copy_to_main(Path(worktree), Path(main), result["review"])
-        if copied:
-            result = recheck()
+        with restoration_lock():
+            if approval_error := restore_approval_error():
+                decided.append(approval_error)
+                recheck = partial(recheck, decided=tuple(decided))
+                result = recheck(restore=restore)
+            else:
+                copied = copy_to_main(Path(worktree), Path(main), result["review"])
+                if copied:
+                    result = recheck()
     if may_detach(result["nested_worktrees"]):
         nested = result["nested_worktrees"]
         # Copies leave only a worktree that goes: one kept for other blockers keeps its dependencies.
@@ -2748,8 +2783,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         break
                 marker, private, common, _ = item["checkout_state"]
                 try:
+                    directories = worktree_directory_stamps(copy)
                     metadata = head_storage_stamps(Path(private), Path(common))
-                    if linked_checkout_state(copy) != item["checkout_state"]:
+                    if (linked_checkout_state(copy) != item["checkout_state"]
+                            or (restore and copy in restore.observed and checkout_head(copy) != restore.observed[copy])):
                         raise ValueError("登録または HEAD が変わりました")
                 except (OSError, ValueError) as error:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
@@ -2761,6 +2798,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 try:
                     if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
                         raise ValueError("登録または HEAD が変わりました")
+                    if any(file_stamp(path) != stamp for path, stamp in directories.items()):
+                        raise ValueError("子 worktree のディレクトリが変わりました")
                 except (OSError, ValueError) as error:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
                     break

@@ -68,6 +68,8 @@ Name each nested repository separately with `--restore-nested`, for example `--r
 Standalone clones must be directly under `local-deps/`.
 It restores index and working-tree changes to files in that repository's HEAD. Use `--discard PATH` for individual
 untracked files the answer authorizes. A remaining untracked file, stash, or unpublished commit can still block cleanup.
+Use the same decision log for the scan and the batch. If the log lacks the current restoration approval or a repository
+recorded by the scan disappears or changes checkout, resolve the discrepancy and save a fresh scan.
 If an answer has no structured values,
 the scan reads its text. For a short closure instruction such as `閉じる。` or `close it`, it prints a command to
 record an explicit approval. A live summary asks for a saved scan before displaying a removal command.
