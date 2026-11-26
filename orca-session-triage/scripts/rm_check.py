@@ -829,7 +829,7 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
 
 
 def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
-    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
+    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags", "refs/stash")
     head = git(copy, "rev-parse", "--verify", "HEAD")
     if local.returncode or head.returncode:
         return None
@@ -1118,7 +1118,7 @@ def native_detach_blockers(copy: Path) -> list[str]:
     return blockers
 
 
-def nested_ignored_blockers(copy: Path, repository: str, discard: frozenset[Path] = frozenset()) -> list[str]:
+def nested_ignored_blockers(copy: Path, repository: str | None, discard: frozenset[Path] = frozenset()) -> list[str]:
     ignored = ignored_paths(copy, repository, discard=discard)
     blockers = [ignored.error] if ignored.error else []
     if ignored.review or ignored.nested:
@@ -1540,11 +1540,17 @@ def latest_head_change(worktree: Path) -> float:
     moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
     stamp = re.search(r"@\{(\d+)\}", moves)
     last = float(stamp.group(1)) if stamp else float(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
-    paths = git(worktree, "rev-parse", "--path-format=absolute", "--git-path", "HEAD", "--git-path", "logs/HEAD")
-    if paths.returncode == 0:
-        for path in paths.stdout.splitlines():
+    if directories := git_directories(worktree):
+        private, common = directories
+        paths = [private / "HEAD", private / "logs/HEAD", private / "reftable/tables.list"]
+        branch = git(worktree, "symbolic-ref", "-q", "HEAD").stdout.strip()
+        if branch.startswith("refs/"):
+            paths.extend((common / branch, common / "logs" / branch, common / "reftable/tables.list"))
+            if not (common / branch).exists():
+                paths.append(common / "packed-refs")
+        for path in paths:
             with suppress(OSError):
-                last = max(last, max(file_stamp(Path(path))[3:]) / 1e9)
+                last = max(last, max(file_stamp(path)[3:]) / 1e9)
     return last
 
 
@@ -1914,23 +1920,30 @@ def untracked_exec_plans(worktree: Path, base: str | None, pr: dict | None) -> t
 
 def named_archive_path(worktree: Path, requested: PurePosixPath) -> Path:
     source = worktree
+    listings: dict[Path, dict[str, Path]] = {}
     for part in requested.parts:
         if source.is_symlink() or (source != worktree and (
                 (source / ".git").exists() or (source / "HEAD").is_file() and (source / "objects").is_dir())):
             raise ValueError("symlink または別の Git リポジトリの内側です")
-        candidate = source / part
-        if not (candidate.exists() or candidate.is_symlink()):
-            raise ValueError("パスがありません")
-        for entry in source.iterdir():
-            if entry.name != part and entry.name.casefold() == part.casefold() and entry.samefile(candidate):
-                candidate = entry
-                break
-        source = candidate
-    rel = source.relative_to(worktree).as_posix()
-    tracked = [git(worktree, "--literal-pathspecs", "ls-files", "-z", "--", rel),
-               git(worktree, "--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", rel)]
-    if any(item.returncode or item.stdout for item in tracked):
+        try:
+            source = disk_entry(source, part, listings)
+        except FileNotFoundError as error:
+            raise ValueError("パスがありません") from error
+    rel = source.relative_to(worktree)
+    tracked = [git(worktree, "ls-files", "--cached", "-z"), git(worktree, "ls-tree", "-rz", "--name-only", "HEAD")]
+    if any(item.returncode for item in tracked):
         raise ValueError("追跡済みのファイルがあるか、確認できません")
+    stamp = source.lstat()
+    key = filename_key(str(rel))
+    for item in tracked:
+        for name in filter(None, item.stdout.split("\0")):
+            prefix = Path(*Path(name).parts[:len(rel.parts)])
+            if prefix == rel:
+                raise ValueError("追跡済みのファイルがあるか、確認できません")
+            if filename_key(str(prefix)) == key:
+                with suppress(FileNotFoundError):
+                    if os.path.samestat((worktree / prefix).lstat(), stamp):
+                        raise ValueError("追跡済みのファイルがあるか、確認できません")
     if source.is_dir() and not source.is_symlink():
         for folder, children, files in os.walk(source):
             if ".git" in {name.casefold() for name in (*children, *files)} or (
@@ -1954,7 +1967,11 @@ def archive_movers(worktree: Path, result: dict, movable: tuple[str, ...], *,
     # Only what is on disk moves: a deleted tracked file named here keeps the worktree as a change.
     present = [named for named in movable if (worktree / named).exists() or (worktree / named).is_symlink()]
     movers = set(explicit).intersection(present)
+    listings: dict[Path, dict[str, Path]] = {}
     for rel in paths:
+        if explicit:
+            with suppress(OSError):
+                rel = disk_path(worktree, Path(rel), listings).relative_to(worktree).as_posix()
         found = {named for named in present if within(rel, named)}
         holder = worktree / rel
         if not found and holder.is_dir() and not holder.is_symlink() and all(
@@ -2055,7 +2072,8 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def archive(source: Path, target: Path, worktree: Path, *, restore_approval: str | None = None) -> dict:
+def archive(source: Path, target: Path, worktree: Path, *, restore_approval: str | None = None,
+            recorded_paths: dict[str, Path] | None = None) -> dict:
     """Copy `source` to `target`, compare every file, record the move in the archive's manifest, then delete
     `source`. A copy that fails or differs is deleted and `source` stays, so nothing is lost on the way."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2075,6 +2093,8 @@ def archive(source: Path, target: Path, worktree: Path, *, restore_approval: str
              "files": len(files_in(source))}
     if restore_approval:
         entry["restore_approval"] = restore_approval
+        entry["recorded_paths"] = {name: str(path.relative_to(source)) for name, path in (recorded_paths or {}).items()
+                                   if path.is_relative_to(source)}
     with (target.parent / ARCHIVE_MANIFEST).open("a", encoding="utf-8") as manifest:
         manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
     remove_path(source)
@@ -2537,7 +2557,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         return bool(args.apply_restore_nested and nested
                     and all(Path(item["path"]) in restore.requested for item in nested))
 
+    approved_archives: list[str] = []
+
     def restore_approval_error() -> str | None:
+        nonlocal approved_archives
         if not args.restore_approval:
             return None
         command = [sys.executable, str(Path(__file__).with_name("scan_sessions.py")),
@@ -2549,8 +2572,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 row = rows[0]
                 decision = row.get("removal_decision") or {}
                 digest = sha256(json.dumps(decision, sort_keys=True).encode()).hexdigest()
-                if (decision.get("allows_removal") is True and digest == args.restore_approval
+                if (decision.get("allows_removal") is True and decision.get("record_id") and digest == args.restore_approval
                         and not any(row.get(key) for key in ("cleanup_blockers", "automation_blocker", "pending_handoffs"))):
+                    approved_archives = decision.get("archive_path") or []
                     return None
         except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError):
             return "--restore-nested の削除承認を復元直前に確認できません"
@@ -2568,22 +2592,22 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
-            linked = {Path(item["path"]) for item in result["nested_worktrees"]}
+            linked = {Path(item["path"]): item["repository"] for item in result["nested_worktrees"]}
             parent_linked = (root / ".git").is_file()
 
             def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
-                return (plan.matches(copy) and (not parent_linked or not worktree_registration_blockers(root))
-                        and (copy not in linked or not native_detach_blockers(copy)) and plan.matches(copy))
+                if (not plan.matches(copy) or (parent_linked and worktree_registration_blockers(root))
+                        or (copy in linked and native_detach_blockers(copy))):
+                    return False
+                fresh = NestedRestore(root, {copy}, since=since, already_missing=restore.already_missing)
+                return (fresh.allows_changes(copy, allow_bytecode=copy in linked) and fresh.plans.get(copy) == plan
+                        and not nested_ignored_blockers(copy, linked.get(copy)) and plan.matches(copy))
 
-            latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
-            for copy in restore.plans:
-                latest.allows_changes(copy, allow_bytecode=copy in linked)
             with restoration_lock():
                 approval_error = restore_approval_error()
                 if approval_error:
                     decided.append(approval_error)
-                changed = [copy for copy, plan in restore.plans.items()
-                           if latest.plans.get(copy) != plan or not restore_matches(copy, plan)]
+                changed = [copy for copy, plan in restore.plans.items() if not restore_matches(copy, plan)]
                 for copy in changed:
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
@@ -2690,9 +2714,23 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["detached"] = detached
     if movable:
         day = datetime.now().strftime("%Y%m%d")
-        archived = [archive(source, archive_target(args.archive_dir, root, source, day), root,
-                            restore_approval=args.restore_approval)
-                    for source in archive_movers(root, result, movable_now(result), explicit=explicit)]
+        moves = archive_movers(root, result, movable_now(result), explicit=explicit)
+        archived: list[dict] = []
+        if moves:
+            with restoration_lock():
+                if approval_error := restore_approval_error():
+                    decided.append(approval_error)
+                    recheck = partial(recheck, decided=tuple(decided))
+                    result = recheck()
+                else:
+                    recorded_paths = {}
+                    for name in approved_archives:
+                        path = PurePosixPath(name)
+                        with suppress(OSError, ValueError):
+                            recorded_paths[str(path)] = named_archive_path(root, path)
+                    archived = [archive(source, archive_target(args.archive_dir, root, source, day), root,
+                                        restore_approval=args.restore_approval, recorded_paths=recorded_paths)
+                                for source in moves]
         if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
             result = {**recheck(), **kept}

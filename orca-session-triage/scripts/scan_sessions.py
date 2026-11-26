@@ -3280,7 +3280,8 @@ def with_cleanup_constraints(rows: list[dict], state_file: Path, decisions_file:
                              for removal in candidates}
             if len(cleanup_terms) > 1:
                 selected = {**selected, "allows_removal": False, "cleanup_conflict": True}
-        row["removal_decision"] = {key: value for key, value in selected.items() if key != "record_id"}
+        row["removal_decision"] = {key: value for key, value in selected.items()
+                                   if key != "record_id" or selected.get("restore_nested")}
         if len(candidates) > 1:
             row["removal_candidates"] = candidates
         else:

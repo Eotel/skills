@@ -65,6 +65,7 @@ check already passes without it. Tracked files and paths inside a symlinked dire
 on the worktree's Mac.
 Use `--approve` for an explicit approval without a PR condition. It can accompany cleanup options.
 Name each nested repository separately with `--restore-nested`, for example `--restore-nested local-deps/library`.
+Standalone clones must be directly under `local-deps/`.
 It restores index and working-tree changes to files in that repository's HEAD. Use `--discard PATH` for individual
 untracked files the answer authorizes. A remaining untracked file, stash, or unpublished commit can still block cleanup.
 If an answer has no structured values,
