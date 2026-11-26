@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Collection, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 import filecmp
@@ -14,7 +14,7 @@ from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
-from tempfile import TemporaryFile
+from tempfile import mkdtemp, TemporaryFile
 import posixpath
 import re
 import shlex
@@ -1029,20 +1029,42 @@ def linked_restore_alias(copy: Path, paths: Collection[str]) -> str | None:
     return None
 
 
-def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> bool:
+def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> None:
     tracked = git(copy, "ls-files", "--cached", "-z")
     names = {filename_key(name) for name in tracked.stdout.split("\0")}
     if tracked.returncode or any(filename_key(name) in names for name in files):
-        return False
+        raise ValueError("バイトコードが未追跡であることを確認できません")
+    staging = Path(mkdtemp(prefix="rm-check-bytecode-", dir=copy))
+    verified = []
     try:
-        for name, stamp in files.items():
+        for number, (name, stamp) in enumerate(files.items()):
             path = copy / name
-            if path.parent.resolve() != path.parent or not holds_only_bytecode(path) or file_stamp(path) != stamp:
-                return False
-        return git(copy, "-c", "core.precomposeunicode=false", "--literal-pathspecs", "clean", "-f", "--",
-                   *files).returncode == 0
-    except OSError:
-        return False
+            if path.parent.resolve() != path.parent:
+                raise ValueError(f"{name} の親ディレクトリが変わりました")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                original = os.fstat(stream.fileno())
+                if not stat.S_ISREG(original.st_mode) or stat_stamp(original) != stamp:
+                    raise ValueError(f"{name} が検査後に変わりました")
+                digest = file_digest(stream, "sha256").digest()
+                if stat_stamp(os.fstat(stream.fileno())) != stamp:
+                    raise ValueError(f"{name} が検査後に変わりました")
+                moved = path.rename(staging / str(number))
+            observed = moved.lstat()
+            if not stat.S_ISREG(observed.st_mode) or stat_stamp(observed)[:4] != stamp[:4]:
+                raise ValueError(f"{name} が検査後に変わりました。退避先は {moved.relative_to(copy)} です")
+            with moved.open("rb") as stream:
+                if file_digest(stream, "sha256").digest() != digest:
+                    raise ValueError(f"{name} が検査後に変わりました。退避先は {moved.relative_to(copy)} です")
+            verified.append(moved)
+        latest = git(copy, "ls-files", "--cached", "-z")
+        if latest.returncode or latest.stdout != tracked.stdout:
+            raise ValueError(f"Git の追跡対象が変わりました。退避先は {staging.relative_to(copy)} です")
+        for path in verified:
+            path.unlink()
+    finally:
+        with suppress(OSError):
+            staging.rmdir()
 
 
 def native_detach_blockers(copy: Path) -> list[str]:
@@ -1424,9 +1446,12 @@ def without_ended(processes: list[dict]) -> list[dict]:
 UNWATCHED_DIRS = {".git", "node_modules", ".venv"}
 
 
-def file_stamp(path: Path) -> list[int]:
-    info = path.lstat()
+def stat_stamp(info: os.stat_result) -> list[int]:
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def file_stamp(path: Path) -> list[int]:
+    return stat_stamp(path.lstat())
 
 
 def filename_key(name: str) -> str:
@@ -2565,9 +2590,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     if applied.returncode or nested_check(copy)["blockers"]:
                         detach_error = f"子 worktree {copy.relative_to(root)} の生成ファイル復元後に削除を確認できません"
                         break
-                if item["untracked_bytecode"] and not clean_nested_bytecode(copy, item["untracked_bytecode"]):
-                    detach_error = f"子 worktree {copy.relative_to(root)} の未追跡バイトコードを確認できません"
-                    break
+                if item["untracked_bytecode"]:
+                    try:
+                        clean_nested_bytecode(copy, item["untracked_bytecode"])
+                    except (OSError, ValueError) as error:
+                        detach_error = f"子 worktree {copy.relative_to(root)} のバイトコードを削除できません（{error}）"
+                        break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除できません: {removed.stderr.strip()}"

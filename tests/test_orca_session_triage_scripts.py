@@ -6876,6 +6876,37 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
         self.assertFalse(copy.exists())
 
+    def test_nested_bytecode_cleanup_preserves_a_directory_created_at_the_same_path(self) -> None:
+        copy = self.nested_catalog().resolve()
+        bytecode = copy / "stale.pyc"
+        bytecode.write_bytes(b"fixture bytecode")
+        actual_git = rmcheck.git
+        rename = Path.rename
+
+        def replace_bytecode() -> None:
+            bytecode.unlink()
+            bytecode.mkdir()
+            (bytecode / "keep.txt").write_text("keep these new contents\n")
+
+        def replace_before_clean(cwd: str | Path, *args: str,
+                                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if Path(cwd) == copy and "clean" in args:
+                replace_bytecode()
+            return actual_git(cwd, *args, env=env)
+
+        def replace_before_rename(source: Path, destination: Path) -> Path:
+            if source == bytecode:
+                replace_bytecode()
+            return rename(source, destination)
+
+        with (patch.object(rmcheck, "git", side_effect=replace_before_clean),
+              patch.object(Path, "rename", replace_before_rename),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual([item.read_text() for item in copy.rglob("keep.txt")], ["keep these new contents\n"])
+
     def test_nested_catalog_with_changed_source_blocks_detach(self) -> None:
         copy = self.nested_catalog()
         (copy / "locale/de/LC_MESSAGES/django.po").write_text('msgid "hello"\nmsgstr "Guten Tag"\n')
