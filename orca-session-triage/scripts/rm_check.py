@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Collection, Sequence
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field
@@ -856,12 +857,47 @@ def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
                                              for name, _, oid in (line.partition(" "),))]
 
 
-def clone_ignore_changes(copy: Path, plan: NestedRestorePlan) -> str | None:
+def excludes_file(copy: Path) -> Path:
+    setting = git(copy, "config", "--path", "--get", "core.excludesFile")
+    if setting.returncode == 0:
+        return copy / setting.stdout.removesuffix("\n")
+    if setting.returncode != 1:
+        raise OSError("Git の core.excludesFile を確認できません")
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "git/ignore"
+
+
+def reference_paths(path: Path) -> set[Path]:
+    path = path.absolute()
+    parts = deque(path.parts[1:])
+    location = Path(path.anchor)
+    links = set()
+    traversed = 0
+    while parts:
+        part = parts.popleft()
+        if part == "..":
+            location = location.parent
+            continue
+        candidate = location / part
+        if not candidate.is_symlink():
+            location = candidate
+            continue
+        traversed += 1
+        if traversed > 40:
+            raise OSError(f"Git の無視ルールが循環しています（{path}）")
+        links.add(candidate)
+        destination = candidate.readlink()
+        if destination.is_absolute():
+            location = Path(destination.anchor)
+        parts.extendleft(reversed(destination.parts[bool(destination.anchor):]))
+    return {location, *links}
+
+
+def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
     try:
-        external = git(copy, "config", "--path", "--get", "core.excludesFile")
-        excludes = (copy / external.stdout.rstrip("\n")).resolve() if external.returncode == 0 else None
-        candidates = {name: path for name in plan.files if (path := (copy / name).resolve()) == excludes
-                      or Path(name).name == ".gitignore"}
+        sources = reference_paths(excludes_file(copy))
+        candidates = {name: copy / name for name in plan.files
+                      if copy / name in sources or Path(name).name == ".gitignore"}
         if not candidates:
             return None
         listing = git(copy, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
@@ -871,7 +907,8 @@ def clone_ignore_changes(copy: Path, plan: NestedRestorePlan) -> str | None:
             return None
         rules = subprocess.run(["git", "-C", str(copy), "check-ignore", "--verbose", "-z", "--stdin"],
                                input=listing.stdout, capture_output=True, text=True, check=True, timeout=30)
-        sources = {(copy / source).resolve() for source in rules.stdout.removesuffix("\0").split("\0")[::4]}
+        sources = {path for source in rules.stdout.removesuffix("\0").split("\0")[::4]
+                   for path in reference_paths(copy / source)}
         for name, path in candidates.items():
             if path in sources:
                 return f"{name} は依存 clone 内の無視ルールに使われています"
@@ -923,7 +960,7 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("commits absent from origin: none")
     status = git(copy, "--no-optional-locks", "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all")
     approved = restore is not None and restore.allows_changes(copy)
-    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := clone_ignore_changes(copy, plan)):
+    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := restore_ignore_change(copy, plan)):
         blockers.append(ignore_change)
     if restore and copy in restore.moved:
         blockers.append("--restore-nested の checkout または HEAD が走査後に変わりました")
@@ -1256,11 +1293,14 @@ def head_storage_stamps(private: Path, common: Path) -> list[list[int] | None]:
 def checkout_metadata_stamps(copy: Path, directories: tuple[Path, Path], *,
                              include_clone_refs: bool = True) -> dict[Path, list[int] | None]:
     private, common = directories
+    if optional_stamp(private / "BISECT_START") is not None:
+        raise OSError(f"git bisect が進行中です（{copy}）")
     index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
     if index.returncode:
         raise OSError(f"Git index を確認できません（{copy}）")
     index_path = Path(index.stdout.strip())
     paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
+             common / "config", private / "config.worktree", *reference_paths(excludes_file(copy)),
              *head_storage_paths(private, common)]
     stamps: dict[Path, list[int] | None] = {}
     if private != common:
@@ -1324,6 +1364,8 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
                    and str(Path(rel).with_suffix(".po")) not in changes]
     changes = [rel for rel in changes if rel not in regenerable]
     approved = restore is not None and restore.allows_changes(copy, allow_bytecode=True)
+    if restore and (plan := restore.plans.get(copy)) is not None and (ignore_change := restore_ignore_change(copy, plan)):
+        blockers.append(ignore_change)
     if changes and not approved:
         blockers.append("%d uncommitted changes" % len(changes))
     if restore is not None and copy in restore.requested and not approved:
@@ -2472,6 +2514,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     parser.add_argument("--restore-nested", action="append", default=[], metavar="PATH",
                         help="plan restoration of tracked changes in a nested Git repository named by a relative path")
     parser.add_argument("--apply-restore-nested", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--require-ignored-clones", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--discard-before-restore", action="append", default=[], metavar="PATH",
                         help="when planning --restore-nested, a file the batch will discard first")
     parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
@@ -2535,6 +2578,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
     if args.apply_restore_nested and (not restore_paths or not args.restore_approval):
         parser.error("--apply-restore-nested needs saved restoration approval; use rm-check-batch --from SCAN_JSON --remove-ok")
+    if args.require_ignored_clones and not args.apply_restore_nested:
+        parser.error("--require-ignored-clones requires --apply-restore-nested")
     if args.removal_stamps and (not restore_paths or not args.from_file
                                 or args.apply_restore_nested or args.detach_nested or args.archive_scratch or named):
         parser.error("--removal-stamps requires a read-only check of recorded restoration")
@@ -2584,12 +2629,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if args.from_file and (since is None or restore_paths):
         rows = json.loads(args.from_file.read_text(encoding="utf-8"))
         local_row = next((row for row in rows if row.get("path") == worktree and not row.get("environment")), {})
-        scanned = local_row.get("scanned_at")
-        if not scanned and not restore_paths:
-            scanned = next((row["scanned_at"] for row in rows if row.get("scanned_at")), None)
-        if scanned:
+        time_row = local_row
+        if "scanned_at" not in time_row and not restore_paths:
+            time_row = next((row for row in rows if "scanned_at" in row), {})
+        if "scanned_at" in time_row:
             try:
-                scanned_at = datetime.fromisoformat(scanned)
+                scanned_at = datetime.fromisoformat(time_row["scanned_at"])
                 if scanned_at.tzinfo is None:
                     scanned_at = scanned_at.astimezone()
             except (TypeError, ValueError):
@@ -2838,7 +2883,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     blockers = nested_check(copy, fresh)["blockers"]
                 else:
                     blockers = clone_check(copy, {}, fresh).blockers
-                    if git(root, "check-ignore", "--", copy.relative_to(root).as_posix()).returncode:
+                    if (args.require_ignored_clones
+                            and git(root, "check-ignore", "--", copy.relative_to(root).as_posix()).returncode):
                         return False
                 return not blockers and fresh.plans.get(copy) == plan and (plan is None or plan.matches(copy))
 

@@ -6611,16 +6611,18 @@ class RmCheckTests(unittest.TestCase):
 
     def test_saved_scan_with_an_invalid_time_blocks_ordinary_removal(self) -> None:
         saved = Path(self.tmp.name) / "scan.json"
-        saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": "bad timestamp"}]))
         changed = self.wt / "app.txt"
         changed.touch()
         self.assertEqual(git(self.wt, "status", "--porcelain"), "")
 
-        with patch.object(rmcheck, "processes_in", return_value=[]):
-            code, result = self.run_main("--from", str(saved))
+        for value in ("bad timestamp", "", None):
+            with self.subTest(value=value):
+                saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": value}]))
+                with patch.object(rmcheck, "processes_in", return_value=[]):
+                    code, result = self.run_main("--from", str(saved))
 
-        self.assertEqual(code, 1, result)
-        self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+                self.assertEqual(code, 1, result)
+                self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
 
     def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
@@ -7092,6 +7094,22 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(set(result["restored_nested"]), {"local-deps/library", "local-deps/pushed"})
         self.assertFalse(linked.exists())
         self.assertFalse(git(clone, "status", "--porcelain"))
+
+    def test_direct_restoration_accepts_an_untracked_dependency_clone(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        clone = self.wt / "local-deps/library"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        git(self.main, "clone", "-q", str(remote), str(clone))
+        target = clone / "app.txt"
+        target.write_text("approved edit\n")
+        self.assertEqual(git(self.wt, "status", "--porcelain"), "?? local-deps/")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
+
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), "v1\n")
+        self.assertTrue(self.wt.is_dir())
 
     def test_nested_restore_revalidates_every_repository_before_the_first_write(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
@@ -7908,6 +7926,30 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
         self.assertFalse(copy.exists())
+
+    def test_nested_restore_keeps_a_linked_checkout_with_active_ignore_changes(self) -> None:
+        copy = self.nested_catalog()
+        dependency = Path(self.tmp.name) / "deps"
+        rule = dependency / ".gitignore"
+        rule.write_text("/old-cache/\n")
+        git(dependency, "add", ".gitignore")
+        git(dependency, "commit", "-qm", "track ignore rule")
+        git(dependency, "push", "-q", "origin", "main")
+        git(copy, "restore", ".")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        (copy / ".gitignore").write_text("/scratch_cache/\n")
+        git(copy, "add", ".gitignore")
+        cache = copy / "scratch_cache"
+        cache.mkdir()
+        (cache / "CACHEDIR.TAG").write_text(rmcheck.CACHE_TAG_SIGNATURE.decode() + "\n")
+        (cache / "cache.tmp").write_text("fixture cache\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertIn("無視ルールに使われています", " ".join(result["reasons"]))
+        self.assertEqual(git(copy, "show", ":.gitignore"), "/scratch_cache/")
 
     def test_locked_parent_worktree_refuses_before_restoring_a_child(self) -> None:
         copy = self.nested_catalog()
