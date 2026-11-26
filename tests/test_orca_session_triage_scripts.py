@@ -7077,6 +7077,52 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
         self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
 
+    def test_nested_restore_retains_a_correctly_registered_replacement(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        parked = Path(self.tmp.name) / "parked"
+        replacement = Path(self.tmp.name) / "replacement"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(deps, "worktree", "add", "-q", "--detach", str(replacement), "main")
+        (copy / rel).unlink()
+        (replacement / rel).write_text("keep this staged edit\n")
+        git(replacement, "add", rel)
+        (replacement / rel).unlink()
+        matches = rmcheck.NestedRestorePlan.matches
+        calls = 0
+
+        def replace_before_write(plan: rmcheck.NestedRestorePlan, path: Path) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                git(deps, "worktree", "move", str(copy), str(parked))
+                git(deps, "worktree", "move", str(replacement), str(copy))
+            return matches(plan, path)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", replace_before_write),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "keep this staged edit")
+        self.assertFalse((copy / rel).exists())
+
+    def test_nested_restore_allows_previously_supported_untracked_bytecode(self) -> None:
+        copy = self.nested_catalog()
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (copy / rel).write_text("approved tracked edit\n")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, preview = self.run_main("--restore-nested", "local-deps/pushed")
+            self.assertEqual(code, 1, preview)
+            self.assertIn(rel, preview["restore_nested"]["local-deps/pushed"])
+            code, removed = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, removed["detached"]), (0, [str(copy.resolve())]), removed)
+        self.assertFalse(copy.exists())
+
     def test_locked_parent_worktree_refuses_before_restoring_a_child(self) -> None:
         copy = self.nested_catalog()
         git(self.main, "worktree", "lock", str(self.wt))

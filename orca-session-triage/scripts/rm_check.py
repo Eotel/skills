@@ -686,6 +686,7 @@ class CloneResult(NamedTuple):
 @dataclass(frozen=True)
 class NestedRestorePlan:
     head: str
+    checkout_stamp: list[int]
     index: Path
     index_stamp: list[int]
     files: dict[str, list[int] | None]
@@ -699,7 +700,8 @@ class NestedRestorePlan:
 
     def matches_files(self, copy: Path) -> bool:
         try:
-            return (file_stamp(self.index) == self.index_stamp
+            return (file_stamp(copy / ".git") == self.checkout_stamp
+                    and file_stamp(self.index) == self.index_stamp
                     and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
         except OSError:
             return False
@@ -715,7 +717,7 @@ class NestedRestore:
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
 
-    def allows_changes(self, copy: Path) -> bool:
+    def allows_changes(self, copy: Path, *, allow_bytecode: bool = False) -> bool:
         if copy not in self.requested or copy.resolve() != copy or git_directories(copy) is None:
             return False
         self.found.add(copy)
@@ -727,6 +729,7 @@ class NestedRestore:
             return False
         entries = {rel: info.split()[0] for item in tracked.stdout.split("\0") if item
                    for info, _, rel in (item.partition("\t"),)}
+        tracked_names = {filename_key(name) for name in entries} if allow_bytecode else set()
         cutoff = self.since.timestamp() * 1e9 if self.since else None
         changes: dict[str, list[int] | None] = {}
         listings: dict[Path, dict[str, Path]] = {}
@@ -734,6 +737,9 @@ class NestedRestore:
             rel = item[3:]
             path = copy / rel
             if item.startswith("?? "):
+                if (allow_bytecode and path.suffix == BYTECODE_SUFFIX and filename_key(rel) not in tracked_names
+                        and path.parent.resolve() == path.parent and holds_only_bytecode(path) and path.is_file()):
+                    continue
                 if self.discard:
                     try:
                         if disk_path(copy, Path(rel), listings) in self.discard:
@@ -759,12 +765,13 @@ class NestedRestore:
         if changes:
             index_path = Path(index.stdout.strip())
             try:
+                checkout_stamp = file_stamp(copy / ".git")
                 stamp = file_stamp(index_path)
             except OSError:
                 return False
             if cutoff is not None and max(stamp[3:]) > cutoff:
                 return False
-            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), index_path, stamp, changes)
+            self.plans[copy] = NestedRestorePlan(head.stdout.strip(), checkout_stamp, index_path, stamp, changes)
         return True
 
     def display(self) -> dict[str, list[str]]:
@@ -1141,7 +1148,7 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
                    and (copy / rel).with_suffix(".po").is_file()
                    and str(Path(rel).with_suffix(".po")) not in changes]
     changes = [rel for rel in changes if rel not in regenerable]
-    approved = restore is not None and restore.allows_changes(copy)
+    approved = restore is not None and restore.allows_changes(copy, allow_bytecode=True)
     if changes and not approved:
         blockers.append("%d uncommitted changes" % len(changes))
     if restore is not None and copy in restore.requested and not approved:
@@ -2537,7 +2544,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
 
             latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
             for copy in restore.plans:
-                latest.allows_changes(copy)
+                latest.allows_changes(copy, allow_bytecode=copy in linked)
             with restoration_lock():
                 approval_error = restore_approval_error()
                 if approval_error:
