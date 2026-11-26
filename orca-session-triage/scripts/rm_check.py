@@ -826,6 +826,15 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
     return False
 
 
+def clone_tips(copy: Path) -> list[tuple[str, str]] | None:
+    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
+    head = git(copy, "rev-parse", "--verify", "HEAD")
+    if local.returncode or head.returncode:
+        return None
+    return [("HEAD", head.stdout.strip()), *((name, oid) for line in local.stdout.splitlines()
+                                             for name, _, oid in (line.partition(" "),))]
+
+
 def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRestore | None = None) -> CloneResult:
     """Reasons a dependency clone cannot be discarded, checking its actual origin branches and tags."""
     copy = copy.resolve()
@@ -858,12 +867,10 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
     modules = copy / ".git/modules"
     if entries.returncode or initialized or (modules.is_dir() and any(modules.iterdir())):
         blockers.append("submodule repositories need preservation: " + ", ".join(initialized or [str(modules)]))
-    local = git(copy, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
-    if local.returncode:
-        blockers.append("local branches and tags could not be checked")
-    tips = [("HEAD", git(copy, "rev-parse", "--verify", "HEAD").stdout.strip()),
-            *(line.split(" ", 1) for line in local.stdout.splitlines())]
-    unsaved = [(name, oid) for name, oid in tips if not oid or refs is None or not remote_contains(copy, oid, refs)]
+    tips = clone_tips(copy)
+    if tips is None:
+        blockers.append("HEAD, local branches and tags could not be checked")
+    unsaved = [(name, oid) for name, oid in tips or [] if not oid or refs is None or not remote_contains(copy, oid, refs)]
     if unsaved:
         blockers.append("local refs are on no verified remote branch or tag: " + ", ".join(name for name, _ in unsaved))
         details.append("local tips: " + ", ".join(f"{name} {oid[:12] or '?'}" for name, oid in unsaved))
@@ -877,6 +884,8 @@ def clone_check(copy: Path, checked: dict[Path, CloneResult], restore: NestedRes
         details.append("uncommitted changes: approved for restoration")
     else:
         details.append("uncommitted changes: none")
+    if tips is not None and clone_tips(copy) != tips:
+        blockers.append("HEAD, local branches or tags changed during the check")
     result = CloneResult(blockers, [*details, *blockers])
     checked[copy] = result
     return result
@@ -1117,12 +1126,27 @@ def nested_ignored_blockers(copy: Path, repository: str, discard: frozenset[Path
     return blockers
 
 
+def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
+    try:
+        marker = file_stamp(copy / ".git")
+        directories = git_directories(copy)
+        head = git(copy, "rev-parse", "--verify", "HEAD")
+        if directories is not None and head.returncode == 0 and marker == file_stamp(copy / ".git"):
+            return marker, str(directories[0]), str(directories[1]), head.stdout.strip()
+    except OSError:
+        pass
+    return None
+
+
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
     repository = main_checkout(copy) or ""
     blockers = []
-    head = git(copy, "rev-parse", "HEAD").stdout.strip()
+    checkout = linked_checkout_state(copy)
+    if checkout is None:
+        blockers.append("Git worktree identity could not be checked")
+    head = checkout[3] if checkout else ""
     if not head or not on_remote(copy, head):
         blockers.append("HEAD %s is on no remote branch" % head[:8])
     elif git(copy, "rev-parse", "HEAD").stdout.strip() != head:
@@ -1152,7 +1176,8 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
         blockers.append(f"--restore-nested の Git とディスクのパス表記が異なります（{alias}）")
     discard = restore.discard if approved and restore else frozenset()
     blockers.extend(nested_ignored_blockers(copy, repository, discard))
-    return {"path": str(copy), "repository": repository, "head": head[:12], "blockers": blockers,
+    return {"path": str(copy), "repository": repository, "head": head[:12], "checkout_state": checkout,
+            "blockers": blockers,
             "regenerable": regenerable, "untracked_bytecode": cached,
             "restore": ["git", "-C", str(copy), "checkout", "HEAD", "--", *regenerable] if regenerable else [],
             "detach": ["git", "-C", repository, "-c", "status.showUntrackedFiles=all", "worktree", "remove", str(copy)]}
@@ -2635,9 +2660,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     decided.extend(ignored_blockers)
                     break
-                head = git(copy, "rev-parse", "--verify", "HEAD")
-                if head.returncode or head.stdout.strip()[:12] != item["head"]:
-                    detach_error = f"子 worktree {copy.relative_to(root)} の HEAD が削除直前に変わりました"
+                if linked_checkout_state(copy) != item["checkout_state"]:
+                    detach_error = f"子 worktree {copy.relative_to(root)} の登録または HEAD が削除直前に変わりました"
                     break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:

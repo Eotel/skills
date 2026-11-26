@@ -6356,6 +6356,34 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["ok"]), (1, False))
         self.assertIn(str(changed.resolve()), " ".join(result["reasons"]))
 
+    def test_local_dependency_clone_keeps_a_commit_created_during_status_check(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        copy = self.wt.resolve() / "local-deps/library"
+        git(self.main, "clone", "-q", str(remote), str(copy))
+        git(copy, "config", "user.email", "t@example.com")
+        git(copy, "config", "user.name", "t")
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (copy / "app.txt").write_text("new unpublished work\n")
+        git(copy, "add", "app.txt")
+        actual_git = rmcheck.git
+        committed = False
+
+        def commit_before_status(cwd: str | Path, *args: str,
+                                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            nonlocal committed
+            if Path(cwd) == copy and "status" in args and "--no-renames" in args and not committed:
+                git(copy, "commit", "-qm", "new unpublished commit")
+                committed = True
+            return actual_git(cwd, *args, env=env)
+
+        with (patch.object(rmcheck, "git", side_effect=commit_before_status),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main()
+
+        self.assertEqual((committed, code, result["ok"]), (True, 1, False), result)
+        self.assertEqual(git(copy, "log", "-1", "--format=%s"), "new unpublished commit")
+
     def test_nested_restore_only_applies_to_the_approved_clone_after_preflight(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
         git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
@@ -6960,6 +6988,28 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(git(copy, "log", "-1", "--format=%s"), "new unpublished commit")
+
+    def test_nested_detach_keeps_a_replacement_moved_in_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        replacement = Path(self.tmp.name) / "replacement"
+        parked = Path(self.tmp.name) / "parked"
+        git(deps, "worktree", "add", "-q", "--detach", str(replacement), "main")
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        marker = (replacement / ".git").read_text().split(": ", 1)[1].strip()
+        clean = rmcheck.clean_nested_bytecode
+
+        def replace_before_removal(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            git(deps, "worktree", "move", str(copy), str(parked))
+            git(deps, "worktree", "move", str(replacement), str(copy))
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", replace_before_removal),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "rev-parse", "--absolute-git-dir"), str(Path(marker).resolve()))
 
     def test_approved_tracked_changes_in_a_nested_worktree_are_restored_before_detaching(self) -> None:
         copy = self.nested_catalog()
