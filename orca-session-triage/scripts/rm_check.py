@@ -1169,6 +1169,16 @@ def worktree_entry_stamps(copy: Path) -> dict[Path, list[int]]:
     return stamps
 
 
+def restore_entry_stamps(copy: Path) -> dict[Path, list[int]]:
+    stamps = worktree_entry_stamps(copy)
+    index = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if index.returncode:
+        raise OSError("Git index を確認できません")
+    path = Path(index.stdout.strip())
+    stamps[path] = file_stamp(path)
+    return stamps
+
+
 def linked_checkout_state(copy: Path) -> tuple[list[int], str, str, str] | None:
     try:
         marker = file_stamp(copy / ".git")
@@ -2687,8 +2697,20 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     def changed_checkouts(restore: NestedRestore) -> set[Path]:
         changed = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
         changed.update(copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs)
-        changed.update(copy for copy, state in restore.expected.items()
-                       if state == CHECKOUT_ABSENT and optional_stamp(copy) is not None)
+        return changed
+
+    def changed_absent_checkouts(restore: NestedRestore) -> set[Path]:
+        changed = set()
+        for copy, state in restore.expected.items():
+            if state != CHECKOUT_ABSENT:
+                continue
+            try:
+                copy.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            changed.add(copy)
         return changed
 
     restored_nested: dict[str, list[str]] = {}
@@ -2718,12 +2740,26 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 if approval_error:
                     decided.append(approval_error)
                 changed = changed_checkouts(restore)
+                pending: dict[Path, dict[Path, list[int]]] = {}
+                if not changed and not approval_error:
+                    for copy in restore.observed:
+                        try:
+                            pending[copy] = restore_entry_stamps(copy)
+                        except OSError:
+                            changed.add(copy)
                 if not changed and not approval_error:
                     changed = {copy for copy in restore.observed if not restore_matches(copy, restore.plans.get(copy))}
+                changed.update(changed_absent_checkouts(restore))
                 for copy in sorted(changed):
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                    if not restore_matches(copy, approved) or changed_checkouts(restore) or not approved.files_match(copy):
+                    try:
+                        ready = (restore_matches(copy, approved) and not changed_checkouts(restore) and approved.files_match(copy)
+                                 and all(file_stamp(path) == stamp for entries in pending.values() for path, stamp in entries.items())
+                                 and not changed_absent_checkouts(restore))
+                    except OSError:
+                        ready = False
+                    if not ready:
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
@@ -2741,9 +2777,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         decided.append(f"--restore-nested の {copy.relative_to(root)} を復元後に確認できません: {error}")
                         break
                     restored_nested[str(copy.relative_to(root))] = paths
+                    pending.pop(copy)
                     notes.append(f"後始末: {copy.relative_to(root)} の追跡済みファイル {len(paths)} 件を復元")
                 if restored_nested:
-                    for copy in sorted(changed_checkouts(restore)):
+                    for copy in sorted(changed_checkouts(restore) | changed_absent_checkouts(restore)):
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元後に変わりました")
             recheck = partial(recheck, decided=tuple(decided))
             result = recheck()

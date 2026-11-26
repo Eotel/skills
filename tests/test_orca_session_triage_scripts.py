@@ -6802,16 +6802,19 @@ class RmCheckTests(unittest.TestCase):
         changed.write_text("keep staged work\n")
         git(first, "add", "--", "app.txt")
         changed.write_text("keep unstaged work\n")
-        matching = rmcheck.NestedRestorePlan.matches
+        matching = rmcheck.NestedRestorePlan.files_match
+        checks = 0
 
-        def move_clone_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
-            if outside.exists():
+        def move_clone_during_file_recheck(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal checks
+            checks += 1
+            if checks == 5:
                 outside.rename(second)
             return matching(plan, copy)
 
         options = self.recorded_restore(("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
                                          "--apply-restore-nested"))
-        with (patch.object(rmcheck.NestedRestorePlan, "matches", move_clone_during_preflight),
+        with (patch.object(rmcheck.NestedRestorePlan, "files_match", move_clone_during_file_recheck),
               patch.object(rmcheck, "processes_in", return_value=[])):
             code, result = self.run_main(*options)
 
@@ -6831,6 +6834,40 @@ class RmCheckTests(unittest.TestCase):
         self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
         self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
         self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_restoration_keeps_first_edit_if_a_clean_sibling_is_edited_during_preflight(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        root = self.wt.resolve()
+        first, second = (root / "local-deps" / name for name in ("first", "second"))
+        for clone in (first, second):
+            git(self.main, "clone", "-q", str(remote), str(clone))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (first / "app.txt").write_text("first staged work\n")
+        git(first, "add", "--", "app.txt")
+        (first / "app.txt").write_text("first unstaged work\n")
+        matching = rmcheck.NestedRestorePlan.matches
+        checks = 0
+
+        def edit_sibling_during_preflight(plan: rmcheck.NestedRestorePlan, copy: Path) -> bool:
+            nonlocal checks
+            if copy == first:
+                checks += 1
+                if checks == 3:
+                    (second / "app.txt").write_text("second staged work\n")
+                    git(second, "add", "--", "app.txt")
+                    (second / "app.txt").write_text("second unstaged work\n")
+            return matching(plan, copy)
+
+        with (patch.object(rmcheck.NestedRestorePlan, "matches", edit_sibling_during_preflight),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested")
+
+        self.assertEqual(code, 1, result)
+        for copy in (first, second):
+            self.assertEqual(git(copy, "show", ":app.txt"), f"{copy.name} staged work")
+            self.assertEqual((copy / "app.txt").read_text(), f"{copy.name} unstaged work\n")
 
     def test_unreadable_checkout_is_not_recorded_as_absent(self) -> None:
         copy = self.nested_catalog().resolve()
