@@ -1067,15 +1067,29 @@ def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> None:
             staging.rmdir()
 
 
-def native_detach_blockers(copy: Path) -> list[str]:
+def worktree_registration_blockers(copy: Path) -> list[str]:
+    directories = git_directories(copy)
+    if directories is None:
+        return ["Git worktree registration could not be checked"]
+    private, common = directories
+    try:
+        backlink = (private / "gitdir").read_text(errors="surrogateescape").strip()
+        if private.parent != common / "worktrees" or (private / backlink).resolve() != copy / ".git":
+            return ["Git worktree registration does not point back to this checkout"]
+    except (OSError, RuntimeError):
+        return ["Git worktree registration could not be checked"]
     worktrees = git(copy, "worktree", "list", "--porcelain", "-z")
-    fields = next((record.split("\0") for record in worktrees.stdout.split("\0\0")
-                   if record.startswith("worktree ") and Path(record.split("\0", 1)[0][9:]).resolve() == copy), [])
-    blockers = []
-    if worktrees.returncode or not fields:
-        blockers.append("Git worktree registration could not be checked")
-    elif any(field == "locked" or field.startswith("locked ") for field in fields):
-        blockers.append("Git worktree is locked")
+    records = [record.split("\0") for record in worktrees.stdout.split("\0\0")
+               if record.startswith("worktree ") and Path(record.split("\0", 1)[0][9:]).resolve() == copy]
+    if worktrees.returncode or len(records) != 1:
+        return ["Git worktree registration could not be checked"]
+    if any(field == "locked" or field.startswith("locked ") for field in records[0]):
+        return ["Git worktree is locked"]
+    return []
+
+
+def native_detach_blockers(copy: Path) -> list[str]:
+    blockers = worktree_registration_blockers(copy)
     modules = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "modules")
     index = git(copy, "ls-files", "--stage", "-z")
     if modules.returncode or index.returncode:
@@ -1530,6 +1544,8 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     blockers = list(decided)
     if Path(worktree).resolve() == Path(main).resolve():
         blockers.append("this is the repository's main checkout: close its tabs and keep it")
+    elif restore is not None and (Path(worktree) / ".git").is_file():
+        blockers.extend(worktree_registration_blockers(Path(worktree).resolve()))
     tracked_changes, untracked, bytecode = working_changes(worktree)
     clone_notes = []
     clone_checks: dict[Path, CloneResult] = {}
@@ -2505,6 +2521,13 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         other = [blocker for blocker in result["blockers"] if blocker not in bypassed]
         archivable = archive_movers(root, result, movable_now(result), besides_nested=detach, explicit=explicit)
         if args.apply_restore_nested and not result["containers"] and (archivable or (not other and not result["review"])):
+            linked = {Path(item["path"]) for item in result["nested_worktrees"]}
+            parent_linked = (root / ".git").is_file()
+
+            def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
+                return (plan.matches(copy) and (not parent_linked or not worktree_registration_blockers(root))
+                        and (copy not in linked or not native_detach_blockers(copy)))
+
             latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
             for copy in restore.plans:
                 latest.allows_changes(copy)
@@ -2512,11 +2535,12 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 approval_error = restore_approval_error()
                 if approval_error:
                     decided.append(approval_error)
-                changed = [copy for copy, plan in restore.plans.items() if latest.plans.get(copy) != plan or not plan.matches(copy)]
+                changed = [copy for copy, plan in restore.plans.items()
+                           if latest.plans.get(copy) != plan or not restore_matches(copy, plan)]
                 for copy in changed:
                     decided.append(f"--restore-nested の {copy.relative_to(root)} が事前検査から変わりました")
                 for copy, approved in (() if changed or approval_error else restore.plans.items()):
-                    if not approved.matches(copy):
+                    if not restore_matches(copy, approved):
                         decided.append(f"--restore-nested の {copy.relative_to(root)} が復元直前に変わりました")
                         break
                     paths = list(approved.files)
