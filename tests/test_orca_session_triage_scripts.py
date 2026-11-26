@@ -6942,6 +6942,25 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(database.read_bytes(), b"keep this database")
 
+    def test_nested_detach_keeps_a_detached_commit_created_during_bytecode_cleanup(self) -> None:
+        copy = self.nested_catalog()
+        (copy / "stale.pyc").write_bytes(b"fixture bytecode")
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        clean = rmcheck.clean_nested_bytecode
+
+        def commit_before_removal(path: Path, files: dict[str, list[int]]) -> None:
+            clean(path, files)
+            changed.write_text("preserve unpublished commit\n")
+            git(copy, "add", str(changed))
+            git(copy, "commit", "-qm", "new unpublished commit")
+
+        with (patch.object(rmcheck, "clean_nested_bytecode", commit_before_removal),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--detach-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "log", "-1", "--format=%s"), "new unpublished commit")
+
     def test_approved_tracked_changes_in_a_nested_worktree_are_restored_before_detaching(self) -> None:
         copy = self.nested_catalog()
         rel = "locale/de/LC_MESSAGES/django.po"
@@ -7056,6 +7075,37 @@ class RmCheckTests(unittest.TestCase):
 
         self.assertEqual((code, result["detached"]), (1, []), result)
         self.assertEqual(changed.read_text(), "keep the newer edit\n")
+
+    def test_nested_restore_retains_edits_after_a_soft_reset_during_registration_check(self) -> None:
+        copy = self.nested_catalog().resolve()
+        deps = Path(self.tmp.name) / "deps"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (deps / rel).write_text("different committed contents\n")
+        git(deps, "commit", "-qam", "a newer revision")
+        git(deps, "push", "-q", "origin", "main")
+        changed = copy / rel
+        changed.write_text("staged edit\n")
+        git(copy, "add", rel)
+        changed.write_text("unstaged edit\n")
+        check = rmcheck.native_detach_blockers
+        calls = 0
+
+        def reset_while_checking(path: Path) -> list[str]:
+            nonlocal calls
+            blockers = check(path)
+            if path == copy:
+                calls += 1
+                if calls == 3:
+                    git(copy, "reset", "--soft", "origin/main")
+            return blockers
+
+        with (patch.object(rmcheck, "native_detach_blockers", reset_while_checking),
+              patch.object(rmcheck, "processes_in", return_value=[])):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
+        self.assertEqual(changed.read_text(), "unstaged edit\n")
 
     def test_nested_restore_refuses_a_replacement_with_mismatched_worktree_registration(self) -> None:
         copy = self.nested_catalog()

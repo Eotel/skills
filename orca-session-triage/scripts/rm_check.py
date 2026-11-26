@@ -694,13 +694,8 @@ class NestedRestorePlan:
     def matches(self, copy: Path) -> bool:
         try:
             head = git(copy, "rev-parse", "--verify", "HEAD")
-        except OSError:
-            return False
-        return head.returncode == 0 and head.stdout.strip() == self.head and self.matches_files(copy)
-
-    def matches_files(self, copy: Path) -> bool:
-        try:
-            return (file_stamp(copy / ".git") == self.checkout_stamp
+            return (head.returncode == 0 and head.stdout.strip() == self.head
+                    and file_stamp(copy / ".git") == self.checkout_stamp
                     and file_stamp(self.index) == self.index_stamp
                     and all(optional_stamp(copy / rel) == stamp for rel, stamp in self.files.items()))
         except OSError:
@@ -2540,7 +2535,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
 
             def restore_matches(copy: Path, plan: NestedRestorePlan) -> bool:
                 return (plan.matches(copy) and (not parent_linked or not worktree_registration_blockers(root))
-                        and (copy not in linked or not native_detach_blockers(copy)) and plan.matches_files(copy))
+                        and (copy not in linked or not native_detach_blockers(copy)) and plan.matches(copy))
 
             latest = NestedRestore(root, set(restore.plans), since=since, already_missing=restore.already_missing)
             for copy in restore.plans:
@@ -2637,6 +2632,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 if ignored_blockers := nested_ignored_blockers(copy, item["repository"]):
                     detach_error = f"子 worktree {copy.relative_to(root)} が削除直前に変わりました"
                     decided.extend(ignored_blockers)
+                    break
+                head = git(copy, "rev-parse", "--verify", "HEAD")
+                if head.returncode or head.stdout.strip()[:12] != item["head"]:
+                    detach_error = f"子 worktree {copy.relative_to(root)} の HEAD が削除直前に変わりました"
                     break
                 removed = subprocess.run(item["detach"], capture_output=True, text=True)
                 if removed.returncode:
