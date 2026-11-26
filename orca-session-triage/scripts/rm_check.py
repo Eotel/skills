@@ -806,18 +806,15 @@ def clone_has_local_changes(copy: Path, status: str, index: str) -> bool:
                         if tracked_mode == mode and disk_path(copy, path, listings) == actual]
             if not expected:
                 return True
-            blobs = {blob for _, blob in expected}
             if mode == "120000":
+                blobs = {blob for _, blob in expected}
                 target = os.readlink(os.fsencode(actual))  # noqa: PTH115 - Git hashes the raw symlink target.
                 hashed_link = subprocess.run(["git", "-C", str(copy), "hash-object", "--stdin"],
                                              input=target, capture_output=True)
                 if hashed_link.returncode or os.fsdecode(hashed_link.stdout).strip() not in blobs:
                     return True
-            else:
-                hashed = git(copy, "hash-object", "--no-filters", "--", str(actual))
-                if hashed.returncode or (hashed.stdout.strip() not in blobs and not any(
-                        matches_checkout_blob(copy, actual, path, blob) for path, blob in expected)):
-                    return True
+            elif not any(matches_checkout_blob(copy, actual, path, blob) for path, blob in expected):
+                return True
         except (OSError, subprocess.TimeoutExpired):
             return True
     return False
@@ -1048,6 +1045,26 @@ def clean_nested_bytecode(copy: Path, files: dict[str, list[int]]) -> bool:
         return False
 
 
+def native_detach_blockers(copy: Path) -> list[str]:
+    worktrees = git(copy, "worktree", "list", "--porcelain", "-z")
+    fields = next((record.split("\0") for record in worktrees.stdout.split("\0\0")
+                   if record.startswith("worktree ") and Path(record.split("\0", 1)[0][9:]).resolve() == copy), [])
+    blockers = []
+    if worktrees.returncode or not fields:
+        blockers.append("Git worktree registration could not be checked")
+    elif any(field == "locked" or field.startswith("locked ") for field in fields):
+        blockers.append("Git worktree is locked")
+    modules = git(copy, "rev-parse", "--path-format=absolute", "--git-path", "modules")
+    index = git(copy, "ls-files", "--stage", "-z")
+    if modules.returncode or index.returncode:
+        blockers.append("submodules could not be checked")
+    elif Path(modules.stdout.strip()).is_dir() or any(
+            (copy / entry.partition("\t")[2] / ".git").exists()
+            for entry in index.stdout.split("\0") if entry.startswith("160000 ")):
+        blockers.append("initialized submodule repositories prevent native Git worktree removal")
+    return blockers
+
+
 def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
     """Whether a nested worktree can be detached from its repository: clean, nothing ignored to open,
     and HEAD on a remote. `restore` resets recompiled catalogs before `detach` removes it."""
@@ -1058,6 +1075,7 @@ def nested_check(copy: Path, restore: NestedRestore | None = None) -> dict:
         blockers.append("HEAD %s is on no remote branch" % head[:8])
     elif git(copy, "rev-parse", "HEAD").stdout.strip() != head:
         blockers.append("HEAD changed during the remote check")
+    blockers.extend(native_detach_blockers(copy))
     tracked_changes, untracked, bytecode = working_changes(copy, all_untracked=True)
     cached: dict[str, list[int]] = {}
     listings: dict[Path, dict[str, Path]] = {}

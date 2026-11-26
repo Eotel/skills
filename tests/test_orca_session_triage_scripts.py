@@ -6935,6 +6935,39 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual((code, clone["ok"]), (0, True), clone)
         self.assertEqual(path.read_text(), "tracked\n")
 
+    def test_locked_nested_worktree_refuses_before_restoring_its_files(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        git(deps, "worktree", "lock", str(copy))
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
+    def test_initialized_nested_submodule_refuses_before_restoring_its_files(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        remote = Path(self.tmp.name) / "submodule.git"
+        git(self.main, "clone", "--bare", "-q", str(self.main), str(remote))
+        git(deps, "-c", "protocol.file.allow=always", "submodule", "add", "-q", "-b", "main", str(remote), "vendor/lib")
+        git(deps, "commit", "-qm", "add tracked submodule")
+        git(deps, "push", "-q", "origin", "main")
+        git(copy, "restore", "locale/de/LC_MESSAGES/django.mo")
+        git(copy, "checkout", "-q", "--detach", "origin/main")
+        git(copy, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+        changed = copy / "locale/de/LC_MESSAGES/django.po"
+        changed.write_text("keep this pre-existing edit\n")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested")
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(changed.read_text(), "keep this pre-existing edit\n")
+
     def test_restore_approval_preserves_other_nested_worktrees_even_with_the_batch_flag(self) -> None:
         copy = self.nested_catalog()
         other = self.wt / "local-deps/other"
