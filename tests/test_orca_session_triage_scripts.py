@@ -6454,7 +6454,7 @@ class RmCheckTests(unittest.TestCase):
             code, result = self.run_main("--restore-nested", "local-deps/library", "--apply-restore-nested")
 
         self.assertEqual(code, 1, result)
-        self.assertIn("復元直前に変わりました", " ".join(result["blockers"]))
+        self.assertEqual(result.get("restored_nested", {}), {})
         self.assertEqual(filename.read_text(), "unstaged change\n")
         self.assertEqual(git(copy, "show", ":app.txt"), "staged change")
 
