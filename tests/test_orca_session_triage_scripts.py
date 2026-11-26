@@ -6231,6 +6231,27 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(with_compose[0], 1)
         self.assertIn("docker が 20 秒応答しません", " ".join(with_compose[1]["blockers"]))
 
+    def test_docker_list_failure_blocks_a_worktree_with_a_compose_definition(self) -> None:
+        (self.wt / "compose.yaml").write_text("services: {}\n")
+        git(self.wt, "add", "compose.yaml")
+        git(self.wt, "commit", "-q", "-m", "compose")
+        git(self.main, "merge", "-q", "feature")
+        command = ["docker", "compose", "ls"]
+        real_run = subprocess.run
+        failures = (FileNotFoundError("docker"), subprocess.CalledProcessError(1, command))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                def fail_docker(cmd: list[str], **kwargs: Unpack[TextRunOptions]) -> subprocess.CompletedProcess[str]:
+                    if cmd[:3] == command:
+                        raise failure
+                    return real_run(cmd, **kwargs)
+
+                with patch.object(rmcheck.subprocess, "run", side_effect=fail_docker):
+                    code, report = self.run_main(docker=True)
+
+                self.assertEqual(code, 1)
+                self.assertIn("docker compose ls", " ".join(report["blockers"]))
+
     def test_a_dangling_symlink_is_reported_instead_of_crashing(self) -> None:
         (self.main / "uploads").mkdir()
         (self.main / "uploads" / "a.png").write_text("png")

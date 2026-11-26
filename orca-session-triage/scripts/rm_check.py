@@ -2123,14 +2123,15 @@ def has_compose_definition(worktree: Path) -> bool:
     return any(rel and not is_cache(rel) and (worktree / rel).is_file() for rel in paths)
 
 
-def compose_projects() -> list[ComposeProject] | None:
-    """Compose projects docker knows, or None without docker; raises TimeoutExpired when docker does not answer."""
-    try:
-        out = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
-                             capture_output=True, text=True, check=True, timeout=DOCKER_TIMEOUT).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return json.loads(out or "[]")
+def compose_projects() -> list[ComposeProject]:
+    out = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
+                         capture_output=True, text=True, check=True, timeout=DOCKER_TIMEOUT).stdout
+    projects = json.loads(out)
+    if not isinstance(projects, list) or not all(
+            isinstance(row, dict) and all(isinstance(row.get(key), str) for key in ("Name", "Status", "ConfigFiles"))
+            for row in projects):
+        raise ValueError("docker compose ls did not return an array of projects")
+    return projects
 
 
 def listed_in_orca(orca: str, worktree: Path) -> bool | None:
@@ -2531,14 +2532,15 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     decided.extend(automation_blockers)
     try:
         projects = [] if args.no_docker else compose_projects()
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         projects = []
+        detail = (f"docker が {DOCKER_TIMEOUT} 秒応答しません" if isinstance(error, subprocess.TimeoutExpired)
+                  else "docker compose ls でプロジェクト一覧を確認できません")
         if has_compose_definition(Path(worktree)):
-            decided.append("docker が %d 秒応答しません。作業場に compose の定義があり、動いているコンテナを確かめられないので、"
-                        "OrbStack か Docker が応答してから rm_check をやり直してください。" % DOCKER_TIMEOUT)
+            decided.append(f"{detail}。作業場に compose の定義があるため、"
+                           "Docker の稼働と PATH を確認してから rm_check を再実行してください。")
         else:
-            notes.append("docker compose ls did not answer in %d seconds; the worktree defines no compose project"
-                         % DOCKER_TIMEOUT)
+            notes.append(f"{detail}。作業場に compose の定義はありません。")
     supplied_head = args.pr_head if not pr or pr.get("state") == "MERGED" else None
     recheck = partial(check, worktree, main, base, projects or [], pr, supplied_head, args.head_ahead_of_pr,
                       decided=tuple(decided), since=since, restored=restored,
@@ -2794,8 +2796,6 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if not args.base and not by_pr and pr_base_name:
         notes.append("PR #%s base origin/%s is not fetched: fetch it or pass --base"
                      % ((pr or {}).get("number"), pr_base_name))
-    if projects is None:
-        notes.append("docker compose unavailable: containers not checked")
     if restored_nested:
         result["restored_nested"] = restored_nested
     if restored:
