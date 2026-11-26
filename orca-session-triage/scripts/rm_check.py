@@ -23,7 +23,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import NamedTuple, NotRequired, TypedDict
+from typing import Literal, NamedTuple, NotRequired, TypedDict
 from unicodedata import normalize
 from urllib.parse import urlsplit
 
@@ -152,6 +152,7 @@ PROCESS_RECHECK_SECONDS = 2
 # Claude Code's lock on a session's scheduled tasks, {"pid": …, "procStart": <ps lstart in UTC>, …}: it says only
 # that its holder runs, so a lock whose holder ended is regenerable and a live holder is a process using the worktree.
 SCHEDULED_LOCK = ".claude/scheduled_tasks.lock"
+CHECKOUT_ABSENT: Literal["absent"] = "absent"
 # How many uncommitted paths `reasons` names after their count.
 REASON_PATHS = 10
 
@@ -717,7 +718,7 @@ class NestedRestore:
     plans: dict[Path, NestedRestorePlan] = field(default_factory=dict)
     found: set[Path] = field(default_factory=set)
     moved: set[Path] = field(default_factory=set)
-    expected: dict[Path, list[int | str] | None] = field(default_factory=dict)
+    expected: dict[Path, list[int | str] | Literal["absent"] | None] = field(default_factory=dict)
     observed: dict[Path, list[int | str]] = field(default_factory=dict)
     clone_refs: dict[Path, list[tuple[str, str]]] = field(default_factory=dict)
     detached: frozenset[Path] = frozenset()
@@ -1187,6 +1188,22 @@ def checkout_head(copy: Path) -> list[int | str] | None:
         reflog = git(copy, "log", "-g", "-1", "--format=%H%x00%gD%x00%gs", "--date=unix", "HEAD")
         if branch.returncode in (0, 1) and reflog.returncode == 0:
             return [*marker[:2], private, common, head, branch.stdout.strip(), reflog.stdout.strip()]
+    return None
+
+
+def snapshot_checkout(copy: Path, cutoff: float | None = None) -> list[int | str] | Literal["absent"] | None:
+    try:
+        copy.lstat()
+    except FileNotFoundError:
+        return CHECKOUT_ABSENT
+    except OSError:
+        return None
+    try:
+        if copy.resolve() == copy and (state := checkout_head(copy)) is not None:
+            if cutoff is None or latest_head_change(copy) <= cutoff:
+                return state
+    except OSError:
+        pass
     return None
 
 
@@ -1753,7 +1770,9 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     if restore:
         missing = restore.requested - restore.found - restore.detached
         blockers.extend(f"--restore-nested の {copy.relative_to(restore.root)} を入れ子の Git リポジトリとして確認できません"
-                        for copy in sorted(missing) if restore.expected.get(copy) is not None or copy.exists() or copy.is_symlink())
+                        for copy in sorted(missing)
+                        if ((copy in restore.expected and restore.expected[copy] != CHECKOUT_ABSENT)
+                            or copy.exists() or copy.is_symlink()))
         blockers.extend(f"削除した子 worktree {copy.relative_to(restore.root)} にファイルが再作成されました"
                         for copy in sorted(restore.detached) if copy.exists() or copy.is_symlink())
     if since is not None:
@@ -2569,7 +2588,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
-    if args.from_file and (unobserved := {str(path) for path in restore_paths} - saved_heads.keys()):
+    if args.from_file and (unobserved := {str(path) for path in restore_paths if saved_heads.get(str(path)) is None}):
         decided.append(f"--restore-nested の checkout 情報が走査にありません（{', '.join(sorted(unobserved))}）。"
                        "新しい走査を保存して再試行してください")
     if args.topic_check or args.from_file:
@@ -2668,7 +2687,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     def changed_checkouts(restore: NestedRestore) -> set[Path]:
         changed = {copy for copy, state in restore.observed.items() if checkout_head(copy) != state}
         changed.update(copy for copy, refs in restore.clone_refs.items() if clone_tips(copy) != refs)
-        changed.update(copy for copy, state in restore.expected.items() if state is None and optional_stamp(copy) is not None)
+        changed.update(copy for copy, state in restore.expected.items()
+                       if state == CHECKOUT_ABSENT and optional_stamp(copy) is not None)
         return changed
 
     restored_nested: dict[str, list[str]] = {}

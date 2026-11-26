@@ -6776,12 +6776,12 @@ class RmCheckTests(unittest.TestCase):
         options = self.recorded_restore(("--restore-nested", name, "--apply-restore-nested"))
         saved = Path(options[options.index("--from") + 1])
         [row] = json.loads(saved.read_text())
-        self.assertEqual(row["restore_checkout_heads"], {name: None})
+        self.assertEqual(row["restore_checkout_heads"], {name: rmcheck.CHECKOUT_ABSENT})
         target = self.wt / name
         target.parent.mkdir()
         source.rename(target)
 
-        for heads in ({name: None}, {}):
+        for heads in ({name: rmcheck.CHECKOUT_ABSENT}, {name: None}, {}):
             with self.subTest(heads=heads), patch.object(rmcheck, "processes_in", return_value=[]):
                 saved.write_text(json.dumps([{**row, "restore_checkout_heads": heads}]))
                 code, result = self.run_main(*options, record_approval=False)
@@ -6809,7 +6809,8 @@ class RmCheckTests(unittest.TestCase):
                 outside.rename(second)
             return matching(plan, copy)
 
-        options = ("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second", "--apply-restore-nested")
+        options = self.recorded_restore(("--restore-nested", "local-deps/first", "--restore-nested", "local-deps/second",
+                                         "--apply-restore-nested"))
         with (patch.object(rmcheck.NestedRestorePlan, "matches", move_clone_during_preflight),
               patch.object(rmcheck, "processes_in", return_value=[])):
             code, result = self.run_main(*options)
@@ -6818,6 +6819,25 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
         self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+        second.rename(outside)
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        row["restore_checkout_heads"]["local-deps/second"] = None
+        saved.write_text(json.dumps([row]))
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*options)
+        self.assertEqual(code, 1, result)
+        self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+        self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
+        self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_unreadable_checkout_is_not_recorded_as_absent(self) -> None:
+        copy = self.nested_catalog().resolve()
+        self.assertIsInstance(rmcheck.snapshot_checkout(copy), list)
+        self.assertEqual(rmcheck.snapshot_checkout(copy.with_name("absent")), rmcheck.CHECKOUT_ABSENT)
+        with patch.object(Path, "lstat", side_effect=PermissionError("fixture denied")):
+            self.assertIsNone(rmcheck.snapshot_checkout(copy))
 
     def test_live_scan_does_not_accept_a_clone_head_that_moves_during_the_scan(self) -> None:
         import lead_decisions
@@ -6857,6 +6877,7 @@ class RmCheckTests(unittest.TestCase):
                                         "--inbox", str(fixture / "no-inbox"), "--ask-answers", str(fixture / "no-answers"),
                                         "--state-file", str(fixture / "no-state")]), 0)
         [row] = json.loads(output.getvalue())
+        self.assertEqual(row["restore_checkout_heads"], {name: None})
         saved.write_text(output.getvalue())
         digest = hashlib.sha256(json.dumps(row["removal_decision"], sort_keys=True).encode()).hexdigest()
         self.assertTrue(row["removal_decision"]["allows_removal"], row)
@@ -8064,14 +8085,8 @@ class RmCheckTests(unittest.TestCase):
             argv = (*argv[:index], *argv[index + 2:])
         if "restore_checkout_heads" not in row:
             since = argv[argv.index("--since") + 1] if "--since" in argv else row.get("scanned_at")
-            heads = {}
-            for name in names:
-                child = self.wt.resolve() / name
-                state = rmcheck.checkout_head(child)
-                if state is not None and since and rmcheck.latest_head_change(child) > datetime.fromisoformat(str(since)).timestamp():
-                    state = []
-                heads[name] = state
-            row["restore_checkout_heads"] = heads
+            cutoff = datetime.fromisoformat(str(since)).timestamp() if since else None
+            row["restore_checkout_heads"] = {name: rmcheck.snapshot_checkout(self.wt.resolve() / name, cutoff) for name in names}
         lead_decisions.append(log, lead_decisions.Decision(
             "approved", f"remove:{workspace}", "削除してよい", "2026-01-01T00:00:00Z",
             removal=lead_decisions.RemovalTerms(approve=True, restore_nested=names)))

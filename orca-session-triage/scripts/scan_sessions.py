@@ -4600,16 +4600,9 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(row["path"]).resolve()
         heads = {}
         for name in decision["restore_nested"]:
-            relative = str(PurePosixPath(name))
             copy = root / name
-            if not copy.is_relative_to(root) or copy.resolve() != copy:
-                heads[relative] = []
-                continue
-            if not copy.exists() and not copy.is_symlink():
-                heads[relative] = None
-                continue
-            state = rm_check.checkout_head(copy)
-            heads[relative] = state if state is not None and rm_check.latest_head_change(copy) <= scan_started.timestamp() else []
+            heads[str(PurePosixPath(name))] = (rm_check.snapshot_checkout(copy, scan_started.timestamp())
+                                              if copy.is_relative_to(root) else None)
         row["restore_checkout_heads"] = heads
     if args.review_out:
         write_review_queue(args.review_out, rows, verdicts, force=bool(args.only))
