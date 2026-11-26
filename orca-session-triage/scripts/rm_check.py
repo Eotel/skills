@@ -1695,7 +1695,9 @@ def compose_projects() -> list[ComposeProject]:
     out = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
                          capture_output=True, text=True, check=True, timeout=DOCKER_TIMEOUT).stdout
     projects = json.loads(out)
-    if not isinstance(projects, list) or not all(isinstance(row, dict) for row in projects):
+    if not isinstance(projects, list) or not all(
+            isinstance(row, dict) and all(isinstance(row.get(key), str) for key in ("Name", "Status", "ConfigFiles"))
+            for row in projects):
         raise ValueError("docker compose ls did not return an array of projects")
     return projects
 
@@ -2178,8 +2180,6 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if not args.base and not by_pr and pr_base_name:
         notes.append("PR #%s base origin/%s is not fetched: fetch it or pass --base"
                      % ((pr or {}).get("number"), pr_base_name))
-    if projects is None:
-        notes.append("docker compose unavailable: containers not checked")
     if notes:
         result["notes"] = notes
     if automation_blockers:
