@@ -1753,7 +1753,7 @@ def check(worktree: str | Path, main: str | Path, base: str | None, compose_proj
     if restore:
         missing = restore.requested - restore.found - restore.detached
         blockers.extend(f"--restore-nested の {copy.relative_to(restore.root)} を入れ子の Git リポジトリとして確認できません"
-                        for copy in sorted(missing) if copy in restore.expected or copy.exists() or copy.is_symlink())
+                        for copy in sorted(missing) if restore.expected.get(copy) is not None or copy.exists() or copy.is_symlink())
         blockers.extend(f"削除した子 worktree {copy.relative_to(restore.root)} にファイルが再作成されました"
                         for copy in sorted(restore.detached) if copy.exists() or copy.is_symlink())
     if since is not None:
@@ -2569,6 +2569,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         notes.append("Using %s as base: the repository has no %s, so the local branch the main checkout keeps "
                      "stands in" % (base, ", ".join(BASE_CANDIDATES)))
     decided = [keep_blocker] if keep_blocker else []
+    if args.from_file and (unobserved := {str(path) for path in restore_paths} - saved_heads.keys()):
+        decided.append(f"--restore-nested の checkout 情報が走査にありません（{', '.join(sorted(unobserved))}）。"
+                       "新しい走査を保存して再試行してください")
     if args.topic_check or args.from_file:
         try:
             drift = (topic_drift_blockers(args.topic_check.expanduser()) if args.topic_check

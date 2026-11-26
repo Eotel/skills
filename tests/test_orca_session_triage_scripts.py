@@ -5668,7 +5668,8 @@ class RmCheckTests(unittest.TestCase):
         fixture = Path(self.tmp.name)
         decisions, saved = fixture / "decisions.jsonl", fixture / "scan.json"
         row = {"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat(),
-               "agent_ownership_observed": True}
+               "agent_ownership_observed": True,
+               "restore_checkout_heads": {"local-deps/library": rmcheck.checkout_head(root / "local-deps/library")}}
         key = f"remove:{root}"
         terms = lead_decisions.RemovalTerms(approve=True, restore_nested=("local-deps/library",), archive_path=(note.name,))
         agreed = "2026-01-01T00:00:00Z"
@@ -5846,7 +5847,8 @@ class RmCheckTests(unittest.TestCase):
             removal=lead_decisions.RemovalTerms(approve=True, restore_nested=(name,))))
         [row] = scan.with_cleanup_constraints(
             [{"path": str(root), "class": "stalled", "scanned_at": datetime.now(timezone.utc).isoformat(),
-              "agent_ownership_observed": True}], fixture / "state.json", log)
+              "agent_ownership_observed": True, "restore_checkout_heads": {name: rmcheck.checkout_head(root / name)}}],
+            fixture / "state.json", log)
         saved.write_text(json.dumps([row]))
         digest = hashlib.sha256(json.dumps(row["removal_decision"], sort_keys=True).encode()).hexdigest()
         revoked = False
@@ -6572,12 +6574,18 @@ class RmCheckTests(unittest.TestCase):
         git(changed.parent, "add", changed.name)
         changed.write_text("keep working file\n")
         options = self.recorded_restore(("--restore-nested", approved, "--apply-restore-nested"))
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        row["restore_checkout_heads"][other] = rmcheck.checkout_head(changed.parent.resolve())
+        saved.write_text(json.dumps([row]))
         wrong_target = ("--restore-nested", other, *options[2:])
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as unapproved:
             self.run_main("--restore-nested", other, "--apply-restore-nested", record_approval=False)
         self.assertEqual(unapproved.exception.code, 2)
-        code, result = self.run_main(*wrong_target, record_approval=False)
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main(*wrong_target, record_approval=False)
+        self.assertIn("削除承認が変わりました", " ".join(result["reasons"]))
         self.assertEqual(code, 1, result)
         self.assertEqual(git(changed.parent, "show", ":app.txt"), "keep staged")
         self.assertEqual(changed.read_text(), "keep working file\n")
@@ -6754,6 +6762,32 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(code, 1, result)
         self.assertEqual(git(first, "show", ":app.txt"), "keep staged work")
         self.assertEqual(changed.read_text(), "keep unstaged work\n")
+
+    def test_recorded_restore_rejects_a_clone_moved_into_an_unobserved_path(self) -> None:
+        remote = Path(self.tmp.name) / "deps.git"
+        git(self.main, "clone", "-q", "--bare", str(self.main), str(remote))
+        source = Path(self.tmp.name) / "off-worktree"
+        git(self.main, "clone", "-q", str(remote), str(source))
+        (self.main / ".git/info/exclude").write_text("local-deps/\n")
+        (source / "app.txt").write_text("keep staged work\n")
+        git(source, "add", "app.txt")
+        (source / "app.txt").write_text("keep unstaged work\n")
+        name = "local-deps/target"
+        options = self.recorded_restore(("--restore-nested", name, "--apply-restore-nested"))
+        saved = Path(options[options.index("--from") + 1])
+        [row] = json.loads(saved.read_text())
+        self.assertEqual(row["restore_checkout_heads"], {name: None})
+        target = self.wt / name
+        target.parent.mkdir()
+        source.rename(target)
+
+        for heads in ({name: None}, {}):
+            with self.subTest(heads=heads), patch.object(rmcheck, "processes_in", return_value=[]):
+                saved.write_text(json.dumps([{**row, "restore_checkout_heads": heads}]))
+                code, result = self.run_main(*options, record_approval=False)
+                self.assertEqual(code, 1, result)
+                self.assertEqual(git(target, "show", ":app.txt"), "keep staged work")
+                self.assertEqual((target / "app.txt").read_text(), "keep unstaged work\n")
 
     def test_live_scan_does_not_accept_a_clone_head_that_moves_during_the_scan(self) -> None:
         import lead_decisions
@@ -7998,6 +8032,16 @@ class RmCheckTests(unittest.TestCase):
             rows = json.loads(Path(argv[index + 1]).read_text())
             row.update(next((saved_row for saved_row in rows if saved_row.get("path") == workspace), {}))
             argv = (*argv[:index], *argv[index + 2:])
+        if "restore_checkout_heads" not in row:
+            since = argv[argv.index("--since") + 1] if "--since" in argv else row.get("scanned_at")
+            heads = {}
+            for name in names:
+                child = self.wt.resolve() / name
+                state = rmcheck.checkout_head(child)
+                if state is not None and since and rmcheck.latest_head_change(child) > datetime.fromisoformat(str(since)).timestamp():
+                    state = []
+                heads[name] = state
+            row["restore_checkout_heads"] = heads
         lead_decisions.append(log, lead_decisions.Decision(
             "approved", f"remove:{workspace}", "削除してよい", "2026-01-01T00:00:00Z",
             removal=lead_decisions.RemovalTerms(approve=True, restore_nested=names)))
