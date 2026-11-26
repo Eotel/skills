@@ -2019,7 +2019,7 @@ def remove_path(path: Path) -> None:
         path.unlink()
 
 
-def archive(source: Path, target: Path, worktree: Path) -> dict:
+def archive(source: Path, target: Path, worktree: Path, *, restore_approval: str | None = None) -> dict:
     """Copy `source` to `target`, compare every file, record the move in the archive's manifest, then delete
     `source`. A copy that fails or differs is deleted and `source` stays, so nothing is lost on the way."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -2037,6 +2037,8 @@ def archive(source: Path, target: Path, worktree: Path) -> dict:
         return moved
     entry = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "worktree": str(worktree), **moved,
              "files": len(files_in(source))}
+    if restore_approval:
+        entry["restore_approval"] = restore_approval
     with (target.parent / ARCHIVE_MANIFEST).open("a", encoding="utf-8") as manifest:
         manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
     remove_path(source)
@@ -2653,7 +2655,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
         result["detached"] = detached
     if movable:
         day = datetime.now().strftime("%Y%m%d")
-        archived = [archive(source, archive_target(args.archive_dir, Path(worktree), source, day), Path(worktree))
+        archived = [archive(source, archive_target(args.archive_dir, root, source, day), root,
+                            restore_approval=args.restore_approval)
                     for source in archive_movers(root, result, movable_now(result), explicit=explicit)]
         if any(item["verified"] for item in archived):
             kept = {key: result[key] for key in ("detached",) if key in result}
