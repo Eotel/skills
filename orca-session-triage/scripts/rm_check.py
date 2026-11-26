@@ -893,6 +893,24 @@ def reference_paths(path: Path) -> set[Path]:
     return {location, *links}
 
 
+def ignore_configuration_paths(copy: Path) -> set[Path]:
+    settings = git(copy, "config", "--includes", "--show-origin", "--null", "--get-regexp",
+                   r"^(core\.excludesfile|include\.path|includeif\..*\.path)$")
+    if settings.returncode not in (0, 1):
+        raise OSError("Git の無視ルールに使う設定を確認できません")
+    sources = {excludes_file(copy)}
+    fields = settings.stdout.split("\0")
+    for source, setting in zip(fields[::2], fields[1::2]):
+        if not source.startswith("file:"):
+            continue
+        config = copy / source.removeprefix("file:")
+        sources.add(config)
+        name, _, value = setting.partition("\n")
+        if name != "core.excludesfile" and value:
+            sources.add(config.parent / Path(value).expanduser())
+    return {path for source in sources for path in reference_paths(source)}
+
+
 def restore_ignore_change(copy: Path, plan: NestedRestorePlan) -> str | None:
     def identity(path: Path) -> tuple[int, int] | None:
         stamp = optional_stamp(path)
@@ -1307,7 +1325,7 @@ def checkout_metadata_stamps(copy: Path, directories: tuple[Path, Path], *,
         raise OSError(f"Git index を確認できません（{copy}）")
     index_path = Path(index.stdout.strip())
     paths = [copy / ".git", index_path, index_path.with_name(index_path.name + ".lock"), common / "info/exclude",
-             common / "config", private / "config.worktree", *reference_paths(excludes_file(copy)),
+             common / "config", private / "config.worktree", *ignore_configuration_paths(copy),
              *head_storage_paths(private, common)]
     stamps: dict[Path, list[int] | None] = {}
     if private != common:
@@ -2633,7 +2651,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     scanned_at = None
     scan_time_invalid = False
     saved_heads = {}
-    if args.from_file and (since is None or restore_paths):
+    if args.from_file:
         rows = json.loads(args.from_file.read_text(encoding="utf-8"))
         local_row = next((row for row in rows if row.get("path") == worktree and not row.get("environment")), {})
         time_row = local_row
@@ -2648,7 +2666,10 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 scanned_at = None
                 scan_time_invalid = True
         if scanned_at is not None:
-            since = scanned_at if since is None else min(since, scanned_at)
+            if since is None:
+                since = scanned_at
+            elif restore_paths:
+                since = min(since, scanned_at)
         saved_heads = {str(PurePosixPath(name)): state for name, state in
                        (local_row.get("restore_checkout_heads") or {}).items()}
     checkout = args.main or main_checkout(worktree)

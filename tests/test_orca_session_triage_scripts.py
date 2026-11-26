@@ -6616,13 +6616,14 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(self.wt, "status", "--porcelain"), "")
 
         for value in ("bad timestamp", "", None):
-            with self.subTest(value=value):
-                saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": value}]))
-                with patch.object(rmcheck, "processes_in", return_value=[]):
-                    code, result = self.run_main("--from", str(saved))
+            saved.write_text(json.dumps([{"path": str(self.wt.resolve()), "scanned_at": value}]))
+            for extra in ((), ("--since", datetime.now(timezone.utc).isoformat())):
+                with self.subTest(value=value, extra=extra):
+                    with patch.object(rmcheck, "processes_in", return_value=[]):
+                        code, result = self.run_main("--from", str(saved), *extra)
 
-                self.assertEqual(code, 1, result)
-                self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
+                    self.assertEqual(code, 1, result)
+                    self.assertIn("新しい走査を保存", " ".join(result["reasons"]))
 
     def test_nested_restore_rechecks_edits_and_staging_after_preflight(self) -> None:
         remote = Path(self.tmp.name) / "deps.git"
