@@ -1151,15 +1151,20 @@ def nested_ignored_blockers(copy: Path, repository: str | None, discard: frozens
     return blockers
 
 
-def worktree_directory_stamps(copy: Path) -> dict[Path, list[int]]:
-    stamps = {}
+def worktree_entry_stamps(copy: Path) -> dict[Path, list[int]]:
+    stamps = {copy: file_stamp(copy)}
     pending = [copy]
     while pending:
         directory = pending.pop()
-        stamps[directory] = file_stamp(directory)
         with os.scandir(directory) as entries:
-            pending.extend(directory / entry.name for entry in entries
-                           if entry.name != ".git" and entry.is_dir(follow_symlinks=False))
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                path = directory / entry.name
+                info = entry.stat(follow_symlinks=False)
+                stamps[path] = stat_stamp(info)
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
     return stamps
 
 
@@ -2371,8 +2376,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                              "catalogs and remove the copies with git worktree remove, then check again")
     parser.add_argument("--restore-nested", action="append", default=[], metavar="PATH",
                         help="plan restoration of tracked changes in a nested Git repository named by a relative path")
-    parser.add_argument("--apply-restore-nested", action="store_true",
-                        help="apply the approved --restore-nested paths if preflight permits cleanup, then recheck")
+    parser.add_argument("--apply-restore-nested", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--discard-before-restore", action="append", default=[], metavar="PATH",
                         help="when planning --restore-nested, a file the batch will discard first")
     parser.add_argument("--restore-approval", help=argparse.SUPPRESS)
@@ -2433,8 +2437,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
     if any(path.is_absolute() or not path.parts or ".." in path.parts
            or any(part.casefold() == ".git" for part in path.parts) for path in (*restore_paths, *discard_paths, *missing_paths)):
         parser.error("--restore-nested and --discard-before-restore take relative paths inside the worktree")
-    if args.apply_restore_nested and not restore_paths:
-        parser.error("--apply-restore-nested needs --restore-nested")
+    if args.apply_restore_nested and (not restore_paths or not args.restore_approval):
+        parser.error("--apply-restore-nested needs saved restoration approval; use rm-check-batch --from SCAN_JSON --remove-ok")
     if args.restore_approval and (not args.apply_restore_nested or not args.from_file
                                   or not re.fullmatch(r"[0-9a-f]{64}", args.restore_approval)):
         parser.error("--restore-approval needs --apply-restore-nested, a saved scan and an approval digest")
@@ -2643,7 +2647,9 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 row = rows[0]
                 decision = row.get("removal_decision") or {}
                 digest = sha256(json.dumps(decision, sort_keys=True).encode()).hexdigest()
+                recorded_paths = {PurePosixPath(name) for name in decision.get("restore_nested") or []}
                 if (decision.get("allows_removal") is True and decision.get("record_id") and digest == args.restore_approval
+                        and recorded_paths == set(restore_paths)
                         and not any(row.get(key) for key in ("cleanup_blockers", "automation_blocker", "pending_handoffs"))):
                     approved_archives = decision.get("archive_path") or []
                     return None
@@ -2783,7 +2789,7 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                         break
                 marker, private, common, _ = item["checkout_state"]
                 try:
-                    directories = worktree_directory_stamps(copy)
+                    entries = worktree_entry_stamps(copy)
                     metadata = head_storage_stamps(Path(private), Path(common))
                     if (linked_checkout_state(copy) != item["checkout_state"]
                             or (restore and copy in restore.observed and checkout_head(copy) != restore.observed[copy])):
@@ -2798,8 +2804,8 @@ def main(argv: list[str] | None = None, worktree_notes: WorktreeNotes = OrcaNote
                 try:
                     if file_stamp(copy / ".git") != marker or head_storage_stamps(Path(private), Path(common)) != metadata:
                         raise ValueError("登録または HEAD が変わりました")
-                    if any(file_stamp(path) != stamp for path, stamp in directories.items()):
-                        raise ValueError("子 worktree のディレクトリが変わりました")
+                    if any(file_stamp(path) != stamp for path, stamp in entries.items()):
+                        raise ValueError("子 worktree のファイルが変わりました")
                 except (OSError, ValueError) as error:
                     detach_error = f"子 worktree {copy.relative_to(root)} を削除直前に確認できません（{error}）"
                     break
