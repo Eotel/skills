@@ -7157,6 +7157,28 @@ class RmCheckTests(unittest.TestCase):
         self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
         self.assertEqual(changed.read_text(), "unstaged edit\n")
 
+    def test_nested_restore_retains_edits_after_a_soft_reset_since_the_scan(self) -> None:
+        copy = self.nested_catalog()
+        deps = Path(self.tmp.name) / "deps"
+        rel = "locale/de/LC_MESSAGES/django.po"
+        (deps / rel).write_text("different committed contents\n")
+        git(deps, "commit", "-qam", "a newer revision")
+        git(deps, "push", "-q", "origin", "main")
+        changed = copy / rel
+        changed.write_text("staged edit\n")
+        git(copy, "add", rel)
+        changed.write_text("unstaged edit\n")
+        since = datetime.now(timezone.utc)
+        git(copy, "reset", "--soft", "origin/main")
+
+        with patch.object(rmcheck, "processes_in", return_value=[]):
+            code, result = self.run_main("--restore-nested", "local-deps/pushed", "--apply-restore-nested",
+                                         "--since", since.isoformat())
+
+        self.assertEqual((code, result["detached"]), (1, []), result)
+        self.assertEqual(git(copy, "show", f":{rel}"), "staged edit")
+        self.assertEqual(changed.read_text(), "unstaged edit\n")
+
     def test_nested_restore_refuses_a_replacement_with_mismatched_worktree_registration(self) -> None:
         copy = self.nested_catalog()
         deps = Path(self.tmp.name) / "deps"

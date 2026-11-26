@@ -759,6 +759,8 @@ class NestedRestore:
             changes[rel] = stamp
         if changes:
             index_path = Path(index.stdout.strip())
+            if self.since is not None and latest_head_change(copy) > self.since.timestamp():
+                return False
             try:
                 checkout_stamp = file_stamp(copy / ".git")
                 stamp = file_stamp(index_path)
@@ -1534,6 +1536,18 @@ def optional_stamp(path: Path) -> list[int] | None:
         return None
 
 
+def latest_head_change(worktree: Path) -> float:
+    moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
+    stamp = re.search(r"@\{(\d+)\}", moves)
+    last = float(stamp.group(1)) if stamp else float(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
+    paths = git(worktree, "rev-parse", "--path-format=absolute", "--git-path", "HEAD", "--git-path", "logs/HEAD")
+    if paths.returncode == 0:
+        for path in paths.stdout.splitlines():
+            with suppress(OSError):
+                last = max(last, max(file_stamp(Path(path))[3:]) / 1e9)
+    return last
+
+
 def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]]) -> list[str]:
     """Blockers for a worktree whose files (outside UNWATCHED_DIRS) or HEAD moved after `since`."""
     after = since.timestamp()
@@ -1556,10 +1570,7 @@ def moved_since(worktree: Path, since: datetime, restored: dict[str, list[int]])
                         % (since.isoformat(timespec="seconds"), len(moved),
                            datetime.fromtimestamp(latest_ns / 1e9, timezone.utc).isoformat(timespec="seconds"),
                            latest.relative_to(worktree)))
-    # The reflog dates every move of HEAD (commit, checkout, reset); the commit date stands in without one.
-    moves = git(worktree, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout.strip()
-    stamp = re.search(r"@\{(\d+)\}", moves)
-    moved_at = int(stamp.group(1)) if stamp else int(git(worktree, "log", "-1", "--format=%ct", "HEAD").stdout.strip() or 0)
+    moved_at = latest_head_change(worktree)
     if moved_at > after:
         blockers.append("走査（%s）の後に HEAD が動きました（%s）。別の担当が使っているかもしれません"
                         % (since.isoformat(timespec="seconds"),
